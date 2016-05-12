@@ -1,0 +1,190 @@
+From f957802cd5377db3d7bbb3a6617886d2900cc608 Mon Sep 17 00:00:00 2001
+Message-Id: <f957802cd5377db3d7bbb3a6617886d2900cc608.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 3 Jul 2014 16:28:00 +0100
+Subject: [PATCH 03/71] FROM_UPSTREAM [VPG]: drm/i915: Emphasize that ctx->id
+ is merely a user handle
+
+This is an Execlists preparatory patch, since they make context ID become an
+overloaded term:
+
+- In the software, it was used to distinguish which context userspace was
+  trying to use.
+- In the BSpec, the term is used to describe the 20-bits long field the
+  hardware uses to it to discriminate the contexts that are submitted to
+  the ELSP and inform the driver about their current status (via Context
+  Switch Interrupts and Context Status Buffers).
+
+Initially, I tried to make the different meanings converge, but it proved
+impossible:
+
+- The software ctx->id is per-filp, while the hardware one needs to be
+  globally unique.
+- Also, we multiplex several backing states objects per intel_context,
+  and all of them need unique HW IDs.
+- I tried adding a per-filp ID and then composing the HW context ID as:
+  ctx->id + file_priv->id + ring->id, but the fact that the hardware only
+  uses 20-bits means we have to artificially limit the number of filps or
+  contexts the userspace can create.
+
+The ctx->user_handle renaming bits are done with this Cocci patch (plus
+manual frobbing of the struct declaration):
+
+    @@
+    struct intel_context c;
+    @@
+    - (c).id
+    + c.user_handle
+
+    @@
+    struct intel_context *c;
+    @@
+    - (c)->id
+    + c->user_handle
+
+Also, while we are at it, s/DEFAULT_CONTEXT_ID/DEFAULT_CONTEXT_HANDLE and
+change the type to unsigned 32 bits.
+
+v2: s/handle/user_handle and change the type to uint32_t as suggested by
+Chris Wilson.
+
+Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org> (v1)
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 821d66dd7ca3f59f68478d0d0ee1f28a1de74267)
+
+Change-Id: I8b343261b0c04e6b0c699401c21ca56dc1416f02
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 821d66dd7ca3f59f68478d0d0ee1f28a1de74267
+Upstream-as-of-tag: drm-intel-next-2014-07-11
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c        |    2 +-
+ drivers/gpu/drm/i915/i915_drv.h            |    6 +++---
+ drivers/gpu/drm/i915/i915_gem_context.c    |   12 ++++++------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    2 +-
+ drivers/gpu/drm/i915/intel_uncore.c        |    2 +-
+ 5 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index ff525a3..5cb93ab 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -2552,7 +2552,7 @@ static int per_file_ctx(int id, void *ptr, void *data)
+ 	if (i915_gem_context_is_default(ctx))
+ 		seq_puts(m, "  default context:\n");
+ 	else
+-		seq_printf(m, "  context %d:\n", ctx->id);
++		seq_printf(m, "  context %d:\n", ctx->user_handle);
+ 	ppgtt->debug_dump(ppgtt, m);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 3a7d8c7..0162e44 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -613,10 +613,10 @@ struct i915_ctx_hang_stats {
+ };
+ 
+ /* This must match up with the value previously used for execbuf2.rsvd1. */
+-#define DEFAULT_CONTEXT_ID 0
++#define DEFAULT_CONTEXT_HANDLE 0
+ struct intel_context {
+ 	struct kref ref;
+-	int id;
++	int user_handle;
+ 	uint8_t remap_slice;
+ 	struct drm_i915_file_private *file_priv;
+ 	struct i915_ctx_hang_stats hang_stats;
+@@ -2638,7 +2638,7 @@ static inline void i915_gem_context_unreference(struct intel_context *ctx)
+ 
+ static inline bool i915_gem_context_is_default(const struct intel_context *c)
+ {
+-	return c->id == DEFAULT_CONTEXT_ID;
++	return c->user_handle == DEFAULT_CONTEXT_HANDLE;
+ }
+ 
+ int i915_gem_context_create_ioctl(struct drm_device *dev, void *data,
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 41b2a20..7649cf5 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -276,14 +276,14 @@ __create_hw_context(struct drm_device *dev,
+ 	/* Default context will never have a file_priv */
+ 	if (file_priv != NULL) {
+ 		ret = idr_alloc(&file_priv->context_idr, ctx,
+-				DEFAULT_CONTEXT_ID, 0, GFP_KERNEL);
++				DEFAULT_CONTEXT_HANDLE, 0, GFP_KERNEL);
+ 		if (ret < 0)
+ 			goto err_out;
+ 	} else
+-		ret = DEFAULT_CONTEXT_ID;
++		ret = DEFAULT_CONTEXT_HANDLE;
+ 
+ 	ctx->file_priv = file_priv;
+-	ctx->id = ret;
++	ctx->user_handle = ret;
+ 	/* NB: Mark all slices as needing a remap so that when the context first
+ 	 * loads it will restore whatever remap state already exists. If there
+ 	 * is no remap info, it will be a NOP. */
+@@ -860,7 +860,7 @@ int i915_gem_context_create_ioctl(struct drm_device *dev, void *data,
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
+-	args->ctx_id = ctx->id;
++	args->ctx_id = ctx->user_handle;
+ 	DRM_DEBUG_DRIVER("HW context %d created\n", args->ctx_id);
+ 
+ 	return 0;
+@@ -874,7 +874,7 @@ int i915_gem_context_destroy_ioctl(struct drm_device *dev, void *data,
+ 	struct intel_context *ctx;
+ 	int ret;
+ 
+-	if (args->ctx_id == DEFAULT_CONTEXT_ID)
++	if (args->ctx_id == DEFAULT_CONTEXT_HANDLE)
+ 		return -ENOENT;
+ 
+ 	ret = i915_mutex_lock_interruptible(dev);
+@@ -887,7 +887,7 @@ int i915_gem_context_destroy_ioctl(struct drm_device *dev, void *data,
+ 		return PTR_ERR(ctx);
+ 	}
+ 
+-	idr_remove(&ctx->file_priv->context_idr, ctx->id);
++	idr_remove(&ctx->file_priv->context_idr, ctx->user_handle);
+ 	i915_gem_context_unreference(ctx);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 118fb07..b7ae215 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -938,7 +938,7 @@ i915_gem_validate_context(struct drm_device *dev, struct drm_file *file,
+ 	struct intel_context *ctx = NULL;
+ 	struct i915_ctx_hang_stats *hs;
+ 
+-	if (ring->id != RCS && ctx_id != DEFAULT_CONTEXT_ID)
++	if (ring->id != RCS && ctx_id != DEFAULT_CONTEXT_HANDLE)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	ctx = i915_gem_context_get(file->driver_priv, ctx_id);
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index 72e8bf7..503188a 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -1003,7 +1003,7 @@ int i915_get_reset_stats_ioctl(struct drm_device *dev,
+ 	if (args->flags || args->pad)
+ 		return -EINVAL;
+ 
+-	if (args->ctx_id == DEFAULT_CONTEXT_ID && !capable(CAP_SYS_ADMIN))
++	if (args->ctx_id == DEFAULT_CONTEXT_HANDLE && !capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+ 	ret = mutex_lock_interruptible(&dev->struct_mutex);
+-- 
+1.7.9.5
+

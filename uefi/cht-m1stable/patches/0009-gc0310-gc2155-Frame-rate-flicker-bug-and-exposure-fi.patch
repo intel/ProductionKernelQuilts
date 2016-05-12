@@ -1,0 +1,809 @@
+From a3e0f5b342861883238511697ac9553c6add9eac Mon Sep 17 00:00:00 2001
+From: "Chen, Ping-chung" <ping-chung.chen@intel.com>
+Date: Fri, 23 Jan 2015 10:11:06 +0800
+Subject: [PATCH] gc0310/gc2155: Frame rate, flicker bug and exposure fixes
+
+This patch includes improvements for:
+1. Improve GC0310 to achieve 30fps.
+2. Improve GC2155 to achieve 19.x fps.
+3. Fix flicker issue of GC2155 by the correct line_length_pck.
+4. Refine the exposure function in GC2155 driver.
+
+Change-Id: I2482b946222fdc36f11c67c78901a296468354a9
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ drivers/media/i2c/atomisp/gc0310.c |  21 ++-
+ drivers/media/i2c/atomisp/gc0310.h |  87 +++++------
+ drivers/media/i2c/atomisp/gc2155.c |  75 +++++----
+ drivers/media/i2c/atomisp/gc2155.h | 302 ++-----------------------------------
+ 4 files changed, 108 insertions(+), 377 deletions(-)
+
+diff --git a/drivers/media/i2c/atomisp/gc0310.c b/drivers/media/i2c/atomisp/gc0310.c
+index 6b9de4e..f84fcc2 100644
+--- a/drivers/media/i2c/atomisp/gc0310.c
++++ b/drivers/media/i2c/atomisp/gc0310.c
+@@ -292,7 +292,6 @@ static int gc0310_get_intg_factor(struct i2c_client *client,
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+ 	struct gc0310_device *dev = to_gc0310_sensor(sd);
+ 	struct atomisp_sensor_mode_data *buf = &info->data;
+-	const unsigned int ext_clk_freq_hz = 19200000;
+ 	u16 val;
+ 	u8 reg_val;
+ 	int ret;
+@@ -304,8 +303,8 @@ static int gc0310_get_intg_factor(struct i2c_client *client,
+ 		return -EINVAL;
+ 
+ 	/* pixel clock calculattion */
+-	dev->vt_pix_clk_freq_mhz = ext_clk_freq_hz / 2;
+-	buf->vt_pix_clk_freq_mhz = ext_clk_freq_hz / 2;
++	dev->vt_pix_clk_freq_mhz = 14400000; // 16.8MHz
++	buf->vt_pix_clk_freq_mhz = dev->vt_pix_clk_freq_mhz;
+ 	pr_info("vt_pix_clk_freq_mhz=%d\n", buf->vt_pix_clk_freq_mhz);
+ 
+ 	/* get integration time */
+@@ -383,7 +382,7 @@ static int gc0310_get_intg_factor(struct i2c_client *client,
+ 					GC0310_H_BLANKING_H, &reg_val);
+ 	if (ret)
+ 		return ret;
+-	val = ((reg_val & 0xF0) >> 4) << 8;
++	val = (reg_val & 0xFF) << 8;
+ 	ret = gc0310_read_reg(client, GC0310_8BIT,
+ 					GC0310_H_BLANKING_L, &reg_val);
+ 	if (ret)
+@@ -402,7 +401,7 @@ static int gc0310_get_intg_factor(struct i2c_client *client,
+ 					GC0310_V_BLANKING_H, &reg_val);
+ 	if (ret)
+ 		return ret;
+-	val = (reg_val & 0x0F) << 8;
++	val = (reg_val & 0xFF) << 8;
+ 	ret = gc0310_read_reg(client, GC0310_8BIT,
+ 					GC0310_V_BLANKING_L, &reg_val);
+ 	if (ret)
+@@ -997,7 +996,7 @@ static int gc0310_try_mbus_fmt(struct v4l2_subdev *sd,
+ 		fmt->width = gc0310_res[idx].width;
+ 		fmt->height = gc0310_res[idx].height;
+ 	}
+-	fmt->code = V4L2_MBUS_FMT_SRGGB8_1X8;
++	fmt->code = V4L2_MBUS_FMT_SGRBG8_1X8;
+ 
+ 	return 0;
+ }
+@@ -1078,7 +1077,7 @@ static int gc0310_g_mbus_fmt(struct v4l2_subdev *sd,
+ 
+ 	fmt->width = gc0310_res[dev->fmt_idx].width;
+ 	fmt->height = gc0310_res[dev->fmt_idx].height;
+-	fmt->code = V4L2_MBUS_FMT_SRGGB8_1X8;
++	fmt->code = V4L2_MBUS_FMT_SGRBG8_1X8;
+ 
+ 	return 0;
+ }
+@@ -1205,7 +1204,7 @@ static int gc0310_enum_mbus_fmt(struct v4l2_subdev *sd,
+ 				unsigned int index,
+ 				enum v4l2_mbus_pixelcode *code)
+ {
+-	*code = V4L2_MBUS_FMT_SRGGB8_1X8;
++	*code = V4L2_MBUS_FMT_SGRBG8_1X8;
+ 
+ 	return 0;
+ }
+@@ -1352,7 +1351,7 @@ static int gc0310_enum_mbus_code(struct v4l2_subdev *sd,
+ 	if (code->index >= MAX_FMTS)
+ 		return -EINVAL;
+ 
+-	code->code = V4L2_MBUS_FMT_SRGGB8_1X8;
++	code->code = V4L2_MBUS_FMT_SGRBG8_1X8;
+ 	return 0;
+ }
+ 
+@@ -1513,7 +1512,7 @@ static int gc0310_probe(struct i2c_client *client,
+ 	if (ACPI_COMPANION(&client->dev))
+ 		pdata = gmin_camera_platform_data(&dev->sd,
+ 						  ATOMISP_INPUT_FORMAT_RAW_8,
+-						  atomisp_bayer_order_rggb);
++						  atomisp_bayer_order_grbg);
+ 	else
+ 		pdata = client->dev.platform_data;
+ 
+@@ -1532,7 +1531,7 @@ static int gc0310_probe(struct i2c_client *client,
+ 
+ 	dev->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+ 	dev->pad.flags = MEDIA_PAD_FL_SOURCE;
+-	dev->format.code = V4L2_MBUS_FMT_SRGGB8_1X8;
++	dev->format.code = V4L2_MBUS_FMT_SGRBG8_1X8;
+ 	dev->sd.entity.type = MEDIA_ENT_T_V4L2_SUBDEV_SENSOR;
+ 
+ 	ret = media_entity_init(&dev->sd.entity, 1, &dev->pad, 0);
+diff --git a/drivers/media/i2c/atomisp/gc0310.h b/drivers/media/i2c/atomisp/gc0310.h
+index 760cd32..0c282f4 100644
+--- a/drivers/media/i2c/atomisp/gc0310.h
++++ b/drivers/media/i2c/atomisp/gc0310.h
+@@ -109,7 +109,7 @@
+ #define GC0310_V_BLANKING_L			0x08
+ #define GC0310_SH_DELAY			0x11
+ 
+-#define GC0310_START_STREAMING			0x96 /* 8-bit enable */
++#define GC0310_START_STREAMING			0x94 /* 8-bit enable */
+ #define GC0310_STOP_STREAMING			0x0 /* 8-bit disable */
+ 
+ #define GC0310_BIN_FACTOR_MAX			3
+@@ -221,25 +221,53 @@ static const struct gc0310_reg gc0310_reset_register[] = {
+ 	{GC0310_8BIT, 0xf2, 0x80}, //sync output
+ 	{GC0310_8BIT, 0xf3, 0x00}, //1f//01 data output
+ 	{GC0310_8BIT, 0xf7, 0x33}, //f9
+-	{GC0310_8BIT, 0xf8, 0x06}, //00
++	{GC0310_8BIT, 0xf8, 0x05}, //00
+ 	{GC0310_8BIT, 0xf9, 0x0e}, // 0x8e //0f
+ 	{GC0310_8BIT, 0xfa, 0x11},
+ 
+ /////////////////////////////////////////////////
++///////////////////   MIPI	 ////////////////////
++/////////////////////////////////////////////////
++	{GC0310_8BIT, 0xfe, 0x03},
++	{GC0310_8BIT, 0x01, 0x03}, ///mipi 1lane
++	{GC0310_8BIT, 0x02, 0x22}, // 0x33
++	{GC0310_8BIT, 0x03, 0x94},
++	{GC0310_8BIT, 0x04, 0x01}, // fifo_prog
++	{GC0310_8BIT, 0x05, 0x00}, //fifo_prog
++	{GC0310_8BIT, 0x06, 0x80}, //b0  //YUV ISP data
++	{GC0310_8BIT, 0x11, 0x2a},//1e //LDI set YUV422
++	{GC0310_8BIT, 0x12, 0x90},//00 //04 //00 //04//00 //LWC[7:0]  //
++	{GC0310_8BIT, 0x13, 0x02},//05 //05 //LWC[15:8]
++	{GC0310_8BIT, 0x15, 0x12}, // 0x10 //DPHYY_MODE read_ready
++	{GC0310_8BIT, 0x17, 0x01},
++	{GC0310_8BIT, 0x40, 0x08},
++	{GC0310_8BIT, 0x41, 0x00},
++	{GC0310_8BIT, 0x42, 0x00},
++	{GC0310_8BIT, 0x43, 0x00},
++	{GC0310_8BIT, 0x21, 0x02}, // 0x01
++	{GC0310_8BIT, 0x22, 0x02}, // 0x01
++	{GC0310_8BIT, 0x23, 0x01}, // 0x05 //Nor:0x05 DOU:0x06
++	{GC0310_8BIT, 0x29, 0x00},
++	{GC0310_8BIT, 0x2A, 0x25}, // 0x05 //data zero 0x7a de
++	{GC0310_8BIT, 0x2B, 0x02},
++
++	{GC0310_8BIT, 0xfe, 0x00},
++
++/////////////////////////////////////////////////
+ /////////////////	CISCTL reg	/////////////////
+ /////////////////////////////////////////////////
+ 	{GC0310_8BIT, 0x00, 0x2f}, //2f//0f//02//01
+ 	{GC0310_8BIT, 0x01, 0x0f}, //06
+ 	{GC0310_8BIT, 0x02, 0x04},
+ 	{GC0310_8BIT, 0x4f, 0x00}, //AEC 0FF
+-	{GC0310_8BIT, 0x03, 0x02}, // 0x03 //04
+-	{GC0310_8BIT, 0x04, 0x40}, // 0xe8 //58
+-	{GC0310_8BIT, 0x05, 0x01},
+-	{GC0310_8BIT, 0x06, 0x26}, // 0x0a //HB
++	{GC0310_8BIT, 0x03, 0x01}, // 0x03 //04
++	{GC0310_8BIT, 0x04, 0xc0}, // 0xe8 //58
++	{GC0310_8BIT, 0x05, 0x00},
++	{GC0310_8BIT, 0x06, 0xb2}, // 0x0a //HB
+ 	{GC0310_8BIT, 0x07, 0x00},
+-	{GC0310_8BIT, 0x08, 0x4e}, // 0x89 //VB
+-	{GC0310_8BIT, 0x09, 0x01}, //row start
+-	{GC0310_8BIT, 0x0a, 0xfc}, //
++	{GC0310_8BIT, 0x08, 0x0c}, // 0x89 //VB
++	{GC0310_8BIT, 0x09, 0x00}, //row start
++	{GC0310_8BIT, 0x0a, 0x00}, //
+ 	{GC0310_8BIT, 0x0b, 0x00}, //col start
+ 	{GC0310_8BIT, 0x0c, 0x00},
+ 	{GC0310_8BIT, 0x0d, 0x01}, //height
+@@ -283,9 +311,9 @@ static const struct gc0310_reg gc0310_reset_register[] = {
+ /////////////////////////////////////////////////
+ //////////////////	 ISP reg  ///////////////////
+ /////////////////////////////////////////////////
+-	{GC0310_8BIT, 0x40, 0x00}, // 0xff //ff //48
++	{GC0310_8BIT, 0x40, 0x06}, // 0xff //ff //48
+ 	{GC0310_8BIT, 0x41, 0x00}, // 0x21 //00//[0]curve_en
+-	{GC0310_8BIT, 0x42, 0x00}, // 0xcf //0a//[1]awn_en
++	{GC0310_8BIT, 0x42, 0x04}, // 0xcf //0a//[1]awn_en
+ 	{GC0310_8BIT, 0x44, 0x18}, // 0x18 //02
+ 	{GC0310_8BIT, 0x46, 0x02}, // 0x03 //sync
+ 	{GC0310_8BIT, 0x49, 0x03},
+@@ -294,7 +322,7 @@ static const struct gc0310_reg gc0310_reset_register[] = {
+ 	{GC0310_8BIT, 0x51, 0x00},
+ 	{GC0310_8BIT, 0x52, 0x00},
+ 	{GC0310_8BIT, 0x53, 0x00},
+-	{GC0310_8BIT, 0x54, 0x00},
++	{GC0310_8BIT, 0x54, 0x01},
+ 	{GC0310_8BIT, 0x55, 0x01}, //crop window height
+ 	{GC0310_8BIT, 0x56, 0xf0},
+ 	{GC0310_8BIT, 0x57, 0x02}, //crop window width
+@@ -303,12 +331,12 @@ static const struct gc0310_reg gc0310_reset_register[] = {
+ /////////////////////////////////////////////////
+ ///////////////////   GAIN	 ////////////////////
+ /////////////////////////////////////////////////
+-	{GC0310_8BIT, 0x70, 0x50}, //70 //80//global gain
++	{GC0310_8BIT, 0x70, 0x70}, //70 //80//global gain
+ 	{GC0310_8BIT, 0x71, 0x20}, // pregain gain
+ 	{GC0310_8BIT, 0x72, 0x40}, // post gain
+-	{GC0310_8BIT, 0x5a, 0x98}, //84//analog gain 0
+-	{GC0310_8BIT, 0x5b, 0xdc}, //c9
+-	{GC0310_8BIT, 0x5c, 0xfe}, //ed//not use pga gain highest level
++	{GC0310_8BIT, 0x5a, 0x84}, //84//analog gain 0
++	{GC0310_8BIT, 0x5b, 0xc9}, //c9
++	{GC0310_8BIT, 0x5c, 0xed}, //ed//not use pga gain highest level
+ 	{GC0310_8BIT, 0x77, 0x40}, // R gain 0x74 //awb gain
+ 	{GC0310_8BIT, 0x78, 0x40}, // G gain
+ 	{GC0310_8BIT, 0x79, 0x40}, // B gain 0x5f
+@@ -336,31 +364,6 @@ static const struct gc0310_reg gc0310_reset_register[] = {
+ 	{GC0310_8BIT, 0x4f, 0x60}, //sun_clamp
+ 	{GC0310_8BIT, 0xfe, 0x00},
+ 
+-/////////////////////////////////////////////////
+-///////////////////   MIPI	 ////////////////////
+-/////////////////////////////////////////////////
+-	{GC0310_8BIT, 0xfe, 0x03},
+-	{GC0310_8BIT, 0x01, 0x03}, ///mipi 1lane
+-	{GC0310_8BIT, 0x02, 0x22}, // 0x33
+-	{GC0310_8BIT, 0x03, 0x94},
+-	{GC0310_8BIT, 0x04, 0x01}, // fifo_prog
+-	{GC0310_8BIT, 0x05, 0x00}, //fifo_prog
+-	{GC0310_8BIT, 0x06, 0x80}, //b0  //YUV ISP data
+-	{GC0310_8BIT, 0x11, 0x2a},//1e //LDI set YUV422
+-	{GC0310_8BIT, 0x12, 0x90},//00 //04 //00 //04//00 //LWC[7:0]  //
+-	{GC0310_8BIT, 0x13, 0x02},//05 //05 //LWC[15:8]
+-	{GC0310_8BIT, 0x15, 0x12}, // 0x10 //DPHYY_MODE read_ready
+-	{GC0310_8BIT, 0x17, 0x01},
+-	{GC0310_8BIT, 0x42, 0x90},
+-	{GC0310_8BIT, 0x43, 0x02},
+-	{GC0310_8BIT, 0x21, 0x02}, // 0x01
+-	{GC0310_8BIT, 0x22, 0x02}, // 0x01
+-	{GC0310_8BIT, 0x23, 0x01}, // 0x05 //Nor:0x05 DOU:0x06
+-	{GC0310_8BIT, 0x29, 0x01},
+-	{GC0310_8BIT, 0x2A, 0x01}, // 0x05 //data zero 0x7a de
+-
+-	{GC0310_8BIT, 0xfe, 0x00},
+-
+ 	{GC0310_TOK_TERM, 0, 0},
+ };
+ 
+@@ -375,7 +378,7 @@ static struct gc0310_reg const gc0310_VGA_30fps[] = {
+ 	{GC0310_8BIT, 0x51, 0x00},
+ 	{GC0310_8BIT, 0x52, 0x00},
+ 	{GC0310_8BIT, 0x53, 0x00},
+-	{GC0310_8BIT, 0x54, 0x00},
++	{GC0310_8BIT, 0x54, 0x01},
+ 	{GC0310_8BIT, 0x55, 0x01}, //crop window height
+ 	{GC0310_8BIT, 0x56, 0xf0},
+ 	{GC0310_8BIT, 0x57, 0x02}, //crop window width
+diff --git a/drivers/media/i2c/atomisp/gc2155.c b/drivers/media/i2c/atomisp/gc2155.c
+index 75ac66b..98dc1ef 100644
+--- a/drivers/media/i2c/atomisp/gc2155.c
++++ b/drivers/media/i2c/atomisp/gc2155.c
+@@ -462,7 +462,7 @@ static int gc2155_get_intg_factor(struct i2c_client *client,
+ 	 *   win_width: Setting by register 0x0f and P0:0x10, win_width = 1600,
+ 	 *   final_output_width + 8. So for UXGA, we should set win_width as 1616.
+ 	 */
+-	buf->line_length_pck = (hb + sh_delay + (buf->output_width + 16)/2 + 4) << 1;
++	buf->line_length_pck = (hb + sh_delay + (buf->output_width)/2 + 4) << 1;
+ 	pr_info("line_length_pck = %d\n", buf->line_length_pck);
+ 
+ 	/* V Blank */
+@@ -495,28 +495,17 @@ static int gc2155_get_intg_factor(struct i2c_client *client,
+ 	return 0;
+ }
+ 
+-static long gc2155_s_exposure(struct v4l2_subdev *sd,
+-					struct atomisp_exposure *exposure)
++static long __gc2155_set_exposure(struct v4l2_subdev *sd, int coarse_itg,
++		int gain, int digitgain)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+-	u8 tmp, lsc;
+ 	int ret = 0;
+-
+-	unsigned int coarse_integration = 0;
+-
+-	//unsigned int AnalogGain, DigitalGain;
+-
+ 	u8 expo_coarse_h,expo_coarse_l;
+-	unsigned int gain, a_gain, d_gain;
++	unsigned int a_gain, d_gain;
+ 
+-	dev_err(&client->dev, "%s(0x%X 0x%X 0x%X)\n", __func__,
+-		exposure->integration_time[0], exposure->gain[0], exposure->gain[1]);
++	dev_dbg(&client->dev, "%s(0x%X 0x%X 0x%X)\n", __func__,
++		coarse_itg, gain, digitgain);
+ 
+-	coarse_integration = exposure->integration_time[0];
+-
+-
+-	gain = exposure->gain[0];
+-	
+ 	if (gain < 16) gain = 16;
+ 	if (gain > 255) gain = 255;
+ 
+@@ -545,23 +534,15 @@ static long gc2155_s_exposure(struct v4l2_subdev *sd,
+ 		a_gain = 0x6;
+ 		d_gain = ((gain / 4) - 48) | 0x30;
+ 	}
+-	printk("%s real %d a_gain %x d_gain %x\n", __func__, gain, a_gain, d_gain);
+-
+-	expo_coarse_h = (u8)((coarse_integration >> 8) & 0x1F);
+-	expo_coarse_l = (u8)(coarse_integration & 0xff);
+-
+-
+-	ret = gc2155_read_reg(client, GC2155_8BIT,  REG_RST_AND_PG_SELECT, &tmp);
++	dev_dbg(&client->dev, "%s real %d a_gain %x d_gain %x\n", __func__, gain, a_gain, d_gain);
+ 
++	expo_coarse_h = (u8)((coarse_itg >> 8) & 0x1F);
++	expo_coarse_l = (u8)(coarse_itg & 0xff);
+ 
+ 	ret = gc2155_write_reg(client, GC2155_8BIT, REG_RST_AND_PG_SELECT, 0x0);
+ 
+-	ret = gc2155_read_reg(client, GC2155_8BIT,  REG_RST_AND_PG_SELECT, &tmp);
+-
+-
+-	ret = gc2155_write_reg(client, GC2155_8BIT, REG_EXPO_COARSE_H, expo_coarse_h);
+-	ret = gc2155_write_reg(client, GC2155_8BIT, REG_EXPO_COARSE_L, expo_coarse_l);
+-	ret = gc2155_read_reg(client, GC2155_8BIT,  0x80, &lsc);
++	ret |= gc2155_write_reg(client, GC2155_8BIT, REG_EXPO_COARSE_H, expo_coarse_h);
++	ret |= gc2155_write_reg(client, GC2155_8BIT, REG_EXPO_COARSE_L, expo_coarse_l);
+ 
+ 	if (ret) {
+ 		 v4l2_err(client, "%s: fail to set exposure time\n", __func__);
+@@ -583,8 +564,8 @@ static long gc2155_s_exposure(struct v4l2_subdev *sd,
+ 	 *  100: 4X
+ 	 */
+ 
+-	gc2155_write_reg(client, GC2155_8BIT, 0x25, a_gain);
+-	gc2155_write_reg(client, GC2155_8BIT, 0xb1, d_gain);
++	ret = gc2155_write_reg(client, GC2155_8BIT, 0x25, a_gain);
++	ret |= gc2155_write_reg(client, GC2155_8BIT, 0xb1, d_gain);
+ 
+ 	if (ret) {
+ 		v4l2_err(client, "%s: fail to set AnalogGainToWrite\n", __func__);
+@@ -594,6 +575,36 @@ static long gc2155_s_exposure(struct v4l2_subdev *sd,
+ 	return ret;
+ }
+ 
++static int gc2155_set_exposure(struct v4l2_subdev *sd, int exposure,
++		int gain, int digitgain)
++{
++	struct gc2155_device *dev = to_gc2155_sensor(sd);
++	int ret;
++
++	mutex_lock(&dev->input_lock);
++	ret = __gc2155_set_exposure(sd, exposure, gain, digitgain);
++	mutex_unlock(&dev->input_lock);
++
++	return ret;
++}
++
++static long gc2155_s_exposure(struct v4l2_subdev *sd,
++		struct atomisp_exposure *exposure)
++{
++	int exp = exposure->integration_time[0];
++	int gain = exposure->gain[0];
++	int digitgain = exposure->gain[1];
++
++	/* we should not accept the invalid value below. */
++	if (gain == 0) {
++		struct i2c_client *client = v4l2_get_subdevdata(sd);
++		v4l2_err(client, "%s: invalid value\n", __func__);
++		return -EINVAL;
++	}
++
++	return gc2155_set_exposure(sd, exp, gain, digitgain);
++}
++
+ /* TO DO */
+ static int gc2155_v_flip(struct v4l2_subdev *sd, s32 value)
+ {
+diff --git a/drivers/media/i2c/atomisp/gc2155.h b/drivers/media/i2c/atomisp/gc2155.h
+index 1587ff4..2dd19a8 100644
+--- a/drivers/media/i2c/atomisp/gc2155.h
++++ b/drivers/media/i2c/atomisp/gc2155.h
+@@ -222,7 +222,7 @@ static const struct gc2155_reg gc2155_reset_register[] = {
+ 	{GC2155_8BIT, 0xf8, 0x85},
+ 	{GC2155_8BIT, 0xfa, 0x00},
+ 	{GC2155_8BIT, 0xf9, 0x8e},
+-	{GC2155_8BIT, 0xf2, 0x0f},
++	{GC2155_8BIT, 0xf2, 0x00},//0x0f->0x00: disable dvp mode
+ 	{GC2155_8BIT, 0xfe, 0x00},
+ 	{GC2155_8BIT, 0x03, 0x04},
+ 	{GC2155_8BIT, 0x04, 0x00},
+@@ -238,23 +238,24 @@ static const struct gc2155_reg gc2155_reset_register[] = {
+ 	{GC2155_8BIT, 0x10, 0x62},
+ 	{GC2155_8BIT, 0x12, 0x2e},
+ 	{GC2155_8BIT, 0x17, 0x14},
+-	{GC2155_8BIT, 0x18, 0x0a},
++	{GC2155_8BIT, 0x18, 0x02},//0x0a->0x02: disable blk sdrak mode
+ 	{GC2155_8BIT, 0x19, 0x0b},
+-	{GC2155_8BIT, 0x1a, 0x09},
++	{GC2155_8BIT, 0x1a, 0x01},//Brian 20140903
+ 	{GC2155_8BIT, 0x1b, 0x4b},
+ 	{GC2155_8BIT, 0x1c, 0x07},
+ 	{GC2155_8BIT, 0x1d, 0x10},
+ 	{GC2155_8BIT, 0x1e, 0x98},
+ 	{GC2155_8BIT, 0x1f, 0x78},
+-	{GC2155_8BIT, 0x20, 0x03},
+-	{GC2155_8BIT, 0x21, 0x60},
++	{GC2155_8BIT, 0x20, 0x05},//Brian 20140903
++	{GC2155_8BIT, 0x21, 0x40},
+ 	{GC2155_8BIT, 0x22, 0xf0},
+ 	{GC2155_8BIT, 0x24, 0x16},
+ 	{GC2155_8BIT, 0x25, 0x01},
+ 	{GC2155_8BIT, 0x26, 0x10},
+ 	{GC2155_8BIT, 0x2d, 0x40},
++	{GC2155_8BIT, 0x31, 0x90},//Brian 20140903
+ 	{GC2155_8BIT, 0x30, 0x01},
+-	{GC2155_8BIT, 0x33, 0x01},
++	{GC2155_8BIT, 0x33, 0x04},//Brian 20140903
+ 	{GC2155_8BIT, 0x34, 0x01},
+ 	{GC2155_8BIT, 0x80, 0x06},//ff//06
+ 	{GC2155_8BIT, 0x81, 0x80},//24//00
+@@ -267,7 +268,7 @@ static const struct gc2155_reg gc2155_reset_register[] = {
+ 	{GC2155_8BIT, 0x85, 0x08},
+ 	{GC2155_8BIT, 0x8a, 0x00},
+ 	{GC2155_8BIT, 0x8b, 0x00},
+-	{GC2155_8BIT, 0xb0, 0x55},
++	{GC2155_8BIT, 0xb0, 0x70},//0x55->0x70: reduce noise
+ 	{GC2155_8BIT, 0xc3, 0x00},
+ 	{GC2155_8BIT, 0xc4, 0x80},
+ 	{GC2155_8BIT, 0xc5, 0x90},
+@@ -305,23 +306,12 @@ static const struct gc2155_reg gc2155_reset_register[] = {
+ 	{GC2155_8BIT, 0x67, 0x20}, //BLK
+ 	{GC2155_8BIT, 0x68, 0x20}, //BLK
+ 	{GC2155_8BIT, 0x69, 0x20}, //BLK
+-	{GC2155_8BIT, 0x6a, 0x00},
+-	{GC2155_8BIT, 0x6b, 0x00},
+-	{GC2155_8BIT, 0x6c, 0x00},
+-	{GC2155_8BIT, 0x6d, 0x00},
+-	{GC2155_8BIT, 0x6e, 0x00},
+-	{GC2155_8BIT, 0x6f, 0x00},
+-	{GC2155_8BIT, 0x70, 0x00},
+-	{GC2155_8BIT, 0x71, 0x00},
+ 	{GC2155_8BIT, 0x72, 0xf0},
+-	{GC2155_8BIT, 0x7e, 0x00},
+-	{GC2155_8BIT, 0x7f, 0x3c},
+ 	{GC2155_8BIT, 0xfe, 0x02},
+ 	{GC2155_8BIT, 0x49, 0x00},
+ 	{GC2155_8BIT, 0x4b, 0x02},
+ 	{GC2155_8BIT, 0xfe, 0x00},
+ 	{GC2155_8BIT, 0xfe, 0x01},
+-	{GC2155_8BIT, 0x01, 0x04},
+ 	{GC2155_8BIT, 0x02, 0xc0},
+ 	{GC2155_8BIT, 0x03, 0x04},
+ 	{GC2155_8BIT, 0x04, 0x90},
+@@ -329,106 +319,45 @@ static const struct gc2155_reg gc2155_reset_register[] = {
+ 	{GC2155_8BIT, 0x06, 0x90},
+ 	{GC2155_8BIT, 0x07, 0x20},
+ 	{GC2155_8BIT, 0x08, 0x70},
+-	{GC2155_8BIT, 0x09, 0x00},
+ 	{GC2155_8BIT, 0x0a, 0xc2},
+ 	{GC2155_8BIT, 0x0b, 0x11},
+ 	{GC2155_8BIT, 0x0c, 0x10},
+ 	{GC2155_8BIT, 0x13, 0x2a},
+ 	{GC2155_8BIT, 0x17, 0x00},
+-	{GC2155_8BIT, 0x1c, 0x11},
+-	{GC2155_8BIT, 0x1e, 0x61},
+ 	{GC2155_8BIT, 0x1f, 0x40},
+ 	{GC2155_8BIT, 0x20, 0x40},
+-	{GC2155_8BIT, 0x22, 0x80},
+ 	{GC2155_8BIT, 0x23, 0x20},
+ 	{GC2155_8BIT, 0x12, 0x00},
+ 	{GC2155_8BIT, 0x15, 0x50},
+ 	{GC2155_8BIT, 0x10, 0x31},
+ 	{GC2155_8BIT, 0x3e, 0x28},
+ 	{GC2155_8BIT, 0x3f, 0xe0},
+-	{GC2155_8BIT, 0x40, 0xe0},
+ 	{GC2155_8BIT, 0x41, 0x0f},
+ 	{GC2155_8BIT, 0xfe, 0x02},
+-	{GC2155_8BIT, 0x90, 0x6c},
+ 	{GC2155_8BIT, 0x91, 0x02},
+ 	{GC2155_8BIT, 0x92, 0x44},
+ 	{GC2155_8BIT, 0x97, 0x78},
+ 	{GC2155_8BIT, 0xa2, 0x11},
+ 	{GC2155_8BIT, 0xfe, 0x00},
+ 	{GC2155_8BIT, 0xfe, 0x02},
+-	{GC2155_8BIT, 0x80, 0xc1},
+-	{GC2155_8BIT, 0x81, 0x08},
+ 	{GC2155_8BIT, 0x82, 0x05},
+ 	{GC2155_8BIT, 0x83, 0x04},
+-	{GC2155_8BIT, 0x84, 0x0a},
+ 	{GC2155_8BIT, 0x86, 0x80},
+-	{GC2155_8BIT, 0x87, 0x30},
+-	{GC2155_8BIT, 0x88, 0x15},
+ 	{GC2155_8BIT, 0x89, 0x80},
+ 	{GC2155_8BIT, 0x8a, 0x60},
+ 	{GC2155_8BIT, 0x8b, 0x30},
+ 	{GC2155_8BIT, 0xfe, 0x01},
+-	{GC2155_8BIT, 0x21, 0x14},
+ 	{GC2155_8BIT, 0xfe, 0x02},
+ 	{GC2155_8BIT, 0xa3, 0x60},
+ 	{GC2155_8BIT, 0xa4, 0x40},
+ 	{GC2155_8BIT, 0xa5, 0x40},
+-	{GC2155_8BIT, 0xa6, 0x80},
+-	{GC2155_8BIT, 0xab, 0x20},
+ 	{GC2155_8BIT, 0xae, 0x0c},
+ 	{GC2155_8BIT, 0xb3, 0x42},
+ 	{GC2155_8BIT, 0xb4, 0x24},
+ 	{GC2155_8BIT, 0xb6, 0x50},
+-	{GC2155_8BIT, 0xb7, 0x01},
+ 	{GC2155_8BIT, 0xb9, 0x25},
+ 	{GC2155_8BIT, 0xfe, 0x00},
+ 	{GC2155_8BIT, 0xfe, 0x02},
+-	{GC2155_8BIT, 0x10, 0x13},
+-	{GC2155_8BIT, 0x11, 0x19},
+-	{GC2155_8BIT, 0x12, 0x20},
+-	{GC2155_8BIT, 0x13, 0x27},
+-	{GC2155_8BIT, 0x14, 0x37},
+-	{GC2155_8BIT, 0x15, 0x48},
+-	{GC2155_8BIT, 0x16, 0x54},
+-	{GC2155_8BIT, 0x17, 0x62},
+-	{GC2155_8BIT, 0x18, 0x79},
+-	{GC2155_8BIT, 0x19, 0x8a},
+-	{GC2155_8BIT, 0x1a, 0x99},
+-	{GC2155_8BIT, 0x1b, 0xa6},
+-	{GC2155_8BIT, 0x1c, 0xb1},
+-	{GC2155_8BIT, 0x1d, 0xc6},
+-	{GC2155_8BIT, 0x1e, 0xd2},
+-	{GC2155_8BIT, 0x1f, 0xde},
+-	{GC2155_8BIT, 0x20, 0xe8},
+-	{GC2155_8BIT, 0x21, 0xef},
+-	{GC2155_8BIT, 0x22, 0xf4},
+-	{GC2155_8BIT, 0x23, 0xfb},
+-	{GC2155_8BIT, 0x24, 0xfd},
+-	{GC2155_8BIT, 0x25, 0xff},
+-	{GC2155_8BIT, 0xfe, 0x02},
+-	{GC2155_8BIT, 0x26, 0x0d},
+-	{GC2155_8BIT, 0x27, 0x12},
+-	{GC2155_8BIT, 0x28, 0x17},
+-	{GC2155_8BIT, 0x29, 0x1c},
+-	{GC2155_8BIT, 0x2a, 0x27},
+-	{GC2155_8BIT, 0x2b, 0x34},
+-	{GC2155_8BIT, 0x2c, 0x44},
+-	{GC2155_8BIT, 0x2d, 0x55},
+-	{GC2155_8BIT, 0x2e, 0x6e},
+-	{GC2155_8BIT, 0x2f, 0x81},
+-	{GC2155_8BIT, 0x30, 0x91},
+-	{GC2155_8BIT, 0x31, 0x9c},
+-	{GC2155_8BIT, 0x32, 0xaa},
+-	{GC2155_8BIT, 0x33, 0xbb},
+-	{GC2155_8BIT, 0x34, 0xca},
+-	{GC2155_8BIT, 0x35, 0xd5},
+-	{GC2155_8BIT, 0x36, 0xe0},
+-	{GC2155_8BIT, 0x37, 0xe7},
+-	{GC2155_8BIT, 0x38, 0xed},
+-	{GC2155_8BIT, 0x39, 0xf6},
+-	{GC2155_8BIT, 0x3a, 0xfb},
+-	{GC2155_8BIT, 0x3b, 0xff},
+-	{GC2155_8BIT, 0xfe, 0x02},
+ 	{GC2155_8BIT, 0xd1, 0x20},
+ 	{GC2155_8BIT, 0xd2, 0x20},
+ 	{GC2155_8BIT, 0xdd, 0x80},
+@@ -503,217 +432,6 @@ static const struct gc2155_reg gc2155_reset_register[] = {
+ 	{GC2155_8BIT, 0xe8, 0x90},
+ 	{GC2155_8BIT, 0xe9, 0x60},
+ 	{GC2155_8BIT, 0xfe, 0x00},
+-	{GC2155_8BIT, 0xfe, 0x01},
+-	{GC2155_8BIT, 0x4f, 0x00},
+-	{GC2155_8BIT, 0x4f, 0x00},
+-	{GC2155_8BIT, 0x4b, 0x01},
+-	{GC2155_8BIT, 0x4f, 0x00},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x6f},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x70},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x8f},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x90},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x91},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xaf},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xb0},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xb1},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xcf},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xd0},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xed},
+-	{GC2155_8BIT, 0x4e, 0x33},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xcd},
+-	{GC2155_8BIT, 0x4e, 0x33},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xec},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x6c},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x6d},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x6e},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x8c},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x8d},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0x8e},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xab},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xac},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xad},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xae},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xcb},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xcc},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xce},
+-	{GC2155_8BIT, 0x4e, 0x02},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xea},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xec},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xee},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x0c},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x0d},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x2c},
+-	{GC2155_8BIT, 0x4e, 0x03},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xca},
+-	{GC2155_8BIT, 0x4e, 0x34},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xcb},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xeb},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xc9},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xa9},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xe9},
+-	{GC2155_8BIT, 0x4e, 0x04},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xc9},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x0a},
+-	{GC2155_8BIT, 0x4e, 0x05},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x0b},
+-	{GC2155_8BIT, 0x4e, 0x35},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x09},
+-	{GC2155_8BIT, 0x4c, 0x01},
+-	{GC2155_8BIT, 0x4d, 0xea},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x2a},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x49},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x29},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0xc8},
+-	{GC2155_8BIT, 0x4e, 0x36},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0xa8},
+-	{GC2155_8BIT, 0x4e, 0x36},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x88},
+-	{GC2155_8BIT, 0x4e, 0x06},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0xa9},
+-	{GC2155_8BIT, 0x4e, 0x06},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0xc9},
+-	{GC2155_8BIT, 0x4e, 0x06},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x89},
+-	{GC2155_8BIT, 0x4e, 0x06},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x69},
+-	{GC2155_8BIT, 0x4e, 0x06},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0x6a},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0xc7},
+-	{GC2155_8BIT, 0x4e, 0x07},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0xe7},
+-	{GC2155_8BIT, 0x4e, 0x07},
+-	{GC2155_8BIT, 0x4c, 0x03},
+-	{GC2155_8BIT, 0x4d, 0x06},
+-	{GC2155_8BIT, 0x4c, 0x03},
+-	{GC2155_8BIT, 0x4d, 0x07},
+-	{GC2155_8BIT, 0x4e, 0x37},
+-	{GC2155_8BIT, 0x4c, 0x03},
+-	{GC2155_8BIT, 0x4d, 0x08},
+-	{GC2155_8BIT, 0x4e, 0x07},
+-	{GC2155_8BIT, 0x4c, 0x02},
+-	{GC2155_8BIT, 0x4d, 0xe8},
+-	{GC2155_8BIT, 0x4e, 0x07},
+-	{GC2155_8BIT, 0x4c, 0x03},
+-	{GC2155_8BIT, 0x4d, 0x28},
+-	{GC2155_8BIT, 0x4e, 0x07},
+-	{GC2155_8BIT, 0x4f, 0x01},
+-	{GC2155_8BIT, 0xfe, 0x01},
+-	{GC2155_8BIT, 0x50, 0x80},
+-	{GC2155_8BIT, 0x51, 0xa8},
+-	{GC2155_8BIT, 0x52, 0x57},
+-	{GC2155_8BIT, 0x53, 0x38},
+-	{GC2155_8BIT, 0x54, 0xc7},
+-	{GC2155_8BIT, 0x56, 0x0e},
+-	{GC2155_8BIT, 0x58, 0x08},
+-	{GC2155_8BIT, 0x5b, 0x00},
+-	{GC2155_8BIT, 0x5c, 0x74},
+-	{GC2155_8BIT, 0x5d, 0x8b},
+-	{GC2155_8BIT, 0x61, 0xd3},
+-	{GC2155_8BIT, 0x62, 0x90},
+-	{GC2155_8BIT, 0x63, 0x04},
+-	{GC2155_8BIT, 0x65, 0x04},
+-	{GC2155_8BIT, 0x67, 0xb2},
+-	{GC2155_8BIT, 0x68, 0xac},
+-	{GC2155_8BIT, 0x69, 0x00},
+-	{GC2155_8BIT, 0x6a, 0xb2},
+-	{GC2155_8BIT, 0x6b, 0xac},
+-	{GC2155_8BIT, 0x6c, 0xdc},
+-	{GC2155_8BIT, 0x6d, 0xb0},
+-	{GC2155_8BIT, 0x6e, 0x30},
+-	{GC2155_8BIT, 0x6f, 0xff},
+-	{GC2155_8BIT, 0x73, 0x00},
+-	{GC2155_8BIT, 0x70, 0x05},
+-	{GC2155_8BIT, 0x71, 0x80},
+-	{GC2155_8BIT, 0x72, 0xc1},
+-	{GC2155_8BIT, 0x74, 0x01},
+-	{GC2155_8BIT, 0x75, 0x01},
+-	{GC2155_8BIT, 0x7f, 0x0c},
+-	{GC2155_8BIT, 0x76, 0x70},
+-	{GC2155_8BIT, 0x77, 0x48},
+-	{GC2155_8BIT, 0x78, 0x90},
+-	{GC2155_8BIT, 0x79, 0x55},
+-	{GC2155_8BIT, 0x7a, 0x48},
+-	{GC2155_8BIT, 0x7b, 0x60},
+-	{GC2155_8BIT, 0xfe, 0x00},
+ 	{GC2155_8BIT, 0xfe, 0x02},
+ 	{GC2155_8BIT, 0xc0, 0x01},
+ 	{GC2155_8BIT, 0xc1, 0x50},
+@@ -738,9 +456,9 @@ static const struct gc2155_reg gc2155_reset_register[] = {
+ 	{GC2155_8BIT, 0xf2, 0x0f},
+ 	{GC2155_8BIT, 0xfe, 0x00},
+ 	{GC2155_8BIT, 0x05, 0x01},
+-	{GC2155_8BIT, 0x06, 0x10},
++	{GC2155_8BIT, 0x06, 0x14},//increase dummpy line
+ 	{GC2155_8BIT, 0x07, 0x00},
+-	{GC2155_8BIT, 0x08, 0x82},//VB : a0
++	{GC2155_8BIT, 0x08, 0x10},//for 20fps
+ 	{GC2155_8BIT, 0xfe, 0x01},
+ 	{GC2155_8BIT, 0x25, 0x00},
+ 	{GC2155_8BIT, 0x26, 0xd4},
+-- 
+2.1.0
+

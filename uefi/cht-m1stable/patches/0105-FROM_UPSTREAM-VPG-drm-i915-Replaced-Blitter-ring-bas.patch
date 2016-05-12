@@ -1,0 +1,370 @@
+From 110ad8f8a1965b6c6cccebe23e65bcee88a50dbd Mon Sep 17 00:00:00 2001
+Message-Id: <110ad8f8a1965b6c6cccebe23e65bcee88a50dbd.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Jon Bloomfield <jon.bloomfield@intel.com>
+Date: Tue, 8 Jul 2014 14:20:28 +0100
+Subject: [PATCH 105/312] FROM_UPSTREAM [VPG]: drm/i915: Replaced Blitter ring
+ based flips with MMIO flips
+
+This patch enables the framework for using MMIO based flip calls,
+in contrast with the CS based flip calls which are being used currently.
+
+MMIO based flip calls can be enabled on architectures where
+Render and Blitter engines reside in different power wells. The
+decision to use MMIO flips can be made based on workloads to give
+100% residency for Media power well.
+
+v2: The MMIO flips now use the interrupt driven mechanism for issuing the
+flips when target seqno is reached. (Incorporating Ville's idea)
+
+v3: Rebasing on latest code. Code restructuring after incorporating
+Damien's comments
+
+v4: Addressing Ville's review comments
+    -general cleanup
+    -updating only base addr instead of calling update_primary_plane
+    -extending patch for gen5+ platforms
+
+v5: Addressed Ville's review comments
+    -Making mmio flip vs cs flip selection based on module parameter
+    -Adding check for DRIVER_MODESET feature in notify_ring before calling
+     notify mmio flip.
+    -Other changes mostly in function arguments
+
+v6: -Having a seperate function to check condition for using mmio flips (Ville)
+    -propogating error code from i915_gem_check_olr (Ville)
+
+v7: -Adding __must_check with i915_gem_check_olr (Chris)
+    -Renaming mmio_flip_data to mmio_flip (Chris)
+    -Rebasing on latest nightly
+
+v8: -Rebasing on latest code
+    -squash 3rd patch in series(mmio setbase vs page flip race) with this patch
+    -Added new tiling mode update in intel_do_mmio_flip (Chris)
+
+v9: -check for obj->last_write_seqno being 0 instead of obj->ring being NULL in
+intel_postpone_flip, as this is a more restrictive condition (Chris)
+
+v10: -Applied Chris's suggestions for squashing patches 2,3 into this patch.
+These patches make the selection of CS vs MMIO flip at the page flip time, and
+make the module parameter for using mmio flips as tristate, the states being
+'force CS flips', 'force mmio flips', 'driver discretion'.
+Changed the logic for driver discretion (Chris)
+
+v11: Minor code cleanup(better readability, fixing whitespace errors, using
+lockdep to check mutex locked status in postpone_flip, removal of __must_check
+in function definition) (Chris)
+
+Change-Id: I55ec64ef9f89c9c859f57c784e016fb9e8ce5c1a
+Upstream-commit: 84c33a64b4e29757d04ba1b285b96ee160d5ff93
+Upstream-repo: drm-intel-nightly
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Sourab Gupta <sourab.gupta@intel.com>
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Tested-by: Chris Wilson <chris@chris-wilson.co.uk> # snb, ivb
+[danvet: Fix up parameter alignement checkpatch spotted.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c      |    1 +
+ drivers/gpu/drm/i915/i915_drv.h      |    8 ++
+ drivers/gpu/drm/i915/i915_gem.c      |    2 +-
+ drivers/gpu/drm/i915/i915_irq.c      |    3 +
+ drivers/gpu/drm/i915/i915_params.c   |    5 ++
+ drivers/gpu/drm/i915/intel_display.c |  148 +++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_drv.h     |    6 ++
+ 7 files changed, 171 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index b6d263d..0c01896 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1605,6 +1605,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 	spin_lock_init(&dev_priv->backlight_lock);
+ 	spin_lock_init(&dev_priv->uncore.lock);
+ 	spin_lock_init(&dev_priv->mm.object_stat_lock);
++	spin_lock_init(&dev_priv->mmio_flip_lock);
+ 	mutex_init(&dev_priv->dpio_lock);
+ 	mutex_init(&dev_priv->modeset_restore_lock);
+ 	mutex_init(&dev_priv->dpst.ioctl_lock);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index e7df796..dcd8ffe 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1418,6 +1418,9 @@ struct drm_i915_private {
+ 	/* protects the irq masks */
+ 	spinlock_t irq_lock;
+ 
++	/* protects the mmio flip data */
++	spinlock_t mmio_flip_lock;
++
+ 	bool display_irqs_enabled;
+ 
+ 	/* To control wakeup latency, e.g. for irq-driven dp aux transfers. */
+@@ -2144,6 +2147,7 @@ struct i915_params {
+ 	bool disable_display;
+ 	bool disable_vtd_wa;
+ 	int drrs_interval;
++	int use_mmio_flip;
+ };
+ extern struct i915_params i915 __read_mostly;
+ 
+@@ -2340,6 +2344,8 @@ bool i915_gem_retire_requests(struct drm_device *dev);
+ void i915_gem_retire_requests_ring(struct intel_engine_cs *ring);
+ int __must_check i915_gem_check_wedge(struct i915_gpu_error *error,
+ 				      bool interruptible);
++int __must_check i915_gem_check_olr(struct intel_engine_cs *ring, u32 seqno);
++
+ static inline bool i915_reset_in_progress(struct i915_gpu_error *error)
+ {
+ 	return unlikely(atomic_read(&error->reset_counter)
+@@ -2733,6 +2739,8 @@ int i915_set_plane_alpha(struct drm_device *dev, void *data,
+ int i915_enable_plane_reserved_reg_bit_2(struct drm_device *dev, void *data,
+ 					struct drm_file *file);
+ 
++void intel_notify_mmio_flip(struct intel_engine_cs *ring);
++
+ /* overlay */
+ extern struct intel_overlay_error_state *intel_overlay_capture_error_state(struct drm_device *dev);
+ extern void intel_overlay_print_error_state(struct drm_i915_error_state_buf *e,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 6a64cc8..3625648 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1095,7 +1095,7 @@ i915_gem_check_wedge(struct i915_gpu_error *error,
+  * Compare seqno against outstanding lazy request. Emit a request if they are
+  * equal.
+  */
+-static int
++int
+ i915_gem_check_olr(struct intel_engine_cs *ring, u32 seqno)
+ {
+ 	int ret;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 9ac6418..c285afe 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1220,6 +1220,9 @@ static void notify_ring(struct drm_device *dev,
+ 
+ 	trace_i915_gem_request_complete(ring);
+ 
++	if (drm_core_check_feature(dev, DRIVER_MODESET))
++		intel_notify_mmio_flip(ring);
++
+ 	wake_up_all(&ring->irq_queue);
+ 	i915_queue_hangcheck(dev);
+ }
+diff --git a/drivers/gpu/drm/i915/i915_params.c b/drivers/gpu/drm/i915/i915_params.c
+index 1d5eb7a..ca1398c 100644
+--- a/drivers/gpu/drm/i915/i915_params.c
++++ b/drivers/gpu/drm/i915/i915_params.c
+@@ -50,6 +50,7 @@ struct i915_params i915 __read_mostly = {
+ 	.enable_cmd_parser = 0,
+ 	.disable_vtd_wa = 0,
+ 	.drrs_interval = 2000,
++	.use_mmio_flip = 0,
+ };
+ module_param_named(limitbw, i915.limitbw, int, 0400);
+ MODULE_PARM_DESC(limitbw,
+@@ -168,3 +169,7 @@ MODULE_PARM_DESC(drrs_interval,
+ 	"If this field is set to 0, then seamless DRRS feature "
+ 	"based on idleness detection is disabled."
+ 	"The interval is to be set in milliseconds.");
++
++module_param_named(use_mmio_flip, i915.use_mmio_flip, int, 0600);
++MODULE_PARM_DESC(use_mmio_flip,
++		 "use MMIO flips (-1=never, 0=driver discretion [default], 1=always)");
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index b3d477a..7b0c343 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10140,6 +10140,147 @@ static int intel_gen7_queue_flip(struct drm_device *dev,
+ 	return 0;
+ }
+ 
++static bool use_mmio_flip(struct intel_engine_cs *ring,
++			  struct drm_i915_gem_object *obj)
++{
++	/*
++	 * This is not being used for older platforms, because
++	 * non-availability of flip done interrupt forces us to use
++	 * CS flips. Older platforms derive flip done using some clever
++	 * tricks involving the flip_pending status bits and vblank irqs.
++	 * So using MMIO flips there would disrupt this mechanism.
++	 */
++
++	if (INTEL_INFO(ring->dev)->gen < 5)
++		return false;
++
++	if (i915.use_mmio_flip < 0)
++		return false;
++	else if (i915.use_mmio_flip > 0)
++		return true;
++	else
++		return ring != obj->ring;
++}
++
++static void intel_do_mmio_flip(struct intel_crtc *intel_crtc)
++{
++	struct drm_device *dev = intel_crtc->base.dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_framebuffer *intel_fb =
++		to_intel_framebuffer(intel_crtc->base.primary->fb);
++	struct drm_i915_gem_object *obj = intel_fb->obj;
++	u32 dspcntr;
++	u32 reg;
++
++	intel_mark_page_flip_active(intel_crtc);
++
++	reg = DSPCNTR(intel_crtc->plane);
++	dspcntr = I915_READ(reg);
++
++	if (INTEL_INFO(dev)->gen >= 4) {
++		if (obj->tiling_mode != I915_TILING_NONE)
++			dspcntr |= DISPPLANE_TILED;
++		else
++			dspcntr &= ~DISPPLANE_TILED;
++	}
++	I915_WRITE(reg, dspcntr);
++
++	I915_WRITE(DSPSURF(intel_crtc->plane),
++		   intel_crtc->unpin_work->gtt_offset);
++	POSTING_READ(DSPSURF(intel_crtc->plane));
++}
++
++static int intel_postpone_flip(struct drm_i915_gem_object *obj)
++{
++	struct intel_engine_cs *ring;
++	int ret;
++
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++
++	if (!obj->last_write_seqno)
++		return 0;
++
++	ring = obj->ring;
++
++	if (i915_seqno_passed(ring->get_seqno(ring, true),
++			      obj->last_write_seqno))
++		return 0;
++
++	ret = i915_gem_check_olr(ring, obj->last_write_seqno);
++	if (ret)
++		return ret;
++
++	if (WARN_ON(!ring->irq_get(ring)))
++		return 0;
++
++	return 1;
++}
++
++void intel_notify_mmio_flip(struct intel_engine_cs *ring)
++{
++	struct drm_i915_private *dev_priv = to_i915(ring->dev);
++	struct intel_crtc *intel_crtc;
++	unsigned long irq_flags;
++	u32 seqno;
++
++	seqno = ring->get_seqno(ring, false);
++
++	spin_lock_irqsave(&dev_priv->mmio_flip_lock, irq_flags);
++	for_each_intel_crtc(ring->dev, intel_crtc) {
++		struct intel_mmio_flip *mmio_flip;
++
++		mmio_flip = &intel_crtc->mmio_flip;
++		if (mmio_flip->seqno == 0)
++			continue;
++
++		if (ring->id != mmio_flip->ring_id)
++			continue;
++
++		if (i915_seqno_passed(seqno, mmio_flip->seqno)) {
++			intel_do_mmio_flip(intel_crtc);
++			mmio_flip->seqno = 0;
++			ring->irq_put(ring);
++		}
++	}
++	spin_unlock_irqrestore(&dev_priv->mmio_flip_lock, irq_flags);
++}
++
++static int intel_queue_mmio_flip(struct drm_device *dev,
++				 struct drm_crtc *crtc,
++				 struct drm_framebuffer *fb,
++				 struct drm_i915_gem_object *obj,
++				 struct intel_engine_cs *ring,
++				 uint32_t flags)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++	unsigned long irq_flags;
++	int ret;
++
++	if (WARN_ON(intel_crtc->mmio_flip.seqno))
++		return -EBUSY;
++
++	ret = intel_postpone_flip(obj);
++	if (ret < 0)
++		return ret;
++	if (ret == 0) {
++		intel_do_mmio_flip(intel_crtc);
++		return 0;
++	}
++
++	spin_lock_irqsave(&dev_priv->mmio_flip_lock, irq_flags);
++	intel_crtc->mmio_flip.seqno = obj->last_write_seqno;
++	intel_crtc->mmio_flip.ring_id = obj->ring->id;
++	spin_unlock_irqrestore(&dev_priv->mmio_flip_lock, irq_flags);
++
++	/*
++	 * Double check to catch cases where irq fired before
++	 * mmio flip data was ready
++	 */
++	intel_notify_mmio_flip(obj->ring);
++	return 0;
++}
++
+ static int intel_default_queue_flip(struct drm_device *dev,
+ 				    struct drm_crtc *crtc,
+ 				    struct drm_framebuffer *fb,
+@@ -10269,7 +10410,12 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 	work->gtt_offset =
+ 		i915_gem_obj_ggtt_offset(obj) + intel_crtc->dspaddr_offset;
+ 
+-	ret = dev_priv->display.queue_flip(dev, crtc, fb, obj, ring, page_flip_flags);
++	if (use_mmio_flip(ring, obj))
++		ret = intel_queue_mmio_flip(dev, crtc, fb, obj, ring,
++					    page_flip_flags);
++	else
++		ret = dev_priv->display.queue_flip(dev, crtc, fb, obj, ring,
++				page_flip_flags);
+ 	if (ret)
+ 		goto cleanup_unpin;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 8fcf152..ff93452 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -364,6 +364,11 @@ struct intel_pipe_wm {
+ 	bool sprites_scaled;
+ };
+ 
++struct intel_mmio_flip {
++	u32 seqno;
++	u32 ring_id;
++};
++
+ struct intel_crtc {
+ 	struct drm_crtc base;
+ 	enum pipe pipe;
+@@ -432,6 +437,7 @@ struct intel_crtc {
+ 
+ 	/* Flag to schedule the sprite disable to corresponding flip */
+ 	bool disable_sprite;
++	struct intel_mmio_flip mmio_flip;
+ };
+ 
+ struct intel_plane_wm_parameters {
+-- 
+1.7.9.5
+

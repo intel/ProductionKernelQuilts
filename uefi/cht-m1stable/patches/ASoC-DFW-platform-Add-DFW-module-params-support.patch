@@ -1,0 +1,174 @@
+From 6a6b4b8398f8f6137fcbe9a483bde77acbd49109 Mon Sep 17 00:00:00 2001
+From: Mythri P K <mythri.p.k@intel.com>
+Date: Sat, 24 May 2014 00:26:29 +0530
+Subject: [PATCH 28/39] ASoC: DFW platform: Add DFW module params support
+
+Issue: GMINL-3679
+
+Add support for DFW as module params.
+
+Change-Id: Ie4772a474205256f8badb748b05b873ea6768ba8
+Signed-off-by: Mythri P K <mythri.p.k@intel.com>
+---
+ arch/x86/include/asm/platform_sst_audio.h        |  1 +
+ sound/soc/intel/pcm.c                            |  8 +++-
+ sound/soc/intel/platform-libs/controls_v2_dpcm.c | 58 ++++++++++++++++++++++++
+ sound/soc/intel/sst/sst_platform.c               | 20 ++++----
+ sound/soc/intel/sst_platform_pvt.h               |  1 +
+ 5 files changed, 75 insertions(+), 13 deletions(-)
+
+diff --git a/arch/x86/include/asm/platform_sst_audio.h b/arch/x86/include/asm/platform_sst_audio.h
+index 0955197..4e566c2 100644
+--- a/arch/x86/include/asm/platform_sst_audio.h
++++ b/arch/x86/include/asm/platform_sst_audio.h
+@@ -230,6 +230,7 @@ struct sst_platform_data {
+ 	int mux_shift[SST_NUM_SSPS];
+ 	const int domain_shift[SST_NUM_SSPS][SST_MAX_SSP_MUX];
+ 	const struct sst_ssp_config ssp_config[SST_NUM_SSPS][SST_MAX_SSP_MUX][SST_MAX_SSP_DOMAINS];
++	int dfw_enable;
+ };
+ 
+ int sst_audio_platform_init(int dev_id);
+diff --git a/sound/soc/intel/pcm.c b/sound/soc/intel/pcm.c
+index bd462a8..3fe7f47 100644
+--- a/sound/soc/intel/pcm.c
++++ b/sound/soc/intel/pcm.c
+@@ -812,12 +812,18 @@ static int sst_pcm_new(struct snd_soc_pcm_runtime *rtd)
+ static int sst_soc_probe(struct snd_soc_platform *platform)
+ {
+ 	int ret = 0;
++	struct sst_data *sst;
+ 
+ 	pr_debug("Enter:%s\n", __func__);
+ 
+ #ifdef CONFIG_SST_DPCM
+-	if (dpcm_enable == 1)
++	sst = snd_soc_platform_get_drvdata(platform);
++	if (dpcm_enable == 1) {
++		if (sst->pdata->dfw_enable == 1)
++			ret = sst_dsp_init_v2_dpcm_dfw(platform);
++		else
+ 			ret = sst_dsp_init_v2_dpcm(platform);
++	}
+ #endif
+ 	if (ret)
+ 		pr_err("Dsp init failed: %d\n", ret);
+diff --git a/sound/soc/intel/platform-libs/controls_v2_dpcm.c b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+index 6a9e4c5..c664a14 100644
+--- a/sound/soc/intel/platform-libs/controls_v2_dpcm.c
++++ b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+@@ -2073,3 +2073,61 @@ int sst_dsp_init_v2_dpcm(struct snd_soc_platform *platform)
+ 
+ 	return ret;
+ }
++
++int sst_dsp_init_v2_dpcm_dfw(struct snd_soc_platform *platform)
++{
++	int i, ret = 0;
++	struct sst_data *sst = snd_soc_platform_get_drvdata(platform);
++
++	sst->byte_stream = devm_kzalloc(platform->dev,
++					SST_MAX_BIN_BYTES, GFP_KERNEL);
++	if (!sst->byte_stream) {
++		pr_err("%s: kzalloc failed\n", __func__);
++		return -ENOMEM;
++	}
++	sst->widget = devm_kzalloc(platform->dev,
++				   SST_NUM_WIDGETS * sizeof(*sst->widget),
++				   GFP_KERNEL);
++	if (!sst->widget) {
++		pr_err("%s: kzalloc failed\n", __func__);
++		return -ENOMEM;
++	}
++
++	snd_soc_dapm_new_controls(&platform->dapm, sst_dapm_widgets,
++			ARRAY_SIZE(sst_dapm_widgets));
++	snd_soc_dapm_add_routes(&platform->dapm, intercon,
++			ARRAY_SIZE(intercon));
++	snd_soc_dapm_new_widgets(platform->dapm.card);
++
++	for (i = 0; i < SST_NUM_GAINS; i++) {
++		sst_gains[i].mute = SST_GAIN_MUTE_DEFAULT;
++		sst_gains[i].l_gain = SST_GAIN_VOLUME_DEFAULT;
++		sst_gains[i].r_gain = SST_GAIN_VOLUME_DEFAULT;
++		sst_gains[i].ramp_duration = SST_GAIN_RAMP_DURATION_DEFAULT;
++	}
++
++	snd_soc_add_platform_controls(platform, sst_gain_controls,
++			ARRAY_SIZE(sst_gain_controls));
++
++	snd_soc_add_platform_controls(platform, sst_algo_controls,
++			ARRAY_SIZE(sst_algo_controls));
++	snd_soc_add_platform_controls(platform, sst_slot_controls,
++			ARRAY_SIZE(sst_slot_controls));
++	snd_soc_add_platform_controls(platform, sst_mux_controls,
++			ARRAY_SIZE(sst_mux_controls));
++	snd_soc_add_platform_controls(platform, sst_debug_controls,
++			ARRAY_SIZE(sst_debug_controls));
++	snd_soc_add_platform_controls(platform, sst_vad_enroll,
++			ARRAY_SIZE(sst_vad_enroll));
++
++	/* initialize the names of the probe points */
++	for (i = 0; i < ARRAY_SIZE(sst_probes); i++)
++		sst_probe_enum_texts[i] = sst_probes[i].name;
++
++	snd_soc_add_platform_controls(platform, sst_probe_controls,
++			ARRAY_SIZE(sst_probe_controls));
++
++	ret = sst_map_modules_to_pipe(platform);
++
++	return ret;
++}
+diff --git a/sound/soc/intel/sst/sst_platform.c b/sound/soc/intel/sst/sst_platform.c
+index 599fb26..771ec7d 100644
+--- a/sound/soc/intel/sst/sst_platform.c
++++ b/sound/soc/intel/sst/sst_platform.c
+@@ -294,12 +294,10 @@ static void set_cht_platform_config(void)
+ {
+ 	sst_platform_pdata.pdev_strm_map = mrfld_strm_map;
+ 	sst_platform_pdata.strm_map_size = ARRAY_SIZE(mrfld_strm_map);
+-	memcpy(sst_platform_pdata.ssp_config, sst_ssp_configs_mrfld,
+-						sizeof(sst_ssp_configs_mrfld));
+-	memcpy(sst_platform_pdata.mux_shift, sst_ssp_mux_shift,
+-						sizeof(sst_ssp_mux_shift));
+-	memcpy(sst_platform_pdata.domain_shift, sst_ssp_domain_shift,
+-						sizeof(sst_ssp_domain_shift));
++	sst_platform_pdata.dfw_enable = 0;
++	memcpy(sst_platform_pdata.ssp_config, sst_ssp_configs_mrfld, sizeof(sst_ssp_configs_mrfld));
++	memcpy(sst_platform_pdata.mux_shift, sst_ssp_mux_shift, sizeof(sst_ssp_mux_shift));
++	memcpy(sst_platform_pdata.domain_shift, sst_ssp_domain_shift, sizeof(sst_ssp_domain_shift));
+ 	pr_info("audio:%s\n", __func__);
+ }
+ 
+@@ -307,12 +305,10 @@ static void set_cht_cr_platform_config(void)
+ {
+ 	sst_platform_pdata.pdev_strm_map = mrfld_strm_map;
+ 	sst_platform_pdata.strm_map_size = ARRAY_SIZE(mrfld_strm_map);
+-	memcpy(sst_platform_pdata.ssp_config, sst_ssp_configs_cht_cr,
+-						sizeof(sst_ssp_configs_cht_cr));
+-	memcpy(sst_platform_pdata.mux_shift, sst_ssp_mux_shift,
+-						sizeof(sst_ssp_mux_shift));
+-	memcpy(sst_platform_pdata.domain_shift, sst_ssp_domain_shift,
+-						sizeof(sst_ssp_domain_shift));
++	sst_platform_pdata.dfw_enable = 0;
++	memcpy(sst_platform_pdata.ssp_config, sst_ssp_configs_cht_cr, sizeof(sst_ssp_configs_cht_cr));
++	memcpy(sst_platform_pdata.mux_shift, sst_ssp_mux_shift, sizeof(sst_ssp_mux_shift));
++	memcpy(sst_platform_pdata.domain_shift, sst_ssp_domain_shift, sizeof(sst_ssp_domain_shift));
+ 	pr_info("audio:%s\n", __func__);
+ }
+ 
+diff --git a/sound/soc/intel/sst_platform_pvt.h b/sound/soc/intel/sst_platform_pvt.h
+index e37e89d..3a6284e 100644
+--- a/sound/soc/intel/sst_platform_pvt.h
++++ b/sound/soc/intel/sst_platform_pvt.h
+@@ -78,6 +78,7 @@ enum ssp_port {
+ int sst_platform_clv_init(struct snd_soc_platform *platform);
+ int sst_dsp_init(struct snd_soc_platform *platform);
+ int sst_dsp_init_v2_dpcm(struct snd_soc_platform *platform);
++int sst_dsp_init_v2_dpcm_dfw(struct snd_soc_platform *platform);
+ int sst_send_pipe_gains(struct snd_soc_dai *dai, int stream, int mute);
+ void send_ssp_cmd(struct snd_soc_platform *platform, const char *id, bool enable);
+ void sst_handle_vb_timer(struct snd_soc_platform *platform, bool enable);
+-- 
+1.9.1
+

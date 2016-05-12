@@ -1,0 +1,328 @@
+From 979da18b0f4ebbbba4ab4337d9ff75e4bf062c42 Mon Sep 17 00:00:00 2001
+Message-Id: <979da18b0f4ebbbba4ab4337d9ff75e4bf062c42.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: Deepak M <m.deepak@intel.com>
+Date: Sun, 25 Jan 2015 15:05:34 +0530
+Subject: [PATCH 14/95] MUST_REBASE [VPG]: adf/intel/vlv: Select pipe
+ configuration as per VBT
+
+VBT contains various configurations of the device, one of
+which is to use which pipe for which display. This patch
+adds code to select a pipe to initialize display, based on VBT.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5541
+Change-Id: Ib02468d732d0a01f011ab8ece5cb66336c8adf5e
+Signed-off-by: Deepak M <m.deepak@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/vlv_dc_config.c   |  106 +++++++++++++++--
+ .../video/adf/intel/include/core/intel_dc_config.h |  122 ++++++++++++++++++++
+ 2 files changed, 217 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+index c1be73c..011e93f 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+@@ -115,7 +115,7 @@ static int vlv_display_encoder_init(struct vlv_dc_config *vlv_config, int pipe,
+ }
+ 
+ static int vlv_initialize_port(struct vlv_dc_config *vlv_config,
+-			int pipe, int type, u8 disp_no)
++			int pipe, int port, int type, u8 disp_no)
+ {
+ 	struct vlv_dsi_port *dsi_port = NULL;
+ 	struct vlv_pipeline *disp = NULL;
+@@ -124,7 +124,7 @@ static int vlv_initialize_port(struct vlv_dc_config *vlv_config,
+ 	switch (type) {
+ 	case INTEL_PIPE_DSI:
+ 		dsi_port = &disp->port.dsi_port;
+-		vlv_dsi_port_init(dsi_port, PORT_A, pipe);
++		vlv_dsi_port_init(dsi_port, port, pipe);
+ 		break;
+ 	default:
+ 		break;
+@@ -134,7 +134,8 @@ static int vlv_initialize_port(struct vlv_dc_config *vlv_config,
+ }
+ 
+ static int vlv_initialize_disp(struct vlv_dc_config *vlv_config,
+-			enum pipe pipe, enum intel_pipe_type type, u8 disp_no)
++			enum pipe pipe, enum intel_pipe_type type,
++			enum port port, u8 disp_no)
+ {
+ 	struct vlv_pri_plane *pplane;
+ 	struct vlv_sp_plane *splane;
+@@ -211,10 +212,10 @@ static int vlv_initialize_disp(struct vlv_dc_config *vlv_config,
+ 
+ 	/* FIXME: update from attachment */
+ 	pll = &disp->pll;
+-	err = vlv_pll_init(pll, type, (enum pipe) pipe, PORT_A);
++	err = vlv_pll_init(pll, type, (enum pipe) pipe, port);
+ 
+ 	/* Initialize port */
+-	vlv_initialize_port(vlv_config, pipe, type, disp_no);
++	vlv_initialize_port(vlv_config, pipe, port, type, disp_no);
+ 
+ 	/* Initialize encoder */
+ 	vlv_display_encoder_init(vlv_config, pipe, disp_no);
+@@ -226,9 +227,14 @@ struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
+ {
+ 	struct vlv_dc_config *config;
+ 	struct intel_dc_memory *memory;
++	union child_device_config *child_dev = NULL;
++	int dev_num;
++	int dvo_port;
++	int devtype;
+ 	int err;
+ 	u8 display_no = 0;
+ 	u16 port;
++	int i, lfp_pipe = 0;
+ 	enum pipe pipe = PIPE_A;
+ 
+ 	if (!pdev)
+@@ -264,15 +270,93 @@ struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
+ 	 * TODO: add dpms config over here and register with adf using
+ 	 * intel_dc_config_add_power();
+ 	 */
+-	port = intel_get_dsi_port_frm_vbt();
++	intel_get_vbt_disp_conf((void **)&child_dev, &dev_num);
+ 
+-	if (port == DVO_PORT_DSI_A)
+-		pipe = PIPE_A;
+-	else if (port == DVO_PORT_DSI_C)
+-		pipe = PIPE_B;
++	/*
++	 * LFP
++	 *      if MIPI A --> PIPEA
++	 *              MIPI C --> PIPEB
++	 *      if eDP  ---> PIPE B
++	 * EFP
++	 *      if port D --> PIPE C
++	 *      else PIPE A or PIPE B
++	 */
+ 
+-	vlv_initialize_disp(config, pipe, INTEL_PIPE_DSI, display_no++);
++	/* To check for the LPF first */
++	for (i = 0; i <= dev_num; i++) {
++		dvo_port = child_dev[i].common.dvo_port;
++		devtype = child_dev[i].common.device_type;
++		if (devtype & DEVICE_TYPE_INTERNAL_CONNECTOR) {
++			if  (devtype & DEVICE_TYPE_MIPI_OUTPUT) {
++				if (dvo_port == DVO_PORT_MIPIA)
++					pipe = PIPE_A;
++				else
++					pipe = PIPE_B;
++
++				/*
++				 * For MIPI dvo port value will be 21-23
++				 * so we have to subtract 21(DVO_PORT_MIPIA)
++				 * from this value to get the port
++				 */
++				vlv_initialize_disp(config, pipe,
++						INTEL_PIPE_DSI,
++						(dvo_port - DVO_PORT_MIPIA),
++						display_no++);
++			} else if (devtype & DEVICE_TYPE_EDP_BITS) {
++				pipe = PIPE_B;
++				vlv_initialize_disp(config, pipe,
++						INTEL_PIPE_EDP,
++						dvo_port - DVO_PORT_CRT,
++						display_no++);
++			}
++			lfp_pipe = pipe;
++		}
++	}
+ 
++	/* To check the EPF */
++	for (i = 0; i <= dev_num; i++) {
++		dvo_port = child_dev[i].common.dvo_port;
++		devtype = child_dev[i].common.device_type;
++
++		if (devtype == DEVICE_TYPE_HDMI ||
++				devtype == DEVICE_TYPE_DP_HDMI_DVI
++				|| devtype == DEVICE_TYPE_DP) {
++
++			/* Selecting the pipe */
++			if ((dvo_port == DVO_PORT_HDMIB) ||
++					(dvo_port == DVO_PORT_HDMIC) ||
++					(dvo_port == DVO_PORT_DPB) ||
++					(dvo_port == DVO_PORT_DPC)) {
++				if (lfp_pipe != PIPE_A)
++					pipe = PIPE_A;
++				else
++					pipe = PIPE_B;
++
++			} else {
++				pipe = PIPE_C;
++			}
++
++			/* Setting the port number */
++			if (devtype == DEVICE_TYPE_DP)
++				port = dvo_port - DVO_PORT_CRT;
++
++			/* Selecting the PIPE type */
++			if (devtype == DEVICE_TYPE_DP_HDMI_DVI
++					|| devtype == DEVICE_TYPE_DP)
++				/*
++				 * If device type is HDMI over DP
++				 * or DP then selecting
++				 * the pipe type as DP
++				 */
++				vlv_initialize_disp(config, pipe,
++						INTEL_PIPE_DP,
++						dvo_port, display_no++);
++			else
++				vlv_initialize_disp(config, pipe,
++						INTEL_PIPE_HDMI,
++						dvo_port, display_no++);
++		}
++	}
+ 
+ 	return &config->base;
+ err:
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index f627bd7..2183c4c 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -46,6 +46,65 @@ struct intel_pipeline;
+ 
+ #define VSYNC_COUNT_MAX_MASK 0xffffff
+ 
++/* Add the device class for LFP, TV, HDMI */
++#define  DEVICE_TYPE_INT_LFP		0x1022
++#define  DEVICE_TYPE_INT_TV		0x1009
++#define  DEVICE_TYPE_HDMI		0x60D2
++#define  DEVICE_TYPE_DP			0x68C6
++#define  DEVICE_TYPE_EDP		0x78C6
++#define  DEVICE_TYPE_DP_HDMI_DVI	0x60D6
++
++#define  DEVICE_TYPE_CLASS_EXTENSION	(1 << 15)
++#define  DEVICE_TYPE_POWER_MANAGEMENT	(1 << 14)
++#define  DEVICE_TYPE_HOTPLUG_SIGNALING	(1 << 13)
++#define  DEVICE_TYPE_INTERNAL_CONNECTOR	(1 << 12)
++#define  DEVICE_TYPE_NOT_HDMI_OUTPUT	(1 << 11)
++#define  DEVICE_TYPE_MIPI_OUTPUT	(1 << 10)
++#define  DEVICE_TYPE_COMPOSITE_OUTPUT	(1 << 9)
++#define  DEVICE_TYPE_DUAL_CHANNEL	(1 << 8)
++#define  DEVICE_TYPE_HIGH_SPEED_LINK	(1 << 6)
++#define  DEVICE_TYPE_LVDS_SINGALING	(1 << 5)
++#define  DEVICE_TYPE_TMDS_DVI_SIGNALING	(1 << 4)
++#define  DEVICE_TYPE_VIDEO_SIGNALING	(1 << 3)
++#define  DEVICE_TYPE_DISPLAYPORT_OUTPUT	(1 << 2)
++#define  DEVICE_TYPE_DIGITAL_OUTPUT	(1 << 1)
++#define  DEVICE_TYPE_ANALOG_OUTPUT	(1 << 0)
++
++/*
++ * Bits we care about when checking for DEVICE_TYPE_EDP
++ * Depending on the system, the other bits may or may not
++ * be set for EDP outputs.
++ */
++#define DEVICE_TYPE_EDP_BITS \
++	(DEVICE_TYPE_INTERNAL_CONNECTOR | \
++	DEVICE_TYPE_NOT_HDMI_OUTPUT | \
++	DEVICE_TYPE_MIPI_OUTPUT | \
++	DEVICE_TYPE_COMPOSITE_OUTPUT | \
++	DEVICE_TYPE_DUAL_CHANNEL | \
++	DEVICE_TYPE_LVDS_SINGALING | \
++	DEVICE_TYPE_TMDS_DVI_SIGNALING | \
++	DEVICE_TYPE_VIDEO_SIGNALING | \
++	DEVICE_TYPE_DISPLAYPORT_OUTPUT | \
++	DEVICE_TYPE_DIGITAL_OUTPUT | \
++	DEVICE_TYPE_ANALOG_OUTPUT)
++
++/* Possible values for the "DVO Port" field for versions >= 155: */
++#define DVO_PORT_HDMIA	0
++#define DVO_PORT_HDMIB	1
++#define DVO_PORT_HDMIC	2
++#define DVO_PORT_HDMID	3
++#define DVO_PORT_LVDS	4
++#define DVO_PORT_TV	5
++#define DVO_PORT_CRT	6
++#define DVO_PORT_DPB	7
++#define DVO_PORT_DPC	8
++#define DVO_PORT_DPD	9
++#define DVO_PORT_DPA	10
++#define DVO_PORT_MIPIA	21
++#define DVO_PORT_MIPIB	22
++#define DVO_PORT_MIPIC	23
++#define DVO_PORT_MIPID	24
++
+ enum gen_id {
+ 	gen_invalid = 0,
+ 	/*
+@@ -416,6 +475,69 @@ struct intel_dc_config {
+ 	struct intel_dc_power *power;
+ };
+ 
++/*
++ * We used to keep this struct but without any version control. We should avoid
++ * using it in the future, but it should be safe to keep using it in the old
++ * code.
++ */
++struct old_child_dev_config {
++	u16 handle;
++	u16 device_type;
++	u8  device_id[10]; /* ascii string */
++	u16 addin_offset;
++	u8  dvo_port;
++	u8  i2c_pin;
++	u8  slave_addr;
++	u8  ddc_pin;
++	u16 edid_ptr;
++	u8  dvo_cfg;
++	u8  dvo2_port;
++	u8  i2c2_pin;
++	u8  slave2_addr;
++	u8  ddc2_pin;
++	u8  capabilities;
++	u8  dvo_wiring;
++	u8  dvo2_wiring;
++	u16 extended_type;
++	u8  dvo_function;
++} __packed;
++
++/*
++ * This one contains field offsets that are known to be common for all BDB
++ * versions. Notice that the meaning of the contents contents may still change,
++ * but at least the offsets are consistent.
++ */
++struct common_child_dev_config {
++	u16 handle;
++	u16 device_type;
++	u8 not_common1[12];
++	u8 dvo_port;
++	u8 not_common2[2];
++	u8 ddc_pin;
++	u16 edid_ptr;
++} __packed;
++
++/*
++ * This field changes depending on the BDB version, so the most reliable way to
++ * read it is by checking the BDB version and reading the raw pointer.
++ */
++union child_device_config {
++	/*
++	 * This one is safe to be used anywhere, but the code should still check
++	 * the BDB version.
++	 */
++	u8 raw[33];
++
++	/* This one should only be kept for legacy code. */
++	struct old_child_dev_config old;
++
++	/*
++	 * This one should also be safe to use anywhere, even without version
++	 * checks.
++	 */
++	struct common_child_dev_config common;
++};
++
+ struct intel_dc_config_entry {
+ 	const enum gen_id id;
+ 	struct intel_dc_config * (*get_dc_config)(struct pci_dev *pdev,
+-- 
+1.7.9.5
+

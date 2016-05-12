@@ -1,0 +1,540 @@
+From 0a305f9c22df90f6df196b8218b02b669c95b884 Mon Sep 17 00:00:00 2001
+From: "qipeng.zha" <qipeng.zha@intel.com>
+Date: Wed, 27 Aug 2014 01:37:16 +0800
+Subject: [PATCH 1/1] PMIC: Add WC PMIC support
+
+a, add WC PMIC driver
+b, For I2C access, since WC supports multiple devices, and
+PMIC client drivers may need to access multiple devices for
+status and control. Hence this driver adds support to send
+16-bit address <device-number reg-number>, for eg. 0x5E04 to
+pmic i2c read/write calls. If the PMIC client need to access
+single device(default client loaded by the BIOS), it can send
+only register number to pmic i2c read/write calls.
+
+v1: Fix NULL pointer exception in accessing id.  Also, add ACPI
+ID for wcove.
+
+v2: Fix for BCU (WARNA & WARNB) interrupt recovery issue.
+  Issue Description:
+  The BCU WARNA and WARNB interrupts are triggered continuously even
+  Vsys voltage is recovered from the WARNA and WARNB level.
+  Solution:
+  To avoid the unnecessary continuous interrupt triggering,
+  clear the respective interrupt once handled by the bcu driver.
+
+Change-Id: I472febe891b065506cda5ac48216adc5b1b2c006
+Signed-off-by: qipeng.zha <qipeng.zha@intel.com>
+Signed-off-by: Sergio Aguirre <sergio.a.aguirre.rodriguez@intel.com>
+Signed-off-by: Eric Ernst <eric.ernst@intel.com>
+Signed-off-by: Albin B <albin.bala.krishnan@intel.com>
+---
+ drivers/mfd/Makefile              |    1 +
+ drivers/mfd/intel_soc_pmic_core.c |   38 +++--
+ drivers/mfd/intel_soc_pmic_core.h |    2 +
+ drivers/mfd/intel_soc_pmic_i2c.c  |   27 +++
+ drivers/mfd/intel_soc_pmic_wc.c   |  325 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 381 insertions(+), 12 deletions(-)
+ create mode 100644 drivers/mfd/intel_soc_pmic_wc.c
+
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index 3b129f2e8d5e..596809ccdd20 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -169,4 +169,5 @@ obj-$(CONFIG_MFD_STW481X)	+= stw481x.o
+ 
+ intel-soc-pmic-objs		:= intel_soc_pmic_core.o intel_soc_pmic_i2c.o intel_soc_pmic_opregion.o
+ intel-soc-pmic-objs 		+= intel_soc_pmic_crc.o intel_soc_pmic_dc.o intel_soc_pmic_dc_ti.o
++intel-soc-pmic-objs 		+= intel_soc_pmic_wc.o
+ obj-$(CONFIG_INTEL_SOC_PMIC)	+= intel-soc-pmic.o
+diff --git a/drivers/mfd/intel_soc_pmic_core.c b/drivers/mfd/intel_soc_pmic_core.c
+index efc910bbc842..a52c8ffd5ef9 100644
+--- a/drivers/mfd/intel_soc_pmic_core.c
++++ b/drivers/mfd/intel_soc_pmic_core.c
+@@ -306,12 +306,20 @@ static void pmic_irq_disable(struct irq_data *data)
+ 
+ static void pmic_irq_sync_unlock(struct irq_data *data)
+ {
+-	int val, irq_offset;
++	struct intel_pmic_regmap *map;
++
++	dev_dbg(pmic->dev, "[%s]: irq_mask = %x", __func__,
++			pmic->irq_mask[(data->irq - pmic->irq_base)/32]);
++
+ 	if (pmic->irq_need_update) {
+-		irq_offset = data->irq - pmic->irq_base;
+-		val = !!test_bit(irq_offset % 32,
+-				 &(pmic->irq_mask[irq_offset / 32]));
+-		pmic_regmap_write(&pmic->irq_regmap[irq_offset].mask, val);
++		map = &pmic->irq_regmap[(data->irq - pmic->irq_base)].mask;
++
++		if (test_bit((data->irq - pmic->irq_base) % 32,
++			&(pmic->irq_mask[(data->irq - pmic->irq_base) / 32])))
++			pmic_regmap_write(map, map->mask);
++		else
++			pmic_regmap_write(map, 0);
++
+ 		pmic->irq_need_update = 0;
+ 		pmic_regmap_flush();
+ 	}
+@@ -339,7 +347,8 @@ static irqreturn_t pmic_irq_thread(int irq, void *data)
+ 			continue;
+ 
+ 		if (pmic_regmap_read(&pmic->irq_regmap[i].status)) {
+-			pmic_regmap_write(&pmic->irq_regmap[i].ack, 1);
++			pmic_regmap_write(&pmic->irq_regmap[i].ack,
++				pmic->irq_regmap[i].ack.mask);
+ 			handle_nested_irq(pmic->irq_base + i);
+ 		}
+ 	}
+@@ -364,17 +373,22 @@ static int pmic_irq_init(void)
+ 	int cur_irq;
+ 	int ret;
+ 	int i;
++	struct intel_pmic_regmap *map;
+ 
+ 	/* Mostly, it can help to increase cache hit if merge same register
+ 	   access in one loop */
+ 	for (i = 0; i < pmic->irq_num; i++) {
+-		pmic_regmap_write(&pmic->irq_regmap[i].mask, 1);
+-		set_bit(i % 32, &(pmic->irq_mask[i / 32]));
++		map = &pmic->irq_regmap[i].mask;
++		if (IS_PMIC_REG_VALID(map)) {
++			pmic_regmap_write(map, map->mask);
++			set_bit(i % 32, &(pmic->irq_mask[i / 32]));
++		}
++	}
++	for (i = 0; i < pmic->irq_num; i++) {
++		map = &pmic->irq_regmap[i].ack;
++		if (IS_PMIC_REG_VALID(map))
++			pmic_regmap_write(map, map->mask);
+ 	}
+-
+-	for (i = 0; i < pmic->irq_num; i++)
+-		pmic_regmap_write(&pmic->irq_regmap[i].ack, 1);
+-
+ 	pmic_regmap_flush();
+ 
+ 	pmic->irq_base = irq_alloc_descs(-1, INTEL_PMIC_IRQBASE,
+diff --git a/drivers/mfd/intel_soc_pmic_core.h b/drivers/mfd/intel_soc_pmic_core.h
+index a98e417ba2f1..db0b68dcf643 100644
+--- a/drivers/mfd/intel_soc_pmic_core.h
++++ b/drivers/mfd/intel_soc_pmic_core.h
+@@ -73,6 +73,7 @@ struct intel_soc_pmic {
+ 	int				irq_base;
+ 	unsigned long			irq_mask[INTEL_PMIC_IRQ_MAX/32];
+ 	int				pmic_int_gpio;
++	int				default_client;
+ 	int				(*init)(void);
+ 	int				(*readb)(int);
+ 	int				(*writeb)(int, u8);
+@@ -88,5 +89,6 @@ void intel_pmic_install_handlers(struct intel_soc_pmic *);
+ extern struct intel_soc_pmic crystal_cove_pmic;
+ extern struct intel_soc_pmic dollar_cove_pmic;
+ extern struct intel_soc_pmic dollar_cove_ti_pmic;
++extern struct intel_soc_pmic whiskey_cove_pmic;
+ 
+ #endif	/* __INTEL_SOC_PMIC_CORE_H__ */
+diff --git a/drivers/mfd/intel_soc_pmic_i2c.c b/drivers/mfd/intel_soc_pmic_i2c.c
+index d334e393a792..d1b412599696 100644
+--- a/drivers/mfd/intel_soc_pmic_i2c.c
++++ b/drivers/mfd/intel_soc_pmic_i2c.c
+@@ -33,13 +33,31 @@
+ static struct i2c_client *pmic_i2c_client;
+ static struct intel_soc_pmic *pmic_i2c;
+ 
++#define I2C_ADDR_MASK		0xFF00
++#define I2C_ADDR_SHIFT		8
++#define I2C_REG_MASK		0xFF
++
+ static int pmic_i2c_readb(int reg)
+ {
++	if (reg & I2C_ADDR_MASK)
++		pmic_i2c_client->addr = (reg & I2C_ADDR_MASK)
++						>> I2C_ADDR_SHIFT;
++	else
++		pmic_i2c_client->addr = pmic_i2c->default_client;
++
++	reg &= I2C_REG_MASK;
+ 	return i2c_smbus_read_byte_data(pmic_i2c_client, reg);
+ }
+ 
+ static int pmic_i2c_writeb(int reg, u8 val)
+ {
++	if (reg & I2C_ADDR_MASK)
++		pmic_i2c_client->addr = (reg & I2C_ADDR_MASK)
++						>> I2C_ADDR_SHIFT;
++	else
++		pmic_i2c_client->addr = pmic_i2c->default_client;
++
++	reg &= I2C_REG_MASK;
+ 	return i2c_smbus_write_byte_data(pmic_i2c_client, reg, val);
+ }
+ 
+@@ -87,10 +105,14 @@ static int pmic_i2c_probe(struct i2c_client *i2c,
+ 	if (pmic_i2c_client != NULL || pmic_i2c != NULL)
+ 		return -EBUSY;
+ 
++	if (!id)
++		return -ENODEV;
++
+ 	pmic_i2c	= (struct intel_soc_pmic *)id->driver_data;
+ 	pmic_i2c_client	= i2c;
+ 	pmic_i2c->dev	= &i2c->dev;
+ 	pmic_i2c->irq	= i2c->irq;
++	pmic_i2c->default_client = i2c->addr;
+ 	pmic_i2c->pmic_int_gpio = pmic_i2c_lookup_gpio(pmic_i2c->dev, 0);
+ 	pmic_i2c->readb	= pmic_i2c_readb;
+ 	pmic_i2c->writeb = pmic_i2c_writeb;
+@@ -117,12 +139,17 @@ static const struct i2c_device_id pmic_i2c_id[] = {
+ 	{ "INT33F5:00", (kernel_ulong_t)&dollar_cove_ti_pmic},
+ 	{ "INT33FD", (kernel_ulong_t)&crystal_cove_pmic},
+ 	{ "INT33FD:00", (kernel_ulong_t)&crystal_cove_pmic},
++	{ "whiskey_cove", (kernel_ulong_t)&whiskey_cove_pmic},
++	{ "INT33FE", (kernel_ulong_t)&whiskey_cove_pmic},
++	{ "INT33FE:00", (kernel_ulong_t)&whiskey_cove_pmic},
++	{ "INT33FE:00:6e", (kernel_ulong_t)&whiskey_cove_pmic},
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(i2c, pmic_i2c_id);
+ 
+ static struct acpi_device_id pmic_acpi_match[] = {
+ 	{ "INT33FD", (kernel_ulong_t)&crystal_cove_pmic},
++	{ "INT33FE", (kernel_ulong_t)&whiskey_cove_pmic},
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(acpi, pmic_acpi_match);
+diff --git a/drivers/mfd/intel_soc_pmic_wc.c b/drivers/mfd/intel_soc_pmic_wc.c
+new file mode 100644
+index 000000000000..0c42e6cd13d8
+--- /dev/null
++++ b/drivers/mfd/intel_soc_pmic_wc.c
+@@ -0,0 +1,325 @@
++/*
++ * Whiskey Cove  --  Device access for Intel WhiskeyCove PMIC
++ *
++ * Copyright (C) 2013, 2014 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * Author: Yang Bin <bin.yang@intel.com>
++ * Author: Kannappan <r.kannappan@intel.com>
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/mfd/core.h>
++#include <linux/err.h>
++#include <linux/i2c.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/acpi.h>
++#include <linux/version.h>
++#include "./intel_soc_pmic_core.h"
++
++#define WHISKEY_COVE_IRQ_NUM	17
++
++#define CHIPID		0x00
++#define CHIPVER	0x01
++
++#define IRQLVL1	0x02
++#define PWRSRCIRQ	0x03
++#define THRM0IRQ	0x04
++#define THRM1IRQ	0x05
++#define THRM2IRQ	0x06
++#define BCUIRQ		0x07
++#define THRM3IRQ	0xD9
++#define CHGRIRQ	0x0A
++
++#define MIRQLVL1	0x0E
++#define MPWRSRCIRQ	0x0F
++#define MTHRMIRQ0	0x0D
++#define MTHRMIRQ1	0x12
++#define MTHRMIRQ2	0x13
++#define MTHRMIRQ3	0xDA
++#define MCHGRIRQ	0x17
++
++enum {
++	PWRSRC_LVL1 = 0,
++	THRM_LVL1,
++	BCU_IRQ,
++	ADC_IRQ,
++	CHGR_LVL1,
++	GPIO_IRQ,
++	CRIT_IRQ = 7,
++	PWRSRC_IRQ,
++	THRM1_IRQ,
++	BATALRT_IRQ,
++	BATZC_IRQ,
++	CHGR_IRQ,
++	THRM0_IRQ,
++	PMICI2C_IRQ,
++	THRM3_IRQ,
++	CTYPE_IRQ,
++};
++
++struct intel_soc_pmic whiskey_cove_pmic;
++
++static struct resource gpio_resources[] = {
++	{
++		.name	= "GPIO",
++		.start	= GPIO_IRQ,
++		.end	= GPIO_IRQ,
++		.flags	= IORESOURCE_IRQ,
++	},
++};
++
++static struct resource pmic_ccsm_resources[] = {
++	{
++		.start = PWRSRC_IRQ,
++		.end   = PWRSRC_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++	{
++		.start = BATZC_IRQ,
++		.end   = BATZC_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++	{
++		.start = BATALRT_IRQ,
++		.end   = BATALRT_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++	{
++		.start = CTYPE_IRQ,
++		.end   = CTYPE_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++
++static struct resource adc_resources[] = {
++	{
++		.name  = "ADC",
++		.start = ADC_IRQ,
++		.end   = ADC_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++
++static struct resource charger_resources[] = {
++	{
++		.name  = "CHARGER",
++		.start = CHGR_IRQ,
++		.end   = CHGR_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++
++static struct resource pmic_i2c_resources[] = {
++	{
++		.name  = "PMIC_I2C",
++		.start = PMICI2C_IRQ,
++		.end   = PMICI2C_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++
++static struct resource thermal_resources[] = {
++	{
++		.start = THRM0_IRQ,
++		.end   = THRM0_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++	{
++		.start = THRM1_IRQ,
++		.end   = THRM1_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++	{
++		.start = THRM3_IRQ,
++		.end   = THRM3_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++
++static struct resource bcu_resources[] = {
++	{
++		.name  = "BCU",
++		.start = BCU_IRQ,
++		.end   = BCU_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++
++static struct mfd_cell whiskey_cove_dev[] = {
++	{
++		.name = "whiskey_cove_adc",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(adc_resources),
++		.resources = adc_resources,
++	},
++	{
++		.name = "whiskey_cove_thermal",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(thermal_resources),
++		.resources = thermal_resources,
++	},
++	{
++		.name = "pmic_ccsm",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(pmic_ccsm_resources),
++		.resources = pmic_ccsm_resources,
++	},
++	{
++		.name = "i2c_pmic_adap",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(pmic_i2c_resources),
++		.resources = pmic_i2c_resources,
++	},
++	{
++		.name = "bd71621",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(charger_resources),
++		.resources = charger_resources,
++	},
++	{
++		.name = "whiskey_cove_bcu",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(bcu_resources),
++		.resources = bcu_resources,
++	},
++	{
++		.name = "whiskey_cove_gpio",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(gpio_resources),
++		.resources = gpio_resources,
++	},
++	{
++		.name = "sw_fuel_gauge",
++		.id = 0,
++		.num_resources = 0,
++		.resources = NULL,
++	},
++	{
++		.name = "sw_fuel_gauge_ha",
++		.id = 0,
++		.num_resources = 0,
++		.resources = NULL,
++	},
++	{NULL, },
++};
++
++struct intel_pmic_irqregmap whiskey_cove_irqregmap[] = {
++	{
++		{MIRQLVL1, PWRSRC_LVL1, 1, 0},
++		{IRQLVL1, PWRSRC_LVL1, 1, 0},
++		INTEL_PMIC_REG_NULL,
++	},
++	{
++		{MIRQLVL1, THRM_LVL1, 1, 0},
++		{IRQLVL1, THRM_LVL1, 1, 0},
++		INTEL_PMIC_REG_NULL,
++	},
++	{
++		{MIRQLVL1, BCU_IRQ, 1, 0},
++		{BCUIRQ, 0, 7, 0},
++		{BCUIRQ, 0, 7, 0},
++	},
++	{
++		{MIRQLVL1, ADC_IRQ, 1, 0},
++		{IRQLVL1, ADC_IRQ, 1, 0},
++		INTEL_PMIC_REG_NULL,
++	},
++	{
++		{MIRQLVL1, CHGR_LVL1, 1, 0},
++		{IRQLVL1, CHGR_LVL1, 1, 0},
++		INTEL_PMIC_REG_NULL,
++	},
++	{
++		{MIRQLVL1, GPIO_IRQ, 1, 0},
++		{IRQLVL1, GPIO_IRQ, 1, 0},
++		INTEL_PMIC_REG_NULL,
++	},
++	{
++		INTEL_PMIC_REG_NULL,
++		INTEL_PMIC_REG_NULL,
++		INTEL_PMIC_REG_NULL,
++	},
++	{
++		{MIRQLVL1, CRIT_IRQ, 1, 0},
++		{IRQLVL1, CRIT_IRQ, 1, 0},
++		INTEL_PMIC_REG_NULL,
++	},
++	{
++		{MIRQLVL1, 0, 0x1, 0},
++		{PWRSRCIRQ, 0, 0x1F, INTEL_PMIC_REG_W1C},
++		{PWRSRCIRQ, 0, 0x1F, INTEL_PMIC_REG_W1C},
++	},
++	{ /* THERM1 IRQ */
++		{MIRQLVL1, 1, 0x1, 0},
++		{THRM1IRQ, 0, 0xF, INTEL_PMIC_REG_W1C},
++		{THRM1IRQ, 0, 0xF, INTEL_PMIC_REG_W1C},
++	},
++	{ /* THERM2 */
++		{MIRQLVL1, 1, 0x1, 0},
++		{THRM2IRQ, 0, 0xC3, INTEL_PMIC_REG_W1C},
++		{THRM2IRQ, 0, 0xC3, INTEL_PMIC_REG_W1C},
++	},
++	{ /* BATZONE CHANGED */
++		{MIRQLVL1, 1, 0x1, 0},
++		{THRM1IRQ, 7, 1, INTEL_PMIC_REG_W1C},
++		{THRM1IRQ, 7, 1, INTEL_PMIC_REG_W1C},
++	},
++	{ /* Ext. Chrgr */
++		{MIRQLVL1, 4, 0x1, 0},
++		{CHGRIRQ, 0, 1, INTEL_PMIC_REG_W1C},
++		{CHGRIRQ, 0, 1, INTEL_PMIC_REG_W1C},
++	},
++	{ /* THERM0 IRQ */
++		{MIRQLVL1, 1, 0x1, 0},
++		{THRM0IRQ, 0, 0xFF, INTEL_PMIC_REG_W1C},
++		{THRM0IRQ, 0, 0xFF, INTEL_PMIC_REG_W1C},
++	},
++	{ /* External I2C Transaction */
++		{MIRQLVL1, 4, 0x1, 0},
++		{CHGRIRQ, 1, 7, INTEL_PMIC_REG_W1C},
++		{CHGRIRQ, 1, 7, INTEL_PMIC_REG_W1C},
++	},
++	{ /* THERM3 */
++		{MIRQLVL1, 1, 0x1, 0},
++		{THRM3IRQ, 0, 0xF0, INTEL_PMIC_REG_W1C},
++		{THRM3IRQ, 0, 0xF0, INTEL_PMIC_REG_W1C},
++	},
++	{ /* CTYP */
++		{MIRQLVL1, 4, 0x1, 0},
++		{CHGRIRQ, 4, 1, INTEL_PMIC_REG_W1C},
++		{CHGRIRQ, 4, 1, INTEL_PMIC_REG_W1C},
++	},
++};
++
++static int whiskey_cove_init(void)
++{
++	pr_info("Whiskey Cove: ID 0x%02X, VERSION 0x%02X\n",
++		intel_soc_pmic_readb(CHIPID), intel_soc_pmic_readb(CHIPVER));
++	return 0;
++}
++
++struct intel_soc_pmic whiskey_cove_pmic = {
++	.label		= "whiskey cove",
++	.irq_flags	= IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
++	.init		= whiskey_cove_init,
++	.cell_dev	= whiskey_cove_dev,
++	.irq_regmap	= whiskey_cove_irqregmap,
++	.irq_num	= WHISKEY_COVE_IRQ_NUM,
++};
++
++MODULE_LICENSE("GPL V2");
++MODULE_AUTHOR("Yang Bin <bin.yang@intel.com");
++
+-- 
+1.7.9.5
+

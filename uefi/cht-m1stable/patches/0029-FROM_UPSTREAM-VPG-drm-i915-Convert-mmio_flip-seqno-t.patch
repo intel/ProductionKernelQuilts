@@ -1,0 +1,92 @@
+From 37e33cd12e0a5a020f97a85ff721c33e88e6d733 Mon Sep 17 00:00:00 2001
+Message-Id: <37e33cd12e0a5a020f97a85ff721c33e88e6d733.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:34 +0000
+Subject: [PATCH 29/63] FROM_UPSTREAM [VPG]: drm/i915: Convert
+ mmio_flip::seqno to struct request
+
+Converted the mmio_flip 'seqno' value to be a request structure as part of the
+on going seqno to request changes. This includes reference counting the request
+being saved away to ensure it can not be retired and freed while the flip code
+is still waiting on it.
+
+v2: Used the IRQ friendly request dereference call in the notify handler as that
+code is called asynchronously without holding any useful mutex locks.
+
+Change-Id: I1adf715df9c7c4e2b37a84451e3e554b98d4b3d4
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+[danvet: Drop the _irq variant and use the normal reques unref,
+wrapped in dev->struct_mutex per the discussion on the m-l.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: cc8c4cc2a0cee06ecdd27aa654e26ec3b2b05048
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/intel_display.c |   13 +++++++------
+ drivers/gpu/drm/i915/intel_drv.h     |    2 +-
+ 2 files changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index b0bfd62..22027d2 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10434,15 +10434,16 @@ void intel_notify_mmio_flip(struct intel_engine_cs *ring)
+ 		struct intel_mmio_flip *mmio_flip;
+ 
+ 		mmio_flip = &intel_crtc->mmio_flip;
+-		if (mmio_flip->seqno == 0)
++		if (mmio_flip->req == NULL)
+ 			continue;
+ 
+ 		if (ring->id != mmio_flip->ring_id)
+ 			continue;
+ 
+-		if (i915_seqno_passed(seqno, mmio_flip->seqno)) {
++		if (i915_seqno_passed(seqno, i915_gem_request_get_seqno(mmio_flip->req))) {
+ 			intel_do_mmio_flip(intel_crtc);
+-			mmio_flip->seqno = 0;
++			i915_gem_request_unreference_irq(mmio_flip->req);
++			mmio_flip->req = NULL;
+ 			ring->irq_put(ring);
+ 		}
+ 	}
+@@ -10461,7 +10462,7 @@ static int intel_queue_mmio_flip(struct drm_device *dev,
+ 	unsigned long irq_flags;
+ 	int ret;
+ 
+-	if (WARN_ON(intel_crtc->mmio_flip.seqno))
++	if (WARN_ON(intel_crtc->mmio_flip.req))
+ 		return -EBUSY;
+ 
+ 	ret = intel_postpone_flip(obj);
+@@ -10473,8 +10474,8 @@ static int intel_queue_mmio_flip(struct drm_device *dev,
+ 	}
+ 
+ 	spin_lock_irqsave(&dev_priv->mmio_flip_lock, irq_flags);
+-	intel_crtc->mmio_flip.seqno =
+-			     i915_gem_request_get_seqno(obj->last_write_req);
++	i915_gem_request_assign(&intel_crtc->mmio_flip.req,
++				obj->last_write_req);
+ 	intel_crtc->mmio_flip.ring_id = obj->ring->id;
+ 	spin_unlock_irqrestore(&dev_priv->mmio_flip_lock, irq_flags);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index b311780..c4af579 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -383,7 +383,7 @@ struct intel_pipe_wm {
+ };
+ 
+ struct intel_mmio_flip {
+-	u32 seqno;
++	struct drm_i915_gem_request *req;
+ 	u32 ring_id;
+ };
+ 
+-- 
+1.7.9.5
+

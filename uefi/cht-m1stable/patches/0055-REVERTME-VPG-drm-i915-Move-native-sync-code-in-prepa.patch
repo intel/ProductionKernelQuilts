@@ -1,0 +1,181 @@
+From f3168b29b3907d53d2e5f667683278b4973d5681 Mon Sep 17 00:00:00 2001
+Message-Id: <f3168b29b3907d53d2e5f667683278b4973d5681.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 22 Apr 2014 15:45:53 +0100
+Subject: [PATCH 55/71] REVERTME [VPG]: drm/i915: Move native sync code in
+ preparation for GPU scheduler
+
+The impending GPU scheduler changes require shuffling various bits of
+execbuffer code around. This change moves the native sync code to a
+more useful position. It has no real world change until the scheduler
+arrives. However, until the scheduler code lands, it makes the
+rebasing onto an evolving tree much simpler.
+
+v2: rebase as per execlists v4.
+
+Issue: GMIN-2905
+Signed-off-by: john.c.harrison@intel.com
+Signed-off-by: Arun Siluvery <arun.siluvery@linux.intel.com>
+(cherry picked from commit cd2614c060d865190a4030264677f5c67fc9e497)
+
+Change-Id: I2dc3d03f5b0ff046fa04bf888ea105b91958213d
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   76 ++++++++++++++--------------
+ drivers/gpu/drm/i915/intel_lrc.c           |   38 +++++++-------
+ 2 files changed, 57 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 315ba37..784774b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1123,6 +1123,44 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 
+ 	seqno = ring->outstanding_lazy_seqno;
+ 
++#ifdef CONFIG_SYNC
++	if (args->flags & I915_EXEC_WAIT_FENCE) {
++		/* Validate the fence wait parameter but don't do the wait until
++		 * a scheduler arrives. Otherwise the entire universe stalls. */
++		int fd_fence_wait = (int) args->rsvd2;
++
++		if (fd_fence_wait < 0) {
++			DRM_ERROR("Wait fence for ring %d has invalid id %d\n",
++				  (int) ring->id, fd_fence_wait);
++		} else {
++			struct sync_fence *fence_wait;
++
++			fence_wait = sync_fence_fdget(fd_fence_wait);
++			if (fence_wait == NULL)
++				DRM_ERROR("Invalid wait fence %d\n",
++					  fd_fence_wait);
++		}
++	}
++#endif
++
++	if (args->flags & I915_EXEC_REQUEST_FENCE) {
++		/* Caller has requested a sync fence.
++		 * User interrupts will be enabled to make sure that
++		 * the timeline is signalled on completion. */
++		ret = i915_sync_create_fence(ring, seqno,
++					     &fd_fence_complete,
++					     args->flags & I915_EXEC_RING_MASK);
++		if (ret) {
++			DRM_ERROR("Fence creation failed for ring %d\n",
++				  ring->id);
++			args->rsvd2 = (__u64) -1;
++			goto error;
++		}
++
++		/* Return the fence through the rsvd2 field */
++		args->rsvd2 = (__u64) fd_fence_complete;
++	}
++
+ 	ret = i915_gem_execbuffer_move_to_gpu(ring, vmas);
+ 	if (ret)
+ 		goto error;
+@@ -1189,44 +1227,6 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 			goto error;
+ 	}
+ 
+-#ifdef CONFIG_SYNC
+-	if (args->flags & I915_EXEC_WAIT_FENCE) {
+-		/* Validate the fence wait parameter but don't do the wait until
+-		 * a scheduler arrives. Otherwise the entire universe stalls. */
+-		int fd_fence_wait = (int) args->rsvd2;
+-
+-		if (fd_fence_wait < 0) {
+-			DRM_ERROR("Wait fence for ring %d has invalid id %d\n",
+-				  (int) ring->id, fd_fence_wait);
+-		} else {
+-			struct sync_fence *fence_wait;
+-
+-			fence_wait = sync_fence_fdget(fd_fence_wait);
+-			if (fence_wait == NULL)
+-				DRM_ERROR("Invalid wait fence %d\n",
+-					  fd_fence_wait);
+-		}
+-	}
+-#endif
+-
+-	if (args->flags & I915_EXEC_REQUEST_FENCE) {
+-		/* Caller has requested a sync fence.
+-		 * User interrupts will be enabled to make sure that
+-		 * the timeline is signalled on completion. */
+-		ret = i915_sync_create_fence(ring, seqno,
+-					     &fd_fence_complete,
+-					     args->flags & I915_EXEC_RING_MASK);
+-		if (ret) {
+-			DRM_ERROR("Fence creation failed for ring %d\n",
+-				  ring->id);
+-			args->rsvd2 = (__u64) -1;
+-			goto error;
+-		}
+-
+-		/* Return the fence through the rsvd2 field */
+-		args->rsvd2 = (__u64) fd_fence_complete;
+-	}
+-
+ 	/* Flag this seqno as being active on the ring so the watchdog
+ 	 * code knows where to look if things go wrong. */
+ 	ret = i915_write_active_seqno(ring, seqno);
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 7b4c297..201b00a 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -735,25 +735,6 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 
+ 	seqno = ring->outstanding_lazy_seqno;
+ 
+-	ret = execlists_move_to_gpu(ringbuf, vmas);
+-	if (ret)
+-		return ret;
+-
+-	if (ring == &dev_priv->ring[RCS] &&
+-	    instp_mode != dev_priv->relative_constants_mode) {
+-		ret = intel_logical_ring_begin(ringbuf, 4);
+-		if (ret)
+-			return ret;
+-
+-		intel_logical_ring_emit(ringbuf, MI_NOOP);
+-		intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
+-		intel_logical_ring_emit(ringbuf, INSTPM);
+-		intel_logical_ring_emit(ringbuf, instp_mask << 16 | instp_mode);
+-		intel_logical_ring_advance(ringbuf);
+-
+-		dev_priv->relative_constants_mode = instp_mode;
+-	}
+-
+ #ifdef CONFIG_SYNC
+ 	if (args->flags & I915_EXEC_WAIT_FENCE) {
+ 		/* Validate the fence wait parameter but don't do the wait until
+@@ -792,6 +773,25 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 		args->rsvd2 = (__u64) fd_fence_complete;
+ 	}
+ 
++	ret = execlists_move_to_gpu(ringbuf, vmas);
++	if (ret)
++		goto error;
++
++	if (ring == &dev_priv->ring[RCS] &&
++	    instp_mode != dev_priv->relative_constants_mode) {
++		ret = intel_logical_ring_begin(ringbuf, 4);
++		if (ret)
++			goto error;
++
++		intel_logical_ring_emit(ringbuf, MI_NOOP);
++		intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
++		intel_logical_ring_emit(ringbuf, INSTPM);
++		intel_logical_ring_emit(ringbuf, instp_mask << 16 | instp_mode);
++		intel_logical_ring_advance(ringbuf);
++
++		dev_priv->relative_constants_mode = instp_mode;
++	}
++
+ 	/* Flag this seqno as being active on the ring so the watchdog
+ 	 * code knows where to look if things go wrong. */
+ 	ret = logical_ring_write_active_seqno(ringbuf, seqno);
+-- 
+1.7.9.5
+

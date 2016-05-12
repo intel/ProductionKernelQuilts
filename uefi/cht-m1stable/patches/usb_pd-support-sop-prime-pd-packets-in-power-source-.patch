@@ -1,0 +1,715 @@
+From 9ccb57248ba30c12ae9ab7d41119d7616a6c95fa Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Tue, 2 Feb 2016 20:42:58 +0530
+Subject: [PATCH 09/24] usb_pd: support sop prime pd packets in power source
+ mode
+
+Device which supports sop prime pd packets can send discover
+identity with sop prime header to active cable and get it's
+cable properties in response in power source mode. This patch
+adds required changes to pd framework.
+
+Change-Id: I94b51aca7be9c1d8a47a80d38aaa7bac6e6743ed
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-18527
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Signed-off-by: R, Kannappan <r.kannappan@intel.com>
+Signed-off-by: Vineesh k k <vineesh.k.k@intel.com>
+Reviewed-on: https://android.intel.com:443/464165
+---
+ drivers/usb/typec/pd/pd_policy.h          |  16 +++--
+ drivers/usb/typec/pd/policy_engine.c      | 107 +++++++++++++++++++++---------
+ drivers/usb/typec/pd/policy_engine.h      |  18 +++--
+ drivers/usb/typec/pd/protocol.c           |  59 ++++++++++------
+ drivers/usb/typec/pd/protocol.h           |  11 +--
+ drivers/usb/typec/pd/vdm_process.c        |  33 +++++++--
+ drivers/usb/typec/pd/vdm_process_helper.h |   2 +-
+ 7 files changed, 169 insertions(+), 77 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/pd_policy.h b/drivers/usb/typec/pd/pd_policy.h
+index b92b59c..3d8ddbb 100644
+--- a/drivers/usb/typec/pd/pd_policy.h
++++ b/drivers/usb/typec/pd/pd_policy.h
+@@ -91,9 +91,11 @@ struct pe_operations {
+ 
+ 	/* Callback functions to receive msgs and cmds from protocol */
+ 	int (*process_data_msg)(struct policy *p, enum pe_event evt,
+-				struct pd_packet *data);
++				struct pd_packet *data,
++				enum pd_pkt_type sop_type);
+ 	int (*process_ctrl_msg)(struct policy *p, enum pe_event evt,
+-				struct pd_packet *data);
++				struct pd_packet *data,
++				enum pd_pkt_type sop_type);
+ 	int (*process_cmd)(struct policy *p, enum pe_event cmd);
+ 
+ 	/* Callback fn to receive DPM event */
+@@ -121,20 +123,22 @@ static inline int pe_process_cmd(struct policy *p, enum pe_event cmd)
+ 
+ static inline int pe_process_data_msg(struct policy *p,
+ 					enum pe_event evt,
+-					struct pd_packet *pkt)
++					struct pd_packet *pkt,
++					enum pd_pkt_type type)
+ {
+ 	if (p && p->ops && p->ops->process_data_msg)
+-		return p->ops->process_data_msg(p, evt, pkt);
++		return p->ops->process_data_msg(p, evt, pkt, type);
+ 
+ 	return -ENOTSUPP;
+ }
+ 
+ static inline int pe_process_ctrl_msg(struct policy *p,
+ 					enum pe_event evt,
+-					struct pd_packet *pkt)
++					struct pd_packet *pkt,
++					enum pd_pkt_type type)
+ {
+ 	if (p && p->ops && p->ops->process_ctrl_msg)
+-		return p->ops->process_ctrl_msg(p, evt, pkt);
++		return p->ops->process_ctrl_msg(p, evt, pkt, type);
+ 
+ 	return -ENOTSUPP;
+ }
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index d0714f6..96622e8 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -50,7 +50,7 @@ static void pe_change_state_to_snk_or_src_reset(struct policy_engine *pe);
+ static void pe_store_port_partner_caps(struct policy_engine *pe,
+ 					struct pe_port_pdos *pdos);
+ 
+-static void pe_change_state(struct policy_engine *pe, enum pe_states state)
++void pe_change_state(struct policy_engine *pe, enum pe_states state)
+ {
+ 	pe->prev_state = pe->cur_state;
+ 	pe->cur_state = state;
+@@ -161,13 +161,22 @@ static void pe_do_complete_reset(struct policy_engine *pe)
+ 	pe->is_pp_pd_capable = 0;
+ }
+ 
+-static int policy_engine_process_data_msg(struct policy *p,
+-				enum pe_event evt, struct pd_packet *pkt)
++static int policy_engine_process_data_msg(struct policy *p, enum pe_event evt,
++			struct pd_packet *pkt, enum pd_pkt_type sop_type)
+ {
+ 	struct policy_engine *pe = container_of(p, struct policy_engine, p);
+ 	int data_len = PD_MSG_NUM_DATA_OBJS(&pkt->header);
+ 
+ 	log_dbg("Data msg received evt - %d\n", evt);
++	if (sop_type == PKT_TYPE_SOP_P
++		&& pe->cur_state != PE_SRC_VDM_IDENTITY_REQUEST) {
++		log_dbg("Ignore SOPP pkt in state=%d", pe->cur_state);
++		return -EINVAL;
++	}
++	if (sop_type != PKT_TYPE_SOP) {
++		log_dbg("Not an SOP packet, ignore");
++		return -EINVAL;
++	}
+ 	if (data_len > MAX_NUM_DATA_OBJ)
+ 		data_len = MAX_NUM_DATA_OBJ;
+ 
+@@ -220,8 +229,8 @@ static int policy_engine_process_data_msg(struct policy *p,
+ 		break;
+ 
+ 	case PE_EVT_RCVD_VDM:
+-		if (pe_is_timer_pending(pe, VMD_RESPONSE_TIMER))
+-			pe_cancel_timer(pe, VMD_RESPONSE_TIMER);
++		if (pe_is_timer_pending(pe, VDM_RESPONSE_TIMER))
++			pe_cancel_timer(pe, VDM_RESPONSE_TIMER);
+ 		pe_handle_vendor_msg(pe, pkt);
+ 		break;
+ 
+@@ -367,7 +376,8 @@ static void pe_handle_gcrc_received(struct policy_engine *pe)
+ 	case PE_DFP_VDM_MODES_ENTRY_REQUEST:
+ 	case PE_DFP_VDM_STATUS_REQUEST:
+ 	case PE_DFP_VDM_CONF_REQUEST:
+-		pe_start_timer(pe, VMD_RESPONSE_TIMER,
++	case PE_SRC_VDM_IDENTITY_REQUEST:
++		pe_start_timer(pe, VDM_RESPONSE_TIMER,
+ 				PE_TIME_VDM_SENDER_RESPONSE);
+ 		break;
+ 	case PE_SNK_SOFT_RESET:
+@@ -382,13 +392,17 @@ static void pe_handle_gcrc_received(struct policy_engine *pe)
+ 	}
+ }
+ 
+-static int policy_engine_process_ctrl_msg(struct policy *p,
+-				enum pe_event evt, struct pd_packet *pkt)
++static int policy_engine_process_ctrl_msg(struct policy *p, enum pe_event evt,
++			struct pd_packet *pkt, enum pd_pkt_type sop_type)
+ {
+ 	int ret = 0;
+ 	struct policy_engine *pe = container_of(p, struct policy_engine, p);
+ 
+ 	log_dbg("Ctrl msg received evt - %d\n", evt);
++	if (sop_type != PKT_TYPE_SOP) {
++		log_dbg("Not an SOP packet, ignore");
++		return -EINVAL;
++	}
+ 
+ 	mutex_lock(&pe->pe_lock);
+ 	pe->is_pp_pd_capable = true;
+@@ -681,12 +695,29 @@ static void pe_dump_data_msg(struct pd_packet *pkt)
+ #endif /* DBG */
+ }
+ 
++int pe_send_packet_type(struct policy_engine *pe, void *data, int len,
++		u8 msg_type, enum pe_event evt, int type)
++{
++	int ret = 0;
++	if (evt == PE_EVT_SEND_VDM && pe->p.prot &&
++		pe->p.prot->policy_fwd_pkt) {
++		pe->p.prot->policy_fwd_pkt(pe->p.prot, msg_type, data,
++			len, type);
++		pe->last_sent_evt = evt;
++		pe_start_timer(pe, CRC_RECEIVE_TIMER, PE_TIME_RECEIVE);
++	} else {
++		log_err("Invalid event %d", evt);
++		ret = -EINVAL;
++	}
++	return ret;
++}
+ 
+ int pe_send_packet(struct policy_engine *pe, void *data, int len,
+ 				u8 msg_type, enum pe_event evt)
+ {
+ 	int ret = 0;
+ 	bool is_crc_timer_req = true;
++	enum pd_pkt_type type;
+ 
+ 	switch (evt) {
+ 	case PE_EVT_SEND_GOTOMIN:
+@@ -706,10 +737,12 @@ int pe_send_packet(struct policy_engine *pe, void *data, int len,
+ 	case PE_EVT_SEND_BIST:
+ 	case PE_EVT_SEND_VDM:
+ 	case PE_EVT_SEND_SOFT_RESET:
++		type = PKT_TYPE_SOP;
+ 		break;
+ 	case PE_EVT_SEND_HARD_RESET:
+ 	case PE_EVT_SEND_PROTOCOL_RESET:
+ 		is_crc_timer_req = false;
++		type = PKT_TYPE_NONE;
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+@@ -721,7 +754,8 @@ int pe_send_packet(struct policy_engine *pe, void *data, int len,
+ 	pe->is_gcrc_received = false;
+ 	log_dbg("Sending pkt, evt=%d", evt);
+ 	if (pe->p.prot && pe->p.prot->policy_fwd_pkt)
+-		pe->p.prot->policy_fwd_pkt(pe->p.prot, msg_type, data, len);
++		pe->p.prot->policy_fwd_pkt(pe->p.prot, msg_type, data,
++			len, type);
+ 
+ 	pe->last_sent_evt = evt;
+ 	if (is_crc_timer_req)
+@@ -1271,8 +1305,8 @@ static char *timer_to_str(enum pe_timers timer_type)
+ 		return "VDM_MODE_ENTRY_TIMER";
+ 	case VDM_MODE_EXIT_TIMER:
+ 		return "VDM_MODE_EXIT_TIMER";
+-	case VMD_RESPONSE_TIMER:
+-		return "VMD_RESPONSE_TIMER";
++	case VDM_RESPONSE_TIMER:
++		return "VDM_RESPONSE_TIMER";
+ 	case VBUS_CHECK_TIMER:
+ 		return "VBUS_CHECK_TIMER";
+ 	case SRC_RESET_RECOVER_TIMER:
+@@ -1487,6 +1521,9 @@ static void pe_timer_expire_worker(struct work_struct *work)
+ 			/* Issue Hard Reset */
+ 			pe_change_state_to_snk_or_src_reset(pe);
+ 			break;
++		} else if (pe->cur_state == PE_SRC_VDM_IDENTITY_REQUEST) {
++			pe_change_state(pe, PE_SRC_WAIT_FOR_VBUS);
++			break;
+ 		}
+ 		if (pe_is_timer_pending(pe, SENDER_RESPONSE_TIMER))
+ 			pe_cancel_timer(pe, SENDER_RESPONSE_TIMER);
+@@ -1530,13 +1567,9 @@ static void pe_timer_expire_worker(struct work_struct *work)
+ 		break;
+ 
+ 	case SWAP_SOURCE_START_TIMER:
+-		if (pe->cur_state == PE_SRC_STARTUP) {
+-			/*
+-			 * Move to PE_SRC_WAIT_FOR_VBUS to check
+-			 * VBUS before sending SrcCap.
+-			 */
+-			pe_change_state(pe, PE_SRC_WAIT_FOR_VBUS);
+-		} else
++		if (pe->cur_state == PE_SRC_STARTUP)
++			pe_change_state(pe, PE_SRC_VDM_IDENTITY_REQUEST);
++		else
+ 			log_warn("%s expired in wrong state=%d",
+ 				timer_to_str(type), pe->cur_state);
+ 		break;
+@@ -1552,7 +1585,7 @@ static void pe_timer_expire_worker(struct work_struct *work)
+ 	case VDM_MODE_ENTRY_TIMER:
+ 	case VDM_MODE_EXIT_TIMER:
+ 		break;
+-	case VMD_RESPONSE_TIMER:
++	case VDM_RESPONSE_TIMER:
+ 		if (pe->cur_state == PE_DFP_UFP_VDM_IDENTITY_REQUEST
+ 			|| pe->cur_state == PE_DFP_VDM_SVIDS_REQUEST
+ 			|| pe->cur_state == PE_DFP_VDM_MODES_REQUEST
+@@ -1561,6 +1594,12 @@ static void pe_timer_expire_worker(struct work_struct *work)
+ 			|| pe->cur_state == PE_DFP_VDM_CONF_REQUEST) {
+ 			log_warn("no response for VDM");
+ 			pe_change_state_to_snk_or_src_ready(pe);
++		} else if (pe->cur_state == PE_SRC_VDM_IDENTITY_REQUEST) {
++			/*
++			 * Move to PE_SRC_WAIT_FOR_VBUS to check
++			 * VBUS before sending SrcCap.
++			 */
++			pe_change_state(pe, PE_SRC_WAIT_FOR_VBUS);
+ 		} else
+ 			log_warn("%s expired in wrong state=%d",
+ 				timer_to_str(type), pe->cur_state);
+@@ -1703,7 +1742,6 @@ pe_process_state_pe_snk_wait_for_capabilities(struct policy_engine *pe)
+ 	else
+ 		time_out = PE_TIME_SINK_WAIT_CAP;
+ 	pe_start_timer(pe, SINK_WAIT_CAP_TIMER, time_out);
+-	pe_enable_pd(pe, true);
+ }
+ 
+ static void
+@@ -1817,6 +1855,8 @@ pe_process_state_pe_snk_hard_reset_received(struct policy_engine *pe)
+ /********** Source Port State Handlers **********************/
+ static void pe_process_state_pe_src_wait_for_vbus(struct policy_engine *pe)
+ {
++	pe_send_packet(pe, NULL, 0, PD_CMD_PROTOCOL_RESET,
++				PE_EVT_SEND_PROTOCOL_RESET);
+ 	if (!devpolicy_get_vbus_state(pe->p.dpm)) {
+ 		log_dbg("VBUS not present, Start %s",
+ 				timer_to_str(VBUS_CHECK_TIMER));
+@@ -1827,6 +1867,12 @@ static void pe_process_state_pe_src_wait_for_vbus(struct policy_engine *pe)
+ 	}
+ }
+ 
++static void pe_process_state_pe_src_vdm_id_request(struct policy_engine *pe)
++{
++	pe_enable_pd(pe, true);
++	pe_send_discover_identity(pe, PKT_TYPE_SOP_P);
++}
++
+ static void pe_process_state_pe_src_startup(struct policy_engine *pe)
+ {
+ 
+@@ -1843,13 +1889,10 @@ static void pe_process_state_pe_src_startup(struct policy_engine *pe)
+ 	if (pe->prev_state == PE_PRS_SNK_SRC_SOURCE_ON) {
+ 		pe_start_timer(pe, SWAP_SOURCE_START_TIMER,
+ 					PE_TIME_SWAP_SOURCE_START);
+-	} else {
+-		/*
+-		 * Move to PE_SRC_WAIT_FOR_VBUS to check
+-		 * VBUS before sending SrcCap.
+-		 */
++	} else if (pe->prev_state == PE_STATE_NONE)
++		pe_change_state(pe, PE_SRC_VDM_IDENTITY_REQUEST);
++	else
+ 		pe_change_state(pe, PE_SRC_WAIT_FOR_VBUS);
+-	}
+ }
+ 
+ static void pe_process_state_pe_src_discovery(struct policy_engine *pe)
+@@ -2339,7 +2382,7 @@ pe_process_state_pe_dr_snk_give_source_cap(struct policy_engine *pe)
+ static void
+ pe_process_state_pe_dfp_ufp_vdm_identity_request(struct policy_engine *pe)
+ {
+-	pe_send_discover_identity(pe);
++	pe_send_discover_identity(pe, PKT_TYPE_SOP);
+ }
+ 
+ static void
+@@ -2505,10 +2548,13 @@ static void pe_state_change_worker(struct work_struct *work)
+ 		pe_process_state_pe_snk_hard_reset_received(pe);
+ 		break;
+ 
+-	/* Soirce Port States */
++	/* Source Port States */
+ 	case PE_SRC_STARTUP:
+ 		pe_process_state_pe_src_startup(pe);
+ 		break;
++	case PE_SRC_VDM_IDENTITY_REQUEST:
++		pe_process_state_pe_src_vdm_id_request(pe);
++		break;
+ 	case PE_SRC_WAIT_FOR_VBUS:
+ 		pe_process_state_pe_src_wait_for_vbus(pe);
+ 		break;
+@@ -2813,18 +2859,15 @@ static void pe_init_policy(struct work_struct *work)
+ 
+ 	pe = container_of(work, struct policy_engine, policy_init_work);
+ 	mutex_init(&pe->pe_lock);
+-	pe->cur_drole = DATA_ROLE_NONE;
+-	pe->cur_prole = POWER_ROLE_NONE;
+ 	pe->is_typec_port = true;
+ 
+ 	/* Initialize pe timers */
+ 	pe_init_timers(pe);
+ 	INIT_WORK(&pe->policy_state_work, pe_state_change_worker);
+ 	INIT_DELAYED_WORK(&pe->post_ready_work, pe_post_ready_worker);
+-	pe->cur_state = PE_STATE_NONE;
+-	pe->alt_state = PE_ALT_STATE_NONE;
+ 
+ 	pe->p.ops = &ops;
++	pe_change_state(pe, PE_STATE_NONE);
+ 	return;
+ }
+ 
+diff --git a/drivers/usb/typec/pd/policy_engine.h b/drivers/usb/typec/pd/policy_engine.h
+index 6c75dab..e119d0a 100644
+--- a/drivers/usb/typec/pd/policy_engine.h
++++ b/drivers/usb/typec/pd/policy_engine.h
+@@ -70,7 +70,8 @@
+ #define PE_TIME_VDM_ENTER_MODE		25
+ #define PE_TIME_VDM_EXIT_MODE		25
+ #define PE_TIME_VDM_RECEIVER_RESPONSE	15
+-#define PE_TIME_VDM_SENDER_RESPONSE	30
++/* 24 >= vdm_sender_response <= 30 */
++#define PE_TIME_VDM_SENDER_RESPONSE	25
+ #define PE_TIME_VDM_WAIT_MODE_ENTRY	50
+ #define PE_TIME_VDM_WAIT_MODE_EXIT	50
+ 
+@@ -386,8 +387,13 @@ enum pe_states {
+ 	/* Cable Hard Reset (209) */
+ 	PE_CBL_HARD_RESET,
+ 
+-	/* CBL Reserved States  (210 - 215 */
+-	PE_CBL_RESERVED = 215,
++	PE_DFP_CBL_SEND_SOFT_RESET,
++	PE_DFP_CBL_SEND_CABLE_RESET,
++	PE_UFP_CBL_SEND_SOFT_RESET,
++
++	PE_SRC_VDM_IDENTITY_REQUEST,
++	PE_SRC_VDM_IDENTITY_ACK,
++	PE_SRC_VDM_IDENTITY_NACK,
+ 
+ 	/* BIST Receive Mode (216, 217) */
+ 	PE_BIST_RECEIVE_MODE,
+@@ -451,7 +457,7 @@ enum pe_timers {
+ 	/* 20 - 22 */
+ 	VDM_MODE_ENTRY_TIMER,
+ 	VDM_MODE_EXIT_TIMER,
+-	VMD_RESPONSE_TIMER,
++	VDM_RESPONSE_TIMER,
+ 	/*23, Misc timer */
+ 	VBUS_CHECK_TIMER,
+ 	SRC_RESET_RECOVER_TIMER,
+@@ -536,6 +542,7 @@ struct policy_engine {
+ 	/* Timer structs for pe_timers */
+ 	struct pe_timer timers[PE_TIMER_CNT];
+ 
++	struct dis_id_response_cable_pkt cable_pkt;
+ 	enum pe_states cur_state;
+ 	enum pe_states prev_state;
+ 	enum data_role	cur_drole;
+@@ -574,4 +581,7 @@ extern void protocol_unbind_pe(struct policy *p);
+ void pe_change_state_to_snk_or_src_ready(struct policy_engine *pe);
+ int pe_send_packet(struct policy_engine *pe, void *data, int len,
+ 				u8 msg_type, enum pe_event evt);
++int pe_send_packet_type(struct policy_engine *pe, void *data, int len,
++			u8 msg_type, enum pe_event evt, int type);
++void pe_change_state(struct policy_engine *pe, enum pe_states state);
+ #endif /*  __POLICY_ENGINE_H__ */
+diff --git a/drivers/usb/typec/pd/protocol.c b/drivers/usb/typec/pd/protocol.c
+index d9053fd..a3719d7 100644
+--- a/drivers/usb/typec/pd/protocol.c
++++ b/drivers/usb/typec/pd/protocol.c
+@@ -34,6 +34,7 @@
+ struct prot_msg {
+ 	struct list_head node;
+ 	struct pd_packet pkt;
++	enum pd_pkt_type sop_type;
+ };
+ 
+ 
+@@ -95,6 +96,8 @@ static void pd_policy_update_power_role(struct pd_prot *prot,
+ 	else if (prole == POWER_ROLE_SOURCE)
+ 		prot->pwr_role = PD_POWER_ROLE_PROVIDER;
+ 
++	typec_enable_sop_prime(prot->phy, prole == POWER_ROLE_SOURCE);
++
+ 	pe_schedule_work_pd_wq(prot->p, &prot->role_chng_work);
+ }
+ 
+@@ -178,15 +181,6 @@ static int pd_tx_fsm_state(struct pd_prot *pd, int tx_state)
+ 	return 0;
+ }
+ 
+-static void pd_prot_tx_work(struct pd_prot *prot)
+-{
+-	int len;
+-
+-	len = PD_MSG_LEN(&prot->tx_buf.header) + PD_MSG_HEADER_SIZE;
+-	pd_prot_send_phy_packet(prot, &prot->tx_buf, len);
+-
+-}
+-
+ static void pd_prot_reset_protocol(struct pd_prot *prot)
+ {
+ 	pd_prot_flush_fifo(prot, FIFO_TYPE_RX | FIFO_TYPE_TX);
+@@ -195,7 +189,7 @@ static void pd_prot_reset_protocol(struct pd_prot *prot)
+ }
+ 
+ static int pd_prot_rcv_pkt_from_policy(struct pd_prot *prot, u8 msg_type,
+-						void *buf, int len)
++				void *buf, int len, enum pd_pkt_type type)
+ {
+ 	struct pd_packet *pkt;
+ 	int ret;
+@@ -224,25 +218,38 @@ static int pd_prot_rcv_pkt_from_policy(struct pd_prot *prot, u8 msg_type,
+ 		else
+ 			prot->is_auto_retry_enable = true;
+ 	}
++	if (msg_type == PD_DATA_MSG_SRC_CAP
++		&& prot->is_auto_retry_enable) {
++		ret = typec_enable_auto_retry(prot->phy, false);
++		if (ret)
++			dev_warn(prot->phy->dev,
++			"%s: failed to disable msg auto retry, ret=%d\n",
++			__func__, ret);
++		else
++			prot->is_auto_retry_enable = false;
++	}
+ 
+ 	pkt = &prot->tx_buf;
+ 	memset(pkt, 0, sizeof(struct pd_packet));
+ 	pkt->header.msg_type = msg_type;
+-	pkt->header.data_role = prot->data_role;
+ 	if (prot->pd_version == 2)
+ 		pkt->header.rev_id = 1;
+ 	else
+ 		pkt->header.rev_id = 0;
+ 
+-	if ((prot->pwr_role == PD_POWER_ROLE_PROVIDER)
+-		|| (prot->pwr_role == PD_POWER_ROLE_CONSUMER_PROVIDER))
+-		pkt->header.pwr_role = PD_PWR_ROLE_SRC;
++	if (type == PKT_TYPE_SOP) {
++		pkt->header.data_role = prot->data_role;
++		if (prot->pwr_role == PD_POWER_ROLE_PROVIDER
++			|| prot->pwr_role == PD_POWER_ROLE_CONSUMER_PROVIDER)
++			pkt->header.pwr_role = PD_PWR_ROLE_SRC;
++	}
+ 
+ 	pkt->header.msg_id = prot->tx_msg_id;
+ 	pkt->header.num_data_obj = len / 4;
+ 	memcpy((u8 *)pkt + sizeof(struct pd_pkt_header), buf, len);
+ 
+-	pd_prot_tx_work(prot);
++	pd_prot_send_phy_packet(prot, &prot->tx_buf,
++		len + PD_MSG_HEADER_SIZE, type);
+ 
+ 	return 0;
+ }
+@@ -251,7 +258,8 @@ int prot_rx_send_goodcrc(struct pd_prot *pd, u8 msg_id)
+ {
+ 	mutex_lock(&pd->tx_data_lock);
+ 	pd_ctrl_msg(pd, PD_CTRL_MSG_GOODCRC, msg_id);
+-	pd_prot_send_phy_packet(pd, &pd->tx_buf, PD_MSG_HEADER_SIZE);
++	pd_prot_send_phy_packet(pd, &pd->tx_buf, PD_MSG_HEADER_SIZE,
++			PKT_TYPE_SOP);
+ 	mutex_unlock(&pd->tx_data_lock);
+ 	return 0;
+ }
+@@ -307,7 +315,7 @@ static int prot_fwd_ctrlmsg_to_pe(struct pd_prot *pd, struct prot_msg *msg)
+ 
+ 	if (event != PE_EVT_RCVD_NONE) {
+ 		/* Forward the msg to policy engine. */
+-		pe_process_ctrl_msg(pd->p, event, &msg->pkt);
++		pe_process_ctrl_msg(pd->p, event, &msg->pkt, msg->sop_type);
+ 		return 0;
+ 	}
+ 	return -EINVAL;
+@@ -340,7 +348,7 @@ static int prot_fwd_datamsg_to_pe(struct pd_prot *pd, struct prot_msg *msg)
+ 
+ 	if (event != PE_EVT_RCVD_NONE) {
+ 		/* Forward the msg to policy engine */
+-		pe_process_data_msg(pd->p, event, &msg->pkt);
++		pe_process_data_msg(pd->p, event, &msg->pkt, msg->sop_type);
+ 		return 0;
+ 	}
+ 	return -EINVAL;
+@@ -392,7 +400,7 @@ static void prot_process_rx_work(struct work_struct *work)
+ }
+ 
+ static int pd_prot_add_msg_rx_list(struct pd_prot *pd,
+-				struct pd_packet *pkt, int len)
++			struct pd_packet *pkt, int len, enum pd_pkt_type type)
+ {
+ 	struct prot_msg *msg;
+ 
+@@ -403,6 +411,7 @@ static int pd_prot_add_msg_rx_list(struct pd_prot *pd,
+ 		return -ENOMEM;
+ 	}
+ 	memcpy(&msg->pkt, pkt, len);
++	msg->sop_type = type;
+ 	mutex_lock(&pd->rx_list_lock);
+ 
+ 	/* Add the message to the rx list */
+@@ -455,13 +464,17 @@ static void pd_prot_phy_rcv(struct pd_prot *pd)
+ {
+ 	struct pd_packet rcv_buf;
+ 	int len, send_good_crc, msg_type, msg_id;
++	enum pd_pkt_type type = 0;
+ 
+ 	mutex_lock(&pd->rx_data_lock);
+ 
+ 	memset(&rcv_buf, 0, sizeof(struct pd_packet));
+-	len = pd_prot_recv_phy_packet(pd, &rcv_buf);
++	len = pd_prot_recv_phy_packet(pd, &rcv_buf, &type);
+ 	if (len == 0)
+ 		goto phy_rcv_end;
++	if (type != PKT_TYPE_SOP
++		&& pd->pwr_role == PD_POWER_ROLE_CONSUMER)
++		goto phy_rcv_end;
+ 
+ 	msg_type = PD_MSG_TYPE(&rcv_buf.header);
+ 	if (!pd->is_pd_enabled) {
+@@ -486,7 +499,8 @@ static void pd_prot_phy_rcv(struct pd_prot *pd)
+ 			send_good_crc = 0;
+ 			if (msg_id == pd->tx_msg_id) {
+ 				pd->tx_msg_id = (msg_id + 1) & PD_MAX_MSG_ID;
+-				pd_prot_add_msg_rx_list(pd, &rcv_buf, len);
++				pd_prot_add_msg_rx_list(pd,
++						&rcv_buf, len, type);
+ 			} else
+ 				dev_warn(pd->phy->dev, "GCRC msg id not matching\n");
+ 			complete(&pd->tx_complete);
+@@ -506,7 +520,7 @@ static void pd_prot_phy_rcv(struct pd_prot *pd)
+ 		 */
+ 		if (pd->rx_msg_id != msg_id) {
+ 			pd->rx_msg_id = msg_id;
+-			pd_prot_add_msg_rx_list(pd, &rcv_buf, len);
++			pd_prot_add_msg_rx_list(pd, &rcv_buf, len, type);
+ 		} else {
+ 			dev_warn(pd->phy->dev,
+ 				"%s:This msg is already received\n",
+@@ -685,6 +699,7 @@ int protocol_bind_dpm(struct typec_phy *phy)
+ 	INIT_LIST_HEAD(&prot->rx_list);
+ 	INIT_WORK(&prot->proc_rx_msg, prot_process_rx_work);
+ 	mutex_init(&prot->rx_list_lock);
++	pd_protocol_enable_pd(prot, false);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/usb/typec/pd/protocol.h b/drivers/usb/typec/pd/protocol.h
+index 85bd0a9..0208db3 100644
+--- a/drivers/usb/typec/pd/protocol.h
++++ b/drivers/usb/typec/pd/protocol.h
+@@ -58,7 +58,7 @@ struct pd_prot {
+ 	struct mutex rx_list_lock;
+ 
+ 	int (*policy_fwd_pkt)(struct pd_prot *prot, u8 msg_type,
+-					void *data, int len);
++			void *data, int len, enum pd_pkt_type type);
+ 
+ 	void (*policy_update_data_role)(struct pd_prot *prot,
+ 					enum data_role drole);
+@@ -71,18 +71,19 @@ struct pd_prot {
+ };
+ 
+ static inline int pd_prot_send_phy_packet(struct pd_prot *pd, void *buf,
+-						int len)
++					int len, enum pd_pkt_type type)
+ {
+ 	if (pd->phy->send_packet)
+-		return pd->phy->send_packet(pd->phy, buf, len);
++		return pd->phy->send_packet(pd->phy, buf, len, type);
+ 
+ 	return -ENOTSUPP;
+ }
+ 
+-static inline int pd_prot_recv_phy_packet(struct pd_prot *pd, void *buf)
++static inline int pd_prot_recv_phy_packet(struct pd_prot *pd,
++					void *buf, enum pd_pkt_type *type)
+ {
+ 	if (pd->phy->recv_packet)
+-		return pd->phy->recv_packet(pd->phy, buf);
++		return pd->phy->recv_packet(pd->phy, buf, type);
+ 
+ 	return -ENOTSUPP;
+ }
+diff --git a/drivers/usb/typec/pd/vdm_process.c b/drivers/usb/typec/pd/vdm_process.c
+index 977b749..2ece8ac 100644
+--- a/drivers/usb/typec/pd/vdm_process.c
++++ b/drivers/usb/typec/pd/vdm_process.c
+@@ -71,15 +71,15 @@ static void pe_prepare_initiator_vdm_header(struct vdm_header *v_hdr,
+ 	pe_prepare_vdm_header(v_hdr, cmd, INITIATOR, svid, obj_pos);
+ }
+ 
+-int pe_send_discover_identity(struct policy_engine *pe)
++int pe_send_discover_identity(struct policy_engine *pe, int type)
+ {
+ 	struct vdm_header v_hdr = { 0 };
+ 	int ret;
+ 
+ 	pe_prepare_initiator_vdm_header(&v_hdr, DISCOVER_IDENTITY,
+ 						PD_SID, 0);
+-	ret = pe_send_packet(pe, &v_hdr, 4,
+-				PD_DATA_MSG_VENDOR_DEF, PE_EVT_SEND_VDM);
++	ret = pe_send_packet_type(pe, &v_hdr, 4, PD_DATA_MSG_VENDOR_DEF,
++				PE_EVT_SEND_VDM, type);
+ 
+ 	return ret;
+ }
+@@ -343,24 +343,43 @@ static int pe_handle_discover_identity(struct policy_engine *pe,
+ 		}
+ 		return 0;
+ 	}
+-	if (pe->cur_state != PE_DFP_UFP_VDM_IDENTITY_REQUEST) {
+-		log_warn("DI RACK received in wrong state,state=%d",
++	if (pe->cur_state != PE_DFP_UFP_VDM_IDENTITY_REQUEST &&
++		pe->cur_state != PE_SRC_VDM_IDENTITY_REQUEST) {
++		log_warn("DI RACK received in wrong state,state=%d\n",
+ 				pe->cur_state);
+ 		return -EINVAL;
+ 	}
++	/*
++	 * consider response initiated from cable when in
++	 * SRC_VDM_IDENTITY_REQUEST state
++	 */
+ 	switch (cmd_type) {
+ 	case REP_ACK:
+ 		/* TODO: Process the port partner's DI */
+ 		log_dbg(" DI Acked ");
++		if (pe->cur_state == PE_SRC_VDM_IDENTITY_REQUEST) {
++			memcpy(&pe->cable_pkt, &pkt->data_obj[0],
++				pkt->header.num_data_obj * 4);
++			pe_change_state(pe, PE_SRC_WAIT_FOR_VBUS);
++			return 0;
++		}
+ 		pe->alt_state = PE_ALT_STATE_DI_ACKED;
+ 		break;
+ 	case REP_NACK:
+ 		log_dbg(" DI Nacked!!! ");
+-		log_err("Responder doesn't support alternate mode");
++		log_err("Responder doesn't support alternate mode\n");
++		if (pe->cur_state == PE_SRC_VDM_IDENTITY_REQUEST) {
++			pe_change_state(pe, PE_SRC_WAIT_FOR_VBUS);
++			return 0;
++		}
+ 		pe->alt_state = PE_ALT_STATE_ALT_MODE_FAIL;
+ 		break;
+ 	case REP_BUSY:
+-		log_info("Responder BUSY!!. Retry Discover Identity");
++		log_info("Responder BUSY!!. Retry Discover Identity\n");
++		if (pe->cur_state == PE_SRC_VDM_IDENTITY_REQUEST) {
++			pe_change_state(pe, PE_SRC_WAIT_FOR_VBUS);
++			return 0;
++		}
+ 		pe->alt_state = PE_ALT_STATE_NONE;
+ 		break;
+ 	}
+diff --git a/drivers/usb/typec/pd/vdm_process_helper.h b/drivers/usb/typec/pd/vdm_process_helper.h
+index c31514f..c2be6949 100644
+--- a/drivers/usb/typec/pd/vdm_process_helper.h
++++ b/drivers/usb/typec/pd/vdm_process_helper.h
+@@ -24,7 +24,7 @@
+ #ifndef VDM_PROCESS_HELPER_H
+ #define VDM_PROCESS_HELPER_H
+ int pe_handle_vendor_msg(struct policy_engine *pe, struct pd_packet *pkt);
+-int pe_send_discover_identity(struct policy_engine *pe);
++int pe_send_discover_identity(struct policy_engine *pe, int type);
+ int pe_send_discover_svid(struct policy_engine *pe);
+ int pe_send_discover_mode(struct policy_engine *pe);
+ int pe_send_enter_mode(struct policy_engine *pe, int index);
+-- 
+1.9.1
+

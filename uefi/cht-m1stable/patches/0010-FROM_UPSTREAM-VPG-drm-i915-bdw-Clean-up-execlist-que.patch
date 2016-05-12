@@ -1,0 +1,209 @@
+From 420f7b872071b6ed2763e617d52b79cf26f4bda2 Mon Sep 17 00:00:00 2001
+Message-Id: <420f7b872071b6ed2763e617d52b79cf26f4bda2.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: Thomas Daniel <thomas.daniel@intel.com>
+Date: Thu, 13 Nov 2014 10:27:05 +0000
+Subject: [PATCH 10/63] FROM_UPSTREAM [VPG]: drm/i915/bdw: Clean up execlist
+ queue items in retire_work
+
+No longer create a work item to clean each execlist queue item.
+Instead, move retired execlist requests to a queue and clean up the
+items during retire_requests.
+
+v2: Fix legacy ring path broken during overzealous cleanup
+
+v3: Update idle detection to take execlists queue into account
+
+v4: Grab execlist lock when checking queue state
+
+v5: Fix leaking requests by freeing in execlists_retire_requests.
+
+Issue: VIZ-4274
+Change-Id: I3644391ce19779693fa369922afa15743b5aa7cf
+Signed-off-by: Thomas Daniel <thomas.daniel@intel.com>
+Reviewed-by: Deepak S <deepak.s@linux.intel.com>
+Reviewed-by: Akash Goel <akash.goels@gmail.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: c86ee3a9f8cddcf2e637da19d6e7c05bdea11a96
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_gem.c         |    9 ++++++
+ drivers/gpu/drm/i915/intel_lrc.c        |   53 ++++++++++++++++++-------------
+ drivers/gpu/drm/i915/intel_lrc.h        |    2 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    1 +
+ 4 files changed, 42 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index f9e14dc..d22e1ff 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2848,6 +2848,15 @@ i915_gem_retire_requests(struct drm_device *dev)
+ 	for_each_ring(ring, dev_priv, i) {
+ 		i915_gem_retire_requests_ring(ring);
+ 		idle &= list_empty(&ring->request_list);
++		if (i915.enable_execlists) {
++			unsigned long flags;
++
++			spin_lock_irqsave(&ring->execlist_lock, flags);
++			idle &= list_empty(&ring->execlist_queue);
++			spin_unlock_irqrestore(&ring->execlist_lock, flags);
++
++			intel_execlists_retire_requests(ring);
++		}
+ 	}
+ 
+ 	if (idle)
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 886b1df..ae48e57 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -543,7 +543,6 @@ static void execlists_context_unqueue(struct intel_engine_cs *ring)
+ {
+ 	struct intel_ctx_submit_request *req0 = NULL, *req1 = NULL;
+ 	struct intel_ctx_submit_request *cursor = NULL, *tmp = NULL;
+-	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 
+ 	assert_spin_locked(&ring->execlist_lock);
+ 
+@@ -560,7 +559,8 @@ static void execlists_context_unqueue(struct intel_engine_cs *ring)
+ 			 * will update tail past first request's workload */
+ 			cursor->elsp_submitted = req0->elsp_submitted;
+ 			list_del(&req0->execlist_link);
+-			queue_work(dev_priv->wq, &req0->work);
++			list_add_tail(&req0->execlist_link,
++				&ring->execlist_retired_req_list);
+ 			req0 = cursor;
+ 		} else {
+ 			req1 = cursor;
+@@ -582,7 +582,6 @@ static void execlists_context_unqueue(struct intel_engine_cs *ring)
+ static bool execlists_check_remove_request(struct intel_engine_cs *ring,
+ 					   u32 request_id)
+ {
+-	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	struct intel_ctx_submit_request *head_req;
+ 
+ 	assert_spin_locked(&ring->execlist_lock);
+@@ -600,7 +599,8 @@ static bool execlists_check_remove_request(struct intel_engine_cs *ring,
+ 
+ 			if (--head_req->elsp_submitted <= 0) {
+ 				list_del(&head_req->execlist_link);
+-				queue_work(dev_priv->wq, &head_req->work);
++				list_add_tail(&head_req->execlist_link,
++					&ring->execlist_retired_req_list);
+ 				return true;
+ 			}
+ 		}
+@@ -669,22 +669,6 @@ void intel_execlists_handle_ctx_events(struct intel_engine_cs *ring)
+ 		   ((u32)ring->next_context_status_buffer & 0x07) << 8);
+ }
+ 
+-static void execlists_free_request_task(struct work_struct *work)
+-{
+-	struct intel_ctx_submit_request *req =
+-		container_of(work, struct intel_ctx_submit_request, work);
+-	struct drm_device *dev = req->ring->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+-	intel_runtime_pm_put(dev_priv);
+-
+-	mutex_lock(&dev->struct_mutex);
+-	i915_gem_context_unreference(req->ctx);
+-	mutex_unlock(&dev->struct_mutex);
+-
+-	kfree(req);
+-}
+-
+ static int execlists_context_queue(struct intel_engine_cs *ring,
+ 				   struct intel_context *to,
+ 				   u32 tail)
+@@ -701,7 +685,6 @@ static int execlists_context_queue(struct intel_engine_cs *ring,
+ 	i915_gem_context_reference(req->ctx);
+ 	req->ring = ring;
+ 	req->tail = tail;
+-	INIT_WORK(&req->work, execlists_free_request_task);
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
+@@ -722,7 +705,8 @@ static int execlists_context_queue(struct intel_engine_cs *ring,
+ 			WARN(tail_req->elsp_submitted != 0,
+ 			     "More than 2 already-submitted reqs queued\n");
+ 			list_del(&tail_req->execlist_link);
+-			queue_work(dev_priv->wq, &tail_req->work);
++			list_add_tail(&tail_req->execlist_link,
++				&ring->execlist_retired_req_list);
+ 		}
+ 	}
+ 
+@@ -1110,6 +1094,30 @@ error:
+ 	return ret;
+ }
+ 
++void intel_execlists_retire_requests(struct intel_engine_cs *ring)
++{
++	struct intel_ctx_submit_request *req, *tmp;
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	unsigned long flags;
++	struct list_head retired_list;
++
++	WARN_ON(!mutex_is_locked(&ring->dev->struct_mutex));
++	if (list_empty(&ring->execlist_retired_req_list))
++		return;
++
++	INIT_LIST_HEAD(&retired_list);
++	spin_lock_irqsave(&ring->execlist_lock, flags);
++	list_replace_init(&ring->execlist_retired_req_list, &retired_list);
++	spin_unlock_irqrestore(&ring->execlist_lock, flags);
++
++	list_for_each_entry_safe(req, tmp, &retired_list, execlist_link) {
++		intel_runtime_pm_put(dev_priv);
++		i915_gem_context_unreference(req->ctx);
++		list_del(&req->execlist_link);
++		kfree(req);
++	}
++}
++
+ void intel_logical_ring_stop(struct intel_engine_cs *ring)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+@@ -1672,6 +1680,7 @@ static int logical_ring_init(struct drm_device *dev, struct intel_engine_cs *rin
+ 	init_waitqueue_head(&ring->irq_queue);
+ 
+ 	INIT_LIST_HEAD(&ring->execlist_queue);
++	INIT_LIST_HEAD(&ring->execlist_retired_req_list);
+ 	spin_lock_init(&ring->execlist_lock);
+ 	ring->next_context_status_buffer = 0;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index 33c3b4b..84bbf19 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -104,11 +104,11 @@ struct intel_ctx_submit_request {
+ 	u32 tail;
+ 
+ 	struct list_head execlist_link;
+-	struct work_struct work;
+ 
+ 	int elsp_submitted;
+ };
+ 
+ void intel_execlists_handle_ctx_events(struct intel_engine_cs *ring);
++void intel_execlists_retire_requests(struct intel_engine_cs *ring);
+ 
+ #endif /* _INTEL_LRC_H_ */
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 145c956..6fa00ee 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -245,6 +245,7 @@ struct intel_engine_cs {
+ 	/* Execlists */
+ 	spinlock_t execlist_lock;
+ 	struct list_head execlist_queue;
++	struct list_head execlist_retired_req_list;
+ 	u8 next_context_status_buffer;
+ 	u32             irq_keep_mask; /* bitmask for interrupts that should not be masked */
+ 	int		(*emit_request)(struct intel_ringbuffer *ringbuf);
+-- 
+1.7.9.5
+

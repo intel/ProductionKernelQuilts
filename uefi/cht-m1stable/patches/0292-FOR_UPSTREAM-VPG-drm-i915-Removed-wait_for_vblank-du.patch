@@ -1,0 +1,198 @@
+From 1b4e536507ad04fc9d459b383719f2edb7d660ee Mon Sep 17 00:00:00 2001
+Message-Id: <1b4e536507ad04fc9d459b383719f2edb7d660ee.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: amanna <animesh.manna@intel.com>
+Date: Thu, 15 May 2014 13:23:15 +0530
+Subject: [PATCH 292/312] FOR_UPSTREAM [VPG]: drm/i915: Removed
+ wait_for_vblank during pixel format switch.
+
+Update DL in irq_handler to remove wait for vblank during pixel
+format switch from 4 bpp to 2 bpp
+
+Issue: GMIN-2945
+Change-Id: I460a43b8aad014aa73bea1542d578c4417d502d5
+Signed-off-by: Animesh Manna <animesh.manna@intel.com>
+Signed-off-by: Mahesh Kumar <mahesh1.kumar@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    7 +++++++
+ drivers/gpu/drm/i915/i915_irq.c      |   19 ++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_display.c |    9 +++++++++
+ drivers/gpu/drm/i915/intel_pm.c      |   24 +++++++++++++++++++++---
+ drivers/gpu/drm/i915/intel_sprite.c  |   19 +++++--------------
+ 5 files changed, 60 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index d2a5568..55e5dbf 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1434,6 +1434,12 @@ struct i915_plane_stat {
+ 	bool sprite_c;
+ 	bool sprite_d;
+ };
++#define DL_PRIMARY_MASK 0x000000ff
++#define DL_SPRITEA_MASK 0x0000ff00
++#define DL_SPRITEB_MASK 0x00ff0000
++#define BPP_CHANGED_PRIMARY (1 << 24)
++#define BPP_CHANGED_SPRITEA (1 << 25)
++#define BPP_CHANGED_SPRITEB (1 << 26)
+ 
+ struct drm_i915_private {
+ 	struct drm_device *dev;
+@@ -1587,6 +1593,7 @@ struct drm_i915_private {
+ 	bool gamma_enabled;
+ 	bool is_resuming;
+ 	struct i915_plane_stat plane_stat;
++	uint32_t pf_change_status[I915_MAX_PIPES];
+ 
+ 	/* PCH chipset type */
+ 	enum intel_pch pch_type;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 1ce7110..a96f8c2 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2014,8 +2014,25 @@ static void valleyview_pipestat_irq_handler(struct drm_device *dev, u32 iir)
+ 	spin_unlock(&dev_priv->irq_lock);
+ 
+ 	for_each_pipe(pipe) {
+-		if (pipe_stats[pipe] & PIPE_START_VBLANK_INTERRUPT_STATUS)
++		if (pipe_stats[pipe] & PIPE_VBLANK_INTERRUPT_STATUS) {
++			if (dev_priv->pf_change_status[pipe] &
++					BPP_CHANGED_PRIMARY)
++				I915_WRITE_BITS(VLV_DDL(pipe),
++					dev_priv->pf_change_status[pipe],
++						DL_PRIMARY_MASK);
++			else if (dev_priv->pf_change_status[pipe] &
++					BPP_CHANGED_SPRITEA)
++				I915_WRITE_BITS(VLV_DDL(pipe),
++					dev_priv->pf_change_status[pipe],
++						DL_SPRITEA_MASK);
++			else if (dev_priv->pf_change_status[pipe] &
++					BPP_CHANGED_SPRITEB)
++				I915_WRITE_BITS(VLV_DDL(pipe),
++					dev_priv->pf_change_status[pipe],
++						DL_SPRITEB_MASK);
++			dev_priv->pf_change_status[pipe] = 0x0;
+ 			intel_pipe_handle_vblank(dev, pipe);
++		}
+ 
+ 		if (pipe_stats[pipe] & PLANE_FLIP_DONE_INT_STATUS_VLV) {
+ 			/* Primary flips only when primary plane enabled */
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index fb97bb3..d8b64d4 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2756,6 +2756,13 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 	} else
+ 		I915_WRITE(DSPADDR(plane), i915_gem_obj_ggtt_offset(obj) + linear_offset);
+ 	POSTING_READ(reg);
++
++	if (intel_crtc->last_pixel_size > pixel_size) {
++		dev_priv->pf_change_status[plane] |= BPP_CHANGED_PRIMARY;
++		intel_update_watermarks(crtc);
++	}
++
++	intel_crtc->last_pixel_size = pixel_size;
+ }
+ 
+ static void ironlake_update_primary_plane(struct drm_crtc *crtc,
+@@ -12988,6 +12995,8 @@ void intel_modeset_init(struct drm_device *dev)
+ 					      pipe_name(pipe), sprite_name(pipe, sprite), ret);
+ 		}
+ 	}
++	memset(&dev_priv->pf_change_status, 0,
++			sizeof(dev_priv->pf_change_status));
+ 
+ 	intel_init_dpio(dev);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 8bc03c9..116191c 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -1560,7 +1560,13 @@ static void vlv_update_drain_latency(struct drm_device *dev)
+ 				DDL_PLANEA_PRECISION_32 :
+ 				DDL_PLANEA_PRECISION_64;
+ 
+-		I915_WRITE_BITS(VLV_DDL1, planea_prec | planea_dl, 0x000000ff);
++		if (dev_priv->pf_change_status[PIPE_A] & BPP_CHANGED_PRIMARY) {
++			dev_priv->pf_change_status[PIPE_A] |=
++				(planea_prec | planea_dl);
++		} else {
++			I915_WRITE_BITS(VLV_DDL1, planea_prec | planea_dl,
++				0x000000ff);
++		}
+ 	} else
+ 		I915_WRITE_BITS(VLV_DDL1, 0x0000, 0x000000ff);
+ 
+@@ -1590,7 +1596,13 @@ static void vlv_update_drain_latency(struct drm_device *dev)
+ 				DRAIN_LATENCY_PRECISION_32) ?
+ 				DDL_PLANEB_PRECISION_32 :
+ 				DDL_PLANEB_PRECISION_64;
+-		I915_WRITE_BITS(VLV_DDL2, planeb_prec | planeb_dl, 0x000000ff);
++		if (dev_priv->pf_change_status[PIPE_B] & BPP_CHANGED_PRIMARY) {
++			dev_priv->pf_change_status[PIPE_B] |=
++				(planeb_prec | planeb_dl);
++		} else {
++			I915_WRITE_BITS(VLV_DDL2, planeb_prec |
++					planeb_dl, 0x000000ff);
++		}
+ 	} else
+ 		I915_WRITE_BITS(VLV_DDL2, 0x0000, 0x000000ff);
+ 
+@@ -3179,8 +3191,14 @@ static void valleyview_update_sprite_wm(struct drm_plane *plane,
+ 					DDL_SPRITEB_PRECISION_64;
+ 		}
+ 
+-		I915_WRITE_BITS(VLV_DDL(intel_plane->pipe),
++		if (dev_priv->pf_change_status[intel_plane->pipe] &
++			(BPP_CHANGED_SPRITEA | BPP_CHANGED_SPRITEB)) {
++			dev_priv->pf_change_status[intel_plane->pipe] |=
++					(sprite_prec | (sprite_dl << shift));
++		} else {
++			I915_WRITE_BITS(VLV_DDL(intel_plane->pipe),
+ 				sprite_prec | (sprite_dl << shift), mask);
++		}
+ 	} else
+ 		I915_WRITE_BITS(VLV_DDL(intel_plane->pipe), 0x00, mask);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index d31357a..432a392d 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -542,20 +542,6 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	I915_MODIFY_DISPBASE(SPSURF(pipe, plane),
+ 		i915_gem_obj_ggtt_offset(obj) + sprsurf_offset);
+ 
+-	if (intel_plane->last_plane_state &&
+-		(intel_plane->last_pixel_size != pixel_size)) {
+-		/*
+-		 * Theoretically this vblank is required for 4->2 pixel size
+-		 * change. DL values immediately get updated in hardware whereas
+-		 * the sprite control register updates happen
+-		 * in the next vblank.
+-		 * So for 4->2 transition we need a vblank.
+-		 * Otherwise we will/may hit underrun
+-		 * As we still have underrun issues,
+-		 * enabling it for 2->4 as well.
+-		 */
+-		intel_wait_for_vblank(dev, pipe);
+-	}
+ 	intel_plane->last_plane_state = INTEL_PLANE_STATE_ENABLED;
+ 
+ 	intel_flush_primary_plane(dev_priv, intel_crtc->plane);
+@@ -564,6 +550,11 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 		POSTING_READ(SPSURF(pipe, plane));
+ 
+ 	if (intel_plane->last_pixel_size > pixel_size) {
++		if (plane == PLANE_A)
++			dev_priv->pf_change_status[pipe] |= BPP_CHANGED_SPRITEA;
++		else
++			dev_priv->pf_change_status[pipe] |= BPP_CHANGED_SPRITEB;
++
+ 		intel_update_sprite_watermarks(dplane, crtc, src_w, pixel_size,
+ 				true, src_w != crtc_w || src_h != crtc_h);
+ 	}
+-- 
+1.7.9.5
+

@@ -1,0 +1,149 @@
+From afbcd5798c5c756f982e93711d88a00d3d1ebeb6 Mon Sep 17 00:00:00 2001
+Message-Id: <afbcd5798c5c756f982e93711d88a00d3d1ebeb6.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 26 Mar 2015 18:39:54 +0000
+Subject: [PATCH 44/68] REVERTME [VPG]: drm/i915: Add debug descriptions to
+ native sync interface
+
+The native sync API includes support for adding descriptions of sync
+points to, for example, the sysfs debug output. This patch adds in
+support for reporting these descriptions from the i915 driver.
+
+Note: The native sync code is not yet upstream and was added in the
+following patch:
+  commit 6b106574fa9863d9c4245b0a374fca50e09e1f2b
+  Author: John Harrison <John.C.Harrison@Intel.com>
+  Date:   Tue Apr 1 17:25:21 2014 +0100
+  Subject: REVERTME [VPG]: drm/i915: Refactored native sync code for better file splits
+  Change-Id: I8c2653787a1b15b4eb00c1dfa05b5e50ab4d2390
+
+Therefore this patch could be squashed into that one and/or dropped
+when that patch is dropped.
+
+Change-Id: Ie0b15f5efe3f4f66f9a1f28147b7e82d0de27f15
+For: VIZ-1587
+For: VIZ-4741
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h   |    2 ++
+ drivers/gpu/drm/i915/i915_gem.c   |   21 +++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_sync.c |   27 +++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_sync.h |    3 +++
+ 4 files changed, 53 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 8d99abb..3059d4e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2242,6 +2242,8 @@ static inline bool i915_gem_request_completed(struct drm_i915_gem_request *req)
+ /* For use by TDR type facilities */
+ struct drm_i915_gem_request *i915_gem_request_find_by_seqno(struct intel_engine_cs *ring,
+ 							    uint32_t seqno);
++struct drm_i915_gem_request *i915_gem_request_find_by_sync_value(struct intel_engine_cs *ring,
++								 uint32_t sync_value);
+ 
+ struct drm_i915_file_private {
+ 	struct drm_i915_private *dev_priv;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 4bc10a7..d88f455 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2946,6 +2946,27 @@ struct drm_i915_gem_request *i915_gem_request_find_by_seqno(struct intel_engine_
+ 	return req;
+ }
+ 
++struct drm_i915_gem_request *i915_gem_request_find_by_sync_value(struct intel_engine_cs *ring,
++								 uint32_t sync_value)
++{
++	struct drm_i915_gem_request *req = NULL;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ring->reqlist_lock, flags);
++
++	list_for_each_entry(req, &ring->request_list, list) {
++		if (req->sync_value == sync_value)
++			break;
++	}
++
++	if (&req->list == &ring->request_list)
++		req = NULL;
++
++	spin_unlock_irqrestore(&ring->reqlist_lock, flags);
++
++	return req;
++}
++
+ /**
+  * This function clears the request list as sequence numbers are passed.
+  */
+diff --git a/drivers/gpu/drm/i915/intel_sync.c b/drivers/gpu/drm/i915/intel_sync.c
+index b5ef1c9..c231708 100644
+--- a/drivers/gpu/drm/i915/intel_sync.c
++++ b/drivers/gpu/drm/i915/intel_sync.c
+@@ -124,6 +124,29 @@ static void i915_sync_pt_free(struct sync_pt *sync_pt)
+ {
+ }
+ 
++void i915_sync_pt_timeline_value_str(struct sync_timeline *timeline, char *str, int size)
++{
++	struct i915_sync_timeline *obj = container_of(timeline, struct i915_sync_timeline, obj);
++
++	snprintf(str, size, "%d [%d]", obj->pvt.value, obj->pvt.ring->get_seqno(obj->pvt.ring, true));
++}
++
++void i915_sync_pt_pt_value_str(struct sync_pt *sync_pt, char *str, int size)
++{
++	struct i915_sync_pt *pt = container_of(sync_pt,
++					       struct i915_sync_pt, pt);
++	struct i915_sync_timeline *timeline =
++		(struct i915_sync_timeline *)sync_pt->parent;
++	struct drm_i915_gem_request *req;
++
++	req = i915_gem_request_find_by_sync_value(timeline->pvt.ring, pt->pvt.value);
++
++	if (req)
++		snprintf(str, size, "%d [%d:%d]", pt->pvt.value, req->uniq, req->seqno);
++	else
++		snprintf(str, size, "%d [-]", pt->pvt.value);
++}
++
+ struct sync_timeline_ops i915_sync_timeline_ops = {
+ 	.driver_name = "i915_sync",
+ 	.dup = i915_sync_pt_dup,
+@@ -131,6 +154,8 @@ struct sync_timeline_ops i915_sync_timeline_ops = {
+ 	.compare = i915_sync_pt_compare,
+ 	.fill_driver_data = i915_sync_fill_driver_data,
+ 	.free_pt = i915_sync_pt_free,
++	.timeline_value_str = i915_sync_pt_timeline_value_str,
++	.pt_value_str = i915_sync_pt_pt_value_str,
+ };
+ 
+ int i915_sync_timeline_create(struct drm_device *dev,
+@@ -160,6 +185,8 @@ int i915_sync_timeline_create(struct drm_device *dev,
+ 	 * that is reserved for invalid sync points.
+ 	 */
+ 	local->pvt.value = 0;
++	local->pvt.ctx = ctx;
++	local->pvt.ring = ring;
+ 
+ 	*timeline = local;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_sync.h b/drivers/gpu/drm/i915/intel_sync.h
+index 104a679..d660bd7 100644
+--- a/drivers/gpu/drm/i915/intel_sync.h
++++ b/drivers/gpu/drm/i915/intel_sync.h
+@@ -48,6 +48,9 @@ struct i915_sync_timeline {
+ 		u32         cycle;
+ 		uint32_t    killed_at;
+ 		uint32_t    next;
++
++		struct intel_context *ctx;
++		struct intel_engine_cs *ring;
+ 	} pvt;
+ };
+ 
+-- 
+1.7.9.5
+

@@ -1,0 +1,219 @@
+From 2f182903b4cb0dc343fac66e0e88551f04526a20 Mon Sep 17 00:00:00 2001
+Message-Id: <2f182903b4cb0dc343fac66e0e88551f04526a20.1423172493.git.feitong.yi@intel.com>
+In-Reply-To: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+References: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+From: rtshiva <sivakumar.thulasimani@intel.com>
+Date: Wed, 14 Jan 2015 08:17:14 +0530
+Subject: [PATCH 16/29] MUST_REBASE [VPG]: adf/intel/vlv: Add power management
+ code
+
+This patch adds a new file which contains power management related
+operations. All encoders will use these functions.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+For: GMINL-5213
+Change-Id: I0074309487e8c2855d550850a2841ec8674e30b8
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Signed-off-by: Deepak M <m.deepak@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/Makefile         |    3 +-
+ drivers/video/adf/intel/core/vlv/vlv_pm.c         |  129 +++++++++++++++++++++
+ drivers/video/adf/intel/include/core/vlv/vlv_pm.h |   36 ++++++
+ 3 files changed, 167 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/video/adf/intel/core/vlv/vlv_pm.c
+ create mode 100644 drivers/video/adf/intel/include/core/vlv/vlv_pm.h
+
+diff --git a/drivers/video/adf/intel/core/vlv/Makefile b/drivers/video/adf/intel/core/vlv/Makefile
+index 7fa28b8..a3e8f2a 100644
+--- a/drivers/video/adf/intel/core/vlv/Makefile
++++ b/drivers/video/adf/intel/core/vlv/Makefile
+@@ -10,4 +10,5 @@ obj-y := vlv_dc_config.o \
+ 	vlv_debugfs.o \
+ 	vlv_pipe.o \
+ 	vlv_pll.o \
+-	vlv_dsi_pll.o
++	vlv_dsi_pll.o \
++	vlv_pm.o
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pm.c b/drivers/video/adf/intel/core/vlv/vlv_pm.c
+new file mode 100644
+index 0000000..da15c0e
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/vlv_pm.c
+@@ -0,0 +1,129 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <intel_adf_device.h>
++#include <core/vlv/vlv_dc_regs.h>
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_pm.h>
++
++bool vlv_pm_update_maxfifo_status(struct vlv_pm *pm, bool enable)
++{
++	if (enable)
++		REG_WRITE(FW_BLC_SELF_VLV, FW_CSPWRDWNEN);
++	else
++		REG_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
++
++	return true;
++}
++
++u32 vlv_pm_save_values(struct vlv_pm *pm, bool pri_plane,
++		bool sp1_plane, bool sp2_plane, u32 val)
++{
++	u32 mask = 0;
++
++	if (pri_plane) {
++		pm->pri_value = val;
++		mask = DDL_PLANEA_MASK;
++	}
++
++	if (sp1_plane) {
++		pm->sp1_value = val;
++		mask = DDL_SPRITEA_MASK;
++	}
++
++	if (sp2_plane) {
++		pm->sp2_value = val;
++		mask = DDL_SPRITEB_MASK;
++	}
++
++	REG_WRITE_BITS(pm->offset, 0, mask);
++	return 0;
++}
++
++u32 vlv_pm_flush_values(struct vlv_pm *pm, u32 events)
++{
++	if (pm->sp2_value && (events & INTEL_PIPE_EVENT_SPRITE2_FLIP)) {
++		REG_WRITE_BITS(pm->offset, pm->sp2_value, DDL_SPRITEB_MASK);
++		pm->sp2_value = 0;
++	}
++
++	if (pm->sp1_value && (events & INTEL_PIPE_EVENT_SPRITE1_FLIP)) {
++		REG_WRITE_BITS(pm->offset, pm->sp1_value, DDL_SPRITEA_MASK);
++		pm->sp1_value = 0;
++	}
++
++	if (pm->pri_value && (events & INTEL_PIPE_EVENT_PRIMARY_FLIP)) {
++		REG_WRITE_BITS(pm->offset, pm->pri_value, DDL_PLANEA_MASK);
++		pm->pri_value = 0;
++	}
++
++	return 0;
++}
++
++static void vlv_pm_update_pfi(struct vlv_pm *pm)
++{
++	/* Trickle feed is disabled by default */
++	REG_WRITE(MI_ARB_VLV, 0x00);
++	/* program the pfi credits, first disable and then program */
++	if (REG_READ(GCI_CONTROL) != 0x78004000) {
++		REG_WRITE(GCI_CONTROL, 0x00004000);
++		REG_WRITE(GCI_CONTROL, 0x78004000);
++	}
++
++}
++
++u32 vlv_pm_program_values(struct vlv_pm *pm, int num_planes)
++{
++	/* FIXME: udpate logic to be based on num_planes enabled */
++	REG_WRITE(DSPFW1,
++		(DSPFW_SR_VAL << DSPFW_SR_SHIFT) |
++		(DSPFW_CURSORB_VAL << DSPFW_CURSORB_SHIFT) |
++		(DSPFW_PLANEB_VAL << DSPFW_PLANEB_SHIFT) |
++		DSPFW_PLANEA_VAL);
++	REG_WRITE(DSPFW2,
++		(DSPFW2_RESERVED) |
++		(DSPFW_CURSORA_VAL << DSPFW_CURSORA_SHIFT) |
++		DSPFW_PLANEC_VAL);
++	REG_WRITE(DSPFW3,
++		(REG_READ(DSPFW3) & ~DSPFW_CURSOR_SR_MASK) |
++		(DSPFW3_VLV));
++	REG_WRITE(DSPFW4, (DSPFW4_SPRITEB_VAL << DSPFW4_SPRITEB_SHIFT) |
++			(DSPFW4_CURSORA_VAL << DSPFW4_CURSORA_SHIFT) |
++			DSPFW4_SPRITEA_VAL);
++	REG_WRITE(DSPFW5, (DSPFW5_DISPLAYB_VAL << DSPFW5_DISPLAYB_SHIFT) |
++			(DSPFW5_DISPLAYA_VAL << DSPFW5_DISPLAYA_SHIFT) |
++			(DSPFW5_CURSORB_VAL << DSPFW5_CURSORB_SHIFT) |
++			DSPFW5_CURSORSR_VAL);
++	REG_WRITE(DSPFW6, DSPFW6_DISPLAYSR_VAL);
++	REG_WRITE(DSPFW7, (DSPFW7_SPRITED1_VAL << DSPFW7_SPRITED1_SHIFT) |
++			(DSPFW7_SPRITED_VAL << DSPFW7_SPRITED_SHIFT) |
++			(DSPFW7_SPRITEC1_VAL << DSPFW7_SPRITEC1_SHIFT) |
++			DSPFW7_SPRITEC_VAL);
++	REG_WRITE(DSPARB, VLV_DEFAULT_DSPARB);
++
++	vlv_pm_update_pfi(pm);
++	return 0;
++}
++
++bool vlv_pm_init(struct vlv_pm *pm, enum pipe pipe)
++{
++	pm->offset = VLV_DDL(pipe);
++
++	return true;
++}
++
++bool vlv_pm_destroy(struct vlv_pm *pm)
++{
++	return true;
++}
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pm.h b/drivers/video/adf/intel/include/core/vlv/vlv_pm.h
+new file mode 100644
+index 0000000..79f9236
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pm.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _VLV_WATERMARK_H_
++#define _VLV_WATERMARK_H_
++
++#include <core/intel_dc_config.h>
++#include <core/vlv/vlv_dc_regs.h>
++
++struct vlv_pm {
++	u32 offset;
++	u32 pri_value;
++	u32 sp1_value;
++	u32 sp2_value;
++};
++
++extern bool vlv_pm_init(struct vlv_pm *pm, enum pipe);
++extern bool vlv_pm_destroy(struct vlv_pm *pm);
++bool vlv_pm_update_maxfifo_status(struct vlv_pm *pm, bool enable);
++u32 vlv_pm_save_values(struct vlv_pm *pm, bool pri_plane,
++		bool sp1_plane, bool sp2_plane, u32 val);
++u32 vlv_pm_program_values(struct vlv_pm *pm, int num_planes);
++u32 vlv_pm_flush_values(struct vlv_pm *pm, u32 event);
++
++#endif /*_VLV_WATERMARK_H_*/
+-- 
+1.7.9.5
+

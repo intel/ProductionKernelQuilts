@@ -1,0 +1,246 @@
+From 0ac6aa515a39db8aa0d2663107702bc11dcc84c4 Mon Sep 17 00:00:00 2001
+From: Zhuang Jin Can <jin.can.zhuang@intel.com>
+Date: Mon, 9 Mar 2015 12:19:28 +0800
+Subject: [PATCH] usb: core: add usb3 lpm sysfs
+
+Some usb3 devices may not support usb3 lpm well.
+The patch adds a sysfs to enable/disable u1 or u2 of the port.The
+settings apply to both before and after device enumeration.
+Supported values are "0" - u1 and u2 are disabled, "u1" - only u1 is
+enabled, "u2" - only u2 is enabled, "u1_u2" - u1 and u2 are enabled.
+
+The interface is useful for testing some USB3 devices during
+development, and provides a way to disable usb3 lpm if the issues can
+not be fixed in final products.
+
+Change-Id: I4110353022a1e5f9b921df5467bcb8ad132c7c3e
+Signed-off-by: Zhuang Jin Can <jin.can.zhuang@intel.com>
+---
+ Documentation/ABI/testing/sysfs-bus-usb | 10 ++++
+ drivers/usb/core/hub.c                  | 21 +++++---
+ drivers/usb/core/hub.h                  |  9 ++++
+ drivers/usb/core/port.c                 | 89 ++++++++++++++++++++++++++++++++-
+ 4 files changed, 121 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-usb b/Documentation/ABI/testing/sysfs-bus-usb
+index 614d451..d79503d 100644
+--- a/Documentation/ABI/testing/sysfs-bus-usb
++++ b/Documentation/ABI/testing/sysfs-bus-usb
+@@ -154,6 +154,16 @@ Description:
+ 		The file will read "hotplug", "wired" and "not used" if the
+ 		information is available, and "unknown" otherwise.
+ 
++What:		/sys/bus/usb/devices/.../(hub interface)/portX/usb3_lpm
++Date:		March 2015
++Contact:	Zhuang Jin Can <jin.can.zhuang@intel.com>
++Description:
++		Some USB3.0 devices may not support usb3 lpm well.
++		usb3_lpm attribute allows enabling/disabling usb3 lpm of the port.
++		It takes effect both before and after a usb device is enumerated.
++		Supported values are "0" if u1 and u2 are disabled, "u1" if only u1 is
++		enabled, "u2" if only u2 is enabled, "u1_u2" if u1 and u2 are enabled.
++
+ What:		/sys/bus/usb/devices/.../power/usb2_lpm_l1_timeout
+ Date:		May 2013
+ Contact:	Mathias Nyman <mathias.nyman@linux.intel.com>
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index b8e3f71..e75b3b6 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -36,11 +36,6 @@
+ #define USB_VENDOR_GENESYS_LOGIC		0x05e3
+ #define HUB_QUIRK_CHECK_PORT_AUTOSUSPEND	0x01
+ 
+-static inline int hub_is_superspeed(struct usb_device *hdev)
+-{
+-	return (hdev->descriptor.bDeviceProtocol == USB_HUB_PR_SS);
+-}
+-
+ /* Protect struct usb_device->state and ->children members
+  * Note: Both are also protected by ->dev.sem, except that ->state can
+  * change to USB_STATE_NOTATTACHED even when the semaphore isn't held. */
+@@ -3959,6 +3954,8 @@ EXPORT_SYMBOL_GPL(usb_unlocked_disable_lpm);
+ void usb_enable_lpm(struct usb_device *udev)
+ {
+ 	struct usb_hcd *hcd;
++	struct usb_hub *hub;
++	struct usb_port *port_dev;
+ 
+ 	if (!udev || !udev->parent ||
+ 			udev->speed != USB_SPEED_SUPER ||
+@@ -3977,8 +3974,18 @@ void usb_enable_lpm(struct usb_device *udev)
+ 	if (udev->lpm_disable_count > 0)
+ 		return;
+ 
+-	usb_enable_link_state(hcd, udev, USB3_LPM_U1);
+-	usb_enable_link_state(hcd, udev, USB3_LPM_U2);
++	hub = usb_hub_to_struct_hub(udev->parent);
++	if (!hub) {
++		dev_err(&udev->dev, "can't enable lpm, usb_hub is null.\n");
++		return;
++	}
++	port_dev = hub->ports[udev->portnum - 1];
++
++	if (port_dev->u1_is_enabled)
++		usb_enable_link_state(hcd, udev, USB3_LPM_U1);
++
++	if (port_dev->u2_is_enabled)
++		usb_enable_link_state(hcd, udev, USB3_LPM_U2);
+ }
+ EXPORT_SYMBOL_GPL(usb_enable_lpm);
+ 
+diff --git a/drivers/usb/core/hub.h b/drivers/usb/core/hub.h
+index e5e767a..7317287 100644
+--- a/drivers/usb/core/hub.h
++++ b/drivers/usb/core/hub.h
+@@ -84,6 +84,8 @@ struct usb_hub {
+  * @portnum: port index num based one
+  * @power_is_on: port's power state
+  * @did_runtime_put: port has done pm_runtime_put().
++ * @u1_is_enabled: whether u1 should be enabled.
++ * @u2_is_enabled: whether u2 should be enabled.
+  */
+ struct usb_port {
+ 	struct usb_device *child;
+@@ -94,6 +96,8 @@ struct usb_port {
+ 	u8 portnum;
+ 	unsigned power_is_on:1;
+ 	unsigned did_runtime_put:1;
++	unsigned u1_is_enabled:1;
++	unsigned u2_is_enabled:1;
+ };
+ 
+ #define to_usb_port(_dev) \
+@@ -123,3 +127,8 @@ static inline int hub_port_debounce_be_stable(struct usb_hub *hub,
+ 	return hub_port_debounce(hub, port1, false);
+ }
+ 
++static inline int hub_is_superspeed(struct usb_device *hdev)
++{
++	return hdev->descriptor.bDeviceProtocol == USB_HUB_PR_SS;
++}
++
+diff --git a/drivers/usb/core/port.c b/drivers/usb/core/port.c
+index 0847770..2b7fed8 100644
+--- a/drivers/usb/core/port.c
++++ b/drivers/usb/core/port.c
+@@ -48,6 +48,72 @@ static ssize_t connect_type_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(connect_type);
+ 
++static ssize_t usb3_lpm_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct usb_port *port_dev = to_usb_port(dev);
++	const char *p;
++
++	if (port_dev->u1_is_enabled) {
++		if (port_dev->u2_is_enabled)
++			p = "u1_u2";
++		else
++			p = "u1";
++	} else {
++		if (port_dev->u2_is_enabled)
++			p = "u2";
++		else
++			p = "0";
++	}
++
++	return sprintf(buf, "%s\n", p);
++}
++
++static ssize_t usb3_lpm_store(struct device *dev,
++			       struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct usb_port *port_dev = to_usb_port(dev);
++	struct usb_device *udev = port_dev->child;
++	struct usb_hcd *hcd;
++
++	if (!strncmp(buf, "u1_u2", 5)) {
++		port_dev->u1_is_enabled = true;
++		port_dev->u2_is_enabled = true;
++
++	} else if (!strncmp(buf, "u1", 2)) {
++		port_dev->u1_is_enabled = true;
++		port_dev->u2_is_enabled = false;
++
++	} else if (!strncmp(buf, "u2", 2)) {
++		port_dev->u1_is_enabled = false;
++		port_dev->u2_is_enabled = true;
++
++	} else if (!strncmp(buf, "0", 1)) {
++		port_dev->u1_is_enabled = false;
++		port_dev->u2_is_enabled = false;
++	} else
++		return -EINVAL;
++
++	/* If device is connected to the port, disable & enable lpm
++	 * to make new u1 u2 setting take effect immediately
++	 */
++	if (udev) {
++		hcd = bus_to_hcd(udev->bus);
++		if (!hcd)
++			return -EINVAL;
++		usb_lock_device(udev);
++		mutex_lock(hcd->bandwidth_mutex);
++		if (!usb_disable_lpm(udev))
++			usb_enable_lpm(udev);
++		mutex_unlock(hcd->bandwidth_mutex);
++		usb_unlock_device(udev);
++	}
++
++	return count;
++}
++static DEVICE_ATTR_RW(usb3_lpm);
++
+ static struct attribute *port_dev_attrs[] = {
+ 	&dev_attr_connect_type.attr,
+ 	NULL,
+@@ -62,6 +128,21 @@ static const struct attribute_group *port_dev_group[] = {
+ 	NULL,
+ };
+ 
++static struct attribute *port_dev_usb3_attrs[] = {
++	&dev_attr_usb3_lpm.attr,
++	NULL,
++};
++
++static struct attribute_group port_dev_usb3_attr_grp = {
++	.attrs = port_dev_usb3_attrs,
++};
++
++static const struct attribute_group *port_dev_usb3_group[] = {
++	&port_dev_attr_grp,
++	&port_dev_usb3_attr_grp,
++	NULL,
++};
++
+ static void usb_port_device_release(struct device *dev)
+ {
+ 	struct usb_port *port_dev = to_usb_port(dev);
+@@ -144,6 +225,7 @@ struct device_type usb_port_device_type = {
+ int usb_hub_create_port_device(struct usb_hub *hub, int port1)
+ {
+ 	struct usb_port *port_dev = NULL;
++	struct usb_device *hdev = hub->hdev;
+ 	int retval;
+ 
+ 	port_dev = kzalloc(sizeof(*port_dev), GFP_KERNEL);
+@@ -156,7 +238,12 @@ int usb_hub_create_port_device(struct usb_hub *hub, int port1)
+ 	port_dev->portnum = port1;
+ 	port_dev->power_is_on = true;
+ 	port_dev->dev.parent = hub->intfdev;
+-	port_dev->dev.groups = port_dev_group;
++	if (hub_is_superspeed(hdev)) {
++		port_dev->u1_is_enabled = true;
++		port_dev->u2_is_enabled = true;
++		port_dev->dev.groups = port_dev_usb3_group;
++	} else
++		port_dev->dev.groups = port_dev_group;
+ 	port_dev->dev.type = &usb_port_device_type;
+ 	dev_set_name(&port_dev->dev, "port%d", port1);
+ 	mutex_init(&port_dev->status_lock);
+-- 
+1.9.1
+

@@ -1,0 +1,251 @@
+From 189843ec2a24bd59efb7602c0542bb0b054540df Mon Sep 17 00:00:00 2001
+Message-Id: <189843ec2a24bd59efb7602c0542bb0b054540df.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 10 Apr 2014 10:48:55 +0100
+Subject: [PATCH 30/61] FOR_UPSTREAM [VPG]: drm/i915: Added scheduler support
+ to __wait_request() calls
+
+The scheduler can cause batch buffers, and hence requests, to be submitted to
+the ring out of order and asynchronously to their submission to the driver. Thus
+at the point of waiting for the completion of a given request, it is not even
+guaranteed that the request has actually been sent to the hardware yet. Even it
+is has been sent, it is possible that it could be pre-empted and thus 'unsent'.
+
+This means that it is necessary to be able to submit requests to the hardware
+during the wait call itself. Unfortunately, while some callers of
+__wait_request() release the mutex lock first, others do not (and apparently can
+not). Hence there is the ability to deadlock as the wait stalls for submission
+but the asynchronous submission is stalled for the mutex lock.
+
+This change hooks the scheduler in to the __wait_request() code to ensure
+correct behaviour. That is, flush the target batch buffer through to the
+hardware and do not deadlock waiting for something that cannot currently be
+submitted. Instead, the wait call must return EAGAIN at least as far back as
+necessary to release the mutex lock and allow the scheduler's asynchronous
+processing to get in and handle the pre-emption operation and eventually
+(re-)submit the work.
+
+Change-Id: I31fe6bc7e38f6ffdd843fcae16e7cc8b1e52a931
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h       |    3 +-
+ drivers/gpu/drm/i915/i915_gem.c       |   33 +++++++++++++++++----
+ drivers/gpu/drm/i915/i915_scheduler.c |   51 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.h |    5 ++++
+ drivers/gpu/drm/i915/intel_display.c  |    2 +-
+ 5 files changed, 87 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 03ede2f..927dde2 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2609,7 +2609,8 @@ int __wait_request(struct drm_i915_gem_request *req,
+ 			unsigned reset_counter,
+ 			bool interruptible,
+ 			struct timespec *timeout,
+-			struct drm_i915_file_private *file_priv);
++			struct drm_i915_file_private *file_priv,
++			bool is_locked);
+ #define I915_SHRINK_PURGEABLE 0x1
+ #define I915_SHRINK_UNBOUND 0x2
+ #define I915_SHRINK_BOUND 0x4
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index bcacbba..ea324b2 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1211,7 +1211,8 @@ int __wait_request(struct drm_i915_gem_request *req,
+ 			  unsigned reset_counter,
+ 			  bool interruptible,
+ 			  struct timespec *timeout,
+-			  struct drm_i915_file_private *file_priv)
++			  struct drm_i915_file_private *file_priv,
++			  bool is_locked)
+ {
+ 	struct intel_engine_cs *ring = i915_gem_request_get_ring(req);
+ 	struct drm_device *dev = ring->dev;
+@@ -1223,7 +1224,9 @@ int __wait_request(struct drm_i915_gem_request *req,
+ 	unsigned long timeout_expire;
+ 	int ret = 0;
+ 	int gem_wedged;
++	bool    busy;
+ 
++	might_sleep();
+ 	WARN(dev_priv->pm.irqs_disabled, "IRQs disabled\n");
+ 
+ 	if (i915_gem_request_completed(req))
+@@ -1274,6 +1277,22 @@ int __wait_request(struct drm_i915_gem_request *req,
+ 			break;
+ 		}
+ 
++		if (is_locked) {
++			/* If this request is being processed by the scheduler
++			 * then it is unsafe to sleep with the mutex lock held
++			 * as the scheduler may require the lock in order to
++			 * progress the request. */
++			if (i915_scheduler_is_request_tracked(req, NULL, &busy)) {
++				if (busy) {
++					ret = -EAGAIN;
++					break;
++				}
++			}
++
++			/* If the request is not tracked by the scheduler then the
++			 * regular test can be done. */
++		}
++
+ 		if (i915_gem_request_completed(req)) {
+ 			ret = 0;
+ 			break;
+@@ -1343,6 +1362,10 @@ i915_wait_request(struct drm_i915_gem_request *req)
+ 
+ 	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
+ 
++	ret = I915_SCHEDULER_FLUSH_REQUEST(req, true);
++	if (ret < 0)
++		return ret;
++
+ 	ret = i915_gem_wedged(dev, interruptible);
+ 	if (ret)
+ 		return ret;
+@@ -1354,7 +1377,7 @@ i915_wait_request(struct drm_i915_gem_request *req)
+ 	i915_gem_request_reference(req);
+ 	ret = __wait_request(req,
+ 			     atomic_read(&dev_priv->gpu_error.reset_counter),
+-			     interruptible, NULL, NULL);
++			     interruptible, NULL, NULL, true);
+ 	i915_gem_request_unreference(req);
+ 	return ret;
+ }
+@@ -1432,7 +1455,7 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
+ 	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
+ 	i915_gem_request_reference(req);
+ 	mutex_unlock(&dev->struct_mutex);
+-	ret = __wait_request(req, reset_counter, true, NULL, file_priv);
++	ret = __wait_request(req, reset_counter, true, NULL, file_priv, false);
+ 	mutex_lock(&dev->struct_mutex);
+ 	i915_gem_request_unreference(req);
+ 	if (ret)
+@@ -3127,7 +3150,7 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ 	i915_gem_request_reference(req);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+-	ret = __wait_request(req, reset_counter, true, timeout, file->driver_priv);
++	ret = __wait_request(req, reset_counter, true, timeout, file->driver_priv, false);
+ 	if (timeout)
+ 		args->timeout_ns = timespec_to_ns(timeout);
+ 
+@@ -4344,7 +4367,7 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 	if (i915_gem_wedged(dev, 1) != 0)
+ 		return -EIO;
+ 
+-	ret = __wait_request(target, reset_counter, true, NULL, NULL);
++	ret = __wait_request(target, reset_counter, true, NULL, NULL, false);
+ 	if (ret == 0)
+ 		queue_retire_work(dev_priv, 0);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 6fa28e6..c292005 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -582,6 +582,57 @@ void i915_gem_scheduler_work_handler(struct work_struct *work)
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
++int i915_scheduler_flush_request(struct drm_i915_gem_request *req,
++				 bool is_locked)
++{
++	struct drm_i915_private            *dev_priv;
++	struct i915_scheduler              *scheduler;
++	unsigned long       flags;
++	int                 flush_count;
++	uint32_t            ring_id;
++
++	if (!req)
++		return -EINVAL;
++
++	dev_priv  = req->ring->dev->dev_private;
++	scheduler = dev_priv->scheduler;
++
++	if (!scheduler)
++		return 0;
++
++	if (!req->scheduler_qe)
++		return 0;
++
++	if (!I915_SQS_IS_QUEUED(req->scheduler_qe))
++		return 0;
++
++	ring_id = req->ring->id;
++	if (is_locked && (scheduler->flags[ring_id] & i915_sf_submitting)) {
++		/* Scheduler is busy already submitting another batch,
++		 * come back later rather than going recursive... */
++		return -EAGAIN;
++	}
++
++	if (list_empty(&scheduler->node_queue[ring_id]))
++		return 0;
++
++	spin_lock_irqsave(&scheduler->lock, flags);
++
++	i915_scheduler_priority_bump_clear(scheduler);
++
++	flush_count = i915_scheduler_priority_bump(scheduler,
++			    req->scheduler_qe, scheduler->priority_level_max);
++
++	spin_unlock_irqrestore(&scheduler->lock, flags);
++
++	if (flush_count) {
++		DRM_DEBUG_DRIVER("<%s> Bumped %d entries\n", req->ring->name, flush_count);
++		flush_count = i915_scheduler_submit_max_priority(req->ring, is_locked);
++	}
++
++	return flush_count;
++}
++
+ void i915_scheduler_priority_bump_clear(struct i915_scheduler *scheduler)
+ {
+ 	struct i915_scheduler_queue_entry *node;
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index f9d7d93..0bdf4df 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -65,6 +65,9 @@ struct i915_scheduler_queue_entry {
+ 	uint32_t                            scheduler_index;
+ };
+ 
++#define I915_SCHEDULER_FLUSH_REQUEST(req, locked)                           \
++	i915_scheduler_flush_request(req, locked)
++
+ struct i915_scheduler {
+ 	struct list_head    node_queue[I915_NUM_RINGS];
+ 	uint32_t            flags[I915_NUM_RINGS];
+@@ -90,6 +93,8 @@ int         i915_scheduler_closefile(struct drm_device *dev,
+ int         i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe);
+ int         i915_scheduler_handle_irq(struct intel_engine_cs *ring);
+ void        i915_gem_scheduler_work_handler(struct work_struct *work);
++int         i915_scheduler_flush_request(struct drm_i915_gem_request *req,
++					 bool is_locked);
+ bool        i915_scheduler_is_request_tracked(struct drm_i915_gem_request *req,
+ 					      bool *completed, bool *busy);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 0cd03de..5069007 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10409,7 +10409,7 @@ static int intel_postpone_flip(struct drm_i915_gem_object *obj)
+ 	else {
+ 		if (!__wait_request(obj->last_write_req,
+ 			atomic_read(&dev_priv->gpu_error.reset_counter), true,
+-			NULL, NULL))
++			NULL, NULL, true))
+ 			return 0;
+ 	}
+ 
+-- 
+1.7.9.5
+

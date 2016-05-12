@@ -1,0 +1,91 @@
+From 8362fce60332c00bf1c3b7c81538c91f8fc25132 Mon Sep 17 00:00:00 2001
+Message-Id: <8362fce60332c00bf1c3b7c81538c91f8fc25132.1443543378.git.yunwei.zhang@intel.com>
+From: Michel Thierry <michel.thierry@intel.com>
+Date: Tue, 22 Sep 2015 17:26:34 +0100
+Subject: [PATCH] SQUASHME! [VPG]: drm/i915: Consider HW CSB write pointer
+ while setting the sw read pointer.
+
+Context Status Buffer Write Pointer (CSBWP) is not reset after
+suspend/resume, so the driver should read this value instead of reseting
+the sw read counter to 0. Otherwise we read old events, leading to possible
+pre-emptions or something worse.
+
+A special case is GPU reset or power up, here the CSBWP is reset to 0x7 (an invalid
+number, and in this case it should be set to 0 in sw).
+
+SQUASHME! - This patch should be squashed into the following existing
+patch:
+
+	commit 297778acf5fd491854a0475cad0f3df3d3aeab60
+	Change-Id: I3e3446b54176607bb08c5db74aac60526015f79f
+	Author: Tim Gore <tim.gore@intel.com>
+	Date:   Wed Jun 3 13:58:13 2015 +0100
+	    FOR_UPSTREAM [VPG]: drm/i915 changes to simulated hangs
+
+Change-Id: Ie1b16112fce7401de3d3a48893262157af96887c
+Tracked-On:https://jira01.devtools.intel.com/browse/GMINL-18073
+Signed-off-by: Lei Shen <lei.shen@intel.com>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+---
+ drivers/gpu/drm/i915/intel_lrc.c |   33 +++++++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+Index: b/drivers/gpu/drm/i915/intel_lrc.c
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_lrc.c	2016-03-08 10:50:11.617503253 -0800
++++ b/drivers/gpu/drm/i915/intel_lrc.c	2016-03-08 10:56:22.429388944 -0800
+@@ -2256,6 +2256,8 @@
+ {
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	unsigned long flags;
++	u8 next_context_status_buffer_hw;
+ 
+ 	I915_WRITE_IMR(ring, ~(ring->irq_enable_mask | ring->irq_keep_mask));
+ 	I915_WRITE(RING_HWSTAM(ring->mmio_base), 0xffffffff);
+@@ -2270,7 +2272,35 @@
+ 		   _MASKED_BIT_DISABLE(GFX_REPLAY_MODE) |
+ 		   _MASKED_BIT_ENABLE(GFX_RUN_LIST_ENABLE));
+ 	POSTING_READ(RING_MODE_GEN7(ring));
+-	DRM_DEBUG_DRIVER("Execlists enabled for %s\n", ring->name);
++
++	/*
++	 * Instead of resetting the Context Status Buffer (CSB) read pointer to
++	 * zero, we need to read the write pointer from hardware and use its
++	 * value because "this register is power context save restored".
++	 * Effectively, these states have been observed:
++	 *
++	 * 	| Suspend-to-idle (freeze) | Suspend-to-RAM (mem) |
++	 * BDW  | CSB regs not reset       | CSB regs reset       |
++	 * CHT  | CSB regs not reset       | CSB regs not reset   |
++	 */
++	next_context_status_buffer_hw = I915_READ(RING_CONTEXT_STATUS_PTR(ring))
++						  & GEN8_CSB_PTR_MASK;
++
++	/*
++	 * When the CSB registers are reset (also after power-up / engine reset),
++	 * CSB write pointer is set to all 1's, which is not valid.
++	 *
++	 * In this special case...
++	 * Reset next_context_status_buffer to GEN8_CSB_ENTRIES - 1. 
++	 * This is because it is pre-incremented (to GEN8_CSB_ENTRIES = 0 
++	 * modulo GEN8_CSB_ENTRIES) before it is used
++	 */
++	if (next_context_status_buffer_hw == 0x7)
++		next_context_status_buffer_hw = (GEN8_CSB_ENTRIES - 1);
++
++	spin_lock_irqsave(&ring->execlist_lock, flags);
++	ring->next_context_status_buffer = next_context_status_buffer_hw;
++	spin_unlock_irqrestore(&ring->execlist_lock, flags);
+ 
+ 	return 0;
+ }
+@@ -2807,7 +2837,6 @@
+ 	INIT_LIST_HEAD(&ring->execlist_queue);
+ 	INIT_LIST_HEAD(&ring->execlist_retired_req_list);
+ 	spin_lock_init(&ring->execlist_lock);
+-	ring->next_context_status_buffer = 0;
+ 
+ 	ret = i915_cmd_parser_init_ring(ring);
+ 	if (ret)

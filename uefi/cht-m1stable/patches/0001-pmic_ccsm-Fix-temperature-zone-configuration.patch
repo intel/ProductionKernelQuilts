@@ -1,0 +1,96 @@
+From e62b49614293af326fccda9acdd4b31d42452236 Mon Sep 17 00:00:00 2001
+From: Jenny TC <jenny.tc@intel.com>
+Date: Mon, 12 Jan 2015 15:24:44 +0530
+Subject: [PATCH 1/1] pmic_ccsm: Fix temperature zone configuration
+
+The translation table is locked due to change in BIOS. Due to this
+the temperature zone config flow exits without properly configured.
+To fix this, if Translation Table Lock bit is set, ignore all write to
+Translation Table and continue to configure the temperature zone.
+Also changed the Kelvin lookup macro to match with the Kelvin
+data from LPAT table. The temperature interpolation is avoided if the
+temperature same as any of the lookup table entry.
+
+Change-Id: Iedfb59f6b75c5a77fb7bbfd1a40893a25d6e4a26
+Signed-off-by: Jenny TC <jenny.tc@intel.com>
+---
+ drivers/power/intel_pmic_ccsm.c | 21 ++++++++++++++++++---
+ drivers/power/intel_pmic_ccsm.h |  1 +
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/power/intel_pmic_ccsm.c b/drivers/power/intel_pmic_ccsm.c
+index b3aff49..c654764 100644
+--- a/drivers/power/intel_pmic_ccsm.c
++++ b/drivers/power/intel_pmic_ccsm.c
+@@ -72,9 +72,9 @@
+ #define IS_RID_B(rid) (rid > RID_B_MIN && rid < RID_B_MAX)
+ #define IS_RID_C(rid) (rid > RID_C_MIN && rid < RID_C_MAX)
+ 
+-#define KELVIN_OFFSET	2732
++#define KELVIN_OFFSET	27315
+ #define DECI_KELVIN_TO_CELSIUS(t) ((t - KELVIN_OFFSET) / 10)
+-#define CELSIUS_TO_DECI_KELVIN(t) ((t * 10) + KELVIN_OFFSET)
++#define CELSIUS_TO_DECI_KELVIN(t) (((t * 100) + KELVIN_OFFSET) / 10)
+ 
+ /* Type definitions */
+ static void pmic_bat_zone_changed(void);
+@@ -168,6 +168,12 @@ static unsigned long temp_to_raw(
+ 	if (i == count - 1)
+ 		return -ENOENT;
+ 
++	if (temp == adc_tbl[i].temp)
++		return adc_tbl[i].raw;
++
++	if (temp == adc_tbl[i+1].temp)
++		return adc_tbl[i+1].raw;
++
+ 	delta_temp = adc_tbl[i+1].temp - adc_tbl[i].temp;
+ 	delta_raw = adc_tbl[i+1].raw - adc_tbl[i].raw;
+ 	raw = adc_tbl[i].raw +
+@@ -204,6 +210,10 @@ static int __pmic_write_tt(u8 addr, u8 data)
+ {
+ 	int ret;
+ 
++	/* If TT is locked return true */
++	if (chc.tt_lock)
++		return 0;
++
+ 	ret = pmic_write_reg(chc.reg_map->pmic_chrttaddr, addr);
+ 	if (!ret)
+ 		ret = pmic_write_reg(chc.reg_map->pmic_chrttdata, data);
+@@ -1584,7 +1594,7 @@ static inline int register_cooling_device(struct pmic_chrgr_drv_context *chc)
+ static int pmic_chrgr_probe(struct platform_device *pdev)
+ {
+ 	int ret = 0, i = 0, irq;
+-	u8 val;
++	u8 val, chgr_ctrl0;
+ 
+ 	if (!pdev)
+ 		return -ENODEV;
+@@ -1639,6 +1649,11 @@ static int pmic_chrgr_probe(struct platform_device *pdev)
+ 		chc.bcprof = NULL;
+ 	}
+ 
++	chgr_ctrl0 = intel_soc_pmic_readb(chc.reg_map->pmic_chgrctrl0);
++
++	if (chgr_ctrl0 >= 0)
++		chc.tt_lock = !!(chgr_ctrl0 & CHGRCTRL0_TTLCK_MASK);
++
+ 	if (intel_soc_pmic_update(chc.reg_map->pmic_chgrctrl0,
+ 			SWCONTROL_ENABLE|CHGRCTRL0_CCSM_OFF_MASK,
+ 			CHGRCTRL0_SWCONTROL_MASK|CHGRCTRL0_CCSM_OFF_MASK))
+diff --git a/drivers/power/intel_pmic_ccsm.h b/drivers/power/intel_pmic_ccsm.h
+index fc7808f..1ac28a4 100644
+--- a/drivers/power/intel_pmic_ccsm.h
++++ b/drivers/power/intel_pmic_ccsm.h
+@@ -372,6 +372,7 @@ struct pmic_chrgr_drv_context {
+ 	bool is_internal_usb_phy;
+ 	enum pmic_charger_cable_type charger_type;
+ 	bool otg_mode_enabled;
++	bool tt_lock;
+ 	unsigned int irq[PMIC_CCSM_IRQ_MAX];		/* GPE_ID or IRQ# */
+ 	int vbus_state;
+ 	int irq_cnt;
+-- 
+1.9.1
+

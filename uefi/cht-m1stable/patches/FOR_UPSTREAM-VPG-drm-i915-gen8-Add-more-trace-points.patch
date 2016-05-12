@@ -1,0 +1,222 @@
+From 7ef51d347c2335cdbd0fde0879ce537a95684782 Mon Sep 17 00:00:00 2001
+From: qzhan36 <qingyuan.zhang@intel.com>
+Date: Wed, 25 Nov 2015 22:07:21 +0800
+Subject: [PATCH 08/10] FOR_UPSTREAM [VPG]: drm/i915/gen8: Add more trace
+ points
+
+Add more trace points to track gem context, request and
+object reference/unreference
+
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-26200
+Signed-off-by: Qingyuan Zhang <qingyuan.zhang@intel.com>
+Change-Id: Ibf93af261175b8faf7a10ff7117056283c113a8e
+Reviewed-on: https://android.intel.com:443/477666
+---
+ drivers/gpu/drm/i915/i915_drv.h   |   9 ++-
+ drivers/gpu/drm/i915/i915_gem.c   |   4 ++
+ drivers/gpu/drm/i915/i915_trace.h | 112 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 123 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index aa9608a..489bb9c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2296,6 +2296,8 @@ struct drm_i915_gem_request {
+ 	uint32_t uniq;
+ };
+ 
++#include "i915_trace.h"
++
+ void i915_gem_request_free(struct kref *req_ref);
+ void i915_gem_complete_requests_ring(struct intel_engine_cs *ring,
+ 				     bool lazy_coherency);
+@@ -2315,6 +2317,7 @@ i915_gem_request_get_ring(struct drm_i915_gem_request *req)
+ static inline void
+ i915_gem_request_reference(struct drm_i915_gem_request *req)
+ {
++	trace_i915_gem_request_reference(req);
+ 	kref_get(&req->ref);
+ }
+ 
+@@ -2322,6 +2325,7 @@ static inline void
+ i915_gem_request_unreference(struct drm_i915_gem_request *req)
+ {
+ 	WARN_ON(!mutex_is_locked(&req->ring->dev->struct_mutex));
++	trace_i915_gem_request_unreference(req);
+ 	kref_put(&req->ref, i915_gem_request_free);
+ }
+ 
+@@ -2565,8 +2569,6 @@ enum context_submission_status {
+ #define PCI_CHV_REV_ID_PACKAGE_TYPE_MASK	0x3
+ #define PCI_CHV_REV_ID_PACKAGE_TYPE_T3		0x2
+ 
+-#include "i915_trace.h"
+-
+ extern const struct drm_ioctl_desc i915_ioctls[];
+ extern struct drm_display_mode rot_mode;
+ extern int i915_max_ioctl;
+@@ -3043,13 +3045,16 @@ i915_gem_context_get(struct drm_i915_file_private *file_priv, u32 id);
+ void i915_gem_context_free(struct kref *ctx_ref);
+ struct drm_i915_gem_object *
+ i915_gem_alloc_context_obj(struct drm_device *dev, size_t size);
++
+ static inline void i915_gem_context_reference(struct intel_context *ctx)
+ {
++	trace_i915_gem_context_reference(ctx);
+ 	kref_get(&ctx->ref);
+ }
+ 
+ static inline void i915_gem_context_unreference(struct intel_context *ctx)
+ {
++	trace_i915_gem_context_unreference(ctx);
+ 	kref_put(&ctx->ref, i915_gem_context_free);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index b24d0c8..cf785cf 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2591,6 +2591,8 @@ i915_gem_object_move_to_active(struct drm_i915_gem_object *obj,
+ 				       &dev_priv->mm.fence_list);
+ 		}
+ 	}
++
++	trace_i915_gem_object_move_to_active(obj, req);
+ }
+ 
+ void i915_vma_move_to_active(struct i915_vma *vma,
+@@ -2628,6 +2630,8 @@ i915_gem_object_move_to_inactive(struct drm_i915_gem_object *obj)
+ 	obj->active = 0;
+ 	drm_gem_object_unreference(&obj->base);
+ 
++	trace_i915_gem_object_move_to_inactive(obj);
++
+ 	WARN_ON(i915_verify_lists(dev));
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_trace.h b/drivers/gpu/drm/i915/i915_trace.h
+index e367b5b..f2e5247 100644
+--- a/drivers/gpu/drm/i915/i915_trace.h
++++ b/drivers/gpu/drm/i915/i915_trace.h
+@@ -1367,6 +1367,118 @@ TRACE_EVENT(i915_gem_retire_work_handler,
+ 		__entry->dev, __entry->idle)
+ );
+ 
++TRACE_EVENT(i915_gem_context_reference,
++	TP_PROTO(struct intel_context *ctx),
++	TP_ARGS(ctx),
++
++	TP_STRUCT__entry(
++			__field(void *, ctx)
++			__field(u32, refcnt)
++			),
++
++	TP_fast_assign(
++			__entry->ctx   = ctx;
++			__entry->refcnt = atomic_read(&(&ctx->ref)->refcount);
++			),
++
++	TP_printk("ctx=%p, refcnt before +1=%d",
++		__entry->ctx, __entry->refcnt)
++);
++
++TRACE_EVENT(i915_gem_context_unreference,
++	TP_PROTO(struct intel_context *ctx),
++	TP_ARGS(ctx),
++
++	TP_STRUCT__entry(
++			__field(void *, ctx)
++			__field(u32, refcnt)
++			),
++
++	TP_fast_assign(
++			__entry->ctx   = ctx;
++			__entry->refcnt  = atomic_read(&(&ctx->ref)->refcount);
++			),
++
++	TP_printk("ctx=%p, refcnt before -1=%d",
++		__entry->ctx, __entry->refcnt)
++);
++
++TRACE_EVENT(i915_gem_request_reference,
++	TP_PROTO(struct drm_i915_gem_request *req),
++	TP_ARGS(req),
++
++	TP_STRUCT__entry(
++			__field(u32, seqno)
++			__field(u32, uniq)
++			__field(u32, refcnt)
++			),
++
++	TP_fast_assign(
++			__entry->uniq = req ? req->uniq : 0;
++			__entry->seqno = i915_gem_request_get_seqno(req);
++			__entry->refcnt  = atomic_read(&(&req->ref)->refcount);
++			),
++
++	TP_printk("uniq=%d, seqno=%d, refcnt before +1=%d",
++		__entry->uniq, __entry->seqno, __entry->refcnt)
++);
++
++TRACE_EVENT(i915_gem_request_unreference,
++	TP_PROTO(struct drm_i915_gem_request *req),
++	TP_ARGS(req),
++
++	TP_STRUCT__entry(
++			__field(u32, seqno)
++			__field(u32, uniq)
++			__field(u32, refcnt)
++			),
++
++	TP_fast_assign(
++			__entry->uniq = req ? req->uniq : 0;
++			__entry->seqno = i915_gem_request_get_seqno(req);
++			__entry->refcnt = atomic_read(&(&req->ref)->refcount);
++			),
++
++	TP_printk("uniq=%d,seqno=%d, refcnt before -1=%d",
++		__entry->uniq, __entry->seqno, __entry->refcnt)
++);
++
++TRACE_EVENT(i915_gem_object_move_to_active,
++	TP_PROTO(struct drm_i915_gem_object *obj,
++			struct drm_i915_gem_request *req),
++	TP_ARGS(obj, req),
++
++	TP_STRUCT__entry(
++			__field(void *, obj)
++			__field(u32, uniq)
++			__field(u32, seqno)
++			),
++
++	TP_fast_assign(
++			__entry->obj  = obj;
++			__entry->uniq = req ? req->uniq : 0;
++			__entry->seqno = i915_gem_request_get_seqno(req);
++			),
++
++	TP_printk("obj=%p, uniq=%d, seqno=%d", __entry->obj,
++		__entry->uniq, __entry->seqno)
++);
++
++TRACE_EVENT(i915_gem_object_move_to_inactive,
++	TP_PROTO(struct drm_i915_gem_object *obj),
++	TP_ARGS(obj),
++
++	TP_STRUCT__entry(
++			__field(void *, obj)
++			),
++
++	TP_fast_assign(
++			__entry->obj  = obj;
++			),
++
++	TP_printk("obj=%p", __entry->obj)
++);
++
+ #endif /* _I915_TRACE_H_ */
+ 
+ /* This part must be outside protection */
+-- 
+1.9.1
+

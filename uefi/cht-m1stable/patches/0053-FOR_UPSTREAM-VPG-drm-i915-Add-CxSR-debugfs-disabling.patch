@@ -1,0 +1,216 @@
+From 2d2ef7664b8b96def57dfc76d2df058df7176bdf Mon Sep 17 00:00:00 2001
+Message-Id: <2d2ef7664b8b96def57dfc76d2df058df7176bdf.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Jeff McGee <jeff.mcgee@intel.com>
+Date: Tue, 17 Dec 2013 17:16:45 -0600
+Subject: [PATCH 053/312] FOR_UPSTREAM [VPG]: drm/i915: Add CxSR debugfs
+ disabling
+
+i915_sr_disable:
+'0' - CxSR enabled normally per device and settings.
+'1' - CxSR explicitly disabled.
+
+(cherry picked from commit b5e8b74635b49df698c0923729b9dd3bf790268d)
+
+For: APDEV-723
+OTC-Tracker: VIZ-3345
+Change-Id: Ia563d74c4cb478c9b5afa0aab219bcb3a8c8a6ff
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   43 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h     |    2 ++
+ drivers/gpu/drm/i915/intel_pm.c     |   47 ++++++++++++++++++++---------------
+ 3 files changed, 72 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 190f7b1..8430a90 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -1635,6 +1635,8 @@ static int i915_sr_status(struct seq_file *m, void *unused)
+ 		sr_enabled = I915_READ(INSTPM) & INSTPM_SELF_EN;
+ 	else if (IS_PINEVIEW(dev))
+ 		sr_enabled = I915_READ(DSPFW3) & PINEVIEW_SELF_REFRESH_EN;
++	else if (IS_VALLEYVIEW(dev))
++		sr_enabled = I915_READ(FW_BLC_SELF_VLV) & FW_CSPWRDWNEN;
+ 
+ 	intel_runtime_pm_put(dev_priv);
+ 
+@@ -1644,6 +1646,46 @@ static int i915_sr_status(struct seq_file *m, void *unused)
+ 	return 0;
+ }
+ 
++static int i915_sr_disable_get(void *data, u64 *val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	*val = dev_priv->sr_disable;
++
++	return 0;
++}
++
++static int i915_sr_disable_set(void *data, u64 val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_crtc *crtc;
++
++	if (dev_priv->sr_disable == (bool)val)
++		return 0;
++
++	drm_modeset_lock_all(dev);
++
++	DRM_DEBUG_DRIVER("Setting CxSR disable %s\n",
++			 val ? "true" : "false");
++
++	dev_priv->sr_disable = (bool)val;
++
++	/* Reset enabled crtc to force CxSR state update */
++	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head)
++		if (crtc->enabled)
++			intel_crtc_restore_mode(crtc);
++
++	drm_modeset_unlock_all(dev);
++
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(i915_sr_disable_fops,
++			i915_sr_disable_get, i915_sr_disable_set,
++			"%llu\n");
++
+ static int i915_emon_status(struct seq_file *m, void *unused)
+ {
+ 	struct drm_info_node *node = m->private;
+@@ -4090,6 +4132,7 @@ static const struct i915_debugfs_files {
+ 	{"i915_rc6_disable", &i915_rc6_disable_fops},
+ 	{"i915_ips_disable", &i915_ips_disable_fops},
+ 	{"i915_fbc_disable", &i915_fbc_disable_fops},
++	{"i915_sr_disable", &i915_sr_disable_fops},
+ 	{"i915_cache_sharing", &i915_cache_sharing_fops},
+ 	{"i915_ring_stop", &i915_ring_stop_fops},
+ 	{"i915_ring_missed_irq", &i915_ring_missed_irq_fops},
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index a452f93..223bd27 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1531,6 +1531,8 @@ struct drm_i915_private {
+ 
+ 	bool ips_disable;
+ 
++	bool sr_disable;
++
+ 	struct i915_power_domains power_domains;
+ 
+ 	struct i915_psr psr;
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 0b1a9a3..bd66f88 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -1181,7 +1181,7 @@ static void pineview_update_wm(struct drm_crtc *unused_crtc)
+ 	}
+ 
+ 	crtc = single_enabled_crtc(dev);
+-	if (crtc) {
++	if (crtc && !dev_priv->sr_disable) {
+ 		const struct drm_display_mode *adjusted_mode;
+ 		int pixel_size = crtc->primary->fb->bits_per_pixel / 8;
+ 		int clock;
+@@ -1475,6 +1475,7 @@ static void valleyview_update_wm(struct drm_crtc *crtc)
+ 		enabled |= 1 << PIPE_B;
+ 
+ 	if (single_plane_enabled(enabled) &&
++	    !dev_priv->sr_disable &&
+ 	    g4x_compute_srwm(dev, ffs(enabled) - 1,
+ 			     sr_latency_ns,
+ 			     &valleyview_wm_info,
+@@ -1532,6 +1533,7 @@ static void g4x_update_wm(struct drm_crtc *crtc)
+ 		enabled |= 1 << PIPE_B;
+ 
+ 	if (single_plane_enabled(enabled) &&
++	    !dev_priv->sr_disable &&
+ 	    g4x_compute_srwm(dev, ffs(enabled) - 1,
+ 			     sr_latency_ns,
+ 			     &g4x_wm_info,
+@@ -1573,7 +1575,7 @@ static void i965_update_wm(struct drm_crtc *unused_crtc)
+ 
+ 	/* Calc sr entries for one plane configs */
+ 	crtc = single_enabled_crtc(dev);
+-	if (crtc) {
++	if (crtc && !dev_priv->sr_disable) {
+ 		/* self-refresh has much higher latency */
+ 		static const int sr_latency_ns = 12000;
+ 		const struct drm_display_mode *adjusted_mode =
+@@ -1753,7 +1755,7 @@ static void i9xx_update_wm(struct drm_crtc *unused_crtc)
+ 	I915_WRITE(FW_BLC2, fwater_hi);
+ 
+ 	if (HAS_FW_BLC(dev)) {
+-		if (enabled) {
++		if (enabled && !dev_priv->sr_disable) {
+ 			if (IS_I945G(dev) || IS_I945GM(dev))
+ 				I915_WRITE(FW_BLC_SELF,
+ 					   FW_BLC_SELF_EN_MASK | FW_BLC_SELF_EN);
+@@ -2537,12 +2539,34 @@ static void ilk_compute_wm_results(struct drm_device *dev,
+ 				   enum intel_ddb_partitioning partitioning,
+ 				   struct ilk_wm_values *results)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc;
+ 	int level, wm_lp;
+ 
+ 	results->enable_fbc_wm = merged->fbc_wm_enabled;
+ 	results->partitioning = partitioning;
+ 
++	/* LP0 register values */
++	for_each_intel_crtc(dev, intel_crtc) {
++		enum pipe pipe = intel_crtc->pipe;
++		const struct intel_wm_level *r =
++			&intel_crtc->wm.active.wm[0];
++
++		if (WARN_ON(!r->enable))
++			continue;
++
++		results->wm_linetime[pipe] = intel_crtc->wm.active.linetime;
++
++		results->wm_pipe[pipe] =
++			(r->pri_val << WM0_PIPE_PLANE_SHIFT) |
++			(r->spr_val << WM0_PIPE_SPRITE_SHIFT) |
++			r->cur_val;
++	}
++
++	/* Leave LP1+ registers zeroed if self-refresh is not to be used */
++	if (dev_priv->sr_disable)
++		return;
++
+ 	/* LP1+ register values */
+ 	for (wm_lp = 1; wm_lp <= 3; wm_lp++) {
+ 		const struct intel_wm_level *r;
+@@ -2580,23 +2604,6 @@ static void ilk_compute_wm_results(struct drm_device *dev,
+ 		} else
+ 			results->wm_lp_spr[wm_lp - 1] = r->spr_val;
+ 	}
+-
+-	/* LP0 register values */
+-	for_each_intel_crtc(dev, intel_crtc) {
+-		enum pipe pipe = intel_crtc->pipe;
+-		const struct intel_wm_level *r =
+-			&intel_crtc->wm.active.wm[0];
+-
+-		if (WARN_ON(!r->enable))
+-			continue;
+-
+-		results->wm_linetime[pipe] = intel_crtc->wm.active.linetime;
+-
+-		results->wm_pipe[pipe] =
+-			(r->pri_val << WM0_PIPE_PLANE_SHIFT) |
+-			(r->spr_val << WM0_PIPE_SPRITE_SHIFT) |
+-			r->cur_val;
+-	}
+ }
+ 
+ /* Find the result with the highest level enabled. Check for enable_fbc_wm in
+-- 
+1.7.9.5
+

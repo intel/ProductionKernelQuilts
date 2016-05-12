@@ -1,0 +1,305 @@
+From d3a645449f8ccc2c405d32f87d98826562bb1599 Mon Sep 17 00:00:00 2001
+Message-Id: <d3a645449f8ccc2c405d32f87d98826562bb1599.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: Durgadoss R <durgadoss.r@intel.com>
+Date: Sat, 31 Jan 2015 03:57:34 +0530
+Subject: [PATCH 64/95] MUST_REBASE [VPG]: drivers/video/adf: Disable displays
+ during boot
+
+This patch disables the displays that were enabled by BIOS
+during boot. This is required to change CDclk, PLLs etc.
+* Use scratch register SWF10 to detect which LFP is present,
+  and which pipe is being used.
+* Since the scratch registers do not report correct information
+  for EFPs, manually probe all port control registers, to find
+  which EFP is enabled by BIOS.
+* To disable, we need various vlv_* pointers, hence do a dummy
+  init for pipeline 0 and use the data structures thus obtained
+  for disabling.
+* Clean up all planes, pipes and ports using corresponding
+  destroy_* methods.
+* Reset n_pipes and n_planes to 0, so that the real
+  vlv_initialize_disp() code is transparent to the above
+  disable sequence.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5443
+Change-Id: I3e01f32ed20e8e584d7de1d1f992865ddc33cfba
+Signed-off-by: Durgadoss R <durgadoss.r@intel.com>
+---
+ .../video/adf/intel/core/common/dsi/dsi_config.c   |    2 +-
+ drivers/video/adf/intel/core/vlv/vlv_dc_config.c   |  206 +++++++++++++++++++-
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |    4 +
+ 3 files changed, 210 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/dsi_config.c b/drivers/video/adf/intel/core/common/dsi/dsi_config.c
+index 6130acf..d51b327 100644
+--- a/drivers/video/adf/intel/core/common/dsi/dsi_config.c
++++ b/drivers/video/adf/intel/core/common/dsi/dsi_config.c
+@@ -253,5 +253,5 @@ out_err0:
+ 
+ void dsi_config_destroy(struct dsi_config *config)
+ {
+-
++	mutex_destroy(&config->ctx_lock);
+ }
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+index 60e5d1a..dfec750 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+@@ -20,6 +20,7 @@
+ #include <core/vlv/vlv_dc_config.h>
+ #include <core/vlv/vlv_pri_plane.h>
+ #include <core/vlv/vlv_sp_plane.h>
++#include <core/vlv/chv_dc_regs.h>
+ 
+ /* only PIPE_C should use DPIO, A & B shares DPIO_2  */
+ #define CHV_DPIO(pipe) (((pipe == PIPE_C) ? IOSF_PORT_DPIO : IOSF_PORT_DPIO_2))
+@@ -251,7 +252,6 @@ static int vlv_display_encoder_init(struct vlv_dc_config *vlv_config, int pipe,
+ 					__func__, err);
+ 			return err;
+ 		}
+-
+ 		intel_dc_config_add_pipe(&vlv_config->base,
+ 					 &hdmi_pipe->base, *n_pipes);
+ 	} else {
+@@ -450,6 +450,207 @@ static u16 chv_dc_get_stepping(struct pci_dev *pdev)
+ 	return stepping;
+ }
+ 
++static void vlv_reset_pipeline_params(struct vlv_dc_config *config)
++{
++	int i;
++
++	/* Clean up planes */
++	vlv_pri_plane_destroy(&config->pipeline[0].pplane);
++	vlv_sp_plane_destroy(&config->pipeline[0].splane[0]);
++	vlv_sp_plane_destroy(&config->pipeline[0].splane[1]);
++
++	for (i = 0; i < config->base.n_planes; i++)
++		config->base.planes[i] = NULL;
++	config->base.pipes[0] = NULL;
++
++	config->base.n_pipes = 0;
++	config->base.n_planes = 0;
++}
++
++static void vlv_disable_efp_dp(struct vlv_dc_config *config, u16 stepping)
++{
++	int i, val;
++	enum pipe pipe;
++	enum port port;
++	enum intel_pipe_type type;
++	struct intel_pipeline *pipeline;
++	struct vlv_pipeline *disp;
++	bool found = false;
++	int dp_port_reg[] = {DP_B, DP_C, DP_D};
++
++	/*
++	 * The scratch pad register does not reflect the reality
++	 * in case of EFPs. Hence, loop through all port control
++	 * registers to properly find out whic port/pipe is
++	 * being used by BIOS; and then disable them.
++	 */
++	for (i = 0; i < ARRAY_SIZE(dp_port_reg); i++) {
++		val = REG_READ(VLV_DISPLAY_BASE + dp_port_reg[i]);
++		if (val & (1 << 31)) {
++			port = PORT_B + i;
++			type = INTEL_PIPE_DP;
++
++			/* Extract bits[16:17] to get the selected pipe */
++			pipe = (val >> 16) & 0x3;
++			found = true;
++			break;
++		}
++	}
++
++	if (!found) {
++		pr_err("EFP: No DP found\n");
++		return;
++	}
++
++	pr_info("Disabling EFP: pipe:%d port:%d type:%d\n", pipe, port, type);
++	vlv_initialize_disp(config, pipe, type, port, 0, stepping);
++	pipeline = &config->pipeline[0].base;
++	chv_pipeline_off(pipeline);
++
++	disp = to_vlv_pipeline(pipeline);
++	vlv_dp_port_destroy(&disp->port.dp_port);
++	intel_pipe_destroy(&disp->gen.dp.base);
++
++	vlv_reset_pipeline_params(config);
++}
++
++static void vlv_disable_efp_hdmi(struct vlv_dc_config *config, u16 stepping)
++{
++	int i, val;
++	enum pipe pipe;
++	enum port port;
++	enum intel_pipe_type type;
++	bool found = false;
++	int hdmi_port_reg[] = {CHV_PORTB_CTRL, CHV_PORTC_CTRL, CHV_PORTD_CTRL};
++	struct intel_pipeline *pipeline;
++	struct vlv_pipeline *disp;
++
++	/*
++	 * The scratch pad register does not reflect the reality
++	 * in case of EFPs. Hence, loop through all port control
++	 * registers to properly find out whic port/pipe is
++	 * being used by BIOS; and then disable them.
++	 */
++	for (i = 0; i < ARRAY_SIZE(hdmi_port_reg); i++) {
++		val = REG_READ(hdmi_port_reg[i]);
++		if (val & (1 << 31)) {
++			port = PORT_B + i;
++			type = INTEL_PIPE_HDMI;
++			/* Extract bits[24:25] to get the selected pipe */
++			pipe = (val >> 24) & 0x3;
++			found = true;
++			break;
++		}
++	}
++
++	if (!found) {
++		pr_err("EFP: No HDMI found\n");
++		return;
++	}
++
++	pr_info("Disabling EFP: pipe:%d port:%d type:%d\n", pipe, port, type);
++	vlv_initialize_disp(config, pipe, type, port, 0, stepping);
++
++	pipeline = &config->pipeline[0].base;
++	chv_pipeline_off(pipeline);
++
++	disp = to_vlv_pipeline(pipeline);
++	intel_pipe_destroy(&disp->gen.hdmi.base);
++
++	vlv_reset_pipeline_params(config);
++}
++
++static void vlv_disable_lfp(enum pipe pipe, struct vlv_dc_config *config,
++			union child_device_config *child_dev,
++			int dev_num, u16 stepping)
++{
++	int i, dvo_port, devtype;
++	enum port port = 0;
++	enum intel_pipe_type type = 0;
++	bool is_lfp = false;
++	struct intel_pipeline *pipeline;
++	struct vlv_pipeline *disp;
++	struct dsi_pipe *dsi;
++
++	for (i = 0; i <= dev_num; i++) {
++		devtype = child_dev[i].common.device_type;
++		is_lfp = devtype & DEVICE_TYPE_INTERNAL_CONNECTOR;
++
++		/* Since we disabled that one LFP, break */
++		if (is_lfp)
++			break;
++	}
++
++	if (!is_lfp)
++		return;
++
++	dvo_port = child_dev[i].common.dvo_port;
++
++	if (devtype & DEVICE_TYPE_MIPI_OUTPUT) {
++		type = INTEL_PIPE_DSI;
++		port = dvo_port - DVO_PORT_MIPIA;
++		vlv_initialize_disp(config, pipe, type, port, 0 , stepping);
++		pipeline = &config->pipeline[0].base;
++		disp = to_vlv_pipeline(pipeline);
++		dsi = &disp->gen.dsi;
++
++		dsi->base.ops->dpms(&dsi->base, DRM_MODE_DPMS_OFF);
++		dsi_pipe_destroy(dsi);
++		intel_pipe_destroy(&dsi->base);
++
++		vlv_reset_pipeline_params(config);
++	} else if (devtype & DEVICE_TYPE_EDP_BITS) {
++		type = INTEL_PIPE_EDP;
++		port = dvo_port - DVO_PORT_CRT;
++		vlv_initialize_disp(config, pipe, type, port, 0, stepping);
++		pipeline = &config->pipeline[0].base;
++
++		/* Turn off backlight/pps for eDP before pipeline */
++		vlv_dp_backlight_seq(pipeline, false);
++		vlv_dp_panel_power_seq(pipeline, false);
++		chv_pipeline_off(pipeline);
++
++		disp = to_vlv_pipeline(pipeline);
++		vlv_dp_port_destroy(&disp->port.dp_port);
++		intel_pipe_destroy(&disp->gen.dp.base);
++
++		vlv_reset_pipeline_params(config);
++	}
++
++	pr_debug("Disabled LFP: pipe:%d port:%d type:%d\n", pipe, port, type);
++}
++
++/* Disables the displays enabled by BIOS */
++static void vlv_disable_displays(struct vlv_dc_config *config,
++			union child_device_config *child_dev,
++			int dev_num, u16 stepping)
++{
++	enum pipe pipe;
++	int tmp, val = REG_READ(SWF00);
++
++	pr_info("%s:scratch pad register[%x]:%x\n", __func__, SWF00, val);
++
++	/*
++	 * The scratch pad registers do not report correct
++	 * information for EFPs. Hence use port control
++	 * registers to find out which EFP is actually
++	 * enabled, and used by BIOS.
++	 */
++	for (pipe = PIPE_A; pipe < PIPE_C; pipe++) {
++		tmp = SWF00_PIPE_MASK & (val >> (SWF00_PIPE_BITS * pipe));
++		if (tmp & SWF00_LFP_ACTIVE_MASK) {
++			vlv_disable_lfp(pipe, config, child_dev,
++					dev_num, stepping);
++		}
++
++		if (tmp & SWF00_EFP_ACTIVE_MASK) {
++			vlv_disable_efp_hdmi(config, stepping);
++			vlv_disable_efp_dp(config, stepping);
++		}
++	}
++	pr_debug("Disabling displays enabled by BIOS: Done\n");
++}
++
+ struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
+ {
+ 	struct vlv_dc_config *config;
+@@ -522,6 +723,9 @@ struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
+ 
+ 	mutex_init(&config->dpio_lock);
+ 
++	/* Disable all displays enabled by BIOS */
++	vlv_disable_displays(config, child_dev, dev_num, stepping);
++
+ 	/*
+ 	 * LFP
+ 	 *      if MIPI A --> PIPEA
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index 0757d98..13024c6 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -3957,6 +3957,10 @@ extern int chv_cursor_offsets[];
+ 
+ /* VBIOS flags */
+ #define SWF00			(VLV_DISPLAY_BASE + 0x71410)
++#define  SWF00_LFP_ACTIVE_MASK	(1 << 3 | 1 << 7)
++#define  SWF00_EFP_ACTIVE_MASK	(1 << 2 | 1 << 5 | 1 << 6)
++#define  SWF00_PIPE_MASK	(0xff)
++#define  SWF00_PIPE_BITS	8
+ #define SWF01			(VLV_DISPLAY_BASE + 0x71414)
+ #define SWF02			(VLV_DISPLAY_BASE + 0x71418)
+ #define SWF03			(VLV_DISPLAY_BASE + 0x7141c)
+-- 
+1.7.9.5
+

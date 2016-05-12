@@ -1,0 +1,130 @@
+From 0a3015616ba80885a5f672971a12e49fb52f4622 Mon Sep 17 00:00:00 2001
+From: "Wu, Hao" <hao.wu@intel.com>
+Date: Mon, 23 Mar 2015 16:51:30 +0800
+Subject: [PATCH] dwc3: avoid ulpi access for Cherrytrail
+
+On Cherrytrail platform, USB dwc3 is not using any
+ULPI phy, but just internal USB phy, so no need to
+check ULPI status or do any ULPI phy setting. This
+change can save time for initialization and resume
+functions, and avoid confusing ULPI error messages
+shown for Cherrytrail platform.
+
+Change-Id: Iae75f5075036056b45fd336f147b278fe050e181
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-26705
+Signed-off-by: Wu, Hao <hao.wu@intel.com>
+---
+ drivers/usb/dwc3/core.c          | 17 +++++++++++++----
+ drivers/usb/dwc3/core.h          |  1 +
+ drivers/usb/dwc3/dwc3-pci.c      | 11 ++++++++++-
+ drivers/usb/dwc3/platform_data.h |  1 +
+ 4 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 8bd2da7..15b3e41 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -236,6 +236,9 @@ void dwc3_set_phy_dpm_pulldown(struct dwc3 *dwc, int pull_down)
+ {
+ 	u32 reg;
+ 
++	if (!dwc->ulpi_phy)
++		return;
++
+ 	reg = ulpi_read(dwc, TUSB1211_OTG_CTRL);
+ 	if (pull_down)
+ 		reg |= TUSB1211_OTG_CTRL_DPPULLDOWN | TUSB1211_OTG_CTRL_DMPULLDOWN;
+@@ -296,8 +299,10 @@ static void dwc3_core_soft_reset(struct dwc3 *dwc)
+ 	reg &= ~DWC3_GCTL_CORESOFTRESET;
+ 	dwc3_writel(dwc->regs, DWC3_GCTL, reg);
+ 
+-	dwc3_check_ulpi(dwc);
+-	set_phy_eye_optim(dwc);
++	if (dwc->ulpi_phy) {
++		dwc3_check_ulpi(dwc);
++		set_phy_eye_optim(dwc);
++	}
+  }
+ 
+ /**
+@@ -679,6 +684,7 @@ static int dwc3_probe(struct platform_device *pdev)
+ 		dwc->needs_fifo_resize = pdata->tx_fifo_resize;
+ 		dwc->dr_mode = pdata->dr_mode;
+ 		dwc->runtime_suspend = pdata->runtime_suspend;
++		dwc->ulpi_phy = pdata->ulpi_phy;
+ 		dwc->quirks = pdata->quirks;
+ 	} else {
+ 		dwc->usb2_phy = devm_usb_get_phy(dev, USB_PHY_TYPE_USB2);
+@@ -1023,11 +1029,14 @@ static int dwc3_resume_common(struct device *dev)
+ 		/* do nothing */
+ 		break;
+ 	}
+-	set_phy_eye_optim(dwc);
++
++	if (dwc->ulpi_phy)
++		set_phy_eye_optim(dwc);
+ 
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
+-	dwc3_check_ulpi(dwc);
++	if (dwc->ulpi_phy)
++		dwc3_check_ulpi(dwc);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index 53f30f1..f1c0a1c 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -740,6 +740,7 @@ struct dwc3 {
+ 	u8			test_mode_nr;
+ 
+ 	bool			runtime_suspend;
++	bool			ulpi_phy;
+ 	struct notifier_block	nb;
+ 	atomic_t		suspend_depth;
+ 
+diff --git a/drivers/usb/dwc3/dwc3-pci.c b/drivers/usb/dwc3/dwc3-pci.c
+index 6f2ef52..94bfd7c 100644
+--- a/drivers/usb/dwc3/dwc3-pci.c
++++ b/drivers/usb/dwc3/dwc3-pci.c
+@@ -187,6 +187,14 @@ static int dwc3_pci_probe(struct pci_dev *pci,
+ 	}
+ 
+ 	pdata.runtime_suspend = true;
++
++	/* CHT is not using ULPI PHY */
++	if (pci->vendor == PCI_VENDOR_ID_INTEL &&
++			pci->device == PCI_DEVICE_ID_INTEL_CHT)
++		pdata.ulpi_phy = false;
++	else
++		pdata.ulpi_phy = true;
++
+ 	fixes = (const struct dwc3_pci_fixes *)id->driver_data;
+ 	if (fixes)
+ 		pdata.quirks = fixes->quirks;
+@@ -226,7 +234,8 @@ static int dwc3_pci_probe(struct pci_dev *pci,
+ 	 * refclock to the phy is not being enabled.
+ 	 * We need an extra step to make sure such clock is enabled.
+ 	 */
+-	dwc3_pci_enable_ulpi_refclock(pci);
++	if (pdata.ulpi_phy)
++		dwc3_pci_enable_ulpi_refclock(pci);
+ 
+ 	ret = platform_device_add(dwc3);
+ 	if (ret) {
+diff --git a/drivers/usb/dwc3/platform_data.h b/drivers/usb/dwc3/platform_data.h
+index 093e2c7..e92a260 100644
+--- a/drivers/usb/dwc3/platform_data.h
++++ b/drivers/usb/dwc3/platform_data.h
+@@ -25,6 +25,7 @@ struct dwc3_platform_data {
+ 	enum usb_dr_mode dr_mode;
+ 	bool tx_fifo_resize;
+ 	bool runtime_suspend;
++	bool ulpi_phy;
+ 	unsigned int quirks;
+ 
+ /* Core transitions directly between PHY power state P2 and P3*/
+-- 
+1.9.1
+

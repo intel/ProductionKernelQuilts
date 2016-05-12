@@ -1,0 +1,287 @@
+From 74625552380caf0c317a92062bd8024ea25f701d Mon Sep 17 00:00:00 2001
+Message-Id: <74625552380caf0c317a92062bd8024ea25f701d.1417780878.git.chang-joon.lee@intel.com>
+In-Reply-To: <cb098d33cdac3271103834fbce08218248d7bddb.1417780878.git.chang-joon.lee@intel.com>
+References: <cb098d33cdac3271103834fbce08218248d7bddb.1417780878.git.chang-joon.lee@intel.com>
+From: "David S. Gordon" <david.s.gordon@intel.com>
+Date: Mon, 10 Nov 2014 13:58:25 +0000
+Subject: [PATCH 06/34] FOR_UPSTREAM [VPG]: drm/i915: Bug fixes to ring 'head'
+ updating
+
+Fixes to both the LRC and the legacy ringbuffer code to correctly
+calculate and update the available space in a ring.
+
+The logical ring code was updating the software ring 'head' value
+by reading the hardware 'HEAD' register. In LRC mode, this is not
+valid as the hardware is not necessarily executing the same context
+that is being processed by the software. Thus reading the h/w HEAD
+could put an unrelated (undefined, effectively random) value into
+the s/w 'head' -- A Bad Thing for the free space calculations.
+
+In addition, the old code could update a ringbuffer's 'head' value
+from the 'last_retired_head' even when the latter hadn't been recently
+updated and therefore had a value of -1; this would also confuse the
+freespace calculations. Now, we consume 'last_retired_head' in just
+one place, ensuring that this confusion does not arise.
+
+v2: (Tomas Elf)
+Fixed whitespace issue based on Jon Bloomfields GMIN review comment.
+
+Signed-off-by: Dave Gordon <david.s.gordon@xxxxxxxxx>
+Signed-off-by: Tomas Elf <tomas.elf@intel.com>
+Issue: GMIN-3580
+Tracked-On: https://jira01.devtools.intel.com/browse/GMIN-3580
+Change-Id: Id31060cb30d8a8f29e14908f9257fb92800df5a2
+---
+ drivers/gpu/drm/i915/i915_dma.c         |    5 ++-
+ drivers/gpu/drm/i915/intel_lrc.c        |   36 ++++++++++-----------
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   54 +++++++++++++++++--------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    1 +
+ 4 files changed, 49 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 51931d4..3045649 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -152,11 +152,10 @@ void i915_kernel_lost_context(struct drm_device * dev)
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET))
+ 		return;
+ 
++	ringbuf->last_retired_head = -1;
+ 	ringbuf->head = I915_READ_HEAD(ring) & HEAD_ADDR;
+ 	ringbuf->tail = I915_READ_TAIL(ring) & TAIL_ADDR;
+-	ringbuf->space = ringbuf->head - (ringbuf->tail + I915_RING_FREE_SPACE);
+-	if (ringbuf->space < 0)
+-		ringbuf->space += ringbuf->size;
++	intel_ring_update_space(ringbuf);
+ 
+ 	if (!dev->primary->master)
+ 		return;
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 5115a0d..be8db82 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1209,16 +1209,20 @@ static int logical_ring_wait_request(struct intel_ringbuffer *ringbuf,
+ 	u32 seqno = 0;
+ 	int ret;
+ 
+-	if (ringbuf->last_retired_head != -1) {
+-		ringbuf->head = ringbuf->last_retired_head;
+-		ringbuf->last_retired_head = -1;
+-
+-		ringbuf->space = intel_ring_space(ringbuf);
+-		if (ringbuf->space >= bytes)
+-			return 0;
+-	}
++	if (intel_ring_space(ringbuf) >= bytes)
++		return 0;
+ 
+ 	list_for_each_entry(request, &ring->request_list, list) {
++		/*
++		 * The request queue is per-engine, so can contain requests
++		 * from multiple ringbuffers. Here, we must ignore any that
++		 * aren't from the ringbuffer we're considering.
++		 */
++		struct intel_context *ctx = request->ctx;
++		if (ctx->engine[ring->id].ringbuf != ringbuf)
++			continue;
++
++		/* Would completion of this request free enough space? */
+ 		if (__intel_ring_space(request->tail, ringbuf->tail,
+ 				       ringbuf->size) >= bytes) {
+ 			seqno = request->seqno;
+@@ -1234,11 +1238,8 @@ static int logical_ring_wait_request(struct intel_ringbuffer *ringbuf,
+ 		return ret;
+ 
+ 	i915_gem_retire_requests_ring(ring);
+-	ringbuf->head = ringbuf->last_retired_head;
+-	ringbuf->last_retired_head = -1;
+ 
+-	ringbuf->space = intel_ring_space(ringbuf);
+-	return 0;
++	return intel_ring_space(ringbuf) >= bytes ? 0 : -ENOSPC;
+ }
+ 
+ static int logical_ring_wait_for_space(struct intel_ringbuffer *ringbuf,
+@@ -1264,13 +1265,10 @@ static int logical_ring_wait_for_space(struct intel_ringbuffer *ringbuf,
+ 	 * case by choosing an insanely large timeout. */
+ 	end = jiffies + 60 * HZ;
+ 
++	ret = 0;
+ 	do {
+-		ringbuf->head = I915_READ_HEAD(ring);
+-		ringbuf->space = intel_ring_space(ringbuf);
+-		if (ringbuf->space >= bytes) {
+-			ret = 0;
++		if (intel_ring_space(ringbuf) >= bytes)
+ 			break;
+-		}
+ 
+ 		msleep(1);
+ 
+@@ -1310,7 +1308,7 @@ static int logical_ring_wrap_buffer(struct intel_ringbuffer *ringbuf)
+ 		iowrite32(MI_NOOP, virt++);
+ 
+ 	ringbuf->tail = 0;
+-	ringbuf->space = intel_ring_space(ringbuf);
++	intel_ring_update_space(ringbuf);
+ 
+ 	return 0;
+ }
+@@ -2139,8 +2137,8 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	ringbuf->effective_size = ringbuf->size;
+ 	ringbuf->head = 0;
+ 	ringbuf->tail = 0;
+-	ringbuf->space = ringbuf->size;
+ 	ringbuf->last_retired_head = -1;
++	intel_ring_update_space(ringbuf);
+ 
+ 	/* TODO: For now we put this in the mappable region so that we can reuse
+ 	 * the existing ringbuffer code which ioremaps it. When we start
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 07e753d..7171813 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -53,16 +53,27 @@ intel_ring_initialized(struct intel_engine_cs *ring)
+ 
+ int __intel_ring_space(int head, int tail, int size)
+ {
+-	int space = head - (tail + I915_RING_FREE_SPACE);
+-	if (space < 0)
++	int space = head - tail;
++	if (space <= 0)
+ 		space += size;
+-	return space;
++	return space - I915_RING_FREE_SPACE;
++}
++
++void intel_ring_update_space(struct intel_ringbuffer *ringbuf)
++{
++	if (ringbuf->last_retired_head != -1) {
++		ringbuf->head = ringbuf->last_retired_head;
++		ringbuf->last_retired_head = -1;
++	}
++
++	ringbuf->space = __intel_ring_space(ringbuf->head & HEAD_ADDR,
++					    ringbuf->tail, ringbuf->size);
+ }
+ 
+ int intel_ring_space(struct intel_ringbuffer *ringbuf)
+ {
+-	return __intel_ring_space(ringbuf->head & HEAD_ADDR,
+-				  ringbuf->tail, ringbuf->size);
++	intel_ring_update_space(ringbuf);
++	return ringbuf->space;
+ }
+ 
+ bool intel_ring_stopped(struct intel_engine_cs *ring)
+@@ -76,7 +87,7 @@ void __intel_ring_advance(struct intel_engine_cs *ring)
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	struct intel_ringbuffer *ringbuf = ring->buffer;
+ 
+-	ringbuf->tail &= ringbuf->size - 1;
++	intel_ring_advance(ring);
+ 
+ 	/* Re-schedule the hangcheck timer each time the ring is given new work
+ 	* so that we can detect hangs caused by commands inserted directly
+@@ -978,10 +989,10 @@ static int init_ring_common(struct intel_engine_cs *ring)
+ 	if (!drm_core_check_feature(ring->dev, DRIVER_MODESET))
+ 		i915_kernel_lost_context(ring->dev);
+ 	else {
++		ringbuf->last_retired_head = -1;
+ 		ringbuf->head = I915_READ_HEAD(ring);
+ 		ringbuf->tail = I915_READ_TAIL(ring) & TAIL_ADDR;
+-		ringbuf->space = intel_ring_space(ringbuf);
+-		ringbuf->last_retired_head = -1;
++		intel_ring_update_space(ringbuf);
+ 	}
+ 
+ 
+@@ -2212,14 +2223,8 @@ static int intel_ring_wait_request(struct intel_engine_cs *ring, int n)
+ 	u32 seqno = 0;
+ 	int ret;
+ 
+-	if (ringbuf->last_retired_head != -1) {
+-		ringbuf->head = ringbuf->last_retired_head;
+-		ringbuf->last_retired_head = -1;
+-
+-		ringbuf->space = intel_ring_space(ringbuf);
+-		if (ringbuf->space >= n)
+-			return 0;
+-	}
++	if (intel_ring_space(ringbuf) >= n)
++		return 0;
+ 
+ 	list_for_each_entry(request, &ring->request_list, list) {
+ 		if (__intel_ring_space(request->tail, ringbuf->tail,
+@@ -2237,10 +2242,7 @@ static int intel_ring_wait_request(struct intel_engine_cs *ring, int n)
+ 		return ret;
+ 
+ 	i915_gem_retire_requests_ring(ring);
+-	ringbuf->head = ringbuf->last_retired_head;
+-	ringbuf->last_retired_head = -1;
+ 
+-	ringbuf->space = intel_ring_space(ringbuf);
+ 	return 0;
+ }
+ 
+@@ -2266,14 +2268,15 @@ static int ring_wait_for_space(struct intel_engine_cs *ring, int n)
+ 	 * case by choosing an insanely large timeout. */
+ 	end = jiffies + 60 * HZ;
+ 
++	ret = 0;
+ 	trace_i915_ring_wait_begin(ring);
+ 	do {
++		if (intel_ring_space(ringbuf) >= n)
++			break;
++
+ 		ringbuf->head = I915_READ_HEAD(ring);
+-		ringbuf->space = intel_ring_space(ringbuf);
+-		if (ringbuf->space >= n) {
+-			ret = 0;
++		if (intel_ring_space(ringbuf) >= n)
+ 			break;
+-		}
+ 
+ 		if (!drm_core_check_feature(dev, DRIVER_MODESET) &&
+ 		    dev->primary->master) {
+@@ -2321,7 +2324,7 @@ static int intel_wrap_ring_buffer(struct intel_engine_cs *ring)
+ 		iowrite32(MI_NOOP, virt++);
+ 
+ 	ringbuf->tail = 0;
+-	ringbuf->space = intel_ring_space(ringbuf);
++	intel_ring_update_space(ringbuf);
+ 
+ 	return 0;
+ }
+@@ -2393,6 +2396,7 @@ int intel_ring_begin(struct intel_engine_cs *ring,
+ 		     int num_dwords)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	struct intel_ringbuffer *ringbuf = ring->buffer;
+ 	int ret;
+ 
+ 	ret = i915_gem_check_wedge(&dev_priv->gpu_error,
+@@ -2409,7 +2413,7 @@ int intel_ring_begin(struct intel_engine_cs *ring,
+ 	if (ret)
+ 		return ret;
+ 
+-	ring->buffer->space -= num_dwords * sizeof(uint32_t);
++	ringbuf->space -= num_dwords * sizeof(uint32_t);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 68d5e01..145c956 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -432,6 +432,7 @@ static inline void intel_ring_advance(struct intel_engine_cs *ring)
+ }
+ 
+ int __intel_ring_space(int head, int tail, int size);
++void intel_ring_update_space(struct intel_ringbuffer *ringbuf);
+ int intel_ring_space(struct intel_ringbuffer *ringbuf);
+ bool intel_ring_stopped(struct intel_engine_cs *ring);
+ void __intel_ring_advance(struct intel_engine_cs *ring);
+-- 
+1.7.9.5
+

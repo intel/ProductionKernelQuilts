@@ -1,0 +1,131 @@
+From 8733ed8ffa7c959f50fbf8b79d083af37e40e1da Mon Sep 17 00:00:00 2001
+From: "Du, Changbin" <changbin.du@intel.com>
+Date: Mon, 28 Dec 2015 18:04:13 +0800
+Subject: [PATCH 2/6] usb: f_fs: avoid race condition with
+ ffs_epfile_io_complete
+
+ffs_epfile_io and ffs_epfile_io_complete runs in different context, but
+there is no synchronization between them.
+
+consider the following scenario:
+1) ffs_epfile_io interrupted by sigal while wait_for_completion_interruptible
+2) then ffs_epfile_io set ret to -EINTR
+3) just before or during usb_ep_dequeue, the request completed
+4) ffs_epfile_io return with -EINTR
+
+In this case, ffs_epfile_io tell caller no transfer success but actually
+it may has been done. This break the caller's pipe.
+
+Below script can help test it (adbd is the process which lies on f_fs).
+while true
+do
+   pkill -19 adbd #SIGSTOP
+   pkill -18 adbd #SIGCONT
+   sleep 0.1
+done
+
+To avoid this, just dequeue the request first. After usb_ep_dequeue, the
+request must be done or canceled.
+
+With this change, we can ensure no race condition in f_fs driver. But
+actually I found some of the udc driver has analogical issue in its
+dequeue implementation. For example,
+1) the dequeue function hold the controller's lock.
+2) before driver request controller  to stop transfer, a request
+   completed.
+3) the controller trigger a interrupt, but its irq handler need wait
+   dequeue function to release the lock.
+4) dequeue function give back the request with negative status, and
+   release lock.
+5) irq handler get lock but the request has already been given back.
+
+So, the dequeue implementation should take care of this case. IMO, it
+can be done as below steps to dequeue a already started request,
+1) request controller to stop transfer on the given ep. HW know the
+   actual transfer status.
+2) after hw stop transfer, driver scan if there are any completed one.
+3) if found, process it with real status. if no, the request can
+   canceled.
+
+Change-Id: I5bc9d586f66e5e316cae9a6c70e504891e8f30c5
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-17245
+Signed-off-by: Du, Changbin <changbin.du@intel.com>
+Signed-off-by: Marcin Walewski <marcin.walewski@intel.com>
+Reviewed-on: https://android.intel.com:443/458108
+Reviewed-on: https://android.intel.com:443/494160
+---
+ drivers/usb/gadget/f_fs.c | 45 +++++++++++++++++++++++++++++----------------
+ 1 file changed, 29 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/usb/gadget/f_fs.c b/drivers/usb/gadget/f_fs.c
+index c090d06..6e63461 100644
+--- a/drivers/usb/gadget/f_fs.c
++++ b/drivers/usb/gadget/f_fs.c
+@@ -587,7 +587,8 @@ static ssize_t ffs_epfile_io(struct file *file,
+ 	struct ffs_epfile *epfile = file->private_data;
+ 	struct ffs_ep *ep;
+ 	char *data = NULL;
+-	ssize_t ret, data_len;
++	ssize_t ret, data_len = 0;
++	bool interrupted = false;
+ 	int halt;
+ 
+ 	/* Are we still active? */
+@@ -673,27 +674,39 @@ static ssize_t ffs_epfile_io(struct file *file,
+ 
+ 		spin_unlock_irq(&epfile->ffs->eps_lock);
+ 
+-		if (unlikely(ret < 0)) {
+-			/* nop */
+-		} else if (unlikely(wait_for_completion_interruptible(&done))) {
+-			ret = -EINTR;
+-			usb_ep_dequeue(ep->ep, req);
+-		} else {
++		if (unlikely(ret < 0))
++			goto out;
++
++		if (unlikely(wait_for_completion_interruptible(&done))) {
+ 			/*
+-			 * XXX We may end up silently droping data here.
+-			 * Since data_len (i.e. req->length) may be bigger
+-			 * than len (after being rounded up to maxpacketsize),
+-			 * we may end up with more data then user space has
+-			 * space for.
++			 * To avoid race condition with ffs_epfile_io_complete,
++			 * dequeue the request first, then check status.
++			 * usb_ep_dequeue API should guarantee no race condition
++			 * with req->complete callback.
+ 			 */
+-			ret = ep->status;
+-			if (read && ret > 0 &&
+-			    unlikely(copy_to_user(buf, data,
+-						  min_t(size_t, ret, len))))
++
++			usb_ep_dequeue(ep->ep, req);
++			interrupted = true;
++		}
++		/*
++		 * XXX We may end up silently droping data here.
++		 * Since data_len (i.e. req->length) may be bigger
++		 * than len (after being rounded up to maxpacketsize),
++		 * we may end up with more data then user space has
++		 * space for.
++		 */
++		ret = ep->status < 0 && interrupted ? -EINTR : ep->status;
++		if (read && ret > 0) {
++			if (ret > len) {
++				pr_err("%s read overflow\n", __func__);
++				ret = -EOVERFLOW;
++			} else if (unlikely(copy_to_user(buf, data,
++					  min_t(size_t, ret, len))))
+ 				ret = -EFAULT;
+ 		}
+ 	}
+ 
++out:
+ 	mutex_unlock(&epfile->mutex);
+ error:
+ 	kfree(data);
+-- 
+1.9.1
+

@@ -1,0 +1,980 @@
+From 319adb23988e3b06548b4ec60cfe32787140b8eb Mon Sep 17 00:00:00 2001
+Message-Id: <319adb23988e3b06548b4ec60cfe32787140b8eb.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Thu, 2 Oct 2014 23:03:47 +0530
+Subject: [PATCH 47/75] MUST_REBASE [VPG]: adf/intel/vlv: Added Basic DPST
+ support to ADF driver
+
+v2: Added dpst_enabled flag to track the DPST enable/disable
+
+v3: Fix the flash seen on resuming DUT from sleep through power button
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I02cf11a7061c16716a01c637edd42adffcd16366
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ .../video/adf/intel/core/common/dsi/gen_dsi_pipe.c |    7 +-
+ drivers/video/adf/intel/core/vlv/Makefile          |    3 +-
+ drivers/video/adf/intel/core/vlv/vlv_dc_config.c   |    2 +
+ drivers/video/adf/intel/core/vlv/vlv_dpst.c        |  648 ++++++++++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_mode_set.c    |    6 +
+ .../video/adf/intel/include/core/intel_dc_config.h |    1 +
+ .../adf/intel/include/core/vlv/vlv_dc_config.h     |    2 +
+ .../video/adf/intel/include/core/vlv/vlv_dpst.h    |   98 +++
+ drivers/video/adf/intel/include/intel_adf.h        |    7 +-
+ drivers/video/adf/intel/intel_adf_interface.c      |   19 +-
+ include/uapi/video/adf.h                           |    1 +
+ 11 files changed, 789 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/vlv/vlv_dpst.c
+ create mode 100644 drivers/video/adf/intel/include/core/vlv/vlv_dpst.h
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+index 2b7fd48..de6a04f 100644
+--- a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
++++ b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+@@ -106,10 +106,13 @@ static void dsi_get_preferred_mode(struct intel_pipe *pipe,
+ {
+ 	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
+ 	struct dsi_config *config = &dsi_pipe->config;
++	bool lock;
+ 
+-	mutex_lock(&config->ctx_lock);
++	lock = mutex_trylock(&config->ctx_lock);
+ 	*mode = &config->perferred_mode;
+-	mutex_unlock(&config->ctx_lock);
++
++	if (lock)
++		mutex_unlock(&config->ctx_lock);
+ 
+ 	pr_err("ADF: %s: Preferred Mode = %dx%d @%d\n", __func__,
+ 	       (*mode)->hdisplay, (*mode)->vdisplay, (*mode)->vrefresh);
+diff --git a/drivers/video/adf/intel/core/vlv/Makefile b/drivers/video/adf/intel/core/vlv/Makefile
+index d0fccbd..89d973e 100644
+--- a/drivers/video/adf/intel/core/vlv/Makefile
++++ b/drivers/video/adf/intel/core/vlv/Makefile
+@@ -5,4 +5,5 @@ ccflags-y := -Idrivers/staging/ -Iinclude/adf -Iinclude/uapi/adf -Idrivers/video
+ obj-y := vlv_dc_config.o \
+ 	vlv_pri_plane.o \
+ 	vlv_sp_plane.o \
+-	vlv_mode_set.o
++	vlv_mode_set.o \
++	vlv_dpst.o
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+index 1635103..c827578 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+@@ -67,6 +67,7 @@ void vlv_dc_config_destroy(struct intel_dc_config *config)
+ 	}
+ 
+ 	intel_dc_config_destroy(config);
++	vlv_dpst_teardown();
+ 	kfree(config);
+ 
+ 	return;
+@@ -181,6 +182,7 @@ struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
+ 
+ 	vlv_initialize_disp(config, PIPE_A, INTEL_PIPE_DSI);
+ 
++	vlv_dpst_init(&config->base);
+ 	return &config->base;
+ err:
+ 	vlv_dc_config_destroy(&config->base);
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dpst.c b/drivers/video/adf/intel/core/vlv/vlv_dpst.c
+new file mode 100644
+index 0000000..7360eda
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/vlv_dpst.c
+@@ -0,0 +1,648 @@
++/*
++ * Copyright © 2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Author:
++ *		Deepak S <deepak.s@intel.com>
++ */
++
++#include <linux/uaccess.h>
++#include <drm/i915_drm.h>
++#include <drm/i915_dpst.h>
++#include <video/adf.h>
++#include <intel_adf_device.h>
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_dpst.h>
++
++/*
++ * DPST (Display Power Savings Technology) is a power savings features
++ * which reduces the backlight while enhancing the image such that the
++ * user does not perceive any difference in the image quality. The backlight
++ * reduction can provide power savings
++ *
++ * The DPST IOCTL implemented in this file can be used by the DPST a user-mode
++ * module. The IOCTL provides methods to initialize the DPST hardware,
++ * manage DPST interrupts, and to apply the new backlight and image enhancement
++ * values.
++ *
++ * The user mode module will initialize the DPST hardware when it starts up.
++ * The kernel will notify user mode module of any DPST histogram interrupts.
++ * When the user mode module receives a notification of these interrupts, it
++ * will query the kernel for all the DPST histogram data. Using this data,
++ * the user mode module will calculate new backlight and image enhancement
++ * values and provides those values to the kernel to program into the DPST
++ * hardware.
++ */
++
++static struct intel_dc_config *g_config;
++
++static u32
++vlv_get_backlight(struct intel_pipe *pipe)
++{
++	return 100;
++}
++
++static void
++vlv_panel_set_backlight(struct intel_pipe *pipe, int level)
++{
++	pipe->ops->set_brightness(pipe, level);
++}
++
++static bool
++vlv_dpst_save_conn_config(struct intel_dc_config *config)
++{
++	struct intel_pipe *pipe;
++	size_t n_intfs = config->n_pipes;
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++	int i;
++
++	for (i = 0; i < n_intfs; i++) {
++		pipe = config->pipes[i];
++		if (pipe && pipe->ops && pipe->ops->is_screen_connected)
++			if (pipe->primary_plane &&
++					pipe->type == INTEL_PIPE_DSI) {
++				vlv_config->dpst.pipe = pipe->base.idx;
++				return true;
++			}
++	}
++	return false;
++}
++
++u32
++vlv_dpst_get_brightness(struct intel_dc_config *config)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++	struct intel_pipe *pipe;
++	int ret = 0;
++
++	if (!vlv_config->dpst.enabled)
++		return 0;
++
++	vlv_dpst_save_conn_config(config);
++	pipe = config->pipes[vlv_config->dpst.pipe];
++
++	/* return the last (non-dpst) set backlight level */
++#ifdef CONFIG_BACKLIGHT_CLASS_DEVICE
++	ret = pipe->ops->get_brightness(pipe);
++#endif
++	return ret;
++
++}
++
++/* called by multi-process, be cautious to avoid race condition */
++void
++vlv_dpst_set_brightness(struct intel_pipe *pipe, u32 brightness_val)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(g_config);
++	u32 backlight_level = brightness_val;
++
++	if (!vlv_config->dpst.enabled)
++		return;
++
++	/* Calculate the backlight after it has been reduced by "dpst
++	 * blc adjustment" percent . blc_adjustment value is stored
++	 * after multiplying by 100, so we have to divide by 100 2nd time
++	 * to get to the correct value */
++	backlight_level = ((brightness_val *
++				vlv_config->dpst.blc_adjustment)/100)/100;
++#ifdef CONFIG_BACKLIGHT_CLASS_DEVICE
++	vlv_panel_set_backlight(pipe, backlight_level);
++#endif
++}
++
++static int
++vlv_dpst_clear_hist_interrupt(struct intel_dc_config *config)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_guard,
++		       REG_READ(vlv_config->dpst.reg.blm_hist_guard) |
++		       HISTOGRAM_EVENT_STATUS);
++	return 0;
++}
++
++static int
++vlv_dpst_enable_hist_interrupt(struct vlv_dc_config *vlv_config)
++{
++	struct intel_pipe  *pipe = g_config->pipes[vlv_config->dpst.pipe];
++	u32 blm_hist_ctl;
++
++	pipe->dpst_enabled = true;
++	vlv_config->dpst.enabled = true;
++	vlv_config->dpst.blc_adjustment = DPST_MAX_FACTOR;
++
++	/* Enable histogram logic to collect data */
++	blm_hist_ctl = REG_READ(vlv_config->dpst.reg.blm_hist_ctl);
++	blm_hist_ctl |= IE_HISTOGRAM_ENABLE | HSV_INTENSITY_MODE;
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_ctl, blm_hist_ctl);
++
++	/* Wait for VBLANK since the histogram enabling logic takes affect
++	 * at the next vblank */
++
++	/*
++	 * FixMe: Call VBlank interface
++	 * */
++
++	/* Clear pending interrupt bit. Clearing the pending interrupt bit
++	 * must be not be done at the same time as enabling the
++	 * interrupt. */
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_guard,
++		       REG_READ(vlv_config->dpst.reg.blm_hist_guard) |
++		       HISTOGRAM_EVENT_STATUS);
++
++	/* Enable histogram interrupts */
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_guard,
++		       REG_READ(vlv_config->dpst.reg.blm_hist_guard) |
++		       HISTOGRAM_INTERRUPT_ENABLE);
++
++	/* DPST interrupt in DE_IER is enabled in irq_postinstall */
++
++	return 0;
++}
++
++static int
++vlv_dpst_disable_hist_interrupt(struct vlv_dc_config *vlv_config)
++{
++	struct intel_pipe  *pipe = g_config->pipes[vlv_config->dpst.pipe];
++	u32 blm_hist_guard, blm_hist_ctl;
++
++	vlv_config->dpst.enabled = false;
++	pipe->dpst_enabled = false;
++	vlv_config->dpst.blc_adjustment = DPST_MAX_FACTOR;
++
++	/* Disable histogram interrupts. It is OK to clear pending interrupts
++	 * and disable interrupts at the same time. */
++	blm_hist_guard = REG_READ(vlv_config->dpst.reg.blm_hist_guard);
++	blm_hist_guard |= HISTOGRAM_EVENT_STATUS; /* clear pending interrupts */
++	blm_hist_guard &= ~HISTOGRAM_INTERRUPT_ENABLE;
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_guard, blm_hist_guard);
++
++	/* Disable histogram logic */
++	blm_hist_ctl = REG_READ(vlv_config->dpst.reg.blm_hist_ctl);
++	blm_hist_ctl &= ~IE_HISTOGRAM_ENABLE;
++	blm_hist_ctl &= ~IE_MOD_TABLE_ENABLE;
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_ctl, blm_hist_ctl);
++
++	/* DPST interrupt in DE_IER register is disabled in irq_uninstall */
++
++	/* Setting blc level to what it would be without dpst adjustment */
++
++	 vlv_panel_set_backlight(pipe, vlv_get_backlight(pipe));
++
++	return 0;
++}
++
++static int
++vlv_dpst_set_user_enable(struct intel_dc_config *config, bool enable)
++{
++	int ret = 0;
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++
++	vlv_config->dpst.user_enable = enable;
++
++	if (enable) {
++		if (!vlv_config->dpst.kernel_disable &&
++				!vlv_config->dpst.enabled)
++			return vlv_dpst_enable_hist_interrupt(vlv_config);
++	} else {
++		/* User disabling invalidates any saved settings */
++		vlv_config->dpst.saved.is_valid = false;
++
++		/* Avoid warning messages */
++		if (vlv_config->dpst.enabled)
++			ret = vlv_dpst_disable_hist_interrupt(vlv_config);
++	}
++
++	return ret;
++}
++
++static int
++vlv_dpst_apply_luma(struct intel_dc_config *config,
++		struct dpst_initialize_context *ioctl_data)
++{
++	u32 diet_factor, i;
++	u32 blm_hist_ctl;
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++	struct intel_pipe  *pipe = config->pipes[vlv_config->dpst.pipe];
++
++	/* This is an invalid call if we are disabled by the user
++	 * If pipe_mismatch is true, the luma data is calculated from the
++	 * histogram from old pipe, ignore it */
++	if (!vlv_config->dpst.user_enable
++			|| vlv_config->dpst.pipe_mismatch)
++		return -EINVAL;
++
++	/* This is not an invalid call if we are disabled by the kernel,
++	 * because kernel disabling is transparent to the user and can easily
++	 * occur before user has completed in-progress adjustments. If in fact
++	 * we are disabled by the kernel, we must store the incoming values for
++	 * later restore. Image enhancement values are stored on the hardware,
++	 * because they will be safely ignored if the table is not enabled. */
++
++	/* Setup register to access image enhancement value from
++	 * index 0.*/
++	blm_hist_ctl = REG_READ(vlv_config->dpst.reg.blm_hist_ctl);
++	blm_hist_ctl |= BIN_REG_FUNCTION_SELECT_IE;
++	blm_hist_ctl &= ~BIN_REGISTER_INDEX_MASK;
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_ctl, blm_hist_ctl);
++
++	/* Program the image enhancement data passed from user mode. */
++	for (i = 0; i < DPST_DIET_ENTRY_COUNT; i++) {
++		diet_factor = ioctl_data->ie_container.
++			dpst_ie_st.factor_present[i] * 0x200 / 10000;
++		REG_WRITE(vlv_config->dpst.reg.blm_hist_bin, diet_factor);
++	}
++
++	if (vlv_config->dpst.kernel_disable) {
++		vlv_config->dpst.saved.is_valid = true;
++		vlv_config->dpst.saved.blc_adjustment =
++			ioctl_data->ie_container.dpst_blc_factor;
++		return 0;
++	}
++
++	/* Backlight settings */
++	vlv_config->dpst.blc_adjustment =
++		ioctl_data->ie_container.dpst_blc_factor;
++
++	 vlv_dpst_set_brightness(pipe, vlv_get_backlight(pipe));
++
++	 /* Enable Image Enhancement Table */
++	blm_hist_ctl = REG_READ(vlv_config->dpst.reg.blm_hist_ctl);
++	blm_hist_ctl |= IE_MOD_TABLE_ENABLE | ENHANCEMENT_MODE_MULT;
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_ctl, blm_hist_ctl);
++
++	return 0;
++}
++
++static void
++vlv_dpst_save_luma(struct intel_dc_config *config)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++
++	/* Only save if user mode has indeed applied valid settings which
++	 * we determine by checking that the IE mod table was enabled */
++	if (!(REG_READ(vlv_config->dpst.reg.blm_hist_ctl) &
++				IE_MOD_TABLE_ENABLE))
++		return;
++
++	/* IE mod table entries are saved in the hardware even if the table
++	 * is disabled, so we only need to save the backlight adjustment */
++	vlv_config->dpst.saved.is_valid = true;
++	vlv_config->dpst.saved.blc_adjustment = vlv_config->dpst.blc_adjustment;
++}
++
++static void
++vlv_dpst_restore_luma(struct intel_dc_config *config)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++	u32 blm_hist_ctl;
++	struct intel_pipe  *pipe = config->pipes[vlv_config->dpst.pipe];
++
++	/* Only restore if valid settings were previously saved */
++	if (!vlv_config->dpst.saved.is_valid)
++		return;
++
++	vlv_config->dpst.blc_adjustment = vlv_config->dpst.saved.blc_adjustment;
++
++	vlv_dpst_set_brightness(pipe, vlv_get_backlight(pipe));
++
++	/* IE mod table entries are saved in the hardware even if the table
++	 * is disabled, so we only need to re-enable the table */
++	blm_hist_ctl = REG_READ(vlv_config->dpst.reg.blm_hist_ctl);
++	blm_hist_ctl |= IE_MOD_TABLE_ENABLE | ENHANCEMENT_MODE_MULT;
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_ctl, blm_hist_ctl);
++}
++
++static int
++vlv_dpst_get_bin_data(struct intel_dc_config *config,
++		struct dpst_initialize_context *ioctl_data)
++{
++	u32 blm_hist_ctl, blm_hist_bin;
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++	u32 ioctl_type = ioctl_data->dpst_ioctl_type;
++	int index;
++	struct dpst_histogram_status *hist_stat =
++		&(ioctl_data->hist_status);
++	struct dpst_histogram_status_legacy *hist_stat_legacy =
++		&(ioctl_data->hist_status_legacy);
++
++	/* We may be disabled by request from kernel or user. Kernel mode
++	 * disablement is without user mode knowledge. Kernel mode disablement
++	 * can occur between the signal to user and user's follow-up call to
++	 * retrieve the data, so return the data as usual. User mode
++	 * disablement makes this an invalid call, so return error. */
++	if (!vlv_config->dpst.enabled && !vlv_config->dpst.user_enable)
++		return -EINVAL;
++	else if (!vlv_config->dpst.enabled &&
++			ioctl_type == DPST_GET_BIN_DATA) {
++		/* Convey to user that dpst has been disabled
++		 * from kernel. */
++		ioctl_data->hist_status.dpst_disable = 1;
++		return 0;
++	}
++
++	/* Setup register to access bin data from index 0 */
++	blm_hist_ctl = REG_READ(vlv_config->dpst.reg.blm_hist_ctl);
++	blm_hist_ctl = blm_hist_ctl & ~(BIN_REGISTER_INDEX_MASK |
++						BIN_REG_FUNCTION_SELECT_IE);
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_ctl, blm_hist_ctl);
++
++	/* Read all bin data */
++	for (index = 0; index < HIST_BIN_COUNT; index++) {
++		blm_hist_bin = REG_READ(vlv_config->dpst.reg.blm_hist_bin);
++
++		if (!(blm_hist_bin & BUSY_BIT)) {
++			if (ioctl_type == DPST_GET_BIN_DATA)
++				hist_stat->histogram_bins.status[index]
++				   = blm_hist_bin &
++				    vlv_config->dpst.reg.blm_hist_bin_count_mask;
++			else
++				hist_stat_legacy->histogram_bins.status[index]
++				   = blm_hist_bin &
++				    vlv_config->dpst.reg.blm_hist_bin_count_mask;
++		} else {
++			/* Engine is busy. Reset index to 0 to grab
++			 * fresh histogram data */
++			index = -1;
++			blm_hist_ctl = REG_READ(
++					vlv_config->dpst.reg.blm_hist_ctl);
++			blm_hist_ctl = blm_hist_ctl &
++				       ~BIN_REGISTER_INDEX_MASK;
++			REG_WRITE(vlv_config->dpst.reg.blm_hist_ctl,
++				       blm_hist_ctl);
++		}
++	}
++
++	return 0;
++}
++
++static u32
++vlv_dpst_get_resolution(struct intel_dc_config *config)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++	struct drm_mode_modeinfo *mode;
++	struct intel_pipe *pipe = config->pipes[vlv_config->dpst.pipe];
++
++	if (!pipe || !pipe->ops || !pipe->ops->get_preferred_mode)
++		return 0;
++
++	/* Get information about current display mode */
++	pipe->ops->get_preferred_mode(pipe, &mode);
++
++	return  mode->hdisplay * mode->vdisplay;
++}
++
++static int
++vlv_dpst_update_registers(struct intel_dc_config *config)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++
++	vlv_config->dpst.reg.blm_hist_ctl = VLV_BLC_HIST_CTL(PIPE_A);
++	vlv_config->dpst.reg.blm_hist_guard = VLV_BLC_HIST_GUARD(PIPE_A);
++	vlv_config->dpst.reg.blm_hist_bin = VLV_BLC_HIST_BIN(PIPE_A);
++	vlv_config->dpst.reg.blm_hist_bin_count_mask = BIN_COUNT_MASK_4M;
++	return 0;
++};
++
++static bool
++vlv_dpst_update_context(struct intel_dc_config *config)
++{
++	u32 cur_resolution, blm_hist_guard, gb_threshold;
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++
++	cur_resolution = vlv_dpst_get_resolution(config);
++
++	if (!cur_resolution)
++		return false;
++
++	if (vlv_config->dpst.init_image_res != cur_resolution) {
++		pr_err("DPST does not support resolution switch on the fly");
++		return false;
++	}
++
++	gb_threshold = (DEFAULT_GUARDBAND_VAL * cur_resolution)/1000;
++
++	if (vlv_dpst_update_registers(config))
++		return false;
++
++	/* Setup guardband delays and threshold */
++	blm_hist_guard = REG_READ(vlv_config->dpst.reg.blm_hist_guard);
++	blm_hist_guard |= (vlv_config->dpst.gb_delay << 22)
++			| gb_threshold;
++	REG_WRITE(vlv_config->dpst.reg.blm_hist_guard, blm_hist_guard);
++
++	return true;
++}
++
++void
++vlv_dpst_display_off()
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(g_config);
++	struct intel_pipe *pipe = g_config->pipes[vlv_config->dpst.pipe];
++
++	/* Check if dpst is user enabled*/
++	if (!vlv_config->dpst.user_enable)
++		return;
++
++	mutex_lock(&vlv_config->dpst.ioctl_lock);
++	/* Set the flag to reject all the subsequent DPST ioctls
++	 * till the Display is turned on again
++	 */
++	vlv_config->dpst.display_off = true;
++	vlv_dpst_disable_hist_interrupt(vlv_config);
++	mutex_unlock(&vlv_config->dpst.ioctl_lock);
++	/* Send a fake signal to user, so that the user can be notified
++	 * to reset the dpst context, to avoid any mismatch of blc_adjusment
++	 * between user and kernel on resume. */
++	vlv_dpst_irq_handler(pipe);
++}
++
++void
++vlv_dpst_display_on()
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(g_config);
++
++	if (!vlv_config->dpst.user_enable
++			|| !vlv_dpst_save_conn_config(g_config))
++		return;
++
++	mutex_lock(&vlv_config->dpst.ioctl_lock);
++
++	if (vlv_dpst_update_context(g_config)
++			&& !vlv_config->dpst.kernel_disable)
++		vlv_dpst_enable_hist_interrupt(vlv_config);
++
++	vlv_config->dpst.display_off = false;
++	mutex_unlock(&vlv_config->dpst.ioctl_lock);
++}
++
++static int
++vlv_dpst_context_init(struct dpst_initialize_context *ioctl_data)
++{
++	struct pid *cur_pid;
++	struct intel_dc_config *config = g_config;
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++
++	vlv_config->dpst.signal = ioctl_data->init_data.sig_num;
++	vlv_config->dpst.gb_delay = ioctl_data->init_data.gb_delay;
++	vlv_config->dpst.pipe_mismatch = false;
++
++	/* Store info needed to talk to user mode */
++	cur_pid = get_task_pid(current, PIDTYPE_PID);
++	put_pid(vlv_config->dpst.pid);
++	vlv_config->dpst.pid = cur_pid;
++	vlv_config->dpst.signal = ioctl_data->init_data.sig_num;
++
++	if (!vlv_dpst_save_conn_config(g_config))
++		return -EINVAL;
++
++	ioctl_data->init_data.image_res = vlv_dpst_get_resolution(config);
++	vlv_config->dpst.init_image_res = ioctl_data->init_data.image_res;
++
++	if (!vlv_dpst_update_context(config))
++		return -EINVAL;
++
++	/* Init is complete so request enablement */
++	return vlv_dpst_set_user_enable(config, true);
++}
++
++void
++vlv_dpst_irq_handler(struct intel_pipe *pipe)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(g_config);
++
++	/* Check if user-mode need to be aware of this interrupt */
++	if (pipe->base.idx != vlv_config->dpst.pipe)
++		return;
++
++	/* reset to false when get the interrupt on current pipe */
++	vlv_config->dpst.pipe_mismatch = false;
++
++	/* Notify user mode of the interrupt */
++	if (vlv_config->dpst.pid != NULL) {
++		if (kill_pid_info(vlv_config->dpst.signal, SEND_SIG_FORCED,
++							vlv_config->dpst.pid)) {
++			put_pid(vlv_config->dpst.pid);
++			vlv_config->dpst.pid = NULL;
++		}
++	}
++}
++
++int
++vlv_dpst_context(unsigned long args)
++{
++	struct dpst_initialize_context *ioctl_data = NULL;
++	int ret = -EINVAL;
++	struct intel_dc_config *config = g_config;
++	struct vlv_dc_config *vlv_config;
++
++	if (!g_config)
++		return -EINVAL;
++
++	vlv_config = to_vlv_dc_config(config);
++
++	/* Can be called from multiple usermode, prevent race condition */
++	mutex_lock(&vlv_config->dpst.ioctl_lock);
++
++	ioctl_data = (struct dpst_initialize_context __user *) args;
++
++	/* If Display is currently off (could be power gated also),
++	 * don't service the ioctls other than GET_BIN_DATA
++	 */
++	if (vlv_config->dpst.display_off &&
++		(ioctl_data->dpst_ioctl_type != DPST_GET_BIN_DATA_LEGACY &&
++			ioctl_data->dpst_ioctl_type != DPST_GET_BIN_DATA)) {
++		pr_err("Display is off\n");
++		mutex_unlock(&vlv_config->dpst.ioctl_lock);
++		return -EINVAL;
++	}
++
++	switch (ioctl_data->dpst_ioctl_type) {
++	case DPST_ENABLE:
++		ret = vlv_dpst_set_user_enable(config, true);
++	break;
++
++	case DPST_DISABLE:
++		ret = vlv_dpst_set_user_enable(config, false);
++	break;
++
++	case DPST_INIT_DATA:
++		ret = vlv_dpst_context_init(ioctl_data);
++	break;
++
++	case DPST_GET_BIN_DATA_LEGACY:
++	case DPST_GET_BIN_DATA:
++		ret = vlv_dpst_get_bin_data(config, ioctl_data);
++	break;
++
++	case DPST_APPLY_LUMA:
++		ret = vlv_dpst_apply_luma(config, ioctl_data);
++	break;
++
++	case DPST_RESET_HISTOGRAM_STATUS:
++		ret = vlv_dpst_clear_hist_interrupt(config);
++	break;
++
++	default:
++		pr_err("Invalid DPST ioctl type\n");
++	break;
++	}
++
++	mutex_unlock(&vlv_config->dpst.ioctl_lock);
++	return ret;
++}
++
++int
++vlv_dpst_set_kernel_disable(struct vlv_dc_config *vlv_config, bool disable)
++{
++	struct intel_dc_config *config = g_config;
++	int ret = 0;
++
++	mutex_lock(&vlv_config->dpst.ioctl_lock);
++
++	vlv_config->dpst.kernel_disable = disable;
++
++	if (disable && vlv_config->dpst.enabled) {
++		vlv_dpst_save_luma(config);
++		ret = vlv_dpst_disable_hist_interrupt(vlv_config);
++	} else if (!disable && vlv_config->dpst.user_enable) {
++		ret = vlv_dpst_enable_hist_interrupt(vlv_config);
++		if (!ret)
++			vlv_dpst_restore_luma(config);
++	}
++
++	mutex_unlock(&vlv_config->dpst.ioctl_lock);
++
++	return ret;
++}
++
++
++void vlv_dpst_init(struct intel_dc_config *config)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++	mutex_init(&vlv_config->dpst.ioctl_lock);
++	g_config = config;
++}
++
++void vlv_dpst_teardown(void)
++{
++	g_config = NULL;
++}
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_mode_set.c b/drivers/video/adf/intel/core/vlv/vlv_mode_set.c
+index 3495f9a..dac154b 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_mode_set.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_mode_set.c
+@@ -134,6 +134,9 @@ int vlv_display_on(struct intel_pipe *pipe)
+ 	/* enable vsyncs */
+ 	pipe->ops->set_event(pipe, INTEL_PIPE_EVENT_VSYNC, true);
+ 
++	/* Enable DPST */
++	vlv_dpst_display_on();
++
+ 	return 0;
+ }
+ 
+@@ -152,6 +155,9 @@ int vlv_display_off(struct intel_pipe *pipe)
+ 
+ 	index = pipe->base.idx;
+ 
++	/* Disable DPST */
++	vlv_dpst_display_off();
++
+ 	/* disable vsyncs */
+ 	pipe->ops->set_event(pipe, INTEL_PIPE_EVENT_VSYNC, false);
+ 
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 8ecc85a..bf7495b 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -280,6 +280,7 @@ struct intel_pipe {
+ 	enum intel_pipe_type type;
+ 	const struct intel_plane *primary_plane;
+ 	const struct intel_pipe_ops *ops;
++	bool dpst_enabled;
+ };
+ 
+ struct intel_dc_attachment {
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+index ff7e314..63daf81 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+@@ -23,6 +23,7 @@
+ #include <core/vlv/vlv_dc_config.h>
+ #include <core/vlv/vlv_pri_plane.h>
+ #include <core/vlv/vlv_sp_plane.h>
++#include <core/vlv/vlv_dpst.h>
+ 
+ #define VLV_N_PLANES	6
+ #define VLV_N_PIPES	2
+@@ -99,6 +100,7 @@ static inline void vlv_cck_write(u32 reg, u32 val)
+ 
+ struct vlv_dc_config {
+ 	struct intel_dc_config base;
++	struct vlv_dpst dpst;
+ 	struct vlv_disp {
+ 		struct vlv_pri_plane pplane;
+ 		struct vlv_sp_plane splane[2];
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dpst.h b/drivers/video/adf/intel/include/core/vlv/vlv_dpst.h
+new file mode 100644
+index 0000000..c6a2c96
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dpst.h
+@@ -0,0 +1,98 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Author:
++ *	Deepak S <deepak.s@intel.com>
++ */
++
++#ifndef VLV_DPST_H
++#define VLV_DPST_H
++
++#define VLV_DISPLAY_BASE 0x180000
++
++#define _PIPE(pipe, a, b) ((a) + (pipe)*((b)-(a)))
++
++/* DPST related registers */
++#define BLM_HIST_CTL	0x48260
++#define IE_HISTOGRAM_ENABLE	(1<<31)
++#define IE_MOD_TABLE_ENABLE	(1<<27)
++#define HSV_INTENSITY_MODE	(1<<24)
++#define ENHANCEMENT_MODE_MULT	(2<<13)
++#define BIN_REG_FUNCTION_SELECT_IE	(1<<11)
++#define BIN_REGISTER_INDEX_MASK	0x7F421
++#define BLM_HIST_BIN	0x48264
++#define BUSY_BIT	(1<<31)
++#define BIN_COUNT_MASK_4M	0x3FFFFF
++#define BIN_COUNT_MASK_16M	0xFFFFFF
++#define BLM_HIST_GUARD	0x48268
++#define HISTOGRAM_INTERRUPT_ENABLE	(1<<31)
++#define HISTOGRAM_EVENT_STATUS	(1<<30)
++#define HIST_BIN_COUNT	32
++
++#define _VLV_BLC_HIST_CTL_A (VLV_DISPLAY_BASE + 0x61260)
++#define _VLV_BLC_HIST_CTL_B (VLV_DISPLAY_BASE + 0x61360)
++#define VLV_BLC_HIST_CTL(pipe) _PIPE(pipe, _VLV_BLC_HIST_CTL_A, \
++				_VLV_BLC_HIST_CTL_B)
++
++#define _VLV_BLC_HIST_BIN_A (VLV_DISPLAY_BASE + 0x61264)
++#define _VLV_BLC_HIST_BIN_B (VLV_DISPLAY_BASE + 0x61364)
++#define VLV_BLC_HIST_BIN(pipe) _PIPE(pipe, _VLV_BLC_HIST_BIN_A, \
++				_VLV_BLC_HIST_BIN_B)
++
++#define _VLV_BLC_HIST_GUARD_A	(VLV_DISPLAY_BASE + 0x61268)
++#define _VLV_BLC_HIST_GUARD_B (VLV_DISPLAY_BASE + 0x61368)
++#define VLV_BLC_HIST_GUARD(pipe) _PIPE(pipe, _VLV_BLC_HIST_GUARD_A, \
++					_VLV_BLC_HIST_GUARD_B)
++
++extern struct vlv_dc_config *config;
++
++/* DPST information */
++struct vlv_dpst_registers {
++	uint32_t blm_hist_guard;
++	uint32_t blm_hist_ctl;
++	uint32_t blm_hist_bin;
++	uint32_t blm_hist_bin_count_mask;
++};
++
++struct vlv_dpst {
++	struct pid *pid;
++	u32 pipe;
++	u32 signal;
++	u32 blc_adjustment;
++	u32 gb_delay;
++	u32 init_image_res;
++	bool user_enable; /*user client wishes to enable */
++	bool kernel_disable; /* kernel override wishes to disable */
++	bool enabled; /* actual functional state */
++	/* Indicates pipe mismatch between user mode and kernel */
++	bool pipe_mismatch;
++	/* Indicates that Display is off (could be power gated also) */
++	bool display_off;
++	struct {
++		bool is_valid;
++		u32 blc_adjustment;
++	} saved;
++
++	struct mutex ioctl_lock;
++	struct vlv_dpst_registers reg;
++};
++
++extern void vlv_wait_for_vblank(int pipe);
++void vlv_dpst_init(struct intel_dc_config *config);
++void vlv_dpst_teardown(void);
++void vlv_dpst_irq_handler(struct intel_pipe *pipe);
++void vlv_dpst_display_on(void);
++void vlv_dpst_display_off(void);
++void vlv_dpst_set_brightness(struct intel_pipe *pipe, u32 brightness_val);
++#endif
++
++
+diff --git a/drivers/video/adf/intel/include/intel_adf.h b/drivers/video/adf/intel/include/intel_adf.h
+index 88910f1..b1ff070 100644
+--- a/drivers/video/adf/intel/include/intel_adf.h
++++ b/drivers/video/adf/intel/include/intel_adf.h
+@@ -27,6 +27,9 @@
+ #endif
+ #include "uapi/intel_adf.h"
+ 
++/* Custom IOCTL for Intel platforms */
++#define INTEL_ADF_DPST_CONTEXT		ADF_IOCTL_NR_CUSTOM
++
+ struct intel_adf_context {
+ 	struct intel_dc_config *dc_config;
+ 	struct intel_adf_device *dev;
+@@ -46,5 +49,7 @@ struct intel_adf_context {
+ extern struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev);
+ extern void intel_adf_context_destroy(struct intel_adf_context *ctx);
+ extern int intel_adf_context_on_event(void);
+-
++extern int intel_adf_map_dma_to_flip(unsigned long args);
++extern int intel_adf_unmap_dma_to_flip(unsigned long args);
++extern int vlv_dpst_context(unsigned long args);
+ #endif /* INTEL_ADF_H_ */
+diff --git a/drivers/video/adf/intel/intel_adf_interface.c b/drivers/video/adf/intel/intel_adf_interface.c
+index 2236c00..a0a3ee4 100644
+--- a/drivers/video/adf/intel/intel_adf_interface.c
++++ b/drivers/video/adf/intel/intel_adf_interface.c
+@@ -16,10 +16,24 @@
+ #include <video/adf_client.h>
+ #include "intel_adf.h"
+ 
++#ifdef CONFIG_ADF_INTEL_VLV
++#include <core/vlv/vlv_dpst.h>
++#endif
++
++/* Custom IOCTL */
+ static long intel_interface_obj_ioctl(struct adf_obj *obj,
+ 	unsigned int cmd, unsigned long arg)
+ {
+-	return -EOPNOTSUPP;
++
++	/* Custom IOCTL commands */
++	switch (cmd) {
++	case INTEL_ADF_DPST_CONTEXT:
++		return vlv_dpst_context(arg);
++	default:
++		pr_debug("%s: Error: Invalid custom IOCTL\n", __func__);
++	}
++
++	return -EINVAL;
+ }
+ 
+ static u32 to_intel_pipe_event(enum adf_event_type event)
+@@ -335,6 +349,9 @@ int intel_adf_interface_handle_event(struct intel_adf_interface *intf)
+ 		events &= ~INTEL_PIPE_EVENT_HOTPLUG_DISCONNECTED;
+ 	}
+ 
++	if (events && INTEL_PIPE_EVENT_DPST)
++		vlv_dpst_irq_handler(pipe);
++
+ 	if (events && pipe->ops->handle_events)
+ 		pipe->ops->handle_events(pipe, events);
+ 
+diff --git a/include/uapi/video/adf.h b/include/uapi/video/adf.h
+index b703bf9..f3fabf7 100644
+--- a/include/uapi/video/adf.h
++++ b/include/uapi/video/adf.h
+@@ -293,6 +293,7 @@ struct adf_overlay_engine_data {
+ 	size_t custom_data_size;
+ 	void __user *custom_data;
+ };
++
+ #define ADF_MAX_SUPPORTED_FORMATS (4096 / sizeof(__u32))
+ 
+ #define ADF_IOCTL_TYPE		'D'
+-- 
+1.7.9.5
+

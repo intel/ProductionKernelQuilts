@@ -1,0 +1,106 @@
+From b87e1e8996ee1ba9dd3f3a7f8c51ac7f4f6a0130 Mon Sep 17 00:00:00 2001
+Message-Id: <b87e1e8996ee1ba9dd3f3a7f8c51ac7f4f6a0130.1421395644.git.chang-joon.lee@intel.com>
+In-Reply-To: <87b3fd6ee09eca535f11edc6180f37fb5c67ac4d.1421395644.git.chang-joon.lee@intel.com>
+References: <87b3fd6ee09eca535f11edc6180f37fb5c67ac4d.1421395644.git.chang-joon.lee@intel.com>
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 31 Oct 2014 13:53:52 +0000
+Subject: [PATCH 4/7] FROM_UPSTREAM [VPG]: drm/i915: Only mark as
+ map-and-fenceable when bound into the GGTT
+
+We use the obj->map_and_fenceable hint for when we already have a
+valid mapping of this object in the aperture. This hint can only apply
+to the GGTT and not to the aliasing-ppGTT. One user of the hint is
+execbuffer relocation, which began to fail when it tried to follow the
+hint and perform the relocate through the non-existent GGTT mapping.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=85671
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+Backport note, replaced vma->bound to obj->has_global_gtt_mapping as
+this is a fairly new change that is not present in GMINL.
+
+Change-Id: I38659572f26f35693df01d5cd59b90f4bce01254
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: ef79e17ccef32599f3cec3842f81d70117181291
+Upstream-as-of-tag: na
+For: GMINL-4004
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c |   39 +++++++++++++++++++++++++--------------
+ 1 file changed, 25 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 315ffca..254e37f 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3685,20 +3685,6 @@ search_free:
+ 	list_move_tail(&obj->global_list, &dev_priv->mm.bound_list);
+ 	list_add_tail(&vma->mm_list, &vm->inactive_list);
+ 
+-	if (i915_is_ggtt(vm)) {
+-		bool mappable, fenceable;
+-
+-		fenceable = (vma->node.size == fence_size &&
+-			     (vma->node.start & (fence_alignment - 1)) == 0);
+-
+-		mappable = (vma->node.start + obj->base.size <=
+-			    dev_priv->gtt.mappable_end);
+-
+-		obj->map_and_fenceable = mappable && fenceable;
+-	}
+-
+-	WARN_ON(flags & PIN_MAPPABLE && !obj->map_and_fenceable);
+-
+ 	trace_i915_vma_bind(vma, flags);
+ 	vma->bind_vma(vma, obj->cache_level,
+ 		      flags & (PIN_MAPPABLE | PIN_GLOBAL) ? GLOBAL_BIND : 0);
+@@ -4270,6 +4256,7 @@ i915_gem_object_pin(struct drm_i915_gem_object *obj,
+ {
+ 	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
+ 	struct i915_vma *vma;
++	unsigned bound;
+ 	int ret;
+ 
+ 	if (WARN_ON(vm == &dev_priv->mm.aliasing_ppgtt->base))
+@@ -4320,6 +4307,7 @@ i915_gem_object_pin(struct drm_i915_gem_object *obj,
+ 		}
+ 	}
+ 
++	bound = vma ? obj->has_global_gtt_mapping : 0;
+ 	if (vma == NULL || !drm_mm_node_allocated(&vma->node)) {
+ 		vma = i915_gem_object_bind_to_vm(obj, vm, alignment, flags);
+ 		if (IS_ERR(vma))
+@@ -4329,6 +4317,29 @@ i915_gem_object_pin(struct drm_i915_gem_object *obj,
+ 	if (flags & PIN_GLOBAL && !obj->has_global_gtt_mapping)
+ 		vma->bind_vma(vma, obj->cache_level, GLOBAL_BIND);
+ 
++	if ((bound ^ obj->has_global_gtt_mapping) & GLOBAL_BIND) {
++		bool mappable, fenceable;
++		u32 fence_size, fence_alignment;
++
++		fence_size = i915_gem_get_gtt_size(obj->base.dev,
++						   obj->base.size,
++						   obj->tiling_mode);
++		fence_alignment = i915_gem_get_gtt_alignment(obj->base.dev,
++							     obj->base.size,
++							     obj->tiling_mode,
++							     true);
++
++		fenceable = (vma->node.size == fence_size &&
++			     (vma->node.start & (fence_alignment - 1)) == 0);
++
++		mappable = (vma->node.start + obj->base.size <=
++			    dev_priv->gtt.mappable_end);
++
++		obj->map_and_fenceable = mappable && fenceable;
++	}
++
++	WARN_ON(flags & PIN_MAPPABLE && !obj->map_and_fenceable);
++
+ 	vma->pin_count++;
+ 	if (flags & PIN_MAPPABLE)
+ 		obj->pin_mappable |= true;
+-- 
+1.7.9.5
+

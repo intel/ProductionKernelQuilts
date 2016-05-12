@@ -1,0 +1,168 @@
+From 45df5e61f27355fa9db752c15ae62f6739c12dd5 Mon Sep 17 00:00:00 2001
+From: Daniel Drubin <daniel.drubin@intel.com>
+Date: Tue, 9 Jun 2015 19:52:49 +0300
+Subject: [PATCH] Fixed power-off control path. Made .remove() of ISH device
+ set corresponding HECI device state to "disabled" and made HECI/IPC level
+ communication regard this setting and drop all communication in both
+ directions
+
+Change-Id: I3e92dfd966f1def35fe70927a9c5918ec0e9f292
+Signed-off-by: Daniel Drubin <daniel.drubin@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1827
+---
+ drivers/misc/heci/bus.c             |  4 +++-
+ drivers/misc/heci/client.c          |  1 +
+ drivers/misc/heci/heci_dev.h        |  1 +
+ drivers/misc/heci/hw-ish.c          | 23 +++++++++++++++++++++++
+ drivers/misc/heci/pci-ish.c         | 12 ++++++++----
+ drivers/misc/heci/platform-config.h |  4 ++--
+ 6 files changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/misc/heci/bus.c b/drivers/misc/heci/bus.c
+index 0f2b3b458498..7c32a952ddd9 100644
+--- a/drivers/misc/heci/bus.c
++++ b/drivers/misc/heci/bus.c
+@@ -259,7 +259,7 @@ void	heci_bus_remove_all_clients(struct heci_device *heci_dev)
+ 
+ 	spin_lock_irqsave(&heci_dev->cl_list_lock, flags);
+ 	list_for_each_entry_safe(cl, next, &heci_dev->cl_list, link) {
+-		list_del(&cl->link);
++/*		list_del(&cl->link);*/
+ 		cl->state = HECI_CL_DISCONNECTED;
+ 
+ 		/*
+@@ -323,8 +323,10 @@ void	heci_bus_remove_all_clients(struct heci_device *heci_dev)
+ 	heci_dev->me_client_presentation_num  = 0;
+ 	heci_dev->me_client_index = 0;
+ 	bitmap_zero(heci_dev->me_clients_map, HECI_CLIENTS_MAX);
++/*
+ 	bitmap_zero(heci_dev->host_clients_map, HECI_CLIENTS_MAX);
+ 	bitmap_set(heci_dev->host_clients_map, 0, 3);
++*/
+ 	spin_unlock_irqrestore(&heci_dev->me_clients_lock, flags);
+ 	ISH_DBG_PRINT(KERN_ALERT "%s(): ---\n", __func__);
+ }
+diff --git a/drivers/misc/heci/client.c b/drivers/misc/heci/client.c
+index dcf8e188453f..b9acd6e21c70 100644
+--- a/drivers/misc/heci/client.c
++++ b/drivers/misc/heci/client.c
+@@ -400,6 +400,7 @@ void	heci_cl_free(struct heci_cl *cl)
+ 	heci_cl_free_tx_ring(cl);
+ 	kfree(cl);
+ }
++EXPORT_SYMBOL(heci_cl_free);
+ 
+ 
+ /**
+diff --git a/drivers/misc/heci/heci_dev.h b/drivers/misc/heci/heci_dev.h
+index a2349d30b977..3e6699f945e6 100644
+--- a/drivers/misc/heci/heci_dev.h
++++ b/drivers/misc/heci/heci_dev.h
+@@ -278,6 +278,7 @@ void heci_device_init(struct heci_device *dev);
+ void heci_reset(struct heci_device *dev, int interrupts);
+ int heci_start(struct heci_device *dev);
+ void heci_stop(struct heci_device *dev);
++void	heci_device_disable(struct heci_device *dev);
+ 
+ static inline unsigned long heci_secs_to_jiffies(unsigned long sec)
+ {
+diff --git a/drivers/misc/heci/hw-ish.c b/drivers/misc/heci/hw-ish.c
+index 30fed051cde0..98025da686b4 100644
+--- a/drivers/misc/heci/hw-ish.c
++++ b/drivers/misc/heci/hw-ish.c
+@@ -260,6 +260,10 @@ int write_ipc_from_queue(struct heci_device *dev)
+ 	unsigned long	out_ipc_flags;
+ 
+ 	ISH_DBG_PRINT(KERN_ALERT "%s(): +++\n", __func__);
++
++	if (dev->dev_state == HECI_DEV_DISABLED)
++		return	-EINVAL;
++
+ 	spin_lock_irqsave(&dev->out_ipc_spinlock, out_ipc_flags);
+ 	if (out_ipc_locked) {
+ 		spin_unlock_irqrestore(&dev->out_ipc_spinlock, out_ipc_flags);
+@@ -554,6 +558,10 @@ irqreturn_t ish_irq_handler(int irq, void *dev_id)
+ 
+ 	ISH_DBG_PRINT(KERN_ALERT "%s(): irq=%d +++\n", __func__, irq);
+ 
++	/* CHECKME: double check this */
++	if (dev->dev_state == HECI_DEV_DISABLED)
++		return	IRQ_NONE;
++
+ 	/* Check that it's interrupt from ISH (may be shared) */
+ 	pisr_val = ish_reg_read(dev, IPC_REG_PISR);
+ 	interrupt_generated = IPC_INT_FROM_ISH_TO_HOST(pisr_val);
+@@ -893,3 +901,18 @@ struct heci_device *ish_dev_init(struct pci_dev *pdev)
+ 	return dev;
+ }
+ 
++
++void	heci_device_disable(struct heci_device *dev)
++{
++	unsigned long	flags;
++	struct wr_msg_ctl_info	*ipc_link;
++	struct heci_cl	*cl;
++
++	dev->dev_state = HECI_DEV_DISABLED;
++	ish_clr_host_rdy(dev);
++	ish_intr_disable(dev);
++
++	/* Free all other allocations */
++	kfree(dev->me_clients);
++}
++
+diff --git a/drivers/misc/heci/pci-ish.c b/drivers/misc/heci/pci-ish.c
+index cf437019b248..5004d26b1aed 100644
+--- a/drivers/misc/heci/pci-ish.c
++++ b/drivers/misc/heci/pci-ish.c
+@@ -1051,8 +1051,8 @@ static void ish_remove(struct pci_dev *pdev)
+ 	struct ish_hw *hw;
+ 
+ 	/*
+-	 *** If this case of removal is viable,
+-	 * also go through HECI clients removal ***
++	 * This happens during power-off/reboot and may be at the same time as
++	 * a lot of bi-directional communication happens
+ 	 */
+ 	if (heci_pci_device != pdev) {
+ 		dev_err(&pdev->dev, "heci: heci_pci_device != pdev\n");
+@@ -1067,8 +1067,12 @@ static void ish_remove(struct pci_dev *pdev)
+ 
+ 	hw = to_ish_hw(dev);
+ 
+-	/* disable interrupts */
+-	ish_intr_disable(dev);
++	/*
++	 * Set HECI device state to disabled.
++	 * Invalidate all other possible communication in both directions
++	 */
++	heci_device_disable(dev);
++
+ 	free_irq(pdev->irq, dev);
+ 	pci_disable_msi(pdev);
+ 	pci_iounmap(pdev, hw->mem_addr);
+diff --git a/drivers/misc/heci/platform-config.h b/drivers/misc/heci/platform-config.h
+index 140601758fe1..02e130702361 100644
+--- a/drivers/misc/heci/platform-config.h
++++ b/drivers/misc/heci/platform-config.h
+@@ -17,7 +17,7 @@
+ #define PLATFORM_CONFIG__H
+ 
+ /* Build ID string */
+-#define	BUILD_ID	"0174-imin-reset-flow-private-prop"
++#define	BUILD_ID	"0178-poweroff-fix"
+ 
+ #define	ISH_DEBUG	0
+ #if ISH_DEBUG
+@@ -33,7 +33,7 @@
+ #define	ISH_INFO_PRINT	no_printk
+ #endif
+ 
+-#define ISH_LOG		1
++#define ISH_LOG		0
+ 
+ #if 0
+ /*
+-- 
+1.9.1
+

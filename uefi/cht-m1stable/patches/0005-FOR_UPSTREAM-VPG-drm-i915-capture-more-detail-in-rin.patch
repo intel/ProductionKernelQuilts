@@ -1,0 +1,115 @@
+From 9cbe5de8fc0a6728d9ea514cfbd2c5034954372b Mon Sep 17 00:00:00 2001
+Message-Id: <9cbe5de8fc0a6728d9ea514cfbd2c5034954372b.1417780878.git.chang-joon.lee@intel.com>
+In-Reply-To: <cb098d33cdac3271103834fbce08218248d7bddb.1417780878.git.chang-joon.lee@intel.com>
+References: <cb098d33cdac3271103834fbce08218248d7bddb.1417780878.git.chang-joon.lee@intel.com>
+From: Dave Gordon <david.s.gordon@intel.com>
+Date: Mon, 11 Aug 2014 17:54:58 +0100
+Subject: [PATCH 05/34] FOR_UPSTREAM [VPG]: drm/i915: capture more detail in
+ ringbuf & LRC request error dump
+
+When analysing error dumps, it's useful to know the state of the
+ringbuf structures, such as last_retired_head. Also, in LRC mode,
+we need to know the context as well as the tail pointer for each
+request in the request queue. This code captures and dumps the
+extra information.
+
+v2: (Tomas Elf)
+Fixed compiler warning in err_printf format string (%x -> %p).
+Fixed various type inconsistencies.
+
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+Signed-off-by: Tomas Elf <tomas.elf@intel.com>
+Issue: GMIN-3575
+Tracked-On: https://jira01.devtools.intel.com/browse/GMIN-3575
+Change-Id: Iaf92fd081f2a7ba99eee7284c1f601e221249b1f
+---
+ drivers/gpu/drm/i915/i915_drv.h       |    8 +++++++-
+ drivers/gpu/drm/i915/i915_gpu_error.c |   19 ++++++++++++++++---
+ 2 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 735d30d..4045ca6 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -367,6 +367,10 @@ struct drm_i915_error_state {
+ 		int num_requests;
+ 
+ 		/* our own tracking of ring head and tail */
++		struct intel_context *ring_context;
++		int size;
++		int space;
++		u32 last_retired_head;
+ 		u32 cpu_ring_head;
+ 		u32 cpu_ring_tail;
+ 
+@@ -398,9 +402,11 @@ struct drm_i915_error_state {
+ 		} *ringbuffer, *batchbuffer, *wa_batchbuffer, *ctx, *hws_page;
+ 
+ 		struct drm_i915_error_request {
++			struct intel_context *ctx;
+ 			long jiffies;
+-			u32 seqno;
++			u32 head;
+ 			u32 tail;
++			u32 seqno;
+ 		} *requests;
+ 
+ 		struct {
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 20ea5e4..2b282c7 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -300,6 +300,11 @@ static void i915_ring_error_state(struct drm_i915_error_state_buf *m,
+ 	}
+ 	err_printf(m, "  seqno: 0x%08x\n", ring->seqno);
+ 	err_printf(m, "  waiting: %s\n", yesno(ring->waiting));
++
++	err_printf(m, "  ring->ctx: %p\n", ring->ring_context);
++	err_printf(m, "  ring->size: 0x%08x\n", (unsigned int) ring->size);
++	err_printf(m, "  ring->space: 0x%08x\n", (unsigned int) ring->space);
++	err_printf(m, "  ring->last_retired_head: 0x%08x\n", ring->last_retired_head);
+ 	err_printf(m, "  ring->head: 0x%08x\n", ring->cpu_ring_head);
+ 	err_printf(m, "  ring->tail: 0x%08x\n", ring->cpu_ring_tail);
+ 	err_printf(m, "  hangcheck: %s\n",
+@@ -416,10 +421,12 @@ int i915_error_state_to_str(struct drm_i915_error_state_buf *m,
+ 				   dev_priv->ring[i].name,
+ 				   error->ring[i].num_requests);
+ 			for (j = 0; j < error->ring[i].num_requests; j++) {
+-				err_printf(m, "  seqno 0x%08x, emitted %ld, tail 0x%08x\n",
++				err_printf(m, "  seqno 0x%08x, emitted %ld, tail 0x%08x [head 0x%x ctx %p]\n",
+ 					   error->ring[i].requests[j].seqno,
+ 					   error->ring[i].requests[j].jiffies,
+-					   error->ring[i].requests[j].tail);
++					   error->ring[i].requests[j].tail,
++					   error->ring[i].requests[j].head,
++					   error->ring[i].requests[j].ctx);
+ 			}
+ 		}
+ 
+@@ -977,6 +984,10 @@ static void i915_gem_record_rings(struct drm_device *dev,
+ 		} else
+ 			rbuf = ring->buffer;
+ 
++		error->ring[i].ring_context = rbuf->ctx;
++		error->ring[i].size = rbuf->size;
++		error->ring[i].space = rbuf->space;
++		error->ring[i].last_retired_head = rbuf->last_retired_head;
+ 		error->ring[i].cpu_ring_head = rbuf->head;
+ 		error->ring[i].cpu_ring_tail = rbuf->tail;
+ 
+@@ -1006,9 +1017,11 @@ static void i915_gem_record_rings(struct drm_device *dev,
+ 			struct drm_i915_error_request *erq;
+ 
+ 			erq = &error->ring[i].requests[count++];
++			erq->ctx = request->ctx;
++			erq->head = request->head;
++			erq->tail = request->tail;
+ 			erq->seqno = request->seqno;
+ 			erq->jiffies = request->emitted_jiffies;
+-			erq->tail = request->tail;
+ 		}
+ 	}
+ }
+-- 
+1.7.9.5
+

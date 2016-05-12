@@ -1,0 +1,114 @@
+From 989f3b171b7194b5c8abd36b0a5554728f8c70bb Mon Sep 17 00:00:00 2001
+Message-Id: <989f3b171b7194b5c8abd36b0a5554728f8c70bb.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 2 Apr 2014 11:33:13 +0100
+Subject: [PATCH 22/61] FOR_UPSTREAM [VPG]: drm/i915: Disable hardware
+ semaphores when GPU scheduler is enabled
+
+Hardware sempahores require seqno values to be continuously incrementing.
+However, the scheduler's reordering of batch buffers means that the seqno values
+going through the hardware could be out of order. Thus semaphores can not be
+used.
+
+On the other hand, the scheduler superceeds the need for hardware semaphores
+anyway. Having one ring stall waiting for something to complete on another ring
+is inefficient if that ring could be working on some other, independent task.
+This is what the scheduler is meant to do - keep the hardware as busy as
+possible by reordering batch buffers to avoid dependency stalls.
+
+Change-Id: I95d1fceacd370455a9720d7dca55cfd0a1f6beaa
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.c         |    9 +++++++++
+ drivers/gpu/drm/i915/i915_scheduler.c   |    7 +++++++
+ drivers/gpu/drm/i915/i915_scheduler.h   |    1 +
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    4 ++++
+ 4 files changed, 21 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 93f95ac..2010810 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -34,6 +34,7 @@
+ #include "i915_trace.h"
+ #include "intel_drv.h"
+ #include "intel_lrc_tdr.h"
++#include "i915_scheduler.h"
+ 
+ #include <linux/console.h>
+ #include <linux/module.h>
+@@ -514,6 +515,14 @@ void intel_detect_stepping(struct drm_device *dev)
+ 
+ bool i915_semaphore_is_enabled(struct drm_device *dev)
+ {
++	/* Hardware semaphores are not compatible with the scheduler due to the
++	 * seqno values being potentially out of order. However, semaphores are
++	 * also not required as the scheduler will handle interring dependencies
++	 * and try do so in a way that does not cause dead time on the hardware.
++	 */
++	if (i915_scheduler_is_enabled(dev))
++		return 0;
++
+ 	if (INTEL_INFO(dev)->gen < 6)
+ 		return false;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index b11cd69..a0b64b3 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -41,6 +41,13 @@ int         i915_scheduler_priority_bump(struct i915_scheduler *scheduler,
+ 				struct i915_scheduler_queue_entry *target,
+ 				uint32_t bump);
+ 
++bool i915_scheduler_is_enabled(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	return dev_priv->scheduler != NULL;
++}
++
+ int i915_scheduler_init(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 81a555f..619a192 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -83,6 +83,7 @@ enum {
+ 	i915_sf_submitting          = (1 << 1),
+ };
+ 
++bool        i915_scheduler_is_enabled(struct drm_device *dev);
+ int         i915_scheduler_init(struct drm_device *dev);
+ int         i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe);
+ int         i915_scheduler_handle_irq(struct intel_engine_cs *ring);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index ce2feba..4e1b38a 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -33,6 +33,7 @@
+ #include "i915_trace.h"
+ #include "intel_sync.h"
+ #include "intel_drv.h"
++#include "i915_scheduler.h"
+ 
+ bool
+ intel_ring_initialized(struct intel_engine_cs *ring)
+@@ -1484,6 +1485,9 @@ gen6_ring_sync(struct intel_engine_cs *waiter,
+ 	u32 wait_mbox = signaller->semaphore.mbox.wait[waiter->id];
+ 	int ret;
+ 
++	/* Arithmetic on sequence numbers is unreliable with a scheduler. */
++	BUG_ON(i915_scheduler_is_enabled(signaller->dev));
++
+ 	/* Throughout all of the GEM code, seqno passed implies our current
+ 	 * seqno is >= the last seqno executed. However for hardware the
+ 	 * comparison is strictly greater than.
+-- 
+1.7.9.5
+

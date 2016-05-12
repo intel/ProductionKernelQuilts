@@ -1,0 +1,206 @@
+From ef17c5c2515f3e728da7a223727d7d02e7c2ad5b Mon Sep 17 00:00:00 2001
+Message-Id: <ef17c5c2515f3e728da7a223727d7d02e7c2ad5b.1431284210.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: Tomas Elf <tomas.elf@intel.com>
+Date: Thu, 23 Apr 2015 15:59:55 +0100
+Subject: [PATCH 65/68] SQUASHME! [VPG]: drm/i915: Don't reference current
+ context from hang checker
+
+Previously in the TDR hang checker function (i915_hangcheck_sample) we have
+taken a reference to the currently running context and held that reference all
+the way through the hang check procedure. When dereferencing this context you
+would normally have to hold the struct_mutex but that is not possible in this
+particular instance since the hang checker needs to work even though another
+kernel thread might have hung holding the mutex (which would cause the hang
+checker to hang itself by trying to grab the struct_mutex). Therefore the
+problem has previously been that we've had to dereference the context without
+holding the struct_mutex. This is not always a problem but if you end up in a
+situation where the hang checker releases the last reference to the context
+then the hang checker thread becomes responsible for deallocating the context
+memory and that will trigger a fatal assert in the DRM layer if the
+struct_mutex is not held.
+
+One way around having to hold the struct_mutex when releasing the context
+reference is to make sure that there is currently at least one other
+outstanding reference to the context aside from the one that the hang checker
+is holding. One way of ensuring this is by making sure that the execlist code
+does not release its own reference while the hang checker is inspecting the
+context, which can be done by holding the execlist_lock. However, one problem
+that has been discovered - which this change fixes - is that you must obviously
+hold the execlist_lock as long as the context reference is to be maintained
+(not just during the dereference itself) otherwise the execlist code is free to
+dereference the context and then leave the hang checker holding the last
+reference, which brings us back to square one again. The problem is that it's
+not feasible for the hang checker to hold the execlist lock that long due to
+the increase in interrupt latency that would incur (since the execlist
+interrupt handler also depends on the execlist lock).
+
+The solution for all of this is for the hangchecker to not depend on the
+current context to begin with. Because, really, all we need to know in the hang
+checker is:
+
+1. Is the driver hung?
+
+2. If so, is TDR in a position to recover from the hang at this point in time?
+At this point we have to check the context submission status to make sure that
+the hardware and the driver share a consistent opinion about what context is
+currently running, which will allow us to recover from the hang. We actually
+don't depend on the currently running context for this - only the submission
+status.
+
+Since we don't actually have a dependence on the currently running context,
+only the context submission status, this change removes this dependency and
+instead makes it possible to ask for the currently running context in two ways:
+1) ask for a reference to the currently running context and 2) just ask for the
+context submission status.
+
+By simply asking for the status the hang checker is no longer exposed to the
+risk of having to dereference the last reference to the context without holding
+the struct_mutex, thereby circumventing the entire issue.
+
+SQUASHME! - This patch should be squashed into the following patch:
+    Author: Tomas Elf <tomas.elf@intel.com>
+    Date:   Fri Oct 24 13:57:09 2014 +0100
+    Change-Id: I45de965b4a81d93c135a74248eb22a8a5c816e9f
+    FOR_UPSTREAM [VPG]: drm/i915: Added gen8 support for Timeout Detection Recovery for engine hangs
+
+Issue: GMINL-8508
+Change-Id: Ie553d80707929c959a2e90275d02afae7294e4c0
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-8508
+Signed-off-by: Tomas Elf <tomas.elf@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |   21 +++++++++------------
+ drivers/gpu/drm/i915/i915_irq.c         |   12 +-----------
+ drivers/gpu/drm/i915/intel_lrc.c        |   24 +++++++++++-------------
+ 3 files changed, 21 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 71abdeb..dcc5f3d 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -957,23 +957,20 @@ i915_gem_context_get_current_context(struct intel_engine_cs *ring,
+ 	struct drm_i915_private *dev_priv;
+ 	enum context_submission_status status = CONTEXT_SUBMISSION_STATUS_OK;
+ 
+-	if (!current_context || !ring) {
+-		WARN(!ring, "Ring is null!\n");
++	if (WARN(!ring, "Ring is null"))
+ 		return CONTEXT_SUBMISSION_STATUS_UNDEFINED;
+-	}
++
++	if (!i915.enable_execlists)
++		return status;
+ 
+ 	dev_priv = ring->dev->dev_private;
+ 
+-	if (i915.enable_execlists) {
+-		status = intel_execlists_TDR_get_submitted_context(ring,
+-				current_context);
+-	} else {
+-		*current_context = ring->last_context;
+-		if (*current_context)
+-			i915_gem_context_reference(*current_context);
+-	}
++	status = intel_execlists_TDR_get_submitted_context(ring,
++		current_context);
++
++	if (current_context &&
++		(status == CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED)) {
+ 
+-	if (!*current_context) {
+ 		/* Use default context if nothing has been submitted yet */
+ 		*current_context = ring->default_context;
+ 		i915_gem_context_reference(*current_context);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 08bb723..1034162 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -3535,7 +3535,6 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 	struct drm_device *dev;
+ 	struct drm_i915_private *dev_priv;
+ 	struct intel_engine_cs *ring;
+-	struct intel_context *current_context = NULL;
+ 	enum context_submission_status status = CONTEXT_SUBMISSION_STATUS_OK;
+ 	struct intel_ring_hangcheck *hc =
+ 		container_of(work, typeof(*hc), work.work);
+@@ -3550,8 +3549,7 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 	/* Sample the current state */
+ 
+ 	if (i915.enable_execlists)
+-		status = i915_gem_context_get_current_context(ring,
+-			&current_context);
++		status = i915_gem_context_get_current_context(ring, NULL);
+ 
+ 	head = I915_READ_HEAD(ring) & HEAD_ADDR;
+ 	tail = I915_READ_TAIL(ring) & TAIL_ADDR;
+@@ -3694,14 +3692,6 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 				&dev_priv->ring[hc->ringid].hangcheck.work,
+ 				round_jiffies_up_relative(DRM_I915_HANGCHECK_JIFFIES));
+ 	}
+-
+-	if (i915.enable_execlists) {
+-		unsigned long flags;
+-
+-		spin_lock_irqsave(&ring->execlist_lock, flags);
+-		i915_gem_context_unreference(current_context);
+-		spin_unlock_irqrestore(&ring->execlist_lock, flags);
+-	}
+ }
+ 
+ void i915_queue_hangcheck(struct drm_device *dev, u32 ringid,
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 2da0f3e..57c708e 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -895,9 +895,7 @@ intel_execlists_TDR_get_submitted_context(struct intel_engine_cs *ring,
+ 	unsigned hw_context = 0;
+ 	enum context_submission_status status =
+ 			CONTEXT_SUBMISSION_STATUS_UNDEFINED;
+-
+-	if (!ctx)
+-		return CONTEXT_SUBMISSION_STATUS_UNDEFINED;
++	struct intel_context *tmpctx = NULL;
+ 
+ 	gen8_gt_force_wake_get(dev_priv);
+ 	spin_lock_irqsave(&ring->execlist_lock, flags);
+@@ -906,19 +904,16 @@ intel_execlists_TDR_get_submitted_context(struct intel_engine_cs *ring,
+ 	req = list_first_entry_or_null(&ring->execlist_queue,
+ 		struct intel_ctx_submit_request, execlist_link);
+ 
+-	*ctx = NULL;
+-	if (req) {
+-		if (req->ctx) {
+-			*ctx = req->ctx;
+-			i915_gem_context_reference(*ctx);
+-		} else {
+-			WARN(1, "No context in request %p", req);
+-		}
++	if (req && req->ctx) {
++		tmpctx = req->ctx;
++
++		if (ctx)
++			i915_gem_context_reference(tmpctx);
+ 	}
+ 
+-	if (*ctx) {
++	if (tmpctx) {
+ 		unsigned sw_context =
+-			intel_execlists_ctx_id((*ctx)->engine[ring->id].state);
++			intel_execlists_ctx_id((tmpctx)->engine[ring->id].state);
+ 
+ 		status = ((hw_context == sw_context) && (0 != hw_context)) ?
+ 			CONTEXT_SUBMISSION_STATUS_OK :
+@@ -934,6 +929,9 @@ intel_execlists_TDR_get_submitted_context(struct intel_engine_cs *ring,
+ 			CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED;
+ 	}
+ 
++	if (ctx)
++		*ctx = tmpctx;
++
+ 	spin_unlock_irqrestore(&ring->execlist_lock, flags);
+ 	gen8_gt_force_wake_put(dev_priv);
+ 
+-- 
+1.7.9.5
+

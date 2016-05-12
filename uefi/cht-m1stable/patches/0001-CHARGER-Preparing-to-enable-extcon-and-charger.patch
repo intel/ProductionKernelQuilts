@@ -1,0 +1,476 @@
+From 5fa259fbcd3c4ab0b53bdbea9c7ee9f5045bff00 Mon Sep 17 00:00:00 2001
+From: Fei Yang <fei.yang@intel.com>
+Date: Fri, 13 Jun 2014 17:13:26 -0700
+Subject: [PATCH 01/10] CHARGER: Preparing to enable extcon and charger
+
+extcon class drivers are used to do charger detection, they
+have dependencies on charger driver framework. This is to
+prepare header files for the data types that is going to be
+shared between charger driver and extcon class drivers.
+
+Change-Id: I46e79def94c150cf151ab80a0da3fb573c8dcc0b
+Signed-off-by: Fei Yang <fei.yang@intel.com>
+---
+ drivers/power/power_supply.h         |  21 +++
+ drivers/power/power_supply_charger.h | 244 +++++++++++++++++++++++++++++++++++
+ include/linux/power_supply.h         |  94 +++++++++++++-
+ 3 files changed, 357 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/power/power_supply_charger.h
+
+diff --git a/drivers/power/power_supply.h b/drivers/power/power_supply.h
+index cc439fd..d2b3a53 100644
+--- a/drivers/power/power_supply.h
++++ b/drivers/power/power_supply.h
+@@ -40,3 +40,24 @@ static inline int power_supply_create_triggers(struct power_supply *psy)
+ static inline void power_supply_remove_triggers(struct power_supply *psy) {}
+ 
+ #endif /* CONFIG_LEDS_TRIGGERS */
++#ifdef CONFIG_POWER_SUPPLY_CHARGER
++
++extern void power_supply_trigger_charging_handler(struct power_supply *psy);
++extern int power_supply_register_charger(struct power_supply *psy);
++extern int power_supply_unregister_charger(struct power_supply *psy);
++extern int psy_charger_throttle_charger(struct power_supply *psy,
++					unsigned long state);
++
++#else
++
++static inline void
++	power_supply_trigger_charging_handler(struct power_supply *psy) { }
++static inline int power_supply_register_charger(struct power_supply *psy)
++{ return 0; }
++static inline int power_supply_unregister_charger(struct power_supply *psy)
++{ return 0; }
++static inline int psy_charger_throttle_charger(struct power_supply *psy,
++					unsigned long state)
++{ return 0; }
++
++#endif
+diff --git a/drivers/power/power_supply_charger.h b/drivers/power/power_supply_charger.h
+new file mode 100644
+index 0000000..0e1d9db
+--- /dev/null
++++ b/drivers/power/power_supply_charger.h
+@@ -0,0 +1,244 @@
++
++#ifndef __POWER_SUPPLY_CHARGER_H__
++
++#define __POWER_SUPPLY_CHARGER_H__
++#include <linux/power/battery_id.h>
++#include <linux/power_supply.h>
++
++#define MAX_CUR_VOLT_SAMPLES 3
++#define DEF_CUR_VOLT_SAMPLE_JIFF (30*HZ)
++
++enum psy_algo_stat {
++	PSY_ALGO_STAT_UNKNOWN,
++	PSY_ALGO_STAT_NOT_CHARGE,
++	PSY_ALGO_STAT_CHARGE,
++	PSY_ALGO_STAT_FULL,
++	PSY_ALGO_STAT_MAINT,
++};
++
++struct batt_props {
++	struct list_head node;
++	const char *name;
++	long voltage_now;
++	long voltage_now_cache[MAX_CUR_VOLT_SAMPLES];
++	long current_now;
++	long current_now_cache[MAX_CUR_VOLT_SAMPLES];
++	int temperature;
++	long status;
++	unsigned long tstamp;
++	enum psy_algo_stat algo_stat;
++	int health;
++	int throttle_state;
++};
++
++struct charger_props {
++	struct list_head node;
++	const char *name;
++	bool present;
++	bool is_charging;
++	int health;
++	bool online;
++	unsigned long cable;
++	unsigned long tstamp;
++};
++
++struct psy_batt_thresholds {
++	int temp_min;
++	int temp_max;
++	unsigned int iterm;
++};
++
++struct charging_algo {
++	struct list_head node;
++	unsigned int chrg_prof_type;
++	char *name;
++	enum psy_algo_stat (*get_next_cc_cv)(struct batt_props,
++			struct ps_batt_chg_prof, unsigned long *cc,
++			unsigned long *cv);
++	int (*get_batt_thresholds)(struct ps_batt_chg_prof,
++			struct psy_batt_thresholds *bat_thr);
++};
++
++
++extern int power_supply_register_charging_algo(struct charging_algo *);
++extern int power_supply_unregister_charging_algo(struct charging_algo *);
++
++static inline int set_ps_int_property(struct power_supply *psy,
++				      enum power_supply_property psp,
++				      int prop_val)
++{
++
++	union power_supply_propval val;
++
++	val.intval = prop_val;
++	return psy->set_property(psy, psp, &val);
++}
++
++static inline int get_ps_int_property(struct power_supply *psy,
++				      enum power_supply_property psp)
++{
++	union power_supply_propval val;
++
++	val.intval = 0;
++
++	psy->get_property(psy, psp, &val);
++	return val.intval;
++}
++/* Define a TTL for some properies to optimize the frequency of
++* algorithm calls. This can be used by properties which will be changed
++* very frequently (eg. current, volatge..)
++*/
++#define PROP_TTL (HZ*10)
++#define enable_charging(psy) \
++		({if ((CABLE_TYPE(psy) != POWER_SUPPLY_CHARGER_TYPE_NONE) &&\
++			!IS_CHARGING_ENABLED(psy)) { \
++		enable_charger(psy); \
++		set_ps_int_property(psy, POWER_SUPPLY_PROP_ENABLE_CHARGING,\
++					true); } })
++#define disable_charging(psy) \
++		set_ps_int_property(psy,\
++				POWER_SUPPLY_PROP_ENABLE_CHARGING, false);
++
++#define enable_charger(psy) \
++		set_ps_int_property(psy, POWER_SUPPLY_PROP_ENABLE_CHARGER, true)
++#define disable_charger(psy) \
++		({  disable_charging(psy); \
++			set_ps_int_property(psy,\
++				POWER_SUPPLY_PROP_ENABLE_CHARGER, false); })
++
++#define set_cc(psy, cc) \
++		set_ps_int_property(psy, POWER_SUPPLY_PROP_CHARGE_CURRENT, cc)
++
++#define set_cv(psy, cv) \
++		set_ps_int_property(psy, POWER_SUPPLY_PROP_CHARGE_VOLTAGE, cv)
++
++#define set_inlmt(psy, inlmt) \
++		set_ps_int_property(psy, POWER_SUPPLY_PROP_INLMT, inlmt)
++
++#define set_present(psy, present) \
++		set_ps_int_property(psy, POWER_SUPPLY_PROP_PRESENT, present)
++
++#define SET_MAX_CC(psy, max_cc) \
++		set_ps_int_property(psy,\
++				POWER_SUPPLY_PROP_MAX_CHARGE_CURRENT, max_cc)
++#define SET_ITERM(psy, iterm) \
++		set_ps_int_property(psy,\
++				POWER_SUPPLY_PROP_CHARGE_TERM_CUR, iterm)
++#define SET_MAX_TEMP(psy, temp) \
++		set_ps_int_property(psy,\
++				POWER_SUPPLY_PROP_MAX_TEMP, temp)
++#define SET_MIN_TEMP(psy, temp) \
++		set_ps_int_property(psy,\
++				POWER_SUPPLY_PROP_MIN_TEMP, temp)
++#define switch_cable(psy, new_cable) \
++		set_ps_int_property(psy,\
++				POWER_SUPPLY_PROP_CABLE_TYPE, new_cable)
++
++#define HEALTH(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_HEALTH)
++#define CV(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_CHARGE_VOLTAGE)
++#define CC(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_CHARGE_CURRENT)
++#define INLMT(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_INLMT)
++#define MAX_CC(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_MAX_CHARGE_CURRENT)
++#define MAX_CV(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_MAX_CHARGE_VOLTAGE)
++#define VOLTAGE_NOW(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW)
++#define VOLTAGE_OCV(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_VOLTAGE_OCV)
++#define CURRENT_NOW(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW)
++#define STATUS(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_STATUS)
++#define TEMPERATURE(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_TEMP)
++#define BATTERY_TYPE(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_TECHNOLOGY)
++#define PRIORITY(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_PRIORITY)
++#define CABLE_TYPE(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_CABLE_TYPE)
++#define ONLINE(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_ONLINE)
++#define INLMT(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_INLMT)
++#define ITERM(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_CHARGE_TERM_CUR)
++
++#define IS_CHARGING_ENABLED(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_ENABLE_CHARGING)
++#define IS_CHARGER_ENABLED(psy) \
++		get_ps_int_property(psy, POWER_SUPPLY_PROP_ENABLE_CHARGER)
++#define IS_BATTERY(psy) (psy->type == POWER_SUPPLY_TYPE_BATTERY)
++#define IS_CHARGER(psy) (psy->type == POWER_SUPPLY_TYPE_USB ||\
++				psy->type == POWER_SUPPLY_TYPE_USB_CDP || \
++			psy->type == POWER_SUPPLY_TYPE_USB_DCP ||\
++			psy->type == POWER_SUPPLY_TYPE_USB_ACA)
++#define IS_ONLINE(psy) \
++		(get_ps_int_property(psy, POWER_SUPPLY_PROP_ONLINE) == 1)
++#define IS_PRESENT(psy) \
++		(get_ps_int_property(psy, POWER_SUPPLY_PROP_PRESENT) == 1)
++#define IS_SUPPORTED_CABLE(psy, cable_type) \
++		(psy->supported_cables & cable_type)
++#define IS_CABLE_ACTIVE(status) \
++	((status != EXTCON_CHRGR_CABLE_DISCONNECTED))
++
++#define IS_CHARGER_PROP_CHANGED(prop, cache_prop)\
++	((cache_prop.online != prop.online) || \
++	(cache_prop.present != prop.present) || \
++	(cache_prop.is_charging != prop.is_charging) || \
++	(cache_prop.health != prop.health))
++
++#define IS_BAT_PROP_CHANGED(bat_prop, bat_cache)\
++	((bat_cache.voltage_now != bat_prop.voltage_now) || \
++	(time_after64(bat_prop.tstamp, (bat_cache.tstamp + PROP_TTL)) &&\
++	((bat_cache.current_now != bat_prop.current_now) || \
++	(bat_cache.voltage_now != bat_prop.voltage_now))) || \
++	(bat_cache.temperature != bat_prop.temperature) || \
++	(bat_cache.health != bat_prop.health) || \
++	(bat_cache.throttle_state != bat_prop.throttle_state))
++
++#define THROTTLE_ACTION(psy, state)\
++		(((psy->throttle_states)+state)->throttle_action)
++
++#define MAX_THROTTLE_STATE(psy)\
++		((psy->num_throttle_states))
++
++#define CURRENT_THROTTLE_STATE(psy)\
++		(get_ps_int_property(psy,\
++			POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT))
++
++#define CURRENT_THROTTLE_ACTION(psy)\
++		THROTTLE_ACTION(psy, CURRENT_THROTTLE_STATE(psy))
++
++#define THROTTLE_CC_VALUE(psy, state)\
++		(((psy->throttle_states)+state)->throttle_val)
++
++#define IS_CHARGER_CAN_BE_ENABLED(psy) \
++	(CURRENT_THROTTLE_ACTION(psy) != PSY_THROTTLE_DISABLE_CHARGER)
++
++#define IS_HEALTH_GOOD(psy)\
++	(HEALTH(psy) == POWER_SUPPLY_HEALTH_GOOD)
++
++static inline int set_battery_status(struct power_supply *psy, int status)
++{
++	if (STATUS(psy) != status) {
++		set_ps_int_property(psy, POWER_SUPPLY_PROP_STATUS, status);
++		return true;
++	}
++	return false;
++}
++
++static inline void set_charger_online(struct power_supply *psy, int online)
++{
++
++	if (ONLINE(psy) != online)
++		set_ps_int_property(psy, POWER_SUPPLY_PROP_ONLINE, online);
++
++}
++
++#endif
+diff --git a/include/linux/power_supply.h b/include/linux/power_supply.h
+index 62c2e9f4..e76e5cf 100644
+--- a/include/linux/power_supply.h
++++ b/include/linux/power_supply.h
+@@ -85,6 +85,14 @@ enum {
+ 	POWER_SUPPLY_SCOPE_DEVICE,
+ };
+ 
++enum {
++	POWER_SUPPLY_CHARGE_CURRENT_LIMIT_ZERO = 0,
++	POWER_SUPPLY_CHARGE_CURRENT_LIMIT_LOW,
++	POWER_SUPPLY_CHARGE_CURRENT_LIMIT_MEDIUM,
++	POWER_SUPPLY_CHARGE_CURRENT_LIMIT_HIGH,
++	POWER_SUPPLY_CHARGE_CURRENT_LIMIT_NONE,
++};
++
+ enum power_supply_property {
+ 	/* Properties of type `int' */
+ 	POWER_SUPPLY_PROP_STATUS = 0,
+@@ -118,8 +126,14 @@ enum power_supply_property {
+ 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+ 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
+ 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX,
++	POWER_SUPPLY_CHARGE_CURRENT_LIMIT,
+ 	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
+ 	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX,
++	POWER_SUPPLY_PROP_CHARGE_CURRENT,
++	POWER_SUPPLY_PROP_MAX_CHARGE_CURRENT,
++	POWER_SUPPLY_PROP_CHARGE_VOLTAGE,
++	POWER_SUPPLY_PROP_MAX_CHARGE_VOLTAGE,
++	POWER_SUPPLY_PROP_INLMT,
+ 	POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN,
+ 	POWER_SUPPLY_PROP_ENERGY_EMPTY_DESIGN,
+ 	POWER_SUPPLY_PROP_ENERGY_FULL,
+@@ -133,6 +147,8 @@ enum power_supply_property {
+ 	POWER_SUPPLY_PROP_TEMP,
+ 	POWER_SUPPLY_PROP_TEMP_ALERT_MIN,
+ 	POWER_SUPPLY_PROP_TEMP_ALERT_MAX,
++	POWER_SUPPLY_PROP_MAX_TEMP,
++	POWER_SUPPLY_PROP_MIN_TEMP,
+ 	POWER_SUPPLY_PROP_TEMP_AMBIENT,
+ 	POWER_SUPPLY_PROP_TEMP_AMBIENT_ALERT_MIN,
+ 	POWER_SUPPLY_PROP_TEMP_AMBIENT_ALERT_MAX,
+@@ -141,6 +157,11 @@ enum power_supply_property {
+ 	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
+ 	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
+ 	POWER_SUPPLY_PROP_TYPE, /* use power_supply.type instead */
++	POWER_SUPPLY_PROP_CHARGE_TERM_CUR,
++	POWER_SUPPLY_PROP_ENABLE_CHARGING,
++	POWER_SUPPLY_PROP_ENABLE_CHARGER,
++	POWER_SUPPLY_PROP_CABLE_TYPE,
++	POWER_SUPPLY_PROP_PRIORITY,
+ 	POWER_SUPPLY_PROP_SCOPE,
+ 	/* Local extensions */
+ 	POWER_SUPPLY_PROP_USB_HC,
+@@ -158,15 +179,63 @@ enum power_supply_type {
+ 	POWER_SUPPLY_TYPE_UPS,
+ 	POWER_SUPPLY_TYPE_MAINS,
+ 	POWER_SUPPLY_TYPE_USB,		/* Standard Downstream Port */
++	POWER_SUPPLY_TYPE_USB_INVAL,	/* Invalid Standard Downstream Port */
+ 	POWER_SUPPLY_TYPE_USB_DCP,	/* Dedicated Charging Port */
+ 	POWER_SUPPLY_TYPE_USB_CDP,	/* Charging Downstream Port */
+ 	POWER_SUPPLY_TYPE_USB_ACA,	/* Accessory Charger Adapters */
++	POWER_SUPPLY_TYPE_USB_HOST,	/* To support OTG devices */
++};
++
++enum power_supply_charger_event {
++	POWER_SUPPLY_CHARGER_EVENT_CONNECT = 0,
++	POWER_SUPPLY_CHARGER_EVENT_UPDATE,
++	POWER_SUPPLY_CHARGER_EVENT_RESUME,
++	POWER_SUPPLY_CHARGER_EVENT_SUSPEND,
++	POWER_SUPPLY_CHARGER_EVENT_DISCONNECT,
++};
++
++struct power_supply_charger_cap {
++	enum power_supply_charger_event chrg_evt;
++	enum power_supply_type chrg_type;
++	unsigned int mA; /* input current limit */
++};
++
++enum power_supply_charger_cable_type {
++	POWER_SUPPLY_CHARGER_TYPE_NONE = 0,
++	POWER_SUPPLY_CHARGER_TYPE_USB_SDP = 1 << 0,
++	POWER_SUPPLY_CHARGER_TYPE_USB_DCP = 1 << 1,
++	POWER_SUPPLY_CHARGER_TYPE_USB_CDP = 1 << 2,
++	POWER_SUPPLY_CHARGER_TYPE_USB_ACA = 1 << 3,
++	POWER_SUPPLY_CHARGER_TYPE_AC = 1 << 4,
++	POWER_SUPPLY_CHARGER_TYPE_ACA_DOCK = 1 << 5,
++	POWER_SUPPLY_CHARGER_TYPE_ACA_A = 1 << 6,
++	POWER_SUPPLY_CHARGER_TYPE_ACA_B = 1 << 7,
++	POWER_SUPPLY_CHARGER_TYPE_ACA_C = 1 << 8,
++	POWER_SUPPLY_CHARGER_TYPE_SE1 = 1 << 9,
++	POWER_SUPPLY_CHARGER_TYPE_MHL = 1 << 10,
++	POWER_SUPPLY_CHARGER_TYPE_B_DEVICE = 1 << 11,
+ };
+ 
+ enum power_supply_notifier_events {
+ 	PSY_EVENT_PROP_CHANGED,
++	PSY_BATTERY_EVENT,
++	PSY_CABLE_EVENT,
+ };
+ 
++struct power_supply_cable_props {
++	enum power_supply_charger_event	chrg_evt;
++	enum power_supply_charger_cable_type chrg_type;
++	unsigned int ma;   /* input current limit */
++};
++
++#define POWER_SUPPLY_CHARGER_TYPE_USB \
++	(POWER_SUPPLY_CHARGER_TYPE_USB_SDP | \
++	POWER_SUPPLY_CHARGER_TYPE_USB_DCP | \
++	POWER_SUPPLY_CHARGER_TYPE_USB_CDP | \
++	POWER_SUPPLY_CHARGER_TYPE_USB_ACA | \
++	POWER_SUPPLY_CHARGER_TYPE_ACA_DOCK| \
++	POWER_SUPPLY_CHARGER_TYPE_SE1)
++
+ union power_supply_propval {
+ 	int intval;
+ 	const char *strval;
+@@ -174,6 +243,19 @@ union power_supply_propval {
+ 
+ struct device_node;
+ 
++enum psy_throttle_action {
++
++	PSY_THROTTLE_DISABLE_CHARGER = 0,
++	PSY_THROTTLE_DISABLE_CHARGING,
++	PSY_THROTTLE_CC_LIMIT,
++	PSY_THROTTLE_INPUT_LIMIT,
++};
++
++struct power_supply_throttle {
++	enum psy_throttle_action throttle_action;
++	unsigned throttle_val;
++};
++
+ struct power_supply {
+ 	const char *name;
+ 	enum power_supply_type type;
+@@ -181,8 +263,10 @@ struct power_supply {
+ 	size_t num_properties;
+ 
+ 	char **supplied_to;
++	unsigned long supported_cables;
+ 	size_t num_supplicants;
+-
++	struct power_supply_throttle *throttle_states;
++	size_t num_throttle_states;
+ 	char **supplied_from;
+ 	size_t num_supplies;
+ 	struct device_node *of_node;
+@@ -197,6 +281,8 @@ struct power_supply {
+ 				     enum power_supply_property psp);
+ 	void (*external_power_changed)(struct power_supply *psy);
+ 	void (*set_charged)(struct power_supply *psy);
++	void (*charging_port_changed)(struct power_supply *psy,
++				struct power_supply_charger_cap *cap);
+ 
+ 	/* For APM emulation, think legacy userspace. */
+ 	int use_for_apm;
+@@ -258,9 +344,13 @@ power_supply_get_by_phandle(struct device_node *np, const char *property)
+ #endif /* CONFIG_OF */
+ extern void power_supply_changed(struct power_supply *psy);
+ extern int power_supply_am_i_supplied(struct power_supply *psy);
++extern int power_supply_is_battery_connected(void);
+ extern int power_supply_set_battery_charged(struct power_supply *psy);
++extern void power_supply_charger_event(struct power_supply_charger_cap cap);
++extern void power_supply_query_charger_caps(struct power_supply_charger_cap
++									*cap);
+ 
+-#ifdef CONFIG_POWER_SUPPLY
++#if defined(CONFIG_POWER_SUPPLY) || defined(CONFIG_POWER_SUPPLY_MODULE)
+ extern int power_supply_is_system_supplied(void);
+ #else
+ static inline int power_supply_is_system_supplied(void) { return -ENOSYS; }
+-- 
+2.0.0
+

@@ -1,0 +1,825 @@
+From 99d0ff9bd40efd88a03f0b401015387660844ff9 Mon Sep 17 00:00:00 2001
+Message-Id: <99d0ff9bd40efd88a03f0b401015387660844ff9.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: ian-lister <ian.lister@intel.com>
+Date: Mon, 23 Dec 2013 12:23:50 +0000
+Subject: [PATCH 57/71] REVERTME [VPG]: drm/i915: Watchdog timeout on
+ individual batch buffers
+
+Original Author: Ian Lister <ian.lister@intel.com>
+
+v1: Add support for watchdog timeout on individual batch buffers
+(sometimes called "media reset"). This feature is supported for
+the render and video rings only
+
+The watchdog feature can be requested per batch buffer via a new
+flag to the exec buffer ioctl(). When set, an extra command is
+inserted into the ring just prior to the MI_BATCH_BUFFER_START
+which starts a timer in the hardware. If the timer reaches the
+threshold value (pre-calculated during driver initialisation)
+then an interrupt is generated and this immediately queues a
+recovery work handler (same reset function as used by TDR).
+
+Under normal circumstances the counter should not get near the
+threshold as extra commands are inserted after the
+MI_BATCH_BUFFER_START to cancel the hardware counter. However,
+if the hardware hangs whilst executing the batch buffer then the
+timer will not be cancelled and the interrupt will fire.
+
+The render and BSD timer interrupts are unmasked during ring
+initialisation and left unmasked. The get_irq/put_irq function
+has been modified as it assumed ownership of the ring IMR
+registers.
+
+A new module parameter enable_watchdog is available in i915 which
+can globally enable/disable watchdog support.
+
+Added RCS_T, VCS_T, BCS_T and RCS_W, VCS_W, BCS_W to the debugfs
+interface to give separate count of hang detections for TDR (_T)
+and watchdog (_W). The existing RCS, VCS, BCS total counts and
+full GPU reset counts still exist.
+
+libdrm: this patch requires the relevant watchdog flag to be
+defined in user space.
+
+Port to 3.10.xx Kernel.
+
+v2: Port to 3.14.xx Kernel and address review comments (Akash)
+Move watchdog_threshold variable to intel_ringbuffer structure.
+Clean up unused variables.
+
+v3: Integrate with execlists v2 on 3.14 kernel.
+ - Gen7: execlists are disabled so watchdog should work as expected
+ - Gen8: Watchdog time out is not expected to work without GPU scheduler
+   but this patch doesn't break Gen8.
+
+v4: Rebase as per execlists v4.
+
+Note: Gen8 has an additional ring VCS2 and in this patch Media reset
+support is not added for this ring because it doesn't exist on Gen7
+and it cannot be tested at the moment on Gen8 also. This should be
+added after integrating TDR and Media reset with scheduler.
+
+This is a REVERTME because this will be replaced with GPU Scheduler
+based Watchdog solution going forward.
+
+For: GMIN-838
+Tracked-On: https://jira01.devtools.intel.com/browse/GMIN-839
+Signed-off-by: Joao Santos <joao.santos@intel.com>
+Signed-off-by: Arun Siluvery <arun.siluvery@linux.intel.com>
+(cherry picked from commit f522089f831835b1edc93f025a2ff39d9eafb488)
+
+Change-Id: I3fdff7686c7ffcb344e327fa58c88ab878968d6e
+---
+ drivers/gpu/drm/i915/i915_debugfs.c        |   18 ++++--
+ drivers/gpu/drm/i915/i915_dma.c            |    3 +
+ drivers/gpu/drm/i915/i915_drv.c            |   31 ++++++++++
+ drivers/gpu/drm/i915/i915_drv.h            |   18 +++++-
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   29 ++++++++-
+ drivers/gpu/drm/i915/i915_irq.c            |   58 +++++++++++++-----
+ drivers/gpu/drm/i915/i915_params.c         |    4 ++
+ drivers/gpu/drm/i915/i915_reg.h            |    4 ++
+ drivers/gpu/drm/i915/intel_lrc.c           |   90 +++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |   84 ++++++++++++++++++++++----
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |   24 ++++++++
+ include/uapi/drm/i915_drm.h                |    5 +-
+ 12 files changed, 332 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 147feb62..d5b0b4b 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4349,30 +4349,30 @@ i915_wedged_set(void *data, u64 val)
+ 		case RCS:
+ 			DRM_INFO("Manual RCS reset\n");
+ 			i915_handle_error(dev,
+-					  &dev_priv->ring[RCS].hangcheck,
++					  &dev_priv->ring[RCS].hangcheck, 0,
+ 					  "Manual RCS reset");
+ 			break;
+ 		case VCS:
+ 			DRM_INFO("Manual VCS reset\n");
+ 			i915_handle_error(dev,
+-					  &dev_priv->ring[VCS].hangcheck,
++					  &dev_priv->ring[VCS].hangcheck, 0,
+ 					  "Manual VCS reset");
+ 			break;
+ 		case BCS:
+ 			DRM_INFO("Manual BCS reset\n");
+ 			i915_handle_error(dev,
+-					  &dev_priv->ring[BCS].hangcheck,
++					  &dev_priv->ring[BCS].hangcheck, 0,
+ 					  "Manual BCS reset");
+ 			break;
+ 		case VECS:
+ 			DRM_INFO("Manual VECS reset\n");
+ 			i915_handle_error(dev,
+-					  &dev_priv->ring[VECS].hangcheck,
++					  &dev_priv->ring[VECS].hangcheck, 0,
+ 					  "Manual VECS reset");
+ 			break;
+ 		default:
+ 			DRM_INFO("Manual global reset\n");
+-			i915_handle_error(dev, NULL, "Manual global reset");
++			i915_handle_error(dev, NULL, 0, "Manual global reset");
+ 			break;
+ 		}
+ 	}
+@@ -4434,6 +4434,13 @@ i915_ring_hangcheck_read(struct file *filp, char __user *ubuf,
+ 				 ringid_to_str(i),
+ 				 (long unsigned)
+ 				 dev_priv->ring[i].hangcheck.tdr_count);
++
++	for (i = 0; i < I915_NUM_RINGS; ++i)
++		len += scnprintf(buf + len, sizeof(buf) - len,
++				 "%s_W=0x%08lX,",
++				 ringid_to_str(i),
++				 (long unsigned)
++				 dev_priv->ring[i].hangcheck.watchdog_count);
+ 	len += scnprintf(buf + len - 1, sizeof(buf) - len, "\n");
+ 
+ 	return simple_read_from_buffer(ubuf, max, ppos, buf, len);
+@@ -4457,6 +4464,7 @@ i915_ring_hangcheck_write(struct file *filp,
+ 		/* Reset the hangcheck counters */
+ 		dev_priv->ring[i].hangcheck.total = 0;
+ 		dev_priv->ring[i].hangcheck.tdr_count = 0;
++		dev_priv->ring[i].hangcheck.watchdog_count = 0;
+ 	}
+ 	dev_priv->gpu_error.total_resets = 0;
+ 	mutex_unlock(&dev->struct_mutex);
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index a105caf..0955f0f 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1582,6 +1582,7 @@ i915_hangcheck_init(struct drm_device *dev)
+ 	for (i = 0; i < I915_NUM_RINGS; i++) {
+ 		dev_priv->ring[i].hangcheck.count = 0;
+ 		dev_priv->ring[i].hangcheck.tdr_count = 0;
++		dev_priv->ring[i].hangcheck.watchdog_count = 0;
+ 		dev_priv->ring[i].hangcheck.total = 0;
+ 		dev_priv->ring[i].hangcheck.last_acthd = 0;
+ 		dev_priv->ring[i].hangcheck.ringid = i;
+@@ -1831,6 +1832,8 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 		acpi_video_register();
+ 	}
+ 
++	i915_init_watchdog(dev);
++
+ 	if (IS_GEN5(dev))
+ 		intel_gpu_ips_init(dev_priv);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index bb9dfb1..55ea272 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -1066,6 +1066,37 @@ int i915_reset(struct drm_device *dev)
+ 	return 0;
+ }
+ 
++void i915_init_watchdog(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* Based on pre-defined time out value (60ms or 30ms) calculate
++	* timer count thresholds needed based on core frequency.
++	*
++	* For RCS.
++	* The timestamp resolution changed in Gen7 and beyond to 80ns
++	* for all pipes. Before that it was 640ns.*/
++
++	int freq;
++
++	if (INTEL_INFO(dev)->gen >= 7)
++		freq = KM_TIMESTAMP_CNTS_PER_SEC_80NS;
++	else
++		freq = KM_TIMESTAMP_CNTS_PER_SEC_640NS;
++
++	dev_priv->ring[RCS].watchdog_threshold =
++		((KM_MEDIA_ENGINE_TIMEOUT_VALUE_IN_MS) *
++		(freq / KM_TIMER_MILLISECOND));
++
++	dev_priv->ring[VCS].watchdog_threshold =
++		((KM_BSD_ENGINE_TIMEOUT_VALUE_IN_MS) *
++		(freq / KM_TIMER_MILLISECOND));
++
++	DRM_DEBUG_TDR("Watchdog Timeout Threshold, RCS: 0x%08X, VCS: 0x%08X\n",
++		      dev_priv->ring[RCS].watchdog_threshold,
++		      dev_priv->ring[VCS].watchdog_threshold);
++}
++
+ static int i915_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ {
+ 	struct intel_device_info *intel_info =
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 7b3316d..7841982 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2313,6 +2313,7 @@ struct i915_params {
+ 	unsigned int hangcheck_period;
+ 	unsigned int ring_reset_min_alive_period;
+ 	unsigned int gpu_reset_min_alive_period;
++	unsigned int enable_watchdog;
+ 	/* leave bools at the end to not create holes */
+ 	bool enable_hangcheck;
+ 	bool fastboot;
+@@ -2360,9 +2361,9 @@ extern void intel_console_resume(struct work_struct *work);
+ 
+ /* i915_irq.c */
+ void i915_queue_hangcheck(struct drm_device *dev, u32 ringid);
+-__printf(3, 4)
++__printf(4, 5)
+ void i915_handle_error(struct drm_device *dev, struct intel_ring_hangcheck *hc,
+-		       const char *fmt, ...);
++		       bool watchdog, const char *fmt, ...);
+ void i915_hangcheck_sample(unsigned long data);
+ 
+ void gen6_set_pm_mask(struct drm_i915_private *dev_priv, u32 pm_iir,
+@@ -3041,6 +3042,19 @@ extern void i915_write_bits32(struct drm_i915_private *dev_priv,
+ #define I915_WRITE_BITS(reg, val, mask) \
+ 	i915_write_bits32(dev_priv, (reg), (val), (mask), true)
+ 
++/* for Watchdog/Media reset */
++#define KM_MEDIA_ENGINE_TIMEOUT_VALUE_IN_MS 60
++#define KM_BSD_ENGINE_TIMEOUT_VALUE_IN_MS 60
++#define KM_TIMER_MILLISECOND 1000
++
++/* Timestamp timer resolution = 0.080 uSec, or 12500000 counts per second*/
++#define KM_TIMESTAMP_CNTS_PER_SEC_80NS 12500000
++
++/* Timestamp timer resolution = 0.640 uSec, or 1562500 counts per second*/
++#define KM_TIMESTAMP_CNTS_PER_SEC_640NS 1562500
++
++void i915_init_watchdog(struct drm_device *dev);
++
+ /* "Broadcast RGB" property */
+ #define INTEL_BROADCAST_RGB_AUTO 0
+ #define INTEL_BROADCAST_RGB_FULL 1
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 784774b..4f0f0a3 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1023,14 +1023,21 @@ i915_reset_gen7_sol_offsets(struct drm_device *dev,
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = intel_ring_begin(ring, 4 * 3);
++	ret = intel_ring_begin(ring, 2 + (4 * 4));
+ 	if (ret)
+ 		return ret;
+ 
++	/* Comments in i915_reg.h indicate that a MI_LOAD_REGISTER_IMM
++	 * should be preceded by a MI_NOOP
++	*/
++	intel_ring_emit(ring, MI_NOOP);
++	intel_ring_emit(ring, MI_NOOP);
++
+ 	for (i = 0; i < 4; i++) {
+ 		intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
+ 		intel_ring_emit(ring, GEN7_SO_WRITE_OFFSET(i));
+ 		intel_ring_emit(ring, 0);
++		intel_ring_emit(ring, MI_NOOP);
+ 	}
+ 
+ 	intel_ring_advance(ring);
+@@ -1117,6 +1124,16 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 		}
+ 	}
+ 
++	/* Start watchdog timer */
++	if ((args->flags & I915_EXEC_ENABLE_WATCHDOG) &&
++	    i915.enable_watchdog &&
++	    intel_ring_supports_watchdog(ring)) {
++
++		ret = intel_ring_start_watchdog(ring);
++		if (ret)
++			goto error;
++	}
++
+ 	ret = intel_ring_alloc_seqno(ring);
+ 	if (ret)
+ 		goto error;
+@@ -1267,6 +1284,16 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 	if (ret)
+ 		goto error;
+ 
++	/* Cancel watchdog timer */
++	if ((args->flags & I915_EXEC_ENABLE_WATCHDOG) &&
++		i915.enable_watchdog &&
++		intel_ring_supports_watchdog(ring)) {
++
++		ret = intel_ring_stop_watchdog(ring);
++		if (ret)
++			goto error;
++	}
++
+ 	trace_i915_gem_ring_dispatch(ring, intel_ring_get_seqno(ring), flags);
+ 
+ 	i915_gem_execbuffer_move_to_active(vmas, ring);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 27c4ea1..020f88d 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1629,20 +1629,40 @@ static void snb_gt_irq_handler(struct drm_device *dev,
+ 		notify_ring(dev, &dev_priv->ring[BCS]);
+ 
+ 	if (gt_iir & GT_RENDER_CS_MASTER_ERROR_INTERRUPT)
+-		i915_handle_error(dev, &dev_priv->ring[RCS].hangcheck,
++		i915_handle_error(dev, &dev_priv->ring[RCS].hangcheck, 0,
+ 				  "GT RCS error interrupt 0x%08x", gt_iir);
+ 
+ 	if (gt_iir & GT_BSD_CS_ERROR_INTERRUPT)
+-		i915_handle_error(dev, &dev_priv->ring[VCS].hangcheck,
++		i915_handle_error(dev, &dev_priv->ring[VCS].hangcheck, 0,
+ 				  "GT VCS error interrupt 0x%08x", gt_iir);
+ 
+ 	if (gt_iir & GT_BLT_CS_ERROR_INTERRUPT)
+-		i915_handle_error(dev, &dev_priv->ring[BCS].hangcheck,
++		i915_handle_error(dev, &dev_priv->ring[BCS].hangcheck, 0,
+ 				  "GT BCS error interrupt 0x%08x", gt_iir);
+ 
+ 	if (gt_iir & GT_PARITY_ERROR(dev))
+ 		ivybridge_parity_error_irq_handler(dev, gt_iir);
+ 
++	if (gt_iir & GT_GEN6_RENDER_WATCHDOG_INTERRUPT) {
++		struct intel_engine_cs *ring;
++		/* Stop the counter to prevent further interrupts */
++		ring = &dev_priv->ring[RCS];
++		I915_WRITE(RING_CNTR(ring->mmio_base), RCS_WATCHDOG_DISABLE);
++		dev_priv->ring[RCS].hangcheck.watchdog_count++;
++		i915_handle_error(dev, &dev_priv->ring[RCS].hangcheck, 1,
++				  "Render ring timeout counter exceeded");
++	}
++
++	if (gt_iir & GT_GEN6_BSD_WATCHDOG_INTERRUPT) {
++		struct intel_engine_cs *ring;
++		/* Stop the counter to prevent further interrupts */
++		ring = &dev_priv->ring[VCS];
++		I915_WRITE(RING_CNTR(ring->mmio_base), VCS_WATCHDOG_DISABLE);
++		dev_priv->ring[VCS].hangcheck.watchdog_count++;
++		i915_handle_error(dev, &dev_priv->ring[VCS].hangcheck, 1,
++				  "Video ring timeout counter exceeded");
++	}
++
+ 	if (gt_iir & GT_RENDER_PERFMON_BUFFER_INTERRUPT) {
+ 		atomic_inc(&dev_priv->perfmon_buffer_interrupts);
+ 		wake_up_all(&dev_priv->perfmon_buffer_queue);
+@@ -1969,7 +1989,7 @@ static void gen6_rps_irq_handler(struct drm_i915_private *dev_priv, u32 pm_iir)
+ 		if (pm_iir & PM_VEBOX_CS_ERROR_INTERRUPT) {
+ 			DRM_ERROR("VEBOX CS error interrupt 0x%08x\n", pm_iir);
+ 			i915_handle_error(dev_priv->dev,
+-					  &dev_priv->ring[VECS].hangcheck,
++					  &dev_priv->ring[VECS].hangcheck, 0,
+ 					  "VEBOX CS error interrupt 0x%08x",
+ 					  pm_iir);
+ 		}
+@@ -2879,7 +2899,7 @@ i915_report_and_clear_eir_exit:
+  * of a ring dump etc.).
+  */
+ void i915_handle_error(struct drm_device *dev, struct intel_ring_hangcheck *hc,
+-		       const char *fmt, ...)
++		       bool watchdog, const char *fmt, ...)
+ {
+ 	int full_reset = 0;
+ 	unsigned long cur_time;
+@@ -2909,12 +2929,13 @@ void i915_handle_error(struct drm_device *dev, struct intel_ring_hangcheck *hc,
+ 		atomic_set_mask(DRM_I915_HANGCHECK_HUNG, &hc->flags);
+ 
+ 		/* Now determine what type of reset to use to clear the hang */
+-		cur_time = get_seconds();
+-		last_reset = hc->last_reset;
+-		hc->last_reset = cur_time;
+-
+-		if ((cur_time - last_reset) <
+-			i915.ring_reset_min_alive_period) {
++		if (!watchdog) {
++			cur_time = get_seconds();
++			last_reset = hc->last_reset;
++			hc->last_reset = cur_time;
++		}
++		if (!watchdog && ((cur_time - last_reset) <
++				  i915.ring_reset_min_alive_period)) {
+ 			/* This ring is hanging too frequently.
+ 			* Opt for full-reset instead */
+ 			DRM_DEBUG_TDR("Ring %d hanging too quickly...\r\n",
+@@ -3259,7 +3280,7 @@ static bool i915_hangcheck_hung(struct intel_ring_hangcheck *hc)
+ 		if (hung) {
+ 			hc->tdr_count++;
+ 			ring->hangcheck.action = HANGCHECK_HUNG;
+-			i915_handle_error(dev, hc, "%s hung", ring->name);
++			i915_handle_error(dev, hc, 0, "%s hung", ring->name);
+ 		}
+ 		return hung;
+ 	}
+@@ -3627,6 +3648,13 @@ static void gen5_gt_irq_postinstall(struct drm_device *dev)
+ 		dev_priv->gt_irq_mask &= ~(I915_SYNC_USER_INTERRUPTS);
+ 
+ 	gt_irqs |= GT_RENDER_USER_INTERRUPT;
++
++	if (INTEL_INFO(dev)->gen >= 6) {
++		dev_priv->gt_irq_mask &= ~(GT_GEN6_BSD_WATCHDOG_INTERRUPT |
++					GT_GEN6_RENDER_WATCHDOG_INTERRUPT);
++		gt_irqs |= GT_GEN6_RENDER_WATCHDOG_INTERRUPT;
++		gt_irqs |= GT_GEN6_BSD_WATCHDOG_INTERRUPT;
++	}
+ 	if (IS_GEN5(dev)) {
+ 		gt_irqs |= GT_RENDER_PIPECTL_NOTIFY_INTERRUPT |
+ 			   ILK_BSD_USER_INTERRUPT;
+@@ -4173,7 +4201,7 @@ static irqreturn_t i8xx_irq_handler(int irq, void *arg)
+ 		 */
+ 		spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
+ 		if (iir & I915_RENDER_COMMAND_PARSER_ERROR_INTERRUPT)
+-			i915_handle_error(dev, NULL,
++			i915_handle_error(dev, NULL, 0,
+ 					  "Command parser error, iir 0x%08x",
+ 					  iir);
+ 
+@@ -4357,7 +4385,7 @@ static irqreturn_t i915_irq_handler(int irq, void *arg)
+ 		 */
+ 		spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
+ 		if (iir & I915_RENDER_COMMAND_PARSER_ERROR_INTERRUPT)
+-			i915_handle_error(dev, NULL,
++			i915_handle_error(dev, NULL, 0,
+ 					  "Command parser error, iir 0x%08x",
+ 					  iir);
+ 
+@@ -4589,7 +4617,7 @@ static irqreturn_t i965_irq_handler(int irq, void *arg)
+ 		 */
+ 		spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
+ 		if (iir & I915_RENDER_COMMAND_PARSER_ERROR_INTERRUPT)
+-			i915_handle_error(dev, NULL,
++			i915_handle_error(dev, NULL, 0,
+ 					  "Command parser error, iir 0x%08x",
+ 					  iir);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_params.c b/drivers/gpu/drm/i915/i915_params.c
+index c6dfcb6..5ec96ee 100644
+--- a/drivers/gpu/drm/i915/i915_params.c
++++ b/drivers/gpu/drm/i915/i915_params.c
+@@ -56,6 +56,7 @@ struct i915_params i915 __read_mostly = {
+ 	.hangcheck_period = 1000,
+ 	.ring_reset_min_alive_period = 0,
+ 	.gpu_reset_min_alive_period = 0,
++	.enable_watchdog = 1,
+ };
+ module_param_named(limitbw, i915.limitbw, int, 0400);
+ MODULE_PARM_DESC(limitbw,
+@@ -122,6 +123,9 @@ MODULE_PARM_DESC(enable_hangcheck,
+ 	"WARNING: Disabling this can cause system wide hangs. "
+ 	"(default: true)");
+ 
++module_param_named(enable_watchdog, i915.enable_watchdog, int, 0644);
++MODULE_PARM_DESC(enable_watchdog, "Enable watchdog timers (default: true)");
++
+ module_param_named(enable_ppgtt, i915.enable_ppgtt, int, 0400);
+ MODULE_PARM_DESC(enable_ppgtt,
+ 	"Override PPGTT usage. "
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 9ea5500..eed6154 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -1094,6 +1094,8 @@ enum punit_power_well {
+ #define RING_MODE_STOP		(1 << 8)
+ #define RING_MODE_IDLE		(1 << 9)
+ #define RING_UHPTR(base) ((base)+0x134)
++#define RING_CNTR(base)	((base)+0x178)
++#define RING_THRESH(base) ((base)+0x17C)
+ #define RING_SYNC_0(base)	((base)+0x40)
+ #define RING_SYNC_1(base)	((base)+0x44)
+ #define RING_SYNC_2(base)	((base)+0x48)
+@@ -1475,11 +1477,13 @@ enum punit_power_well {
+ #define GT_BLT_FLUSHDW_NOTIFY_INTERRUPT		(1 << 26)
+ #define GT_BLT_CS_ERROR_INTERRUPT		(1 << 25)
+ #define GT_BLT_USER_INTERRUPT			(1 << 22)
++#define GT_GEN6_BSD_WATCHDOG_INTERRUPT		(1 << 18)
+ #define GT_BSD_CS_ERROR_INTERRUPT		(1 << 15)
+ #define GT_BSD_USER_INTERRUPT			(1 << 12)
+ #define GT_RENDER_L3_PARITY_ERROR_INTERRUPT_S1	(1 << 11) /* hsw+; rsvd on snb, ivb, vlv */
+ #define GT_RENDER_PERFMON_BUFFER_INTERRUPT      (1 <<  9) /* !snb */
+ #define GT_CONTEXT_SWITCH_INTERRUPT		(1 <<  8)
++#define GT_GEN6_RENDER_WATCHDOG_INTERRUPT	(1 <<  6)
+ #define GT_RENDER_L3_PARITY_ERROR_INTERRUPT	(1 <<  5) /* !snb */
+ #define GT_RENDER_PIPECTL_NOTIFY_INTERRUPT	(1 <<  4)
+ #define GT_RENDER_CS_MASTER_ERROR_INTERRUPT	(1 <<  3)
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 362e15f..5898a99 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -575,6 +575,71 @@ static int logical_ring_invalidate_all_caches(struct intel_ringbuffer *ringbuf)
+ 	return 0;
+ }
+ 
++static int
++gen8_ring_start_watchdog(struct intel_ringbuffer *ringbuf)
++{
++	int ret;
++	struct intel_engine_cs *ring = ringbuf->ring;
++
++	ret = intel_logical_ring_begin(ringbuf, 10);
++	if (ret)
++		return ret;
++
++	/* i915_reg.h includes a warning to place a MI_NOOP
++	* before a MI_LOAD_REGISTER_IMM*/
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++
++	/* Set counter period */
++	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
++	intel_logical_ring_emit(ringbuf, RING_THRESH(ring->mmio_base));
++	intel_logical_ring_emit(ringbuf, ring->watchdog_threshold);
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++
++	/* Start counter */
++	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
++	intel_logical_ring_emit(ringbuf, RING_CNTR(ring->mmio_base));
++	intel_logical_ring_emit(ringbuf, WATCHDOG_ENABLE);
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++	intel_logical_ring_advance(ringbuf);
++
++	return 0;
++}
++
++static int
++gen8_ring_stop_watchdog(struct intel_ringbuffer *ringbuf)
++{
++	int ret;
++	struct intel_engine_cs *ring = ringbuf->ring;
++
++	ret = intel_logical_ring_begin(ringbuf, 6);
++	if (ret)
++		return ret;
++
++	/* i915_reg.h includes a warning to place a MI_NOOP
++	* before a MI_LOAD_REGISTER_IMM*/
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++
++	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
++	intel_logical_ring_emit(ringbuf, RING_CNTR(ring->mmio_base));
++
++	switch (ring->id) {
++	default:
++	case RCS:
++		intel_logical_ring_emit(ringbuf, RCS_WATCHDOG_DISABLE);
++		break;
++	case VCS:
++		intel_logical_ring_emit(ringbuf, VCS_WATCHDOG_DISABLE);
++		break;
++	}
++
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++	intel_logical_ring_advance(ringbuf);
++
++	return 0;
++}
++
+ static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
+ 				    struct intel_context *ctx)
+ {
+@@ -730,9 +795,13 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 
+ 	if (args->flags & I915_EXEC_GEN7_SOL_RESET) {
+ 		DRM_DEBUG("sol reset is gen7 only\n");
+-		return ret;
++                return ret;
+ 	}
+ 
++	ret = logical_ring_alloc_seqno(ring, ringbuf->FIXME_lrc_ctx);
++	if (ret)
++		return ret;
++
+ 	seqno = ring->outstanding_lazy_seqno;
+ 
+ #ifdef CONFIG_SYNC
+@@ -777,6 +846,15 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	if (ret)
+ 		goto error;
+ 
++	/* Start watchdog timer */
++	if ((args->flags & I915_EXEC_ENABLE_WATCHDOG) &&
++	    i915.enable_watchdog &&
++	    intel_ring_supports_watchdog(ring)) {
++		ret = gen8_ring_start_watchdog(ringbuf);
++		if (ret)
++			goto error;
++	}
++
+ 	if (ring == &dev_priv->ring[RCS] &&
+ 	    instp_mode != dev_priv->relative_constants_mode) {
+ 		ret = intel_logical_ring_begin(ringbuf, 4);
+@@ -810,6 +888,16 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	if (ret)
+ 		goto error;
+ 
++	/* Cancel watchdog timer */
++	if ((args->flags & I915_EXEC_ENABLE_WATCHDOG) &&
++		i915.enable_watchdog &&
++		intel_ring_supports_watchdog(ring)) {
++
++		ret = gen8_ring_stop_watchdog(ringbuf);
++		if (ret)
++			return ret;
++	}
++
+ 	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index eabb5f6..284a54e7 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1258,6 +1258,8 @@ static int init_render_ring(struct intel_engine_cs *ring)
+ 		imr &= ~GT_PARITY_ERROR(dev);
+ 	if (IS_GEN7(dev))
+ 		imr &= ~GT_RENDER_PERFMON_BUFFER_INTERRUPT;
++	if (INTEL_INFO(dev)->gen >= 7)
++		imr &= ~GT_GEN6_RENDER_WATCHDOG_INTERRUPT;
+ 	I915_WRITE_IMR(ring, imr);
+ 
+ 	return ret;
+@@ -1734,11 +1736,8 @@ gen6_ring_get_irq(struct intel_engine_cs *ring)
+ 
+ 	spin_lock_irqsave(&dev_priv->irq_lock, flags);
+ 	if (ring->irq_refcount++ == 0) {
+-		u32 mask = ~ring->irq_enable_mask;
+-		if (HAS_L3_DPF(dev) && ring->id == RCS)
+-			mask &= ~GT_PARITY_ERROR(dev);
+-		if (IS_GEN7(dev))
+-			mask &= ~GT_RENDER_PERFMON_BUFFER_INTERRUPT;
++		unsigned mask = I915_READ_IMR(ring);
++		mask &= ~ring->irq_enable_mask;
+ 		I915_WRITE_IMR(ring, mask);
+ 		ilk_enable_gt_irq(dev_priv, ring->irq_enable_mask);
+ 	}
+@@ -1756,12 +1755,9 @@ gen6_ring_put_irq(struct intel_engine_cs *ring)
+ 
+ 	spin_lock_irqsave(&dev_priv->irq_lock, flags);
+ 	if (--ring->irq_refcount == 0) {
+-		u32 mask = ~0;
+-		if (HAS_L3_DPF(dev) && ring->id == RCS)
+-			mask &= ~GT_PARITY_ERROR(dev);
+-		if (IS_GEN7(dev))
+-			mask &= ~GT_RENDER_PERFMON_BUFFER_INTERRUPT;
+-		I915_WRITE_IMR(ring, mask);
++		unsigned imr = I915_READ_IMR(ring);
++		imr |= ring->irq_enable_mask;
++		I915_WRITE_IMR(ring, imr);
+ 		ilk_disable_gt_irq(dev_priv, ring->irq_enable_mask);
+ 	}
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, flags);
+@@ -3061,6 +3057,9 @@ int intel_init_bsd_ring_buffer(struct drm_device *dev)
+ 	}
+ 	ring->init = init_ring_common;
+ 
++	/* Enable the timeout counter for watchdog reset */
++	I915_WRITE_IMR(ring, ~GT_GEN6_BSD_WATCHDOG_INTERRUPT);
++
+ 	return intel_init_ring_buffer(dev, ring);
+ }
+ 
+@@ -3238,6 +3237,69 @@ int intel_init_vebox_ring_buffer(struct drm_device *dev)
+ }
+ 
+ int
++intel_ring_start_watchdog(struct intel_engine_cs *ring)
++{
++	int ret;
++
++	ret = intel_ring_begin(ring, 10);
++	if (ret)
++		return ret;
++
++	/* i915_reg.h includes a warning to place a MI_NOOP
++	* before a MI_LOAD_REGISTER_IMM*/
++	intel_ring_emit(ring, MI_NOOP);
++	intel_ring_emit(ring, MI_NOOP);
++
++	/* Set counter period */
++	intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
++	intel_ring_emit(ring, RING_THRESH(ring->mmio_base));
++	intel_ring_emit(ring, ring->watchdog_threshold);
++	intel_ring_emit(ring, MI_NOOP);
++
++	/* Start counter */
++	intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
++	intel_ring_emit(ring, RING_CNTR(ring->mmio_base));
++	intel_ring_emit(ring, WATCHDOG_ENABLE);
++	intel_ring_emit(ring, MI_NOOP);
++	intel_ring_advance(ring);
++
++	return 0;
++}
++
++int
++intel_ring_stop_watchdog(struct intel_engine_cs *ring)
++{
++	int ret;
++
++	ret = intel_ring_begin(ring, 6);
++	if (ret)
++		return ret;
++
++	/* i915_reg.h includes a warning to place a MI_NOOP
++	* before a MI_LOAD_REGISTER_IMM*/
++	intel_ring_emit(ring, MI_NOOP);
++	intel_ring_emit(ring, MI_NOOP);
++
++	intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
++	intel_ring_emit(ring, RING_CNTR(ring->mmio_base));
++
++	switch (ring->id) {
++	default:
++	case RCS:
++		intel_ring_emit(ring, RCS_WATCHDOG_DISABLE);
++		break;
++	case VCS:
++		intel_ring_emit(ring, VCS_WATCHDOG_DISABLE);
++		break;
++	}
++
++	intel_ring_emit(ring, MI_NOOP);
++	intel_ring_advance(ring);
++
++	return 0;
++}
++
++int
+ intel_ring_flush_all_caches(struct intel_engine_cs *ring)
+ {
+ 	int ret;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 440fe86..3d80076 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -46,6 +46,10 @@ struct  intel_hw_status_page {
+ 						VCS_RING_CTX_SIZE), \
+ 						BCS_RING_CTX_SIZE))
+ 
++#define WATCHDOG_ENABLE 0
++#define RCS_WATCHDOG_DISABLE 1
++#define VCS_WATCHDOG_DISABLE 0xFFFFFFFF
++
+ #define I915_READ_TAIL(ring) I915_READ(RING_TAIL((ring)->mmio_base))
+ #define I915_WRITE_TAIL(ring, val) I915_WRITE(RING_TAIL((ring)->mmio_base), val)
+ 
+@@ -120,6 +124,9 @@ struct intel_ring_hangcheck {
+ 	/* Number of TDR hang detections of r */
+ 	u32 tdr_count;
+ 
++	/* Number of watchdog hang detections for this ring */
++	u32 watchdog_count;
++
+ 	atomic_t active;
+ };
+ 
+@@ -285,6 +292,12 @@ struct intel_engine_cs {
+ 	u32 saved_state[I915_RING_CONTEXT_SIZE];
+ 	uint32_t last_irq_seqno;
+ 
++	/*
++	 * Watchdog timer threshold values
++	 * only RCS, VCS rings have watchdog timeout support
++	 */
++	uint32_t watchdog_threshold;
++
+ 	struct {
+ 		struct drm_i915_gem_object *obj;
+ 		u32 gtt_offset;
+@@ -428,6 +441,17 @@ int intel_ring_save(struct intel_engine_cs *ring, u32 flags);
+ int intel_ring_restore(struct intel_engine_cs *ring);
+ int intel_ring_invalidate_tlb(struct intel_engine_cs *ring);
+ 
++static inline int intel_ring_supports_watchdog(struct intel_engine_cs *ring)
++{
++	/* Return 1 if the ring supports watchdog reset, otherwise 0 */
++	if (ring)
++		return ring->id == RCS || ring->id == VCS;
++
++	return 0;
++}
++int intel_ring_start_watchdog(struct intel_engine_cs *ring);
++int intel_ring_stop_watchdog(struct intel_engine_cs *ring);
++
+ int __must_check intel_ring_idle(struct intel_engine_cs *ring);
+ void intel_ring_init_seqno(struct intel_engine_cs *ring, u32 seqno);
+ int intel_ring_flush_all_caches(struct intel_engine_cs *ring);
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index d233b1c..61274fe 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -831,7 +831,10 @@ struct drm_i915_gem_execbuffer2 {
+  */
+ #define I915_EXEC_REQUEST_FENCE         (1<<14)
+ 
+-#define __I915_EXEC_UNKNOWN_FLAGS -(I915_EXEC_REQUEST_FENCE<<1)
++/* Enable watchdog timer for this batch buffer */
++#define I915_EXEC_ENABLE_WATCHDOG       (1<<15)
++
++#define __I915_EXEC_UNKNOWN_FLAGS -(I915_EXEC_ENABLE_WATCHDOG<<1)
+ 
+ #define I915_EXEC_CONTEXT_ID_MASK	(0xffffffff)
+ #define i915_execbuffer2_set_context_id(eb2, context) \
+-- 
+1.7.9.5
+

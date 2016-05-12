@@ -1,0 +1,295 @@
+From a3700d8936441cf6400f83f710f18e085bccd0f7 Mon Sep 17 00:00:00 2001
+Message-Id: <a3700d8936441cf6400f83f710f18e085bccd0f7.1398812351.git.mark.gross@intel.com>
+In-Reply-To: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+References: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+From: Jarkko Nikula <jarkko.nikula@linux.intel.com>
+Date: Mon, 10 Feb 2014 17:41:23 +0200
+Subject: [PATCH 228/429] ASoC: Intel: Add Baytrail SST probing and byt-5640
+ machine driver
+
+Signed-off-by: Jarkko Nikula <jarkko.nikula@linux.intel.com>
+---
+ sound/soc/intel/Kconfig      |   9 ++
+ sound/soc/intel/Makefile     |   2 +
+ sound/soc/intel/byt-rt5640.c | 200 +++++++++++++++++++++++++++++++++++++++++++
+ sound/soc/intel/sst-acpi.c   |  17 ++++
+ 4 files changed, 228 insertions(+)
+ create mode 100644 sound/soc/intel/byt-rt5640.c
+
+diff --git a/sound/soc/intel/Kconfig b/sound/soc/intel/Kconfig
+index 262eafa..5cb0c7f 100644
+--- a/sound/soc/intel/Kconfig
++++ b/sound/soc/intel/Kconfig
+@@ -51,3 +51,12 @@ config SND_SOC_INTEL_BROADWELL_MACH
+ 	  Ultrabook platforms.
+           Say Y if you have such a device
+           If unsure select "N".
++
++config SND_SOC_INTEL_BYT_RT5640_MACH
++	tristate "ASoC Audio driver for Intel Baytrail with RT5640 codec"
++	depends on SND_SOC_INTEL_SST && X86_INTEL_LPSS
++	select SND_SOC_INTEL_BAYTRAIL
++	select SND_SOC_RT5640
++	help
++          This adds audio driver for Intel Baytrail platform based boards
++          with the RT5640 audio codec.
+diff --git a/sound/soc/intel/Makefile b/sound/soc/intel/Makefile
+index 499c6b1..d16ae25 100644
+--- a/sound/soc/intel/Makefile
++++ b/sound/soc/intel/Makefile
+@@ -23,6 +23,8 @@ obj-$(CONFIG_SND_SOC_INTEL_BAYTRAIL) += snd-soc-sst-baytrail-pcm.o
+ # Machine support
+ snd-soc-sst-haswell-objs := haswell.o
+ snd-soc-sst-broadwell-objs := broadwell.o
++snd-soc-sst-byt-rt5640-mach-objs := byt-rt5640.o
+ 
+ obj-$(CONFIG_SND_SOC_INTEL_HASWELL_MACH) += snd-soc-sst-haswell.o
+ obj-$(CONFIG_SND_SOC_INTEL_BROADWELL_MACH) += snd-soc-sst-broadwell.o
++obj-$(CONFIG_SND_SOC_INTEL_BYT_RT5640_MACH) += snd-soc-sst-byt-rt5640-mach.o
+diff --git a/sound/soc/intel/byt-rt5640.c b/sound/soc/intel/byt-rt5640.c
+new file mode 100644
+index 0000000..0204d81
+--- /dev/null
++++ b/sound/soc/intel/byt-rt5640.c
+@@ -0,0 +1,200 @@
++/*
++ * Intel Baytrail SST RT5640 machine driver
++ * Copyright (c) 2014, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/acpi.h>
++#include <linux/device.h>
++#include <linux/slab.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/jack.h>
++#include "../codecs/rt5640.h"
++
++#include "sst-dsp.h"
++
++static const struct snd_soc_dapm_widget byt_dapm_widgets[] = {
++	SND_SOC_DAPM_HP("Headphone", NULL),
++	SND_SOC_DAPM_MIC("Headset Mic", NULL),
++	SND_SOC_DAPM_MIC("Int Mic", NULL),
++	SND_SOC_DAPM_SPK("Ext Spk", NULL),
++};
++
++static const struct snd_soc_dapm_route byt_audio_map[] = {
++	{"IN2P", NULL, "Headset Mic"},
++	{"IN2N", NULL, "Headset Mic"},
++	{"DMIC1", NULL, "Int Mic"},
++	{"Headphone", NULL, "HPOL"},
++	{"Headphone", NULL, "HPOR"},
++	{"Ext Spk", NULL, "SPOLP"},
++	{"Ext Spk", NULL, "SPOLN"},
++	{"Ext Spk", NULL, "SPORP"},
++	{"Ext Spk", NULL, "SPORN"},
++};
++
++static const struct snd_kcontrol_new byt_mc_controls[] = {
++	SOC_DAPM_PIN_SWITCH("Headphone"),
++	SOC_DAPM_PIN_SWITCH("Headset Mic"),
++	SOC_DAPM_PIN_SWITCH("Int Mic"),
++	SOC_DAPM_PIN_SWITCH("Ext Spk"),
++};
++
++static int byt_aif1_hw_params(struct snd_pcm_substream *substream,
++			     struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++	struct snd_soc_dai *codec_dai = rtd->codec_dai;
++	unsigned int fmt;
++	int ret;
++
++	/* I2S Slave Mode`*/
++	fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
++	      SND_SOC_DAIFMT_CBS_CFS;
++
++	/* Set codec DAI configuration */
++	ret = snd_soc_dai_set_fmt(codec_dai, fmt);
++	if (ret < 0) {
++		dev_err(codec_dai->dev,
++			"can't set codec DAI configuration %d\n", ret);
++		return ret;
++	}
++
++	ret = snd_soc_dai_set_sysclk(codec_dai, RT5640_SCLK_S_PLL1,
++				     params_rate(params) * 256,
++				     SND_SOC_CLOCK_IN);
++	if (ret < 0) {
++		dev_err(codec_dai->dev, "Can't set codec clock %d\n", ret);
++		return ret;
++	}
++	ret = snd_soc_dai_set_pll(codec_dai, 0, RT5640_PLL1_S_BCLK1,
++				  params_rate(params) * 64,
++				  params_rate(params) * 256);
++	if (ret < 0) {
++		dev_err(codec_dai->dev, "can't set codec pll: %d\n", ret);
++		return ret;
++	}
++	return 0;
++}
++
++static int byt_init(struct snd_soc_pcm_runtime *runtime)
++{
++	int ret;
++	struct snd_soc_codec *codec = runtime->codec;
++	struct snd_soc_dapm_context *dapm = &codec->dapm;
++	struct snd_soc_card *card = runtime->card;
++
++	card->dapm.idle_bias_off = true;
++
++	ret = snd_soc_add_card_controls(card, byt_mc_controls,
++					ARRAY_SIZE(byt_mc_controls));
++	if (ret) {
++		dev_err(card->dev, "unable to add card controls\n");
++		return ret;
++	}
++
++	/* Keep the voice call paths active during
++	suspend. Mark the end points ignore_suspend */
++	/*TODO: CHECK this */
++	snd_soc_dapm_ignore_suspend(dapm, "HPOL");
++	snd_soc_dapm_ignore_suspend(dapm, "HPOR");
++
++	snd_soc_dapm_ignore_suspend(dapm, "SPOLP");
++	snd_soc_dapm_ignore_suspend(dapm, "SPOLN");
++	snd_soc_dapm_ignore_suspend(dapm, "SPORP");
++	snd_soc_dapm_ignore_suspend(dapm, "SPORN");
++
++	snd_soc_dapm_enable_pin(dapm, "Headset Mic");
++	snd_soc_dapm_enable_pin(dapm, "Headphone");
++	snd_soc_dapm_enable_pin(dapm, "Ext Spk");
++	snd_soc_dapm_enable_pin(dapm, "Int Mic");
++
++	snd_soc_dapm_sync(dapm);
++	return ret;
++}
++
++static struct snd_soc_ops byt_aif1_ops = {
++	.hw_params = byt_aif1_hw_params,
++};
++
++static struct snd_soc_dai_link byt_dailink[] = {
++	{
++		.name = "Baytrail Audio",
++		.stream_name = "Audio",
++		.cpu_dai_name = "Front-cpu-dai",
++		.codec_dai_name = "rt5640-aif1",
++		.codec_name = "i2c-10EC5640:00",
++		.platform_name = "baytrail-pcm-audio",
++		.init = byt_init,
++		.ignore_suspend = 1,
++		.ops = &byt_aif1_ops,
++	},
++	{
++		.name = "Baytrail Voice",
++		.stream_name = "Voice",
++		.cpu_dai_name = "Mic1-cpu-dai",
++		.codec_dai_name = "rt5640-aif1",
++		.codec_name = "i2c-10EC5640:00",
++		.platform_name = "baytrail-pcm-audio",
++		.init = NULL,
++		.ignore_suspend = 1,
++		.ops = &byt_aif1_ops,
++	},
++};
++
++/* SoC card */
++static struct snd_soc_card snd_soc_card_byt = {
++	.name = "byt-rt5640",
++	.dai_link = byt_dailink,
++	.num_links = ARRAY_SIZE(byt_dailink),
++	.dapm_widgets = byt_dapm_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(byt_dapm_widgets),
++	.dapm_routes = byt_audio_map,
++	.num_dapm_routes = ARRAY_SIZE(byt_audio_map),
++};
++
++static int byt_audio_probe(struct platform_device *pdev)
++{
++	struct snd_soc_card *card = &snd_soc_card_byt;
++	struct device *dev = &pdev->dev;
++
++	card->dev = &pdev->dev;
++	dev_set_drvdata(dev, card);
++	return snd_soc_register_card(card);
++}
++
++static int byt_audio_remove(struct platform_device *pdev)
++{
++	struct snd_soc_card *card = platform_get_drvdata(pdev);
++
++	snd_soc_unregister_card(card);
++
++	return 0;
++}
++
++static struct platform_driver byt_audio = {
++	.probe = byt_audio_probe,
++	.remove = byt_audio_remove,
++	.driver = {
++		.name = "byt-rt5640",
++		.owner = THIS_MODULE,
++	},
++};
++module_platform_driver(byt_audio)
++
++MODULE_DESCRIPTION("ASoC Intel(R) Baytrail Machine driver");
++MODULE_AUTHOR("Omair Md Abdullah, Jarkko Nikula");
++MODULE_LICENSE("GPL v2");
++MODULE_ALIAS("platform:byt-rt5640");
+diff --git a/sound/soc/intel/sst-acpi.c b/sound/soc/intel/sst-acpi.c
+index 72eedae..fe1ebcc 100644
+--- a/sound/soc/intel/sst-acpi.c
++++ b/sound/soc/intel/sst-acpi.c
+@@ -179,6 +179,17 @@ static struct sst_acpi_desc sst_acpi_broadwell_desc = {
+ 	.dma_size = SST_LPT_DSP_DMA_SIZE,
+ };
+ 
++static struct sst_acpi_desc sst_acpi_baytrail_desc = {
++	.drv_name = "baytrail-pcm-audio",
++	.resindex_lpe_base = 0,
++	.resindex_pcicfg_base = 1,
++	.resindex_fw_base = 2,
++	.irqindex_host_ipc = 5,
++	.sst_id = SST_DEV_ID_BYT,
++	.fw_filename = "intel/fw_sst_0f28.bin-i2s_master",
++	.resindex_dma_base = -1,
++};
++
+ static struct sst_acpi_mach haswell_mach = {
+ 	.drv_name = "haswell-audio",
+ 	.res_desc = &sst_acpi_haswell_desc,
+@@ -189,9 +200,15 @@ static struct sst_acpi_mach broadwell_mach = {
+ 	.res_desc = &sst_acpi_broadwell_desc,
+ };
+ 
++static struct sst_acpi_mach byt_rt5640 = {
++	.drv_name = "byt-rt5640",
++	.res_desc = &sst_acpi_baytrail_desc,
++};
++
+ static struct acpi_device_id sst_acpi_match[] = {
+ 	{ "INT33C8", (unsigned long)&haswell_mach },
+ 	{ "INT3438", (unsigned long)&broadwell_mach },
++	{ "80860F28", (unsigned long)&byt_rt5640 },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(acpi, sst_acpi_match);
+-- 
+1.8.3.2
+

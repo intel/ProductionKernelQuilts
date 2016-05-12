@@ -1,0 +1,105 @@
+From 94c1914211964c21a96fd7a99bb4b7a0e69dc54a Mon Sep 17 00:00:00 2001
+Message-Id: <94c1914211964c21a96fd7a99bb4b7a0e69dc54a.1425610844.git.chang-joon.lee@intel.com>
+In-Reply-To: <6fa2ab23adf6d7de781e906d04a0224410262d9b.1425610844.git.chang-joon.lee@intel.com>
+References: <6fa2ab23adf6d7de781e906d04a0224410262d9b.1425610844.git.chang-joon.lee@intel.com>
+From: "Yang, Dong" <dong.yang@intel.com>
+Date: Thu, 22 Jan 2015 11:03:13 +0800
+Subject: [PATCH 25/27] FOR_UPSTREAM [VPG]: drm/i915: Fix invalid memory
+ access in intel_crtc_set_display()
+
+Work memory will be freed in intel_unpin_sprite_work_fn(),
+so after the function callback, there shouldn't any access
+to the work memory.
+	The Call Trace:
+	[<ffffffff810c32a0>] ? wake_up_atomic_t+0x30/0x30
+	[<ffffffff815a9969>] intel_crtc_set_display+0x69/0x310
+	[<ffffffff81516ddd>] ? _object_find+0x6d/0xa0
+	[<ffffffff8151b1e9>] drm_mode_setdisplay+0x59/0x90
+	[<ffffffff8150bee3>] drm_ioctl+0x1e3/0x650
+	[<ffffffff813b5d47>] ? inode_has_perm.isra.40+0x27/0x30
+	[<ffffffff813b5e66>] ? file_has_perm+0x86/0xa0
+	[<ffffffff81547775>] i915_compat_ioctl+0x45/0x50
+	[<ffffffff811fd2ff>] compat_sys_ioctl+0xbf/0x1370
+	[<ffffffff810ec381>] ? compat_SyS_futex+0x71/0x140
+	[<ffffffff8141e62e>] ? trace_hardirqs_on_thunk+0x3a/0x3c
+	[<ffffffff81aeb409>] ia32_do_call+0x13/0x13
+
+Issue: GMIN-3645
+Change-Id: I5cfc3193607ea1643bf89aea4bca99f45e9edf6d
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-17697
+Signed-off-by: Yang, Dong <dong.yang@intel.com>
+Signed-off-by: Liu, Chuansheng <chuansheng.liu@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |   34 +++++++++++++++++-----------------
+ 1 file changed, 17 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 13285f2..13b4a36 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -3968,6 +3968,7 @@ void intel_crtc_wait_for_pending_flips(struct drm_crtc *crtc)
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct drm_i915_gem_object *obj;
+ 	unsigned long flags;
++	struct intel_unpin_work *unpin_work, *sprite_unpin_work;
+ 
+ 	if (crtc->primary->fb == NULL)
+ 		return;
+@@ -3985,28 +3986,27 @@ void intel_crtc_wait_for_pending_flips(struct drm_crtc *crtc)
+ 		DRM_ERROR("flip wait timed out.\n");
+ 
+ 		/* cleanup */
+-		if (intel_crtc->unpin_work) {
+-			intel_unpin_work_fn(&intel_crtc->unpin_work->work);
++		spin_lock_irqsave(&dev->event_lock, flags);
++		unpin_work = intel_crtc->unpin_work;
++		intel_crtc->unpin_work = NULL;
++
++		sprite_unpin_work = intel_crtc->sprite_unpin_work;
++		intel_crtc->sprite_unpin_work = NULL;
++		spin_unlock_irqrestore(&dev->event_lock, flags);
++
++		if (unpin_work) {
++			intel_unpin_work_fn(&unpin_work->work);
+ 			atomic_clear_mask(1 << intel_crtc->plane,
+ 					&obj->pending_flip.counter);
+-
+-			spin_lock_irqsave(&dev->event_lock, flags);
+-			intel_crtc->unpin_work = NULL;
+-			spin_unlock_irqrestore(&dev->event_lock, flags);
+ 		}
+ 
+-		if (intel_crtc->sprite_unpin_work) {
+-			intel_unpin_sprite_work_fn(
+-				&intel_crtc->sprite_unpin_work->work);
+-			obj = intel_crtc->sprite_unpin_work->old_fb_obj;
+-
++		if (sprite_unpin_work) {
++			obj = sprite_unpin_work->old_fb_obj;
+ 			if (obj)
+ 				atomic_clear_mask(1 << intel_crtc->plane,
+ 					&obj->pending_flip.counter);
+-
+-			spin_lock_irqsave(&dev->event_lock, flags);
+-			intel_crtc->sprite_unpin_work = NULL;
+-			spin_unlock_irqrestore(&dev->event_lock, flags);
++			intel_unpin_sprite_work_fn(
++				&sprite_unpin_work->work);
+ 		}
+ 	}
+ 
+@@ -12255,8 +12255,8 @@ static int __intel_set_mode(struct drm_crtc *crtc,
+ 		if ((connector->dpms != DRM_MODE_DPMS_OFF)
+ 			&& (prepare_pipes & (1 << (intel_crtc)->pipe))) {
+ 			/*
+-			 * Now enable the clocks, plane, pipe, and connectors that we 
+-			 * set up.
++			 * Now enable the clocks, plane, pipe, and
++			 * connectors that we set up.
+ 			*/
+ 			if (!connector->encoder->crtc->primary->fb) {
+ 
+-- 
+1.7.9.5
+

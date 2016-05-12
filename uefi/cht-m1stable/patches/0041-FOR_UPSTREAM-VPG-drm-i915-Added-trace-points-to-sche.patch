@@ -1,0 +1,396 @@
+From a660f85927ee15041f4886ff6ca5d03ea5e55aff Mon Sep 17 00:00:00 2001
+Message-Id: <a660f85927ee15041f4886ff6ca5d03ea5e55aff.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 10 Apr 2014 10:58:56 +0100
+Subject: [PATCH 41/61] FOR_UPSTREAM [VPG]: drm/i915: Added trace points to
+ scheduler
+
+Added trace points to the scheduler to track all the various events, node state
+transitions and other interesting things that occur.
+
+Change-Id: I9886390cfc7897bc1faf50a104bc651d8baed8a5
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    2 +
+ drivers/gpu/drm/i915/i915_scheduler.c      |   30 ++++-
+ drivers/gpu/drm/i915/i915_trace.h          |  194 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_lrc.c           |    2 +
+ 4 files changed, 227 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 13dba13..713a095 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1165,6 +1165,8 @@ i915_gem_ringbuffer_submission(struct i915_execbuffer_params *params,
+ 	 */
+ 	ring->outstanding_lazy_request = NULL;
+ 
++	trace_i915_gem_ring_queue(ring, params);
++
+ 	qe = container_of(params, typeof(*qe), params);
+ 	ret = i915_scheduler_queue_execbuffer(qe);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index fd3669d..37749ca 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -98,6 +98,8 @@ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe)
+ 
+ 		qe->scheduler_index = scheduler->index++;
+ 
++		trace_i915_scheduler_queue(qe->params.ring, qe);
++
+ 		scheduler->flags[qe->params.ring->id] |= i915_sf_submitting;
+ 		ret = dev_priv->gt.do_execfinal(&qe->params);
+ 		scheduler->flags[qe->params.ring->id] &= ~i915_sf_submitting;
+@@ -237,6 +239,9 @@ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe)
+ 		not_flying = i915_scheduler_count_flying(scheduler, ring) <
+ 							 scheduler->min_flying;
+ 
++	trace_i915_scheduler_queue(ring, node);
++	trace_i915_scheduler_node_state_change(ring, node);
++
+ 	spin_unlock_irqrestore(&scheduler->lock, flags);
+ 
+ 	if (not_flying)
+@@ -264,6 +269,9 @@ int i915_scheduler_fly_node(struct i915_scheduler_queue_entry *node)
+ 
+ 	node->status = i915_sqs_flying;
+ 
++	trace_i915_scheduler_fly(ring, node);
++	trace_i915_scheduler_node_state_change(ring, node);
++
+ 	if (!(scheduler->flags[ring->id] & i915_sf_interrupts_enabled)) {
+ 		bool    success = true;
+ 
+@@ -328,6 +336,8 @@ static void i915_scheduler_node_requeue(struct i915_scheduler_queue_entry *node)
+ 	BUG_ON(!I915_SQS_IS_FLYING(node));
+ 
+ 	node->status = i915_sqs_queued;
++	trace_i915_scheduler_unfly(node->params.ring, node);
++	trace_i915_scheduler_node_state_change(node->params.ring, node);
+ }
+ 
+ /* Give up on a popped node completely. For example, because it is causing the
+@@ -338,6 +348,8 @@ static void i915_scheduler_node_kill(struct i915_scheduler_queue_entry *node)
+ 	BUG_ON(!I915_SQS_IS_FLYING(node));
+ 
+ 	node->status = i915_sqs_dead;
++	trace_i915_scheduler_unfly(node->params.ring, node);
++	trace_i915_scheduler_node_state_change(node->params.ring, node);
+ }
+ 
+ /* Abandon a queued node completely. For example because the driver is being
+@@ -349,6 +361,7 @@ static void i915_scheduler_node_kill_queued(struct i915_scheduler_queue_entry *n
+ 	BUG_ON(!I915_SQS_IS_QUEUED(node));
+ 
+ 	node->status = i915_sqs_dead;
++	trace_i915_scheduler_node_state_change(node->params.ring, node);
+ }
+ 
+ /* The system is toast. Terminate all nodes with extreme prejudice. */
+@@ -411,13 +424,17 @@ static void i915_scheduler_seqno_complete(struct intel_engine_cs *ring, uint32_t
+ 	 * if a completed entry is found then there is no need to scan further.
+ 	 */
+ 	list_for_each_entry(node, &scheduler->node_queue[ring->id], link) {
+-		if (I915_SQS_IS_COMPLETE(node))
++		if (I915_SQS_IS_COMPLETE(node)) {
++			trace_i915_scheduler_landing(ring, seqno, node);
+ 			return;
++		}
+ 
+ 		if (seqno == node->params.request->seqno)
+ 			break;
+ 	}
+ 
++	trace_i915_scheduler_landing(ring, seqno, node);
++
+ 	/*
+ 	 * NB: Lots of extra seqnos get added to the ring to track things
+ 	 * like cache flushes and page flips. So don't complain about if
+@@ -439,6 +456,7 @@ static void i915_scheduler_seqno_complete(struct intel_engine_cs *ring, uint32_t
+ 
+ 		/* Node was in flight so mark it as complete. */
+ 		node->status = i915_sqs_complete;
++		trace_i915_scheduler_node_state_change(ring, node);
+ 		got_changes = true;
+ 	}
+ 
+@@ -461,6 +479,8 @@ int i915_scheduler_handle_irq(struct intel_engine_cs *ring)
+ 
+ 	seqno = ring->get_seqno(ring, false);
+ 
++	trace_i915_scheduler_irq(ring, seqno);
++
+ 	if (i915.scheduler_override & i915_so_direct_submit)
+ 		return 0;
+ 
+@@ -573,6 +593,8 @@ static int i915_scheduler_remove(struct intel_engine_cs *ring)
+ 	/* Launch more packets now? */
+ 	do_submit = (queued > 0) && (flying < scheduler->min_flying);
+ 
++	trace_i915_scheduler_remove(ring, min_seqno, do_submit);
++
+ 	spin_unlock_irqrestore(&scheduler->lock, flags);
+ 
+ 	if (do_submit)
+@@ -582,6 +604,8 @@ static int i915_scheduler_remove(struct intel_engine_cs *ring)
+ 		node = list_first_entry(&remove, typeof(*node), link);
+ 		list_del(&node->link);
+ 
++		trace_i915_scheduler_destroy(ring, node);
++
+ #ifdef CONFIG_SYNC
+ 		if (node->params.fence_wait)
+ 			sync_fence_put(node->params.fence_wait);
+@@ -957,6 +981,8 @@ static int i915_scheduler_pop_from_queue_locked(struct intel_engine_cs *ring,
+ 		INIT_LIST_HEAD(&best->link);
+ 		best->status  = i915_sqs_popped;
+ 
++		trace_i915_scheduler_node_state_change(ring, best);
++
+ 		ret = 0;
+ 	} else {
+ 		/* Can only get here if:
+@@ -1014,6 +1040,8 @@ static int i915_scheduler_pop_from_queue_locked(struct intel_engine_cs *ring,
+ #endif
+ 	}
+ 
++	trace_i915_scheduler_pop_from_queue(ring, best);
++
+ 	*pop_node = best;
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_trace.h b/drivers/gpu/drm/i915/i915_trace.h
+index 5f648dbd..0fbbd4e 100644
+--- a/drivers/gpu/drm/i915/i915_trace.h
++++ b/drivers/gpu/drm/i915/i915_trace.h
+@@ -9,6 +9,7 @@
+ #include "i915_drv.h"
+ #include "intel_drv.h"
+ #include "intel_ringbuffer.h"
++#include "i915_scheduler.h"
+ 
+ #undef TRACE_SYSTEM
+ #define TRACE_SYSTEM i915
+@@ -604,6 +605,199 @@ TRACE_EVENT(intel_gpu_freq_change,
+ 	    TP_printk("new_freq=%u", __entry->freq)
+ );
+ 
++TRACE_EVENT(i915_scheduler_queue,
++	    TP_PROTO(struct intel_engine_cs *ring,
++		     struct i915_scheduler_queue_entry *node),
++	    TP_ARGS(ring, node),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, seqno)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring      = ring->id;
++			   __entry->seqno     = node ? node->params.request->seqno : 0;
++			   ),
++
++	    TP_printk("ring=%d, seqno=%d",
++		      __entry->ring, __entry->seqno)
++);
++
++TRACE_EVENT(i915_scheduler_fly,
++	    TP_PROTO(struct intel_engine_cs *ring,
++		     struct i915_scheduler_queue_entry *node),
++	    TP_ARGS(ring, node),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, seqno)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring      = ring->id;
++			   __entry->seqno     = node ? node->params.request->seqno : 0;
++			   ),
++
++	    TP_printk("ring=%d, seqno=%d",
++		      __entry->ring, __entry->seqno)
++);
++
++TRACE_EVENT(i915_scheduler_unfly,
++	    TP_PROTO(struct intel_engine_cs *ring,
++		     struct i915_scheduler_queue_entry *node),
++	    TP_ARGS(ring, node),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, seqno)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring      = ring->id;
++			   __entry->seqno     = node ? node->params.request->seqno : 0;
++			   ),
++
++	    TP_printk("ring=%d, seqno=%d",
++		      __entry->ring, __entry->seqno)
++);
++
++TRACE_EVENT(i915_scheduler_landing,
++	    TP_PROTO(struct intel_engine_cs *ring, u32 seqno,
++		     struct i915_scheduler_queue_entry *node),
++	    TP_ARGS(ring, seqno, node),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, seqno)
++			     __field(u32, status)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring   = ring->id;
++			   __entry->seqno  = seqno;
++			   __entry->status = node ? node->status : ~0U;
++			   ),
++
++	    TP_printk("ring=%d, seqno=%d, status=%d",
++		      __entry->ring, __entry->seqno, __entry->status)
++);
++
++TRACE_EVENT(i915_scheduler_remove,
++	    TP_PROTO(struct intel_engine_cs *ring,
++		     u32 min_seqno, bool do_submit),
++	    TP_ARGS(ring, min_seqno, do_submit),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, min_seqno)
++			     __field(bool, do_submit)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring      = ring->id;
++			   __entry->min_seqno = min_seqno;
++			   __entry->do_submit = do_submit;
++			   ),
++
++	    TP_printk("ring=%d, min_seqno = %d, do_submit=%d",
++		      __entry->ring, __entry->min_seqno, __entry->do_submit)
++);
++
++TRACE_EVENT(i915_scheduler_destroy,
++	    TP_PROTO(struct intel_engine_cs *ring,
++		     struct i915_scheduler_queue_entry *node),
++	    TP_ARGS(ring, node),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, seqno)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring      = ring->id;
++			   __entry->seqno     = node ? node->params.request->seqno : 0;
++			   ),
++
++	    TP_printk("ring=%d, seqno=%d",
++		      __entry->ring, __entry->seqno)
++);
++
++TRACE_EVENT(i915_scheduler_pop_from_queue,
++	    TP_PROTO(struct intel_engine_cs *ring,
++		     struct i915_scheduler_queue_entry *node),
++	    TP_ARGS(ring, node),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, seqno)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring   = ring->id;
++			   __entry->seqno  = node ? node->params.request->seqno : 0;
++			   ),
++
++	    TP_printk("ring=%d, seqno=%d",
++		      __entry->ring, __entry->seqno)
++);
++
++TRACE_EVENT(i915_scheduler_node_state_change,
++	    TP_PROTO(struct intel_engine_cs *ring,
++		     struct i915_scheduler_queue_entry *node),
++	    TP_ARGS(ring, node),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, seqno)
++			     __field(u32, status)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring   = ring->id;
++			   __entry->seqno  = node->params.request->seqno;
++			   __entry->status = node->status;
++			   ),
++
++	    TP_printk("ring=%d, seqno=%d, status=%d",
++		      __entry->ring, __entry->seqno, __entry->status)
++);
++
++TRACE_EVENT(i915_scheduler_irq,
++	    TP_PROTO(struct intel_engine_cs *ring, uint32_t seqno),
++	    TP_ARGS(ring, seqno),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, seqno)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring   = ring->id;
++			   __entry->seqno  = seqno;
++			   ),
++
++	    TP_printk("ring=%d, seqno=%d", __entry->ring, __entry->seqno)
++);
++
++TRACE_EVENT(i915_gem_ring_queue,
++	    TP_PROTO(struct intel_engine_cs *ring,
++		     struct i915_execbuffer_params *params),
++	    TP_ARGS(ring, params),
++
++	    TP_STRUCT__entry(
++			     __field(u32, ring)
++			     __field(u32, seqno)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->ring   = ring->id;
++			   __entry->seqno  = params->request->seqno;
++			   ),
++
++	    TP_printk("ring=%d, seqno=%d", __entry->ring, __entry->seqno)
++);
++
+ #endif /* _I915_TRACE_H_ */
+ 
+ /* This part must be outside protection */
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index fe32c18..d774ef4 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1397,6 +1397,8 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
+ 	 */
+ 	ring->outstanding_lazy_request = NULL;
+ 
++	trace_i915_gem_ring_queue(ring, params);
++
+ 	qe = container_of(params, typeof(*qe), params);
+ 	ret = i915_scheduler_queue_execbuffer(qe);
+ 	if (ret)
+-- 
+1.7.9.5
+

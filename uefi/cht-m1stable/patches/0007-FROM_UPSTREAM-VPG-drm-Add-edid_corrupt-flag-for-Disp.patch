@@ -1,0 +1,227 @@
+From 38e925501dca2d2546a59a7931aedba7fc574526 Mon Sep 17 00:00:00 2001
+Message-Id: <38e925501dca2d2546a59a7931aedba7fc574526.1443127809.git.yunwei.zhang@intel.com>
+In-Reply-To: <e1b2a1693f0b49269998c391abb456b0391b67de.1443127809.git.yunwei.zhang@intel.com>
+References: <e1b2a1693f0b49269998c391abb456b0391b67de.1443127809.git.yunwei.zhang@intel.com>
+From: Todd Previte <tprevite@gmail.com>
+Date: Tue, 21 Apr 2015 11:09:41 -0700
+Subject: [PATCH 7/9] FROM_UPSTREAM [VPG]: drm: Add edid_corrupt flag for
+ Displayport Link CTS 4.2.2.6
+
+Displayport compliance test 4.2.2.6 requires that a source device be capable of
+detecting a corrupt EDID. The test specification states that the sink device
+sets up the EDID with an invalid checksum. To do this, the sink sets up an
+invalid EDID header, expecting the source device to generate the checksum and
+compare it to the value stored in the last byte of the block data.
+
+Unfortunately, the DRM EDID reading and parsing functions are actually too good
+in this case; the header is fixed before the checksum is computed and thus the
+test never sees the invalid checksum. This results in a failure to pass the
+compliance test.
+
+To correct this issue, when the EDID code detects that the header is invalid,
+a flag is set to indicate that the EDID is corrupted. In this case, it sets
+edid_corrupt flag and continues with its fix-up code. This flag is also set in
+the case of a more seriously damaged header (fixup score less than the
+threshold). For consistency, the edid_corrupt flag is also set when the
+checksum is invalid as well.
+
+V2:
+- Removed the static bool global
+- Added a bool to the drm_connector struct to reaplce the static one for
+  holding the status of raw edid header corruption detection
+- Modified the function signature of the is_valid function to take an
+  additional parameter to store the corruption detected value
+- Fixed the other callers of the above is_valid function
+V3:
+- Updated the commit message to be more clear about what and why this
+  patch does what it does.
+- Added comment in code to clarify the operations there
+- Removed compliance variable and check_link_status update; those
+  have been moved to a later patch
+- Removed variable assignment from the bottom of the test handler
+V4:
+- Removed i915 tag from subject line as the patch is not i915-specific
+V5:
+- Moved code causing a compilation error to this patch where the variable
+  is actually declared
+- Maintained blank lines / spacing so as to not contaminate the patch
+V6:
+- Removed extra debug messages
+- Added documentation to for the added parameter on drm_edid_block_valid
+- Fixed more whitespace issues in check_link_status
+- Added a clear of the header_corrupt flag to the end of the test handler
+  in intel_dp.c
+- Changed the usage of the new function prototype in several places to use
+  NULL where it is not needed by compliance testing
+V7:
+- Updated to account for long_pulse flag propagation
+V8:
+- Removed clearing of header_corrupt flag from the test handler in intel_dp.c
+- Added clearing of header_corrupt flag in the drm_edid_block_valid function
+V9:
+- Renamed header_corrupt flag to edid_corrupt to more accurately reflect its
+  value and purpose
+- Updated commit message
+V10:
+- Updated for versioning and patch swizzle
+- Revised the title to more accurately reflect the nature and contents of
+  the patch
+- Fixed formatting/whitespace problems
+- Added set flag when computed checksum is invalid
+
+Change-Id: If53b31edd0c401b14e77ac1148f4b7b5c6b2c850
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-17498
+Signed-off-by: Todd Previte <tprevite@gmail.com>
+Cc: dri-devel@lists.freedesktop.org
+Acked-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+---
+ drivers/gpu/drm/drm_edid.c      | 32 ++++++++++++++++++++++++++------
+ drivers/gpu/drm/drm_edid_load.c |  7 +++++--
+ include/drm/drm_crtc.h          |  8 +++++++-
+ 3 files changed, 38 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index acab0d5..7ebf54a 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -1019,13 +1019,15 @@ MODULE_PARM_DESC(edid_fixup,
+  * @raw_edid: pointer to raw EDID block
+  * @block: type of block to validate (0 for base, extension otherwise)
+  * @print_bad_edid: if true, dump bad EDID blocks to the console
++ * @edid_corrupt: if true, the header or checksum is invalid
+  *
+  * Validate a base or extension EDID block and optionally dump bad blocks to
+  * the console.
+  *
+  * Return: True if the block is valid, false otherwise.
+  */
+-bool drm_edid_block_valid(u8 *raw_edid, int block, bool print_bad_edid)
++bool drm_edid_block_valid(u8 *raw_edid, int block, bool print_bad_edid,
++			  bool *edid_corrupt)
+ {
+ 	int i;
+ 	u8 csum = 0;
+@@ -1039,11 +1041,22 @@ bool drm_edid_block_valid(u8 *raw_edid, int block, bool print_bad_edid)
+ 
+ 	if (block == 0) {
+ 		int score = drm_edid_header_is_valid(raw_edid);
+-		if (score == 8) ;
+-		else if (score >= edid_fixup) {
++		if (score == 8) {
++			if (edid_corrupt)
++				*edid_corrupt = 0;
++		} else if (score >= edid_fixup) {
++			/* Displayport Link CTS Core 1.2 rev1.1 test 4.2.2.6
++			 * The corrupt flag needs to be set here otherwise, the
++			 * fix-up code here will correct the problem, the
++			 * checksum is correct and the test fails
++			 */
++			if (edid_corrupt)
++				*edid_corrupt = 1;
+ 			DRM_DEBUG("Fixing EDID header, your hardware may be failing\n");
+ 			memcpy(raw_edid, edid_header, sizeof(edid_header));
+ 		} else {
++			if (edid_corrupt)
++				*edid_corrupt = 1;
+ 			goto bad;
+ 		}
+ 	}
+@@ -1055,6 +1068,9 @@ bool drm_edid_block_valid(u8 *raw_edid, int block, bool print_bad_edid)
+ 			DRM_ERROR("EDID checksum is invalid, remainder is %d\n", csum);
+ 		}
+ 
++		if (edid_corrupt)
++			*edid_corrupt = 1;
++
+ 		/* allow CEA to slide through, switches mangle this */
+ 		if (raw_edid[0] != 0x02)
+ 			goto bad;
+@@ -1105,7 +1121,7 @@ bool drm_edid_is_valid(struct edid *edid)
+ 		return false;
+ 
+ 	for (i = 0; i <= edid->extensions; i++)
+-		if (!drm_edid_block_valid(raw + i * EDID_LENGTH, i, true))
++		if (!drm_edid_block_valid(raw + i * EDID_LENGTH, i, true, NULL))
+ 			return false;
+ 
+ 	return true;
+@@ -1198,7 +1214,8 @@ drm_do_get_edid(struct drm_connector *connector, struct i2c_adapter *adapter)
+ 	for (i = 0; i < 4; i++) {
+ 		if (drm_do_probe_ddc_edid(adapter, block, 0, EDID_LENGTH))
+ 			goto out;
+-		if (drm_edid_block_valid(block, 0, print_bad_edid))
++		if (drm_edid_block_valid(block, 0, print_bad_edid,
++					 &connector->edid_corrupt))
+ 			break;
+ 		if (i == 0 && drm_edid_is_zero(block, EDID_LENGTH)) {
+ 			connector->null_edid_counter++;
+@@ -1223,7 +1240,10 @@ drm_do_get_edid(struct drm_connector *connector, struct i2c_adapter *adapter)
+ 				  block + (valid_extensions + 1) * EDID_LENGTH,
+ 				  j, EDID_LENGTH))
+ 				goto out;
+-			if (drm_edid_block_valid(block + (valid_extensions + 1) * EDID_LENGTH, j, print_bad_edid)) {
++			if (drm_edid_block_valid(block + (valid_extensions + 1)
++						 * EDID_LENGTH, j,
++						 print_bad_edid,
++						 NULL)) {
+ 				valid_extensions++;
+ 				break;
+ 			}
+diff --git a/drivers/gpu/drm/drm_edid_load.c b/drivers/gpu/drm/drm_edid_load.c
+index 0a235fe..efb5385 100644
+--- a/drivers/gpu/drm/drm_edid_load.c
++++ b/drivers/gpu/drm/drm_edid_load.c
+@@ -216,7 +216,8 @@ static void *edid_load(struct drm_connector *connector, const char *name,
+ 		goto out;
+ 	}
+ 
+-	if (!drm_edid_block_valid(edid, 0, print_bad_edid)) {
++	if (!drm_edid_block_valid(edid, 0, print_bad_edid,
++				  &connector->edid_corrupt)) {
+ 		connector->bad_edid_counter++;
+ 		DRM_ERROR("Base block of EDID firmware \"%s\" is invalid ",
+ 		    name);
+@@ -229,7 +230,9 @@ static void *edid_load(struct drm_connector *connector, const char *name,
+ 		if (i != valid_extensions + 1)
+ 			memcpy(edid + (valid_extensions + 1) * EDID_LENGTH,
+ 			    edid + i * EDID_LENGTH, EDID_LENGTH);
+-		if (drm_edid_block_valid(edid + i * EDID_LENGTH, i, print_bad_edid))
++		if (drm_edid_block_valid(edid + i * EDID_LENGTH, i,
++					 print_bad_edid,
++					 NULL))
+ 			valid_extensions++;
+ 	}
+ 
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 91676459..1d120cf 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -563,6 +563,11 @@ struct drm_connector {
+ 	int null_edid_counter; /* needed to workaround some HW bugs where we get all 0s */
+ 	unsigned bad_edid_counter;
+ 
++	/* Flag for raw EDID header corruption - used in Displayport
++	 * compliance testing - * Displayport Link CTS Core 1.2 rev1.1 4.2.2.6
++	 */
++	bool edid_corrupt;
++
+ 	struct dentry *debugfs_entry;
+ };
+ 
+@@ -1104,7 +1109,8 @@ extern void drm_set_preferred_mode(struct drm_connector *connector,
+ 				   int hpref, int vpref);
+ 
+ extern int drm_edid_header_is_valid(const u8 *raw_edid);
+-extern bool drm_edid_block_valid(u8 *raw_edid, int block, bool print_bad_edid);
++extern bool drm_edid_block_valid(u8 *raw_edid, int block, bool print_bad_edid,
++				 bool *edid_corrupt);
+ extern bool drm_edid_is_valid(struct edid *edid);
+ struct drm_display_mode *drm_mode_find_dmt(struct drm_device *dev,
+ 					   int hsize, int vsize, int fresh,
+-- 
+1.9.1
+

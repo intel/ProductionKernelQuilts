@@ -1,0 +1,262 @@
+From 41895cbf4a6a2c07ee09015b583fac55363dcf3d Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Tue, 16 Dec 2014 19:55:28 +0530
+Subject: [PATCH] Implemented xpwr pmic/soc mux and vbus for otg handling
+
+The USB mux switch which connects the D+/D- lines between pmic and soc
+is controlled by gpoi line. This gpio resource should be initialized
+during pdata initilization and handled in dc pwrsrc driver. Vbus should
+be enbaled/disabled based on usb id.
+
+Change-Id: I9af0e12654a0a5a3980e2644d93e373820941f19
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-944
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+---
+ drivers/extcon/extcon-dc-pwrsrc.c       | 98 ++++++++++++++++++++++++++++++++-
+ drivers/mfd/intel_soc_pmic_dc.c         | 23 +++++++-
+ drivers/power/dc_xpwr_charger.c         |  4 ++
+ include/linux/extcon/extcon-dc-pwrsrc.h |  2 +
+ 4 files changed, 123 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/extcon/extcon-dc-pwrsrc.c b/drivers/extcon/extcon-dc-pwrsrc.c
+index eec961f..797a9a4 100644
+--- a/drivers/extcon/extcon-dc-pwrsrc.c
++++ b/drivers/extcon/extcon-dc-pwrsrc.c
+@@ -33,6 +33,7 @@
+ #include <linux/wakelock.h>
+ #include <linux/mfd/intel_soc_pmic.h>
+ #include <linux/extcon/extcon-dc-pwrsrc.h>
++#include <linux/gpio.h>
+ 
+ #define DC_PS_STAT_REG			0x00
+ #define PS_STAT_VBUS_TRIGGER		(1 << 0)
+@@ -97,6 +98,8 @@
+ #define PWRSRC_DRV_NAME			"dollar_cove_pwrsrc"
+ 
+ #define PWRSRC_EXTCON_CABLE_USB		"USB"
++#define PWRSRC_GPIO_MUX_SEL_PMIC	0
++#define PWRSRC_GPIO_MUX_SEL_SOC		1
+ 
+ enum {
+ 	VBUS_FALLING_IRQ = 0,
+@@ -117,6 +120,8 @@ struct dc_pwrsrc_info {
+ 	struct extcon_dev *edev;
+ 	struct usb_phy		*otg;
+ 	struct notifier_block	id_nb;
++	struct notifier_block	extcon_nb;
++	struct extcon_specific_cable_nb cable_obj;
+ 	struct wake_lock	wakelock;
+ 	bool is_sdp;
+ 	bool id_short;
+@@ -272,6 +277,15 @@ static int handle_chrg_det_event(struct dc_pwrsrc_info *info)
+ notify_otg_em:
+ 	if (!vbus_attach) {	/* disconnevt event */
+ 		if (notify_otg) {
++			/*
++			 * During OTG the D+/D- line will be connected to SOC.
++			 * On charger disconnect, change these line back to
++			 * PMIC for next BC detection.
++			 */
++			if (info->pdata->gpio_mux_cntl != NULL)
++				gpiod_set_value(info->pdata->gpio_mux_cntl,
++					PWRSRC_GPIO_MUX_SEL_PMIC);
++
+ 			atomic_notifier_call_chain(&info->otg->notifier,
+ 				vbus_mask ? USB_EVENT_VBUS : USB_EVENT_NONE,
+ 				NULL);
+@@ -289,9 +303,14 @@ notify_otg_em:
+ 			wake_lock(&info->wakelock);
+ 		if (notify_otg) {
+ 			/*
+-			 * TODO:close mux path to switch
+-			 * b/w device mode and host mode.
++			 * By default the D+/D- will be connected to pmic
++			 * for BC detection. Hence change the mux to connect
++			 * these lines to SOC.
+ 			 */
++			if (info->pdata->gpio_mux_cntl != NULL)
++				gpiod_set_value(info->pdata->gpio_mux_cntl,
++					PWRSRC_GPIO_MUX_SEL_SOC);
++
+ 			atomic_notifier_call_chain(&info->otg->notifier,
+ 				vbus_mask ? USB_EVENT_VBUS : USB_EVENT_NONE,
+ 				NULL);
+@@ -442,6 +461,47 @@ static int pwrsrc_extcon_registration(struct dc_pwrsrc_info *info)
+ 	return ret;
+ }
+ 
++static bool is_usb_host_mode(struct extcon_dev *evdev)
++{
++	return !!evdev->state;
++}
++
++static int dc_pwrsrc_handle_extcon_event(struct notifier_block *nb,
++				   unsigned long event, void *param)
++{
++	struct dc_pwrsrc_info *info =
++	    container_of(nb, struct dc_pwrsrc_info, extcon_nb);
++	struct extcon_dev *edev = param;
++	int usb_host = is_usb_host_mode(edev);
++
++	dev_info(&info->pdev->dev,
++		"[extcon notification] evt:USB-Host val:%s\n",
++		usb_host ? "Connected" : "Disconnected");
++
++	/*
++	 * in case of id short(usb_host = 1)
++	 * enable vbus else disable vbus.
++	 */
++	info->id_short = usb_host;
++	/*
++	 * By default the D+/D- will be connected to pmic
++	 * for BC detection. Hence change the mux to connect
++	 * these lines to SOC.
++	 */
++	if (info->pdata->gpio_mux_cntl != NULL) {
++		dev_info(&info->pdev->dev, "%s:id_short=%d\n",
++				__func__, info->id_short);
++		if (info->id_short)
++			gpiod_set_value(info->pdata->gpio_mux_cntl,
++					PWRSRC_GPIO_MUX_SEL_SOC);
++		else
++			gpiod_set_value(info->pdata->gpio_mux_cntl,
++					PWRSRC_GPIO_MUX_SEL_PMIC);
++	}
++
++	return NOTIFY_OK;
++}
++
+ static int dc_xpwr_pwrsrc_probe(struct platform_device *pdev)
+ {
+ 	struct dc_pwrsrc_info *info;
+@@ -485,6 +545,40 @@ static int dc_xpwr_pwrsrc_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++
++	dev_info(&info->pdev->dev, "%s: gpio_mux_cntl=%d\n",
++			__func__, desc_to_gpio(info->pdata->gpio_mux_cntl));
++	if (info->pdata->gpio_mux_cntl != NULL) {
++		if (gpio_request(desc_to_gpio(info->pdata->gpio_mux_cntl),
++					"USB_MUX")) {
++			dev_err(&info->pdev->dev,
++				"%s:USB Mux gpio request failed,gpio=%d\n",
++				__func__,
++				desc_to_gpio(info->pdata->gpio_mux_cntl));
++			goto intr_reg_failed;
++		}
++		gpiod_direction_output(info->pdata->gpio_mux_cntl,
++					PWRSRC_GPIO_MUX_SEL_PMIC);
++		dev_info(&info->pdev->dev,
++				"%s:Successfuly enabled gpio_mux_cntl=%d\n",
++				__func__,
++				desc_to_gpio(info->pdata->gpio_mux_cntl));
++
++		info->extcon_nb.notifier_call = dc_pwrsrc_handle_extcon_event;
++		ret = extcon_register_interest(&info->cable_obj, NULL,
++					"USB-Host", &info->extcon_nb);
++		if (ret)
++			dev_err(&pdev->dev, "failed to register extcon notifier\n");
++
++		if (info->cable_obj.edev)
++			info->id_short = is_usb_host_mode(info->cable_obj.edev);
++		if (info->id_short)
++			gpiod_set_value(info->pdata->gpio_mux_cntl,
++					PWRSRC_GPIO_MUX_SEL_SOC);
++		dev_info(&info->pdev->dev, "%s: id_short=%d\n",
++				__func__, info->id_short);
++	}
++
+ 	/* Unmask VBUS interrupt */
+ 	intel_soc_pmic_writeb(DC_PWRSRC_IRQ_CFG_REG, PWRSRC_IRQ_CFG_MASK);
+ 	intel_soc_pmic_clearb(DC_BC_GLOBAL_REG, BC_GLOBAL_RUN);
+diff --git a/drivers/mfd/intel_soc_pmic_dc.c b/drivers/mfd/intel_soc_pmic_dc.c
+index f3fb80f..7abf130 100644
+--- a/drivers/mfd/intel_soc_pmic_dc.c
++++ b/drivers/mfd/intel_soc_pmic_dc.c
+@@ -35,6 +35,9 @@
+ 
+ #define XPOWER_DEFAULT_TEMP_MAX 45
+ 
++#define GPIO_USB_MUX_INDEX	1
++#define GPIO_OTG_VBUS_INDEX	2
++
+ enum {
+ 	VBUS_FALLING_IRQ = 2,
+ 	VBUS_RISING_IRQ,
+@@ -408,6 +411,7 @@ static void platform_set_battery_data(struct dollarcove_fg_pdata *pdata,
+ static void dc_xpwr_chrg_pdata(void)
+ {
+ 	static struct dollarcove_chrg_pdata pdata;
++	struct gpio_desc *gpio_desc;
+ 
+ 	pdata.max_cc = 2000;
+ 	pdata.max_cv = 4350;
+@@ -418,8 +422,14 @@ static void dc_xpwr_chrg_pdata(void)
+ 	pdata.def_max_temp = 55;
+ 	pdata.def_min_temp = 0;
+ 
+-	/* Deprecated: DC does not handle GPIO for VBUS */
+-	pdata.otg_gpio = -1;
++	gpio_desc = devm_gpiod_get_index(dollar_cove_pmic.dev,
++			"pmic_res", GPIO_OTG_VBUS_INDEX);
++	if (IS_ERR(gpio_desc))
++		pdata.otg_gpio = -1;
++	else {
++		pdata.otg_gpio = desc_to_gpio(gpio_desc);
++		gpiod_put(gpio_desc);
++	}
+ 
+ 	platform_init_chrg_params(&pdata);
+ 
+@@ -571,6 +581,15 @@ static void dc_xpwr_pwrsrc_pdata(void)
+ 	 */
+ 	pdata.en_chrg_det = true;
+ 
++	/* Get the gpio based uab mux which will be used to switch usb D+/D-
++	 * data line between SOC for data communication and PMIC for charger
++	 * detection functionality.
++	 */
++	pdata.gpio_mux_cntl = devm_gpiod_get_index(dollar_cove_pmic.dev,
++				"pmic_res", GPIO_USB_MUX_INDEX);
++	if (IS_ERR(pdata.gpio_mux_cntl))
++		pdata.gpio_mux_cntl = NULL;
++
+ 	intel_soc_pmic_set_pdata("dollar_cove_pwrsrc",
+ 				 (void *)&pdata, sizeof(pdata), 0);
+ }
+diff --git a/drivers/power/dc_xpwr_charger.c b/drivers/power/dc_xpwr_charger.c
+index 4d903f0..33351d5 100644
+--- a/drivers/power/dc_xpwr_charger.c
++++ b/drivers/power/dc_xpwr_charger.c
+@@ -1031,10 +1031,14 @@ static int pmic_chrg_probe(struct platform_device *pdev)
+ 				"%s:OTG VBUS gpio request failed,gpio=%d\n",
+ 				__func__, info->pdata->otg_gpio);
+ 		} else {
++			/* By default disable the VBUS during gpio request */
+ 			gpio_direction_output(info->pdata->otg_gpio, 0);
+ 			dev_info(&info->pdev->dev,
+ 				"%s:Successfuly enabled otg_gpio=%d\n",
+ 				__func__, info->pdata->otg_gpio);
++			/* Schedule the worker thread to enable the VBUS based
++			 * on usb id during boot.
++			 */
+ 			schedule_work(&info->otg_work);
+ 		}
+ 	}
+diff --git a/include/linux/extcon/extcon-dc-pwrsrc.h b/include/linux/extcon/extcon-dc-pwrsrc.h
+index 7303b9d..616c459 100644
+--- a/include/linux/extcon/extcon-dc-pwrsrc.h
++++ b/include/linux/extcon/extcon-dc-pwrsrc.h
+@@ -4,6 +4,8 @@
+ 
+ struct dc_xpwr_pwrsrc_pdata {
+ 	bool	en_chrg_det;
++	/* Gpio based mux to switch D+/D- line between pmic and soc */
++	struct gpio_desc *gpio_mux_cntl;
+ };
+ 
+ #ifdef CONFIG_INTEL_SOC_PMIC
+-- 
+1.9.1
+

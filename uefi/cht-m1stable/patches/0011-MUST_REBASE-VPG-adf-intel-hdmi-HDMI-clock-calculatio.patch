@@ -1,0 +1,268 @@
+From 4866e96eb6d943a7416020e2307d0740cd7fa6ea Mon Sep 17 00:00:00 2001
+Message-Id: <4866e96eb6d943a7416020e2307d0740cd7fa6ea.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: Shashank Sharma <shashank.sharma@intel.com>
+Date: Mon, 2 Feb 2015 22:06:22 +0530
+Subject: [PATCH 11/61] MUST_REBASE [VPG]: adf/intel/hdmi: HDMI clock
+ calculation
+
+This patch adds function to calculate PLL dividers and multipliers
+for HDMI clock, dynamically. The calcuations rely on a formula, which
+calculates the best dividers on the basis of VCO gain and best PPM
+values. The CHV limits block are the HW limits of CHV pll.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5620
+Change-Id: I8c55eb1b50d2b13153874698160bb582c181f94d
+Signed-off-by: Shashank Sharma <shashank.sharma@intel.com>
+Signed-off-by: Siva Thulasimani <sivakumar.thulasimani@intel.com@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/vlv_pipeline.c    |   38 ++++--
+ drivers/video/adf/intel/core/vlv/vlv_pll.c         |  123 ++++++++++++++++++--
+ drivers/video/adf/intel/include/core/vlv/vlv_pll.h |    7 ++
+ 3 files changed, 152 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+index 8facbd4..7b00afa 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+@@ -302,15 +302,37 @@ u32 vlv_pipeline_on(struct intel_pipeline *pipeline,
+ 		err = vlv_pll_program_timings(pll, mode, &clock, multiplier);
+ 		if (err)
+ 			pr_err("ADF: %s: clock calculation failed\n", __func__);
++
+ 		if (disp->type == INTEL_PIPE_HDMI) {
+-			pr_err("HARDCODING clock for 19x10 HDMI\n");
+-
+-			clock.p1 = 4;
+-			clock.p2 = 2;
+-			clock.m1 = 2;
+-			clock.m2 = 0x1d2cccc0;
+-			clock.n = 1;
+-			clock.vco = 0x9104f;
++
++			if (!get_best_hdmi_pll(dotclock, &clock)) {
++				/*
++				  * Failed to calculate dynamic PLL, fallback
++				  * to 1920x1080@60, and try your luck
++				  */
++				clock.p1 = 4;
++				clock.p2 = 2;
++				clock.m1 = 2;
++				clock.m2 = 0x1d2cccc0;
++				clock.n = 1;
++				clock.vco = 0x9104f;
++
++				pr_info("ADF: Hardcoded p1=%d p2=%d m1=%d m2=%d n=%d vco=%d\n",
++					clock.p1, clock.p2, clock.m1, clock.m2,
++					clock.n, clock.vco);
++			} else {
++				pr_info("ADF: Calculated p1=%d p2=%d m1=%d m2=%d n=%d vco=%d\n",
++						clock.p1, clock.p2, clock.m1,
++						clock.m2, clock.n, clock.vco);
++			}
++
++		} else {
++			err = calc_clock_timings(mode->clock, &clock);
++			if (!err) {
++				pr_err("%s: unable to find clock values\n",
++					__func__);
++				return -EINVAL;
++			}
+ 		}
+ 		chv_dpio_update_clock(pipeline, &clock);
+ 		chv_dpio_update_channel(pipeline);
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pll.c b/drivers/video/adf/intel/core/vlv/vlv_pll.c
+index ae2c1f3..36a5b5b 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pll.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pll.c
+@@ -11,6 +11,7 @@
+  * GNU General Public License for more details.
+  */
+ 
++#include <linux/kernel.h>
+ #include <intel_adf_device.h>
+ #include <core/intel_dc_config.h>
+ #include <core/vlv/vlv_dc_config.h>
+@@ -107,7 +108,7 @@ static void chv_clock(int refclk, struct intel_clock *clock)
+ 	clock->dot = DIV_ROUND_CLOSEST(clock->vco, clock->p);
+ }
+ 
+-static bool calc_clock_timings(u32 target, struct intel_clock *best_clock)
++bool calc_clock_timings(u32 target, struct intel_clock *best_clock)
+ {
+ 	struct intel_limit *limit = &intel_limits_chv;
+ 	struct intel_clock clock = {0};
+@@ -159,16 +160,128 @@ static bool calc_clock_timings(u32 target, struct intel_clock *best_clock)
+ 			}
+ 		}
+ 	}
++	return found;
++}
++
++bool get_best_hdmi_pll(int target, struct intel_clock *best_clock)
++{
++	bool found = false;
++	struct intel_limit *limit = &intel_limits_chv;
++	struct intel_clock clock = {0};
++	u64 m2;
++	u64 best_m2 = 0;
++	u64 fastclock = target;
++	u64 vco_temp = 0;
++	u64 vco;
++
++	int refclk = 100;
++	ulong shift = (1 << CHV_PLL_INT_SHIFT);
++	ulong best_ppm = CHV_BEST_PPM;
++
++	ulong abs_ppm_diff = 0;
++	ulong abs_ppm = 0;
++	ulong temp;
++	ulong effective_m2;
++
++	memset(best_clock, 0, sizeof(*best_clock));
++
++	/*
++	  * Based on hardware doc, the n always set to 1, and m1 always
++	  * set to 2.  If requires to support 200Mhz refclk, we need to
++	  * revisit this because n may not 1 anymore.
++	  */
++	clock.n = 1;
++	clock.m1 = 2;
++
++	pr_err("ADF: fastclock = %llu\n", fastclock);
++
++	/* Get fastlock in Hz */
++	fastclock = (10 * fastclock) / (2 * 1000);
++
++	/* Find best PLL clocks with in range of P1 and P2 */
++	for (clock.p1 = limit->p1.max; clock.p1 >= limit->p1.min; clock.p1--) {
++		for (clock.p2 = limit->p2.p2_fast;
++				clock.p2 >= limit->p2.p2_slow;
++					clock.p2 -= clock.p2 > 10 ? 2 : 1) {
++			/*
++			  * Get M2, make it 10.CHV_PLL_INT_SHIFT
++			  * and then adjust for Khz
++			  */
++			clock.p = clock.p1 * clock.p2;
++			m2 = (fastclock * clock.p * clock.n) / 200;
++			m2 <<= CHV_PLL_INT_SHIFT;
++			m2 /= 1000;
++
++			/* VCO values, just to serach the boundary conditions */
++			vco_temp = (refclk * clock.m1 * m2)
++						>> CHV_PLL_INT_SHIFT;
++
++			/* Select only if VCO is in range */
++			if ((vco_temp >= 4800) && (vco_temp < 6480)) {
++
++				pr_info("ADF: %s M2=%llu vco_temp = %llu\n",
++					__func__, m2, vco_temp);
++
++				abs_ppm_diff = abs(DIV_ROUND_CLOSEST(
++					vco_temp	* 1000, clock.p) -
++							fastclock);
++
++				abs_ppm = DIV_ROUND_CLOSEST(abs_ppm_diff * 1000,
++						fastclock);
++
++				/* Prefer bigger P and less PPM */
++				if ((abs_ppm < 100) &&
++					(clock.p > best_clock->p)) {
++					best_ppm = 0;
++					*best_clock = clock;
++					found = true;
++					best_m2 = m2;
++				}
++
++				if (best_ppm &&
++					(abs_ppm < (best_ppm - 10)) &&
++						(clock.p > best_clock->p)) {
++					best_ppm = abs_ppm;
++					best_m2 = m2;
++					*best_clock = clock;
++					found = true;
++				}
++			}
++		}
++	}
++
++	if (found) {
++		vco = (best_clock->m1 * (best_m2 * 100) * (refclk))
++					>> CHV_PLL_INT_SHIFT;
++
++		effective_m2 = (unsigned long)best_m2;
++		temp = ((best_m2 % shift)) &  CHV_PLL_VCO_FRACT_MASK;
++		effective_m2 >>= CHV_PLL_INT_SHIFT;
++		effective_m2 = (effective_m2 << CHV_PLL_EFFECTIVE_M2_SHIFT)
++						| temp;
++
++		best_clock->vco = vco;
++		best_clock->m2 = effective_m2;
++	}
++
++	pr_info("====================================\n");
++	pr_info("ADF: best PLL p1=%d p2=%d m1=%d m2=0x%x\n",
++			best_clock->p1, best_clock->p2, best_clock->m1,
++				best_clock->m2);
++	pr_info("m=%d n=%d p=%d dot=%d vco=%d\n",
++			best_clock->m, best_clock->n, best_clock->p,
++				best_clock->dot, best_clock->vco);
++	pr_info("====================================\n");
+ 
+ 	return found;
+ }
+ 
++
+ u32 vlv_pll_program_timings(struct vlv_pll *pll,
+ 		struct drm_mode_modeinfo *mode,
+ 		struct intel_clock *clock, u32 multiplier)
+ {
+ 	u32 val = 0;
+-	bool ret = false;
+ 
+ 	val = DPLL_SSC_REF_CLOCK_CHV | DPLL_REFA_CLK_ENABLE_VLV
+ 		| DPLL_VGA_MODE_DIS;
+@@ -181,12 +294,6 @@ u32 vlv_pll_program_timings(struct vlv_pll *pll,
+ 	val = (multiplier - 1) << DPLL_MD_UDI_MULTIPLIER_SHIFT;
+ 	REG_WRITE(pll->md_offset, val);
+ 
+-	ret = calc_clock_timings(mode->clock, clock);
+-	if (!ret) {
+-		pr_err("%s: unable to find clock values\n", __func__);
+-		return -EINVAL;
+-	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pll.h b/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
+index 46158a7..1313a01 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
+@@ -49,6 +49,11 @@ struct intel_limit {
+ 	struct intel_p2 p2;
+ };
+ 
++#define CHV_PLL_INT_SHIFT 22
++#define CHV_PLL_VCO_FRACT_MASK 0x3FFFFF
++#define CHV_PLL_EFFECTIVE_M2_SHIFT 24
++#define CHV_BEST_PPM 1000000
++
+ u32 vlv_pll_wait_for_port_ready(enum port port_id);
+ u32 vlv_pll_program_timings(struct vlv_pll *pll,
+ 		struct drm_mode_modeinfo *mode,
+@@ -71,4 +76,6 @@ bool vlv_pll_init(struct vlv_pll *pll, enum intel_pipe_type type,
+ bool vlv_pll_destroy(struct vlv_pll *pll);
+ u32 vlv_pll_dpms(struct vlv_pll *pll, u8 dpms_state);
+ 
++bool calc_clock_timings(u32 target, struct intel_clock *best_clock);
++bool get_best_hdmi_pll(int target, struct intel_clock *best_clock);
+ #endif /*_VLV_PLL_H_*/
+-- 
+1.7.9.5
+

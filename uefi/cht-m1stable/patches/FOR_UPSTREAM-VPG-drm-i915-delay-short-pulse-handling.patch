@@ -1,0 +1,99 @@
+From 26879a940ca67930c98f2d5465c99c986098c219 Mon Sep 17 00:00:00 2001
+From: "Thulasimani,Sivakumar" <sivakumar.thulasimani@intel.com>
+Date: Tue, 3 Nov 2015 14:49:29 +0530
+Subject: [PATCH 23/28] FOR_UPSTREAM [VPG]: drm/i915: delay short pulse
+ handling till display is up
+
+DPCD read will succeed in CHT only if the respective PLL & DPIO
+are programmed properly, which is done as part of modeset.
+Due to presence of upfront link training it is possible for sink to
+give short pulse even before modeset is complete. This results in
+failing to handle this short pulse. This patch delays dpcd
+operations inside short pulse for a max of 80ms, which will
+allow us to handle most of the short pulse generated while
+modeset is in progress.
+
+Max delay is set to 80ms instead of 100ms to account for
+delays required during dpcd read.
+
+Change-Id: Id67e8ae7701c2eed6d04b0fb715a764eac6b9b2f
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9749
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Reviewed-on: https://android.intel.com:443/439696
+---
+ drivers/gpu/drm/i915/intel_dp.c  | 18 +++++++++++++++++-
+ drivers/gpu/drm/i915/intel_drv.h |  1 +
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index b191560..708a857 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -3092,6 +3092,7 @@ static void chv_pre_enable_dp(struct intel_encoder *encoder)
+ 	if (is_edp(intel_dp))
+ 		vlv_init_panel_power_sequencer(intel_dp);
+ 
++	intel_dp->allow_dpcd = true;
+ 	intel_enable_dp(encoder);
+ 
+ 	vlv_wait_port_ready(dev_priv, dport);
+@@ -4131,6 +4132,7 @@ intel_dp_link_down(struct intel_dp *intel_dp)
+ 
+ 	intel_dp_stop_link_train(intel_dp);
+ 	intel_dp->has_fast_link_train = false;
++	intel_dp->allow_dpcd = false;
+ 
+ 	if (HAS_PCH_CPT(dev) && (IS_GEN7(dev) || port != PORT_A)) {
+ 		DP &= ~DP_LINK_TRAIN_MASK_CPT;
+@@ -4480,6 +4482,15 @@ static void intel_dp_update_simulate_detach_info(struct intel_dp *intel_dp)
+ }
+ 
+ /*
++ * Required DPCD registers should be read
++ * within 100ms from short pulse generation. so
++ * retry for a max of 80ms, if we are blocked
++ * for so long better to fail, since crossing
++ * the limit will result in failure as well
++ */
++#define MAX_SHORT_PULSE_RETRY_COUNT 8
++
++/*
+  * According to DP spec
+  * 5.1.2:
+  *  1. Read DPCD
+@@ -4498,14 +4509,19 @@ intel_dp_check_link_status(struct intel_dp *intel_dp, bool *perform_full_detect)
+ 	u8 old_sink_count = intel_dp->sink_count;
+ 	u8 old_lane_count = intel_dp->dpcd[DP_MAX_LANE_COUNT];
+ 	bool ret;
++	uint8_t counter = MAX_SHORT_PULSE_RETRY_COUNT;
+ 
+ 	*perform_full_detect = false;
+ 	intel_dp->compliance_test_active = 0;
+ 	intel_dp->compliance_test_type = 0;
+ 	intel_dp->compliance_test_data = 0;
+ 
++	while (!intel_dp->allow_dpcd && counter-- > 0)
++		mdelay(10);
++
++	DRM_DEBUG_KMS("\n");
+ 	/* Try to read receiver status if the link appears to be up */
+-	if (!intel_dp_get_link_status(intel_dp, link_status)) {
++	if (counter == 0 || !intel_dp_get_link_status(intel_dp, link_status)) {
+ 		*perform_full_detect = true;
+ 		return;
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 9335ce8..a5a0c45 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -680,6 +680,7 @@ struct intel_dp {
+ 	enum hdmi_force_audio force_audio;
+ 	uint32_t color_range;
+ 	bool color_range_auto;
++	bool allow_dpcd;
+ 	uint8_t link_bw;
+ 	uint8_t lane_count;
+ 	uint8_t sink_count;
+-- 
+1.9.1
+

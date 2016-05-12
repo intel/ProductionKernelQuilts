@@ -1,0 +1,261 @@
+From 84b12a3231ffa9a7367a1630fa1dcca0e6c31271 Mon Sep 17 00:00:00 2001
+Message-Id: <84b12a3231ffa9a7367a1630fa1dcca0e6c31271.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 9 Apr 2014 13:21:39 +0100
+Subject: [PATCH 28/61] FOR_UPSTREAM [VPG]: drm/i915: Added manipulation of
+ OLR
+
+The scheduler requires each batch buffer to be tagged with the request (and
+seqno) it has been assigned and for that request to only be attached to the
+given batch buffer. Note that the seqno assigned to a batch buffer that is being
+submitted to the hardware might be very different to the next request that would
+be assigned automatically on ring submission.
+
+This means manipulating the lazy request pointer around batch buffer submission.
+At the start of execbuffer() the lazy request should be null, if not it means
+that something has been written to the ring without a request being added. The
+lazy request also needs to be reset back to null at the end ready for the next
+request to start.
+
+Then, execbuffer_final() needs to manually set the lazy request to the batch
+buffer's pre-assigned object rather than grabbing a brand new one. There is no
+need to explictly clear the lazy request at the end of _final() as the
+add_request() call within _retire_commands() will do that automatically.
+
+Change-Id: Iaa7f20c00371761909c9345dcc7fa32e695bd842
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   47 ++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_lrc.c           |   33 ++++++++++++++++---
+ 2 files changed, 73 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 9685b0a..df4611e 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1158,6 +1158,13 @@ i915_gem_ringbuffer_submission(struct i915_execbuffer_params *params,
+ 	 * of the work in progress which in turn would be a Bad Thing). */
+ 	WARN_ON(ring->outstanding_lazy_request != params->request);
+ 
++	/*
++	 * A new request has been assigned to the buffer and saved away for
++	 * future reference. So clear the OLR to ensure that any further
++	 * work is assigned a brand new request:
++	 */
++	ring->outstanding_lazy_request = NULL;
++
+ 	qe = container_of(params, typeof(*qe), params);
+ 	ret = i915_scheduler_queue_execbuffer(qe);
+ 	if (ret)
+@@ -1192,9 +1199,10 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
+-	/* Request matches? */
+-	WARN_ON(ring->outstanding_lazy_request != params->request);
++	/* Ensure the correct request gets assigned to the correct buffer: */
++	WARN_ON(ring->outstanding_lazy_request != NULL);
+ 	WARN_ON(params->request == NULL);
++	ring->outstanding_lazy_request = params->request;
+ 
+ 	/* Start watchdog timer */
+ 	if (params->args_flags & I915_EXEC_ENABLE_WATCHDOG) {
+@@ -1212,6 +1220,9 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 		watchdog_running = 1;
+ 	}
+ 
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
+ 	/*
+ 	 * Unconditionally invalidate gpu caches and ensure that we do flush
+ 	 * any residual writes from the previous batch.
+@@ -1225,6 +1236,9 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 	if (ret)
+ 		goto error;
+ 
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
+ 	if (ring == &dev_priv->ring[RCS] &&
+ 			params->instp_mode != dev_priv->relative_constants_mode) {
+ 		ret = intel_ring_begin(ring, 4);
+@@ -1255,6 +1269,9 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 		goto error;
+ 	}
+ 
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
+ 	exec_len   = params->args_batch_len;
+ 	exec_start = params->batch_obj_vm_offset +
+ 		     params->args_batch_start_offset;
+@@ -1294,11 +1311,17 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 			goto error;
+ 	}
+ 
+-	trace_i915_gem_ring_dispatch(intel_ring_get_request(ring), params->dispatch_flags);
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
++	trace_i915_gem_ring_dispatch(params->request, params->dispatch_flags);
+ 
+ 	i915_gem_execbuffer_retire_commands(params->dev, params->file, ring,
+ 					    params->batch_obj);
+ 
++	/* OLR should be empty by now. */
++	WARN_ON(ring->outstanding_lazy_request);
++
+ 	/* For VLV, modify RC6 promotion timer upon hitting Media workload only
+ 	   This will help in better power savings with media scenarios.
+ 	*/
+@@ -1321,6 +1344,11 @@ error:
+ 	 */
+ 	intel_runtime_pm_put(dev_priv);
+ 
++	if (ret) {
++		/* Reset the OLR ready to try again later. */
++		ring->outstanding_lazy_request = NULL;
++	}
++
+ early_error:
+ 	return ret;
+ }
+@@ -1578,12 +1606,18 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	} else
+ 		params->batch_obj_vm_offset = i915_gem_obj_offset(batch_obj, vm);
+ 
++	/* OLR should be zero at this point. If not then this buffer is going
++	 * to be tagged as someone else's work! */
++	WARN_ON(ring->outstanding_lazy_request != NULL);
++
+ 	/* Allocate a request for this batch buffer nice and early. */
+ 	ret = dev_priv->gt.alloc_request(ring, ctx);
+ 	if (ret)
+ 		goto err;
+ 	params->request = ring->outstanding_lazy_request;
+ 
++	WARN_ON(ring->outstanding_lazy_request == NULL);
++
+ 	/* Save assorted stuff away to pass through to *_submission_final() */
+ 	params->dev                     = dev;
+ 	params->file                    = file;
+@@ -1617,6 +1651,9 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	i915_gem_context_reference(ctx);
+ 	params->ctx = ctx;
+ 
++	/* OLR should have been set to something useful above */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
+ #ifdef CONFIG_SYNC
+ 	if (args->flags & I915_EXEC_WAIT_FENCE) {
+ 		int fd_fence_wait = (int) args->rsvd2;
+@@ -1698,6 +1735,10 @@ err:
+ 			i915_gem_context_unreference(params->ctx);
+ 	}
+ 
++	/* Free the OLR again in case the failure occurred after it had been
++	 * allocated. */
++	i915_gem_request_assign(&ring->outstanding_lazy_request, NULL);
++
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ pre_mutex_err:
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index dada2ac..2c39753 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1390,6 +1390,13 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
+ 	 * of the work in progress which in turn would be a Bad Thing). */
+ 	WARN_ON(ring->outstanding_lazy_request != params->request);
+ 
++	/*
++	 * A new request has been assigned to the buffer and saved away for
++	 * future reference. So clear the OLR to ensure that any further
++	 * work is assigned a brand new request:
++	 */
++	ring->outstanding_lazy_request = NULL;
++
+ 	qe = container_of(params, typeof(*qe), params);
+ 	ret = i915_scheduler_queue_execbuffer(qe);
+ 	if (ret)
+@@ -1413,10 +1420,10 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 
+ 	/* The mutex must be acquired before calling this function */
+ 	BUG_ON(!mutex_is_locked(&params->dev->struct_mutex));
+-
+-	/* Request matches? */
+-	WARN_ON(ring->outstanding_lazy_request != params->request);
++	/* Ensure the correct request gets assigned to the correct buffer: */
++	WARN_ON(ring->outstanding_lazy_request != NULL);
+ 	WARN_ON(params->request == NULL);
++	ring->outstanding_lazy_request = params->request;
+ 
+ 	/* Start watchdog timer */
+ 	if (params->args_flags & I915_EXEC_ENABLE_WATCHDOG) {
+@@ -1434,6 +1441,9 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 		watchdog_running = 1;
+ 	}
+ 
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
+ 	/*
+ 	 * Unconditionally invalidate gpu caches and ensure that we do flush
+ 	 * any residual writes from the previous batch.
+@@ -1442,6 +1452,9 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 	if (ret)
+ 		goto error;
+ 
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
+ 	if (ring == &dev_priv->ring[RCS] &&
+ 	    params->instp_mode != dev_priv->relative_constants_mode) {
+ 		ret = intel_logical_ring_begin(ringbuf, 4);
+@@ -1469,6 +1482,9 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 		goto error;
+ 	}
+ 
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
+ 	exec_start = params->batch_obj_vm_offset +
+ 		     params->args_batch_start_offset;
+ 
+@@ -1495,7 +1511,10 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 			return ret;
+ 	}
+ 
+-	trace_i915_gem_ring_dispatch(intel_ring_get_request(ring), params->dispatch_flags);
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
++	trace_i915_gem_ring_dispatch(params->request, params->dispatch_flags);
+ 
+ 	i915_gem_execbuffer_retire_commands(params->dev, params->file, ring, params->batch_obj);
+ 
+@@ -1515,9 +1534,15 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 
+ 	}
+ 
++	/* OLR should be empty by now. */
++	WARN_ON(ring->outstanding_lazy_request);
++
+ 	return 0;
+ 
+ error:
++	/* Reset the OLR ready to try again later. */
++	ring->outstanding_lazy_request = NULL;
++
+ 	return ret;
+ }
+ 
+-- 
+1.7.9.5
+

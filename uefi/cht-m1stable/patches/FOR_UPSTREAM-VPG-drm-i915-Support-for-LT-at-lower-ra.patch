@@ -1,0 +1,163 @@
+From fcb2a800992ba85ceb7a051461a8fc7905145f89 Mon Sep 17 00:00:00 2001
+From: "Thulasimani,Sivakumar" <sivakumar.thulasimani@intel.com>
+Date: Sat, 10 Oct 2015 01:38:31 +0530
+Subject: [PATCH 19/28] FOR_UPSTREAM [VPG]: drm/i915: Support for LT at lower
+ rates in VLV
+
+Link training protocol requires driver to begin the sequence
+at highest link rate and if that fails the source should
+retry at the next lower link rate. This patch adds support
+for this mechanism in valleyview boards.
+
+v2: moved the retry logic to seperate function instead of
+using goto logic (Raf)
+
+v3: renamed function & modifed condition as recommended (Raf)
+
+Change-Id: I89c77df9f29b551de111fc82ae5ccbe5e16a3185
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9749
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Reviewed-on: https://android.intel.com:443/439692
+---
+ drivers/gpu/drm/i915/intel_display.c | 76 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_dp.c      | 16 ++++++++
+ 2 files changed, 92 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 2f8e1c1..2981e4e 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5570,6 +5570,21 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
+ 			}
+ 			encoder->pre_enable(encoder);
+ 		}
++
++		/* check if link training succeeded */
++		if ((encoder->type == INTEL_OUTPUT_EDP) ||
++		   (encoder->type == INTEL_OUTPUT_DISPLAYPORT)) {
++			struct intel_dp *intel_dp =
++			    &(enc_to_dig_port(&encoder->base)->dp);
++
++			if (!intel_dp->has_fast_link_train) {
++				/* failed */
++				dev_priv->display.crtc_disable(crtc);
++
++				return;
++			}
++
++		}
+ 	}
+ 
+ 	i9xx_pfit_enable(intel_crtc);
+@@ -12536,6 +12551,57 @@ static void update_scanline_offset(struct intel_crtc *crtc)
+ 		crtc->scanline_offset = 1;
+ }
+ 
++/*
++ * This function implements support for retrying modeset
++ * with lower link rate/lane count if previous crtc_enable
++ * failed. This is done as per below logic.
++ *
++ * This function performs simple task of checking if
++ * DP/edp is active or not. if it is not active, we call
++ * compute_config to update the link rate and lane count
++ * and try crtc_enable again.
++ * This will continue as long as compute_config succeeds.
++ * if there is no more combinations to try then it will
++ * fail resulting in exiting the function.
++ */
++static void intel_set_mode_dp(struct intel_crtc *intel_crtc)
++{
++	struct drm_device *dev = intel_crtc->base.dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_encoder *encoder;
++	bool found = false;
++
++	/* get the encoder first */
++	for_each_encoder_on_crtc(dev, &intel_crtc->base, encoder) {
++		if ((encoder->type == INTEL_OUTPUT_EDP) ||
++		   (encoder->type == INTEL_OUTPUT_DISPLAYPORT)) {
++			found = true;
++			break;
++		}
++	}
++
++	if (!found)
++		return;
++
++	/*
++	 * compute config for DP decrements the link_rate every time
++	 * it is called. This will result in each crtc_enable
++	 * retried with different link_rates and when called with
++	 * lowest link rate it will return false and exit the loop
++	 */
++	while ((!intel_crtc->active) &&
++		(encoder->compute_config(encoder, &intel_crtc->config))) {
++		DRM_DEBUG_KMS("Display not up, retrying\n");
++
++		/* retry enable */
++		dev_priv->display.crtc_enable(&intel_crtc->base);
++
++		/* TBD: need to update pipe_config->dither */
++	}
++
++
++}
++
+ static int __intel_set_mode(struct drm_crtc *crtc,
+ 			    struct drm_display_mode *mode,
+ 			    int x, int y, struct drm_framebuffer *fb)
+@@ -12709,6 +12775,16 @@ static int __intel_set_mode(struct drm_crtc *crtc,
+ 			dev_priv->display.crtc_enable(&intel_crtc->base);
+ 
+ 			/*
++			 * if DP display was used might have to retry if
++			 * link training failed
++			 */
++			if (!intel_crtc->active &&
++			   (intel_pipe_has_type(crtc, INTEL_OUTPUT_DISPLAYPORT)
++			   || intel_pipe_has_type(crtc, INTEL_OUTPUT_EDP))) {
++				intel_set_mode_dp(intel_crtc);
++			}
++
++			/*
+ 			 * As we are updating crtc active state before
+ 			 * connector's DPMS state (which will be done by
+ 			 * subsequent DPMS ON call), hence we can ignore
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 140cab5..6d3573c 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -1021,6 +1021,21 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLCLK)
+ 		return false;
+ 
++	/*
++	 * port_clock is 0 for the very first call, hence
++	 * using it to differentiate from further calls.
++	 * further calls indicate link training failed
++	 * at last link rate and so retry with next lower rate.
++	 */
++	if (intel_dp->link_bw && pipe_config->port_clock) {
++		if (intel_dp->link_bw == DP_LINK_BW_2_7)
++			intel_dp->link_bw = DP_LINK_BW_1_62;
++		else if (intel_dp->link_bw == DP_LINK_BW_1_62)
++			return false;
++
++		max_clock = (intel_dp->link_bw >> 3);
++	}
++
+ 	DRM_DEBUG_KMS("DP link computation with max lane count %i "
+ 		      "max bw %02x pixel clock %iKHz\n",
+ 		      max_lane_count, bws[max_clock],
+@@ -4115,6 +4130,7 @@ intel_dp_link_down(struct intel_dp *intel_dp)
+ 
+ 	DRM_DEBUG_KMS("\n");
+ 
++	intel_dp_stop_link_train(intel_dp);
+ 	intel_dp->has_fast_link_train = false;
+ 
+ 	if (HAS_PCH_CPT(dev) && (IS_GEN7(dev) || port != PORT_A)) {
+-- 
+1.9.1
+

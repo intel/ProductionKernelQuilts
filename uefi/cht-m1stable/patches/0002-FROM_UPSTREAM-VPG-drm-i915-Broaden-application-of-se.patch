@@ -1,0 +1,150 @@
+From 322ded0c97288bf806d75746b91cdac2e4868eaa Mon Sep 17 00:00:00 2001
+Message-Id: <322ded0c97288bf806d75746b91cdac2e4868eaa.1423172493.git.feitong.yi@intel.com>
+In-Reply-To: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+References: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 2 Jan 2015 16:29:29 +0530
+Subject: [PATCH 02/29] FROM_UPSTREAM [VPG]: drm/i915: Broaden application of
+ set-domain(GTT)
+
+Previously, this was restricted to only operate on bound objects - to
+make pointer access through the GTT to the object coherent with writes
+to and from the GPU. A second usecase is drm_intel_bo_wait_rendering()
+which at present does not function unless the object also happens to
+be bound into the GGTT (on current systems that is becoming increasingly
+rare, especially for the typical requests from mesa). A third usecase is
+a future patch wishing to extend the coverage of the GTT domain to
+include objects not bound into the GGTT but still in its coherent cache
+domain. For the latter pair of requests, we need to operate on the
+object regardless of its bind state.
+
+v2: After discussion with Akash, we came to the conclusion that the
+get-pages was required in order for accurate domain tracking in the
+corner cases (like the shrinker) and also useful for ensuring memory
+coherency with earlier cached CPU mmaps in case userspace uses exotic
+cache bypass (non-temporal) instructions.
+
+v3: Fix the inactive object check.
+
+v4: Rebase to latest drm-intel-nightly codebase
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Akash Goel <akash.goel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+Change-Id: I5ab9ac1b71af0702611f137084bfa27f056a6e35
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 43566dedde54f9729113f5f9fde77d53e75e61e9
+For: GMINL-4760
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c |   53 ++++++++++++++++-----------------------
+ 1 file changed, 21 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 0108f19..669e339 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -204,12 +204,6 @@ int i915_mutex_lock_interruptible(struct drm_device *dev)
+ 	return 0;
+ }
+ 
+-static inline bool
+-i915_gem_object_is_inactive(struct drm_i915_gem_object *obj)
+-{
+-	return i915_gem_obj_bound_any(obj) && !obj->active;
+-}
+-
+ int
+ i915_gem_init_ioctl(struct drm_device *dev, void *data,
+ 		    struct drm_file *file)
+@@ -1493,18 +1487,10 @@ i915_gem_set_domain_ioctl(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto unref;
+ 
+-	if (read_domains & I915_GEM_DOMAIN_GTT) {
++	if (read_domains & I915_GEM_DOMAIN_GTT)
+ 		ret = i915_gem_object_set_to_gtt_domain(obj, write_domain != 0);
+-
+-		/* Silently promote "you're not bound, there was nothing to do"
+-		 * to success, since the client was just asking us to
+-		 * make sure everything was done.
+-		 */
+-		if (ret == -EINVAL)
+-			ret = 0;
+-	} else {
++	else
+ 		ret = i915_gem_object_set_to_cpu_domain(obj, write_domain != 0);
+-	}
+ 
+ unref:
+ 	drm_gem_object_unreference(&obj->base);
+@@ -3904,14 +3890,10 @@ i915_gem_object_flush_cpu_write_domain(struct drm_i915_gem_object *obj,
+ int
+ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj, bool write)
+ {
+-	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
+ 	uint32_t old_write_domain, old_read_domains;
++	struct i915_vma *vma;
+ 	int ret;
+ 
+-	/* Not valid to be called on unbound objects. */
+-	if (!i915_gem_obj_bound_any(obj))
+-		return -EINVAL;
+-
+ 	if (obj->base.write_domain == I915_GEM_DOMAIN_GTT)
+ 		return 0;
+ 
+@@ -3920,6 +3902,19 @@ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj, bool write)
+ 		return ret;
+ 
+ 	i915_gem_object_retire(obj);
++
++	/* Flush and acquire obj->pages so that we are coherent through
++	 * direct access in memory with previous cached writes through
++	 * shmemfs and that our cache domain tracking remains valid.
++	 * For example, if the obj->filp was moved to swap without us
++	 * being notified and releasing the pages, we would mistakenly
++	 * continue to assume that the obj remained out of the CPU cached
++	 * domain.
++	 */
++	ret = i915_gem_object_get_pages(obj);
++	if (ret)
++		return ret;
++
+ 	i915_gem_object_flush_cpu_write_domain(obj, false);
+ 
+ 	/* Serialise direct access to this object with the barriers for
+@@ -3948,13 +3943,10 @@ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj, bool write)
+ 					    old_write_domain);
+ 
+ 	/* And bump the LRU for this access */
+-	if (i915_gem_object_is_inactive(obj)) {
+-		struct i915_vma *vma = i915_gem_obj_to_ggtt(obj);
+-		if (vma)
+-			list_move_tail(&vma->mm_list,
+-				       &dev_priv->gtt.base.inactive_list);
+-
+-	}
++	vma = i915_gem_obj_to_ggtt(obj);
++	if (vma && drm_mm_node_allocated(&vma->node) && !obj->active)
++		list_move_tail(&vma->mm_list,
++			       &to_i915(obj->base.dev)->gtt.base.inactive_list);
+ 
+ 	return 0;
+ }
+@@ -5700,10 +5692,7 @@ struct i915_vma *i915_gem_obj_to_ggtt(struct drm_i915_gem_object *obj)
+ {
+ 	struct i915_vma *vma;
+ 
+-	/* This WARN has probably outlived its usefulness (callers already
+-	 * WARN if they don't find the GGTT vma they expect). When removing,
+-	 * remember to remove the pre-check in is_pin_display() as well */
+-	if (WARN_ON(list_empty(&obj->vma_list)))
++	if (list_empty(&obj->vma_list))
+ 		return NULL;
+ 
+ 	vma = list_first_entry(&obj->vma_list, typeof(*vma), vma_link);
+-- 
+1.7.9.5
+

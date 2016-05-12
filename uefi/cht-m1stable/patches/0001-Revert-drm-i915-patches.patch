@@ -1,0 +1,765 @@
+From 9fe31c98fac29cb103bac14a502872b02be1a6d8 Mon Sep 17 00:00:00 2001
+From: Carlos Pargada <carlos.pargada@intel.com>
+Date: Fri, 29 Apr 2016 09:43:06 +0200
+Subject: [PATCH] Revert drm/i915 patches
+
+- "FOR_UPSTREAM [VPG]: drm/i915: Perform upfront before edid read"
+- "SQUASHME! [VPG]: drm/i915: Avoid clearing test request till handling it"
+- "SQUASHME! [VPG]: drm/i915: Always do fake detach-attach for SHPD failure"
+- "SQUASHME! [VPG]: drm/i915: fix boundry condition for allow_dpcd"
+- "FOR_UPSTREAM [VPG]: drm/i915: move pm_qos_update_request to dp detect"
+- "Revert "FOR_UPSTREAM [VPG]: drm/i915: Calculate multiplier value for DP panels""
+- "FOR_UPSTREAM [VPG]: drm/i915: use correct pipe for get/put in dp aux"
+- "FOR_UPSTREAM [VPG]: drm/i915: Change sleep to delays for DPCD ops"
+- "FOR_UPSTREAM [VPG]: drm/i915: Always perform link training when requested"
+- "FOR_UPSTREAM [VPG]: drm/i915: Use Max CD clock for DP in CHT"
+- "FOR_UPSTREAM [VPG]: drm/i915: Optimize CD clock change for CHT"
+- "SQUASHME! [VPG]: drm/i915: Fix upfront link training if MIPI is present"
+- "Displayport infoframe support in Audio driver"
+- "FOR_UPSTREAM [VPG]: drm/i915: Disable MaxFifo during modeset"
+- "FOR_UPSTREAM [VPG]: drm/i915: Fix audio checks during modeset"
+- "Revert "FOR_UPSTREAM [VPG]: drm/i915: Avoid optimizing lane count""
+- "FOR_UPSTREAM [VPG]: drm/i915: Avoid lane optimization for External panels"
+- "FOR_UPSTREAM [VPG]: drm/i915: Modify Link BW warn to debug msg"
+- "FOR_UPSTREAM [VPG]: drm/i915: Avoid enabling dithering for 6bpc"
+
+Change-Id: I9e5adacfb0588bf4abaae95ee672de1e802756d6
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-30675
+Reviewed-on: https://android.intel.com:443/501687
+---
+ drivers/gpu/drm/i915/i915_drv.h                 |   1 -
+ drivers/gpu/drm/i915/intel_display.c            |  97 ++--------
+ drivers/gpu/drm/i915/intel_dp.c                 | 226 +++++++++---------------
+ drivers/gpu/drm/i915/intel_drv.h                |   2 +
+ drivers/gpu/drm/i915/intel_hdmi.c               |  10 +-
+ sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c |  49 ++---
+ 6 files changed, 119 insertions(+), 266 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 0a27a85..489bb9c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1760,7 +1760,6 @@ struct drm_i915_private {
+ 
+ 	unsigned int fsb_freq, mem_freq, is_ddr3;
+ 	unsigned int vlv_cdclk_freq;
+-	unsigned int req_cdclk_freq; /* requested value, can be < current */
+ 	u16 stepping_id;
+ 
+ 	/**
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 4d23545..58c7a05 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5423,11 +5423,7 @@ int valleyview_cur_cdclk(struct drm_i915_private *dev_priv)
+ static int valleyview_calc_cdclk(struct drm_i915_private *dev_priv,
+ 				 int max_pixclk)
+ {
+-	struct drm_device *dev = dev_priv->dev;
+-	struct drm_crtc *crtc;
+-	struct intel_encoder *encoder;
+ 	int new_cdclk;
+-
+ 	/*
+ 	 * Really only a few cases to deal with, as only 4 CDclks are supported:
+ 	 *   200MHz
+@@ -5437,50 +5433,14 @@ static int valleyview_calc_cdclk(struct drm_i915_private *dev_priv,
+ 	 * So we check to see whether we're above 90% of the lower bin and
+ 	 * adjust if needed.
+ 	 */
+-	if (max_pixclk > 288000 && !IS_CHERRYVIEW(dev))
++	if (max_pixclk > 288000 && !IS_CHERRYVIEW(dev_priv->dev))
+ 		new_cdclk = 400;
+ 	else if (max_pixclk > 240000)
+ 		new_cdclk = 320;
+-	else {
++	else
+ 		new_cdclk = 266;
+-		/*
+-		 * Looks like the 200MHz CDclk freq doesn't work on some configs
+-		 * hence minimum is 266 programmed above.
+-		 *
+-		 * Also, running on 4 lanes, at HBR link rate and enabling audio
+-		 * results in blankout of the display at 266MHz hence
+-		 * use 320 MHz always if DP that has audio support is enabled.
+-		 */
+-		for_each_crtc(dev, crtc) {
+-			if (!to_intel_crtc(crtc)->new_enabled)
+-				continue;
+-
+-			/*
+-			 * we have not linked CRTC, encoder & connector yet
+-			 * (too early in the mode set sequence for that)
+-			 * so we have to manualy check for each encoder
+-			 * that is to be associated with our CRTC.
+-			 */
+-			list_for_each_entry(encoder,
+-				&dev->mode_config.encoder_list, base.head) {
+-				struct intel_dp *intel_dp;
+-
+-				if (&encoder->new_crtc->base != crtc)
+-					continue;
+-
+-				if (encoder->type != INTEL_OUTPUT_DISPLAYPORT)
+-					continue;
++	/* Looks like the 200MHz CDclk freq doesn't work on some configs */
+ 
+-				intel_dp = &(enc_to_dig_port
+-							(&encoder->base)->dp);
+-
+-				if (intel_dp->has_audio) {
+-					DRM_DEBUG_KMS("Using 320MHz for DP\n");
+-					return 320;
+-				}
+-			}
+-		}
+-	}
+ 	return new_cdclk;
+ }
+ 
+@@ -5507,8 +5467,8 @@ static void valleyview_modeset_global_pipes(struct drm_device *dev,
+ 	struct intel_crtc *intel_crtc;
+ 	int max_pixclk = intel_mode_max_pixclk(dev_priv);
+ 
+-	dev_priv->req_cdclk_freq = valleyview_calc_cdclk(dev_priv, max_pixclk);
+-	if (dev_priv->req_cdclk_freq <= dev_priv->vlv_cdclk_freq)
++	if (valleyview_calc_cdclk(dev_priv, max_pixclk) ==
++	    dev_priv->vlv_cdclk_freq)
+ 		return;
+ 
+ 	/* disable/enable all currently active pipes while we change cdclk */
+@@ -5520,9 +5480,10 @@ static void valleyview_modeset_global_pipes(struct drm_device *dev,
+ static void valleyview_modeset_global_resources(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	int req_cdclk = dev_priv->req_cdclk_freq;
++	int max_pixclk = intel_mode_max_pixclk(dev_priv);
++	int req_cdclk = valleyview_calc_cdclk(dev_priv, max_pixclk);
+ 
+-	if (dev_priv->vlv_cdclk_freq < dev_priv->req_cdclk_freq) {
++	if (req_cdclk != dev_priv->vlv_cdclk_freq) {
+ 		if (IS_CHERRYVIEW(dev))
+ 			cherryview_set_cdclk(dev, req_cdclk);
+ 		else
+@@ -6172,9 +6133,6 @@ void intel_encoder_destroy(struct drm_encoder *encoder)
+ static void intel_encoder_dpms(struct intel_encoder *encoder, int mode)
+ {
+ 	struct drm_device *dev = encoder->base.dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct drm_crtc *crtc;
+-
+ 	if (mode == DRM_MODE_DPMS_ON) {
+ 		encoder->connectors_active = true;
+ 		intel_crtc_update_dpms(encoder->base.crtc);
+@@ -6189,24 +6147,6 @@ static void intel_encoder_dpms(struct intel_encoder *encoder, int mode)
+ 		intel_save_clr_mgr_status(dev);
+ 
+ 		intel_crtc_update_dpms(encoder->base.crtc);
+-
+-		if (!IS_VALLEYVIEW(dev))
+-			return;
+-
+-		for_each_crtc(dev, crtc) {
+-			if (!crtc || !to_intel_crtc(crtc))
+-				continue;
+-			if (to_intel_crtc(crtc)->active)
+-				return;
+-		}
+-
+-		/*HACK: force cdclock change by setting current to 0 */
+-		if (dev_priv->vlv_cdclk_freq != dev_priv->req_cdclk_freq) {
+-			dev_priv->vlv_cdclk_freq = 0;
+-			DRM_DEBUG_KMS("Lowering CD clock to %d\n",
+-				dev_priv->req_cdclk_freq);
+-			valleyview_modeset_global_resources(dev);
+-		}
+ 	}
+ }
+ 
+@@ -7268,17 +7208,6 @@ static void i9xx_set_pipeconf(struct intel_crtc *intel_crtc)
+ 
+ 	/* only g4x and later have fancy bpc/dither controls */
+ 	if (IS_G4X(dev) || IS_VALLEYVIEW(dev)) {
+-
+-		/*
+-		 * compliance will fail if dithering is enabled for 6bpc
+-		 * hence avoid this. This will not affect normal functioning
+-		 * since external DP does not need dithering for 6bpc
+-		 */
+-		if (intel_pipe_has_type(&intel_crtc->base,
+-				INTEL_OUTPUT_DISPLAYPORT) &&
+-				intel_crtc->config.pipe_bpp < 24)
+-			intel_crtc->config.dither = false;
+-
+ 		/* Bspec claims that we can't use dithering for 30bpp pipes. */
+ 		if (intel_crtc->config.dither && intel_crtc->config.pipe_bpp != 30)
+ 			pipeconf |= PIPECONF_DITHER_EN |
+@@ -12285,8 +12214,7 @@ intel_pipe_config_compare(struct drm_device *dev,
+ 	    IS_VALLEYVIEW(dev))
+ 		PIPE_CONF_CHECK_I(limited_color_range);
+ 
+-	if (!IS_VALLEYVIEW(dev))
+-		PIPE_CONF_CHECK_I(has_audio);
++	PIPE_CONF_CHECK_I(has_audio);
+ 
+ 	PIPE_CONF_CHECK_FLAGS(adjusted_mode.flags,
+ 			      DRM_MODE_FLAG_INTERLACE);
+@@ -12705,7 +12633,6 @@ static int __intel_set_mode(struct drm_crtc *crtc,
+ 
+ 	*saved_mode = crtc->mode;
+ 
+-	intel_update_maxfifo(dev_priv, crtc, false);
+ 	/* Hack: Because we don't (yet) support global modeset on multiple
+ 	 * crtcs, we don't keep track of the new mode for more than one crtc.
+ 	 * Hence simply check whether any bit is set in modeset_pipes in all the
+@@ -15302,9 +15229,6 @@ bool chv_upfront_link_train(struct drm_device *dev,
+ 		if (intel_crtc_active(&crtc->base))
+ 			continue;
+ 
+-		if (intel_pipe_has_type(&crtc->base, INTEL_OUTPUT_DSI))
+-			continue;
+-
+ 		connector->new_encoder = encoder;
+ 		encoder->new_crtc = crtc;
+ 		encoder->base.crtc = &crtc->base;
+@@ -15342,6 +15266,9 @@ start_link_train:
+ 		crtc->config.port_clock =
+ 				drm_dp_bw_code_to_link_rate(intel_dp->link_bw);
+ 
++		crtc->config.pixel_multiplier = intel_dp_calc_multiplier(
++						encoder, intel_dp->link_bw);
++
+ 		/* Enable PLL followed by port */
+ 		intel_dp_set_clock(encoder, &crtc->config, intel_dp->link_bw);
+ 		chv_update_pll(crtc);
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index a9b177d..c3e363e 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -162,8 +162,8 @@ int intel_dp_max_link_bw(struct intel_dp *intel_dp)
+ 			max_link_bw = DP_LINK_BW_2_7;
+ 		break;
+ 	default:
+-		DRM_DEBUG_KMS("Unsupported Max Link bw:%x, using 1.62Gbps\n",
+-				max_link_bw);
++		WARN(1, "invalid max DP link bw val %x, using 1.62Gbps\n",
++		     max_link_bw);
+ 		max_link_bw = DP_LINK_BW_1_62;
+ 		break;
+ 	}
+@@ -643,69 +643,6 @@ static uint32_t i9xx_get_aux_send_ctl(struct intel_dp *intel_dp,
+ 	       (aux_clock_divider << DP_AUX_CH_CTL_BIT_CLOCK_2X_SHIFT);
+ }
+ 
+-/*
+- * This funcion brings together the assumptions(hack) about
+- * combinations of displays possible in CHT to find the
+- * current pipe. this is required since our power domain
+- * logic works on pipe id and during our detection we do
+- * not have any pipe associated with the current encoder
+- * or connector. so this is the only way to handle this
+- * as of now. The proper fix is to move the get/put
+- * calls to power domain to the caller and let them
+- * worry about the power domain. but that has to be done
+- * another day as any such change is not going to be
+- * simple fix.
+- */
+-static enum pipe cht_find_pipe(struct intel_dp *intel_dp)
+-{
+-	struct intel_digital_port *intel_dig_port = dp_to_dig_port(intel_dp);
+-	struct drm_device *dev = intel_dig_port->base.base.dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_encoder *intel_encoder;
+-
+-	if (intel_dig_port->port == PORT_D)
+-		return PIPE_C;
+-
+-	if (is_edp(intel_dp))
+-		return PIPE_B;
+-
+-	/*
+-	 * since we have handled edp above, reaching here means
+-	 * we have an external DP, hence use the logic below
+-	 */
+-	list_for_each_entry(intel_encoder, &dev->
+-			mode_config.encoder_list, base.head) {
+-
+-		/*
+-		 * MIPI always comes on Pipe A or Pipe B
+-		 * depending on Port A or Port C and EDP
+-		 * comes on Pipe B. So the other pipe
+-		 * will only be able to drive the DP.
+-		 * MIPI on Port A is driven by Pipe A
+-		 * and MIPI on Port C is driven by
+-		 * Pipe B. So the other pipe will
+-		 * drive DP.
+-		 */
+-
+-		if (intel_encoder->type == INTEL_OUTPUT_EDP) {
+-			return PIPE_A;
+-		} else if (intel_encoder->type == INTEL_OUTPUT_DSI &&
+-				dev_priv->vbt.dsi.port == DVO_PORT_MIPIA) {
+-			return PIPE_B;
+-		} else if (intel_encoder->type == INTEL_OUTPUT_DSI &&
+-				dev_priv->vbt.dsi.port == DVO_PORT_MIPIC) {
+-			return PIPE_A;
+-		}
+-	}
+-
+-	/*
+-	 * if none of the above conditions are hit
+-	 * it means we are in a system without LFP
+-	 * just taking a guess and sending A
+-	 */
+-	return PIPE_A;
+-}
+-
+ static int
+ intel_dp_aux_ch(struct intel_dp *intel_dp,
+ 		uint8_t *send, int send_bytes,
+@@ -722,27 +659,27 @@ intel_dp_aux_ch(struct intel_dp *intel_dp,
+ 	int try, clock = 0;
+ 	bool has_aux_irq = HAS_AUX_IRQ(dev) && !IS_VALLEYVIEW(dev);
+ 	bool vdd = false;
+-	enum pipe pipe;
+ 
+ 	/* If we already have panel power, do not call _vdd_on */
+ 	if (is_edp(intel_dp) && !edp_have_panel_power(intel_dp))
+ 		vdd = _edp_panel_vdd_on(intel_dp);
+ 
+-	intel_dp_check_edp(intel_dp);
++	/* dp aux is extremely sensitive to irq latency, hence request the
++	 * lowest possible wakeup latency and so prevent the cpu from going into
++	 * deep sleep states.
++	 */
++	pm_qos_update_request(&dev_priv->pm_qos, 0);
+ 
+-	if (IS_CHERRYVIEW(dev))
+-		pipe = cht_find_pipe(intel_dp);
+-	else
+-		pipe = PIPE_A;
++	intel_dp_check_edp(intel_dp);
+ 
+-	intel_display_power_get(dev_priv, pipe);
++	intel_display_power_get(dev_priv, PIPE_A);
+ 
+ 	/* Try to wait for any previous AUX channel activity */
+ 	for (try = 0; try < 3; try++) {
+ 		status = I915_READ_NOTRACE(ch_ctl);
+ 		if ((status & DP_AUX_CH_CTL_SEND_BUSY) == 0)
+ 			break;
+-		usleep_range(1000, 1100);
++		msleep(1);
+ 	}
+ 
+ 	if (try == 3) {
+@@ -837,7 +774,8 @@ intel_dp_aux_ch(struct intel_dp *intel_dp,
+ 
+ 	ret = recv_bytes;
+ out:
+-	intel_display_power_put(dev_priv, pipe);
++	pm_qos_update_request(&dev_priv->pm_qos, PM_QOS_DEFAULT_VALUE);
++	intel_display_power_put(dev_priv, PIPE_A);
+ 
+ 	if (vdd)
+ 		edp_panel_vdd_off(intel_dp, false);
+@@ -1025,6 +963,27 @@ intel_dp_set_m2_n2(struct intel_crtc *crtc, struct intel_link_m_n *m_n)
+ 	I915_WRITE(PIPE_LINK_N2(transcoder), m_n->link_n);
+ }
+ 
++uint8_t intel_dp_calc_multiplier(struct intel_encoder *encoder,
++			u32 link_rate)
++{
++	struct drm_device *dev = encoder->base.dev;
++	uint8_t multiplier = 1;
++
++	if (!IS_VALLEYVIEW(dev))
++		return multiplier;
++
++	/*
++	 * CHV/VLV supports only HBR and LBR,
++	 * so use precalculated values
++	 */
++	if (link_rate == DP_LINK_BW_2_7)
++		multiplier = 4;
++	else if (link_rate != DP_LINK_BW_1_62)
++		DRM_ERROR("Invalid link rate used\n");
++
++	return multiplier;
++}
++
+ bool
+ intel_dp_compute_config(struct intel_encoder *encoder,
+ 			struct intel_crtc_config *pipe_config)
+@@ -1115,8 +1074,8 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 			DRM_DEBUG_KMS("using min %02x link bw per VBT\n",
+ 				      bws[min_clock]);
+ 		}
+-	} else
+-		min_lane_count = max_lane_count;
++	}
++
+ 	/*
+ 	 * Walk through all bpp values. Luckily they're all nicely spaced with 2
+ 	 * bpc in between.
+@@ -1155,16 +1114,25 @@ found:
+ 	if (intel_dp->color_range)
+ 		pipe_config->limited_color_range = true;
+ 
++	/*
++	 * compliance tests expect same lane count as reported, so
++	 * avoid any optimization during tests
++	 */
++	if (intel_dp->compliance_test_type == DP_TEST_LINK_TRAINING)
++		lane_count = max_lane_count;
++
+ 	intel_dp->link_bw = bws[clock];
+ 	intel_dp->lane_count = lane_count;
+ 	pipe_config->pipe_bpp = bpp;
+ 	pipe_config->port_clock = drm_dp_bw_code_to_link_rate(intel_dp->link_bw);
++	pipe_config->pixel_multiplier =
++			intel_dp_calc_multiplier(encoder, bws[clock]);
+ 
+ 	DRM_DEBUG_KMS("DP link bw %02x lane count %d clock %d bpp %d\n",
+ 		      intel_dp->link_bw, intel_dp->lane_count,
+ 		      pipe_config->port_clock, bpp);
+-	DRM_DEBUG_KMS("DP link bw required %i available %i\n",
+-		      mode_rate, link_avail);
++	DRM_DEBUG_KMS("DP link bw required %i available %i and multiplier %d\n",
++		      mode_rate, link_avail, pipe_config->pixel_multiplier);
+ 
+ 	intel_link_compute_m_n(bpp, lane_count,
+ 			       adjusted_mode->crtc_clock,
+@@ -1247,15 +1215,9 @@ static void intel_dp_prepare(struct intel_encoder *encoder)
+ 	intel_dp->DP |= DP_VOLTAGE_0_4 | DP_PRE_EMPHASIS_0;
+ 	intel_dp->DP |= DP_PORT_WIDTH(intel_dp->lane_count);
+ 
+-	/*
+-	 * LP audio driver communicates through i915
+-	 * where we enable audio output on port
+-	 * hence not needed to be enabled during
+-	 * modeset
+-	 */
+-	if (crtc->config.has_audio && !IS_VALLEYVIEW(dev)) {
++	if (crtc->config.has_audio) {
+ 		DRM_DEBUG_DRIVER("Enabling DP audio on pipe %c\n",
+-				pipe_name(crtc->pipe));
++				 pipe_name(crtc->pipe));
+ 		intel_dp->DP |= DP_AUDIO_OUTPUT_ENABLE;
+ 		intel_write_eld(&encoder->base, adjusted_mode);
+ 	}
+@@ -3137,6 +3099,7 @@ static void chv_pre_enable_dp(struct intel_encoder *encoder)
+ 	if (is_edp(intel_dp))
+ 		vlv_init_panel_power_sequencer(intel_dp);
+ 
++	intel_dp->allow_dpcd = true;
+ 	intel_enable_dp(encoder);
+ 
+ 	vlv_wait_port_ready(dev_priv, dport);
+@@ -4087,7 +4050,6 @@ intel_dp_complete_link_train(struct intel_dp *intel_dp)
+ 
+ 	if (channel_eq) {
+ 		intel_dp->has_fast_link_train = true;
+-		intel_dp->allow_dpcd = true;
+ 		DRM_DEBUG_KMS("Channel EQ done. DP Training successful\n");
+ 	}
+ 
+@@ -4554,7 +4516,6 @@ intel_dp_check_link_status(struct intel_dp *intel_dp, bool *perform_full_detect)
+ 	u8 old_sink_count = intel_dp->sink_count;
+ 	u8 old_lane_count = intel_dp->dpcd[DP_MAX_LANE_COUNT];
+ 	bool ret;
+-	bool check_link = false;
+ 	uint8_t counter = MAX_SHORT_PULSE_RETRY_COUNT;
+ 
+ 	*perform_full_detect = false;
+@@ -4562,7 +4523,7 @@ intel_dp_check_link_status(struct intel_dp *intel_dp, bool *perform_full_detect)
+ 	intel_dp->compliance_test_type = 0;
+ 	intel_dp->compliance_test_data = 0;
+ 
+-	while (!intel_dp->allow_dpcd && counter-- > 1)
++	while (!intel_dp->allow_dpcd && counter-- > 0)
+ 		mdelay(10);
+ 
+ 	DRM_DEBUG_KMS("\n");
+@@ -4586,6 +4547,13 @@ intel_dp_check_link_status(struct intel_dp *intel_dp, bool *perform_full_detect)
+ 		return;
+ 	}
+ 
++	/* FIXME: This access isn't protected by any locks. */
++	if (!intel_encoder->connectors_active)
++		return;
++
++	if (WARN_ON(!intel_encoder->base.crtc))
++		return;
++
+ 	/* Try to read the source of the interrupt */
+ 	if (intel_dp->dpcd[DP_DPCD_REV] >= 0x11 &&
+ 	    intel_dp_get_sink_irq(intel_dp, &sink_irq_vector)) {
+@@ -4605,6 +4573,7 @@ intel_dp_check_link_status(struct intel_dp *intel_dp, bool *perform_full_detect)
+ 		 */
+ 		if (old_lane_count != intel_dp->dpcd[DP_MAX_LANE_COUNT]) {
+ 			DRM_DEBUG_KMS("Lane count changed\n");
++			intel_dp_update_simulate_detach_info(intel_dp);
+ 			*perform_full_detect = true;
+ 			return;
+ 		}
+@@ -4622,23 +4591,14 @@ intel_dp_check_link_status(struct intel_dp *intel_dp, bool *perform_full_detect)
+ 		}
+ 	}
+ 
+-	/* FIXME: This access isn't protected by any locks.
+-	 * if link training is requested we should perform it always
+-	 */
+-	if (intel_dp->compliance_test_type == DP_TEST_LINK_TRAINING) {
+-		DRM_DEBUG_KMS("%s: Link training requested, retraining\n",
+-				intel_encoder->base.name);
+-		check_link = true;
+-	} else  if (((intel_encoder->connectors_active) &&
+-				(intel_encoder->base.crtc)) &&
+-		(!drm_dp_channel_eq_ok(link_status, intel_dp->lane_count))) {
++	/* if link training is requested we should perform it always */
++	if ((intel_dp->compliance_test_type == DP_TEST_LINK_TRAINING) ||
++	    (!drm_dp_channel_eq_ok(link_status, intel_dp->lane_count))) {
+ 		DRM_DEBUG_KMS("%s: channel EQ not ok, retraining\n",
+-				intel_encoder->base.name);
+-		check_link = true;
+-	}
++			      intel_encoder->base.name);
+ 
+-	if (check_link) {
+ 		if (IS_CHERRYVIEW(dev)) {
++			intel_dp_update_simulate_detach_info(intel_dp);
+ 			*perform_full_detect = true;
+ 		} else {
+ 			if (intel_dp_start_link_train(intel_dp))
+@@ -4873,7 +4833,6 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 		intel_dp->aux.i2c_defer_count = 0;
+ 
+ 		intel_dp->has_audio =  false;
+-		pm_qos_update_request(&dev_priv->pm_qos, PM_QOS_DEFAULT_VALUE);
+ 		goto out;
+ 	}
+ 
+@@ -4884,27 +4843,6 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 
+ 	intel_dp_probe_oui(intel_dp);
+ 
+-	/* if simulation was in progress clear the flag & skip upfront */
+-	if (dev_priv->simulate_dp_in_progress & intel_encoder->hpd_pin)
+-		dev_priv->simulate_dp_in_progress &= ~(intel_encoder->hpd_pin);
+-	else if (IS_CHERRYVIEW(dev) &&
+-		intel_dp->compliance_test_type != DP_TEST_LINK_TRAINING &&
+-			intel_encoder->type == INTEL_OUTPUT_DISPLAYPORT) {
+-
+-		/*
+-		 * TODO: Need to test connected boot scenario once platform
+-		 * patches are ready. This path is tested on reworked-RVP only.
+-		 */
+-		if (intel_encoder->connectors_active &&
+-						crtc && crtc->enabled) {
+-			intel_crtc = to_intel_crtc(crtc);
+-			DRM_DEBUG_KMS("Disabling crtc %c for upfront LT\n",
+-					pipe_name(intel_crtc->pipe));
+-			intel_crtc_control(crtc, false);
+-		}
+-		chv_upfront_link_train(dev, intel_dp, intel_crtc);
+-	}
+-
+ 	if (intel_dp->force_audio != HDMI_AUDIO_AUTO) {
+ 		intel_dp->has_audio = (intel_dp->force_audio == HDMI_AUDIO_ON);
+ 	} else {
+@@ -4923,27 +4861,38 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 	/* Try to read the source of the interrupt */
+ 	if (intel_dp->dpcd[DP_DPCD_REV] >= 0x11 &&
+ 	    intel_dp_get_sink_irq(intel_dp, &sink_irq_vector)) {
+-		if (sink_irq_vector & DP_AUTOMATED_TEST_REQUEST) {
+-			intel_dp_handle_test_request(intel_dp, false);
+-			sink_irq_vector &= ~DP_AUTOMATED_TEST_REQUEST;
+-		}
+-		if (sink_irq_vector & (DP_CP_IRQ | DP_SINK_SPECIFIC_IRQ))
+-			DRM_DEBUG_DRIVER("CP or sink specific irq unhandled\n");
+-
+ 		/* Clear interrupt source */
+ 		drm_dp_dpcd_writeb(&intel_dp->aux,
+ 				   DP_DEVICE_SERVICE_IRQ_VECTOR,
+ 				   sink_irq_vector);
+ 
++		if (sink_irq_vector & DP_AUTOMATED_TEST_REQUEST)
++			intel_dp_handle_test_request(intel_dp, false);
++		if (sink_irq_vector & (DP_CP_IRQ | DP_SINK_SPECIFIC_IRQ))
++			DRM_DEBUG_DRIVER("CP or sink specific irq unhandled\n");
+ 	}
+ 
++	if (IS_CHERRYVIEW(dev) &&
++		intel_dp->compliance_test_type != DP_TEST_LINK_TRAINING &&
++			intel_encoder->type == INTEL_OUTPUT_DISPLAYPORT) {
+ 
+-	/*
+-	 * dp aux is extremely sensitive to irq latency, hence request the
+-	 * lowest possible wakeup latency and so prevent the cpu from going into
+-	 * deep sleep states.
+-	 */
+-	pm_qos_update_request(&dev_priv->pm_qos, 0);
++		/*
++		 * TODO: Need to test connected boot scenario once platform
++		 * patches are ready. This path is tested on reworked-RVP only.
++		 */
++		if (intel_encoder->connectors_active &&
++						crtc && crtc->enabled) {
++			intel_crtc = to_intel_crtc(crtc);
++			DRM_DEBUG_KMS("Disabling crtc %c for upfront LT\n",
++					pipe_name(intel_crtc->pipe));
++			intel_crtc_control(crtc, false);
++		}
++		chv_upfront_link_train(dev, intel_dp, intel_crtc);
++	}
++
++	/* if simulation was in progress clear the flag */
++	if (dev_priv->simulate_dp_in_progress & intel_encoder->hpd_pin)
++		dev_priv->simulate_dp_in_progress &= ~(intel_encoder->hpd_pin);
+ 
+ out:
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+@@ -5244,7 +5193,6 @@ intel_dp_hpd_pulse(struct intel_digital_port *intel_dig_port, bool long_hpd)
+ 
+ 	if (full_detect) {
+ 		DRM_DEBUG_KMS("Forcing full detect for short pulse\n");
+-		intel_dp_update_simulate_detach_info(intel_dp);
+ 		return true;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 1df27b7..e010515 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1016,6 +1016,8 @@ bool intel_dp_compute_config(struct intel_encoder *encoder,
+ bool intel_dp_is_edp(struct drm_device *dev, enum port port);
+ bool intel_dp_hpd_pulse(struct intel_digital_port *intel_dig_port,
+ 			bool long_hpd);
++uint8_t intel_dp_calc_multiplier(struct intel_encoder *encoder,
++			u32 pixel_clock);
+ int intel_dp_max_link_bw(struct intel_dp *intel_dp);
+ 
+ void intel_edp_backlight_on(struct intel_dp *intel_dp);
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index a5533ec..d5ae6db 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -692,13 +692,7 @@ static void intel_hdmi_prepare(struct intel_encoder *encoder)
+ 	if (crtc->config.has_hdmi_sink)
+ 		hdmi_val |= HDMI_MODE_SELECT_HDMI;
+ 
+-	/*
+-	 * LP audio driver communicates through i915
+-	 * where we enable audio output on port
+-	 * hence not needed to be enabled during
+-	 * modeset
+-	 */
+-	if (crtc->config.has_audio && !IS_VALLEYVIEW(dev)) {
++	if (crtc->config.has_audio) {
+ 		WARN_ON(!crtc->config.has_hdmi_sink);
+ 		DRM_DEBUG_DRIVER("Enabling HDMI audio on pipe %c\n",
+ 				 pipe_name(crtc->pipe));
+@@ -793,7 +787,7 @@ static void intel_enable_hdmi(struct intel_encoder *encoder)
+ 	u32 temp;
+ 	u32 enable_bits = SDVO_ENABLE;
+ 
+-	if (intel_crtc->config.has_audio && !IS_VALLEYVIEW(dev))
++	if (intel_crtc->config.has_audio)
+ 		enable_bits |= SDVO_AUDIO_ENABLE;
+ 
+ 	temp = I915_READ(intel_hdmi->hdmi_reg);
+diff --git a/sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c b/sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c
+index 540c2bb..d8a3caa 100644
+--- a/sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c
++++ b/sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c
+@@ -61,8 +61,7 @@ MODULE_LICENSE("GPL v2");
+ MODULE_SUPPORTED_DEVICE("{Intel,Intel_HAD}");
+ MODULE_VERSION(HAD_DRIVER_VERSION);
+ 
+-#define HDMI_INFO_FRAME_WORD1	0x000a0184
+-#define DP_INFO_FRAME_WORD1	0x00441b84
++#define INFO_FRAME_WORD1	0x000a0184
+ #define FIFO_THRESHOLD		0xFE
+ #define DMA_FIFO_THRESHOLD	0x7
+ #define BYTES_PER_WORD		0x4
+@@ -785,11 +784,8 @@ static void snd_intelhad_prog_dip_v1(struct snd_pcm_substream *substream,
+ 					intelhaddata, channels);
+ 
+ 	/*Calculte the byte wide checksum for all valid DIP words*/
+-	for (i = 0; i < BYTES_PER_WORD; i++) {
+-		checksum += (HDMI_INFO_FRAME_WORD1 >> i*BITS_PER_BYTE) &
+-				MASK_BYTE0;
+-	}
+-
++	for (i = 0; i < BYTES_PER_WORD; i++)
++		checksum += (INFO_FRAME_WORD1 >> i*BITS_PER_BYTE) & MASK_BYTE0;
+ 	for (i = 0; i < BYTES_PER_WORD; i++)
+ 		checksum += (frame2.fr2_val >> i*BITS_PER_BYTE) & MASK_BYTE0;
+ 	for (i = 0; i < BYTES_PER_WORD; i++)
+@@ -797,7 +793,7 @@ static void snd_intelhad_prog_dip_v1(struct snd_pcm_substream *substream,
+ 
+ 	frame2.fr2_regx.chksum = -(checksum);
+ 
+-	had_write_register(AUD_HDMIW_INFOFR, HDMI_INFO_FRAME_WORD1);
++	had_write_register(AUD_HDMIW_INFOFR, INFO_FRAME_WORD1);
+ 	had_write_register(AUD_HDMIW_INFOFR, frame2.fr2_val);
+ 	had_write_register(AUD_HDMIW_INFOFR, frame3.fr3_val);
+ 
+@@ -826,41 +822,28 @@ static void snd_intelhad_prog_dip_v2(struct snd_pcm_substream *substream,
+ 	union aud_info_frame2 frame2 = {.fr2_val = 0};
+ 	union aud_info_frame3 frame3 = {.fr3_val = 0};
+ 	u8 checksum = 0;
+-	u32 info_frame;
+ 	int channels;
+ 
+ 	channels = substream->runtime->channels;
+ 
+ 	had_write_register(AUD_CNTL_ST, ctrl_state.ctrl_val);
+ 
+-	if (intelhaddata->eeld.capabilities & ELD_DP_CONN_TYPE) {
+-		info_frame = DP_INFO_FRAME_WORD1;
+-		frame2.fr2_val = 1;
+-	} else {
+-		info_frame = HDMI_INFO_FRAME_WORD1;
+-		frame2.fr2_regx.chnl_cnt = substream->runtime->channels - 1;
++	frame2.fr2_regx.chnl_cnt = substream->runtime->channels - 1;
+ 
+-		frame3.fr3_regx.chnl_alloc = snd_intelhad_channel_allocation(
+-				intelhaddata, channels);
++	frame3.fr3_regx.chnl_alloc = snd_intelhad_channel_allocation(
++					intelhaddata, channels);
+ 
+-		/*Calculte the byte wide checksum for all valid DIP words*/
+-		for (i = 0; i < BYTES_PER_WORD; i++) {
+-			checksum += (info_frame >> i*BITS_PER_BYTE) &
+-					MASK_BYTE0;
+-		}
+-		for (i = 0; i < BYTES_PER_WORD; i++) {
+-			checksum += (frame2.fr2_val >> i*BITS_PER_BYTE) &
+-					MASK_BYTE0;
+-		}
+-		for (i = 0; i < BYTES_PER_WORD; i++) {
+-			checksum += (frame3.fr3_val >> i*BITS_PER_BYTE) &
+-					MASK_BYTE0;
+-		}
++	/*Calculte the byte wide checksum for all valid DIP words*/
++	for (i = 0; i < BYTES_PER_WORD; i++)
++		checksum += (INFO_FRAME_WORD1 >> i*BITS_PER_BYTE) & MASK_BYTE0;
++	for (i = 0; i < BYTES_PER_WORD; i++)
++		checksum += (frame2.fr2_val >> i*BITS_PER_BYTE) & MASK_BYTE0;
++	for (i = 0; i < BYTES_PER_WORD; i++)
++		checksum += (frame3.fr3_val >> i*BITS_PER_BYTE) & MASK_BYTE0;
+ 
+-		frame2.fr2_regx.chksum = -(checksum);
+-	}
++	frame2.fr2_regx.chksum = -(checksum);
+ 
+-	had_write_register(AUD_HDMIW_INFOFR_v2, info_frame);
++	had_write_register(AUD_HDMIW_INFOFR_v2, INFO_FRAME_WORD1);
+ 	had_write_register(AUD_HDMIW_INFOFR_v2, frame2.fr2_val);
+ 	had_write_register(AUD_HDMIW_INFOFR_v2, frame3.fr3_val);
+ 
+-- 
+1.9.1
+

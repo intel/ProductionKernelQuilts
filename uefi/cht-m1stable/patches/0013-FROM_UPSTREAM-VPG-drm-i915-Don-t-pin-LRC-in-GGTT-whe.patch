@@ -1,0 +1,133 @@
+From 51de1a64e20ada1783188ed571ac0e9bea6da293 Mon Sep 17 00:00:00 2001
+Message-Id: <51de1a64e20ada1783188ed571ac0e9bea6da293.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: Thomas Daniel <thomas.daniel@intel.com>
+Date: Tue, 2 Dec 2014 13:21:18 +0000
+Subject: [PATCH 13/63] FROM_UPSTREAM [VPG]: drm/i915: Don't pin LRC in GGTT
+ when dumping in debugfs
+
+LRC object does not need to be mapped into the GGTT when dumping. A side-effect
+of this patch is that a compiler warning goes away (not checking return value
+of i915_gem_obj_ggtt_pin).
+
+v2: Broke out individual context dumping into a new function as the indentation
+was getting a bit crazy.  Added notification of contexts with no gem object for
+debugging purposes.  Removed unnecessary pin_pages and unpin_pages, replaced
+with explicit get_pages for the context object as there may be no backing store
+allocated at this time (Comment for get_pages says "Ensure that the associated
+pages are gathered from the backing storage and pinned into our object").
+Improved error checking - get_pages and get_page are checked for failure.
+
+Change-Id: Iefd556966be255c1ab61ade91f8573d937d5661a
+For: VIZ-4277
+Signed-off-by: Thomas Daniel <thomas.daniel@intel.com>
+[danvet: Align paramter continuation lines properly. Also add some
+braces to the nested loops again for readability.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 064ca1d250b14b785e662b0a13d8d20cb84574e1
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   78 +++++++++++++++++++++--------------
+ 1 file changed, 47 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 55038bb..966f1d9 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -2001,6 +2001,50 @@ static int i915_context_status(struct seq_file *m, void *unused)
+ 	return 0;
+ }
+ 
++static void i915_dump_lrc_obj(struct seq_file *m,
++			      struct intel_engine_cs *ring,
++			      struct drm_i915_gem_object *ctx_obj)
++{
++	struct page *page;
++	uint32_t *reg_state;
++	int j;
++	unsigned long ggtt_offset = 0;
++
++	if (ctx_obj == NULL) {
++		seq_printf(m, "Context on %s with no gem object\n",
++			   ring->name);
++		return;
++	}
++
++	seq_printf(m, "CONTEXT: %s %u\n", ring->name,
++		   intel_execlists_ctx_id(ctx_obj));
++
++	if (!i915_gem_obj_ggtt_bound(ctx_obj))
++		seq_puts(m, "\tNot bound in GGTT\n");
++	else
++		ggtt_offset = i915_gem_obj_ggtt_offset(ctx_obj);
++
++	if (i915_gem_object_get_pages(ctx_obj)) {
++		seq_puts(m, "\tFailed to get pages for context object\n");
++		return;
++	}
++
++	page = i915_gem_object_get_page(ctx_obj, 1);
++	if (!WARN_ON(page == NULL)) {
++		reg_state = kmap_atomic(page);
++
++		for (j = 0; j < 0x600 / sizeof(u32) / 4; j += 4) {
++			seq_printf(m, "\t[0x%08lx] 0x%08x 0x%08x 0x%08x 0x%08x\n",
++				   ggtt_offset + 4096 + (j * 4),
++				   reg_state[j], reg_state[j + 1],
++				   reg_state[j + 2], reg_state[j + 3]);
++		}
++		kunmap_atomic(reg_state);
++	}
++
++	seq_putc(m, '\n');
++}
++
+ static int i915_dump_lrc(struct seq_file *m, void *unused)
+ {
+ 	struct drm_info_node *node = (struct drm_info_node *) m->private;
+@@ -2021,37 +2065,9 @@ static int i915_dump_lrc(struct seq_file *m, void *unused)
+ 
+ 	list_for_each_entry(ctx, &dev_priv->context_list, link) {
+ 		for_each_ring(ring, dev_priv, i) {
+-			struct drm_i915_gem_object *ctx_obj = ctx->engine[i].state;
+-
+-			if (ring->default_context == ctx)
+-				continue;
+-
+-			if (ctx_obj) {
+-				struct page *page;
+-				uint32_t *reg_state;
+-				int j;
+-
+-				ret = i915_gem_obj_ggtt_pin(ctx_obj,
+-						GEN8_LR_CONTEXT_ALIGN, 0);
+-
+-				page = i915_gem_object_get_page(ctx_obj, 1);
+-				reg_state = kmap_atomic(page);
+-
+-				seq_printf(m, "CONTEXT: %s %u\n", ring->name,
+-						intel_execlists_ctx_id(ctx_obj));
+-
+-				for (j = 0; j < 0x600 / sizeof(u32) / 4; j += 4) {
+-					seq_printf(m, "\t[0x%08lx] 0x%08x 0x%08x 0x%08x 0x%08x\n",
+-					i915_gem_obj_ggtt_offset(ctx_obj) + 4096 + (j * 4),
+-					reg_state[j], reg_state[j + 1],
+-					reg_state[j + 2], reg_state[j + 3]);
+-				}
+-				kunmap_atomic(reg_state);
+-
+-				i915_gem_object_ggtt_unpin(ctx_obj);
+-
+-				seq_putc(m, '\n');
+-			}
++			if (ring->default_context != ctx)
++				i915_dump_lrc_obj(m, ring,
++						  ctx->engine[i].state);
+ 		}
+ 	}
+ 
+-- 
+1.7.9.5
+

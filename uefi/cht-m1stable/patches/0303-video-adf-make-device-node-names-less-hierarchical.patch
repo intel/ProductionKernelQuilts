@@ -1,0 +1,148 @@
+From a41cc70b729c4384728cb272fb5a1427205a9e0a Mon Sep 17 00:00:00 2001
+From: Greg Hackmann <ghackmann@google.com>
+Date: Thu, 7 Nov 2013 10:12:00 -0800
+Subject: [PATCH 303/634] video: adf: make device node names less hierarchical
+
+adf/foobar/device -> adf0
+adf/foobar/interface1 -> adf-interface0.1
+adf/foobar/overlay-engine1 -> adf-overlay-engine0.1
+
+Change-Id: I7af7f84ce3f101ecb02f448070c200ff3e03f2ec
+Signed-off-by: Greg Hackmann <ghackmann@google.com>
+---
+ drivers/video/adf/adf.c       | 28 +++++++++++++---------------
+ drivers/video/adf/adf_sysfs.c | 16 +++++-----------
+ 2 files changed, 18 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/video/adf/adf.c b/drivers/video/adf/adf.c
+index fd5bcde..933e74a 100644
+--- a/drivers/video/adf/adf.c
++++ b/drivers/video/adf/adf.c
+@@ -37,6 +37,8 @@
+ #define ADF_SHORT_FENCE_TIMEOUT (1 * MSEC_PER_SEC)
+ #define ADF_LONG_FENCE_TIMEOUT (10 * MSEC_PER_SEC)
+ 
++static DEFINE_IDR(adf_devices);
++
+ static void adf_fence_wait(struct adf_device *dev, struct sync_fence *fence)
+ {
+ 	/* sync_fence_wait() dumps debug information on timeout.  Experience
+@@ -455,23 +457,20 @@ static int adf_obj_init(struct adf_obj *obj, enum adf_obj_type type,
+ 		struct idr *idr, struct adf_device *parent,
+ 		const struct adf_obj_ops *ops, const char *fmt, va_list args)
+ {
++	int ret;
++
+ 	if (ops && ops->supports_event && !ops->set_event) {
+ 		pr_err("%s: %s implements supports_event but not set_event\n",
+ 				__func__, adf_obj_type_str(type));
+ 		return -EINVAL;
+ 	}
+ 
+-	if (idr) {
+-		int ret = idr_alloc(idr, obj, 0, 0, GFP_KERNEL);
+-		if (ret < 0) {
+-			pr_err("%s: allocating object id failed: %d\n",
+-					__func__, ret);
+-			return ret;
+-		}
+-		obj->id = ret;
+-	} else {
+-		obj->id = -1;
++	ret = idr_alloc(idr, obj, 0, 0, GFP_KERNEL);
++	if (ret < 0) {
++		pr_err("%s: allocating object id failed: %d\n", __func__, ret);
++		return ret;
+ 	}
++	obj->id = ret;
+ 
+ 	vscnprintf(obj->name, sizeof(obj->name), fmt, args);
+ 
+@@ -498,8 +497,7 @@ static void adf_obj_destroy(struct adf_obj *obj, struct idr *idr)
+ 	}
+ 
+ 	mutex_destroy(&obj->event_lock);
+-	if (idr)
+-		idr_remove(idr, obj->id);
++	idr_remove(idr, obj->id);
+ }
+ 
+ /**
+@@ -543,8 +541,8 @@ int adf_device_init(struct adf_device *dev, struct device *parent,
+ 	memset(dev, 0, sizeof(*dev));
+ 
+ 	va_start(args, fmt);
+-	ret = adf_obj_init(&dev->base, ADF_OBJ_DEVICE, NULL, dev, &ops->base,
+-			fmt, args);
++	ret = adf_obj_init(&dev->base, ADF_OBJ_DEVICE, &adf_devices, dev,
++			&ops->base, fmt, args);
+ 	va_end(args);
+ 	if (ret < 0)
+ 		return ret;
+@@ -612,7 +610,7 @@ void adf_device_destroy(struct adf_device *dev)
+ 	}
+ 	mutex_destroy(&dev->post_lock);
+ 	mutex_destroy(&dev->client_lock);
+-	adf_obj_destroy(&dev->base, NULL);
++	adf_obj_destroy(&dev->base, &adf_devices);
+ }
+ EXPORT_SYMBOL(adf_device_destroy);
+ 
+diff --git a/drivers/video/adf/adf_sysfs.c b/drivers/video/adf/adf_sysfs.c
+index 076ccbd..8c659c7 100644
+--- a/drivers/video/adf/adf_sysfs.c
++++ b/drivers/video/adf/adf_sysfs.c
+@@ -105,11 +105,6 @@ static struct device_attribute adf_interface_attrs[] = {
+ 	__ATTR_RO(vsync_timestamp),
+ };
+ 
+-static char *adf_devnode(struct device *dev, umode_t *mode)
+-{
+-	return kasprintf(GFP_KERNEL, "adf/%s", dev_name(dev));
+-}
+-
+ int adf_obj_sysfs_init(struct adf_obj *obj, struct device *parent)
+ {
+ 	int ret = idr_alloc(&adf_minors, obj, 0, 0, GFP_KERNEL);
+@@ -142,7 +137,7 @@ static char *adf_device_devnode(struct device *dev, umode_t *mode,
+ 		kuid_t *uid, kgid_t *gid)
+ {
+ 	struct adf_obj *obj = container_of(dev, struct adf_obj, dev);
+-	return kasprintf(GFP_KERNEL, "adf/%s/device", obj->name);
++	return kasprintf(GFP_KERNEL, "adf%d", obj->id);
+ }
+ 
+ static char *adf_interface_devnode(struct device *dev, umode_t *mode,
+@@ -151,8 +146,8 @@ static char *adf_interface_devnode(struct device *dev, umode_t *mode,
+ 	struct adf_obj *obj = container_of(dev, struct adf_obj, dev);
+ 	struct adf_interface *intf = adf_obj_to_interface(obj);
+ 	struct adf_device *parent = adf_interface_parent(intf);
+-	return kasprintf(GFP_KERNEL, "adf/%s/interface%d",
+-			parent->base.name, intf->base.id);
++	return kasprintf(GFP_KERNEL, "adf-interface%d.%d",
++			parent->base.id, intf->base.id);
+ }
+ 
+ static char *adf_overlay_engine_devnode(struct device *dev, umode_t *mode,
+@@ -161,8 +156,8 @@ static char *adf_overlay_engine_devnode(struct device *dev, umode_t *mode,
+ 	struct adf_obj *obj = container_of(dev, struct adf_obj, dev);
+ 	struct adf_overlay_engine *eng = adf_obj_to_overlay_engine(obj);
+ 	struct adf_device *parent = adf_overlay_engine_parent(eng);
+-	return kasprintf(GFP_KERNEL, "adf/%s/overlay-engine%d",
+-			parent->base.name, eng->base.id);
++	return kasprintf(GFP_KERNEL, "adf-overlay-engine%d.%d",
++			parent->base.id, eng->base.id);
+ }
+ 
+ static void adf_noop_release(struct device *dev)
+@@ -285,7 +280,6 @@ int adf_sysfs_init(void)
+ 		goto err_chrdev;
+ 	}
+ 
+-	class->devnode = adf_devnode;
+ 	adf_class = class;
+ 	adf_major = ret;
+ 	return 0;
+-- 
+1.9.1
+

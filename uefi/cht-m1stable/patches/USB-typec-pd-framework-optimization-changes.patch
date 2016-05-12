@@ -1,0 +1,1393 @@
+From 69e585d272daf49d126925b1010e486d115489e1 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Fri, 3 Jul 2015 14:18:36 +0530
+Subject: [PATCH] USB typec pd framework optimization changes
+
+Below two change are added with this patch to usb type-c pd framework
+for pd framework optimization.
+1. Moved the rx message process worker from policy engine to protocol layer.
+2. Moved pd message to event translation process from policy engine
+   to protocol layer.
+
+Change-Id: Id22a8307f2c74eb889907962869b40eff3fd26db
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-40627
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+---
+ drivers/usb/typec/pd/message.h       |  34 ++-
+ drivers/usb/typec/pd/policy_engine.c | 524 +++++++++++++----------------------
+ drivers/usb/typec/pd/policy_engine.h |  50 ++--
+ drivers/usb/typec/pd/protocol.c      | 311 +++++++++++++++++----
+ drivers/usb/typec/pd/protocol.h      |   8 +-
+ drivers/usb/typec/pd/sink_port_pe.c  |  15 +-
+ 6 files changed, 528 insertions(+), 414 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/message.h b/drivers/usb/typec/pd/message.h
+index f272ebc91e44..8438439eb759 100644
+--- a/drivers/usb/typec/pd/message.h
++++ b/drivers/usb/typec/pd/message.h
+@@ -210,10 +210,42 @@ struct dis_svid_response_pkt {
+ 	struct dp_vdo vdo[6];
+ } __packed;
+ 
++struct disp_mode {
++	u32 port_cap:2;
++	u32 dp_sig:4;
++	u32 r_ind:1;
++	u32 usb_sig:1;
++	u32 dfp_pin:8;
++	u32 ufp_pin:8;
++	u32 rsrvd:8;
++} __packed;
++
++struct disp_config {
++	u32 conf_sel:2;
++	u32 trans_sig:4;
++	u32 rsrvd:2;
++	u32 dfp_pin:8;
++	u32 ufp_pin:8;
++	u32 rsrvd1:8;
++} __packed;
++
+ struct dis_mode_response_pkt {
+ 	struct pd_pkt_header msg_hdr;
+ 	struct vdm_header vdm_hdr;
+-	u32 mode[6];
++	struct disp_mode mode[6];
++} __packed;
++
++struct dis_port_status {
++	u32 dev_connected:2;
++	u32 pwr_low:1;
++	u32 enabled:1;
++	u32 multi_func:1;
++	u32 usb_conf:1;
++	u32 exit_mode:1;
++	u32 hpd_state:1;
++	u32 irq_hpd:1;
++	u32 rsrvd:7;
++	u32 rsrvd1:16;
+ } __packed;
+ 
+ struct pd_sink_fixed_pdo {
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 2329643f18a6..d31004efd369 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -37,222 +37,134 @@
+ static LIST_HEAD(pe_list);
+ static DEFINE_SPINLOCK(pe_lock);
+ 
++static void pe_dump_header(struct pd_pkt_header *header);
++static void pe_dump_data_msg(struct pd_packet *pkt);
++
+ static inline
+-struct policy *find_active_policy(struct list_head *head)
++struct policy *pe_get_active_src_or_snk_policy(struct list_head *head)
+ {
+ 	struct policy *p = NULL;
+ 
+ 	list_for_each_entry(p, head, list) {
+-		if (p && p->status == POLICY_STATUS_STARTED)
+-			return p;
++		if (p && ((p->type == POLICY_TYPE_SINK)
++			|| (p->type == POLICY_TYPE_SOURCE))) {
++			if (p->state == POLICY_STATE_ONLINE)
++				return p;
++		}
+ 	}
+ 
+ 	return NULL;
+ }
+ 
+-static int pe_handle_data_msg(struct policy_engine *pe, struct pd_packet *pkt)
++static inline
++struct policy *pe_get_running_policy(struct list_head *head)
+ {
+-	struct policy *p;
+-	int ret = 0;
+-	enum pe_event event;
++	struct policy *p = NULL;
+ 
+-	p = find_active_policy(&pe->policy_list);
+-	if (!p) {
+-		pr_err("PE: No Active policy!\n");
+-		return -EINVAL;
++	list_for_each_entry(p, head, list) {
++		if (p && (p->state == POLICY_STATE_ONLINE)
++			&& (p->status == POLICY_STATUS_RUNNING))
++				return p;
+ 	}
+ 
+-	switch (PD_MSG_TYPE(&pkt->header)) {
+-	case PD_DATA_MSG_SRC_CAP:
+-		pr_debug("PE: Data msg received - PD_DATA_MSG_SRC_CAP\n");
+-		event = PE_EVT_RCVD_SRC_CAP;
+-
+-		if (p && p->rcv_pkt) {
+-			p->rcv_pkt(p, pkt, event);
+-		} else {
+-			pr_err("PE: Unable to find send pkt\n");
+-			ret = -ENODEV;
+-		}
+-		break;
+-	case PD_DATA_MSG_REQUEST:
+-		pr_debug("PE: Data msg received - PD_DATA_MSG_REQUEST\n");
+-		break;
+-	case PD_DATA_MSG_BIST:
+-		pr_debug("PE: Data msg received - PD_DATA_MSG_BIST\n");
+-		break;
+-	case PD_DATA_MSG_SINK_CAP:
+-		pr_debug("PE: Data msg received - PD_DATA_MSG_SINK_CAP\n");
+-		break;
+-	case PD_DATA_MSG_VENDOR_DEF:
+-		pr_debug("PE: Data msg received - PD_DATA_MSG_VENDOR_DEF\n");
+-		break;
+-	case PD_DATA_MSG_RESERVED_0:
+-	case PD_DATA_MSG_RESERVED_5:
+-	case PD_DATA_MSG_RESERVED_6:
+-	case PD_DATA_MSG_RESERVED_7:
+-	case PD_DATA_MSG_RESERVED_8:
+-	case PD_DATA_MSG_RESERVED_9:
+-	case PD_DATA_MSG_RESERVED_10:
+-	case PD_DATA_MSG_RESERVED_11:
+-	case PD_DATA_MSG_RESERVED_12:
+-	case PD_DATA_MSG_RESERVED_13:
+-	case PD_DATA_MSG_RESERVED_14:
+-	default:
+-		pr_debug("PE: Data msg received - Unknown\n");
+-		ret = -EINVAL;
+-		goto end;
+-	}
+-	pe->prev_evt = event;
++	return NULL;
++}
+ 
+-end:
+-	return ret;
++static inline bool pe_is_policy_active(struct policy *p)
++{
++	return (p->state == POLICY_STATE_ONLINE) ? true : false;
+ }
+ 
+-static int pe_fwdpkt_snkport(struct policy_engine *pe, struct pd_packet *pkt,
+-					 enum pe_event evt)
++static inline bool pe_is_policy_running(struct policy *p)
+ {
+-	struct policy *p;
+-	int ret = 0;
++	return (p->status == POLICY_STATUS_RUNNING) ? true : false;
++}
+ 
+-	pe->prev_evt = evt;
+-	p = find_active_policy(&pe->policy_list);
+-	if (!p) {
+-		pr_err("PE: No Active policy!\n");
+-		return -EINVAL;
+-	}
++static struct policy *pe_get_policy(struct policy_engine *pe,
++					enum policy_type type)
++{
++	struct policy *p = NULL;
+ 
+-	if (p && p->rcv_pkt) {
+-		p->rcv_pkt(p, pkt, evt);
+-	} else {
+-		pr_err("PE: Unable to find send pkt\n");
+-		ret = -ENODEV;
++	list_for_each_entry(p, &pe->policy_list, list) {
++		if (p && (p->type == type))
++			return p;
+ 	}
+-
+-	return ret;
++	return NULL;
+ }
+ 
+-static int pe_handle_ctrl_msg(struct policy_engine *pe, struct pd_packet *pkt)
++static int policy_engine_process_data_msg(struct policy_engine *pe,
++				enum pe_event evt, struct pd_packet *pkt)
+ {
++	struct policy *p = NULL;
+ 	int ret = 0;
+-	enum pe_event event = PD_CTRL_MSG_RESERVED_0;
+-
+-	switch (pkt->header.msg_type) {
+-	case PD_CTRL_MSG_GOODCRC:
+-		/* Assume that the previous message sent successfully.
+-		 * modify the internal state if requried */
+-		pr_debug("PE Ctrl msg received - PD_CTRL_MSG_GOODCRC\n");
+-		event = PE_EVT_SEND_GOODCRC;
+-		break;
+-	case PD_CTRL_MSG_GOTOMIN:
+-		/* send by source only event, Start PSTransitionTimer Reduce
+-		 * current min and send Good  CRC*/
+-		event = PE_EVT_RCVD_GOTOMIN;
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_GOTOMIN\n");
+-		ret = pe_fwdpkt_snkport(pe, pkt, event);
+-		if (ret < 0) {
+-			pr_err("PE: Error in handling pkt\n");
+-			goto error;
+-		}
+-		break;
+-	case PD_CTRL_MSG_ACCEPT:
+-		/* sent by recipient of the Soft Reset Message, PR_Swap,
+-		 * DR_Swap, VCONN_Swap */
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_ACCEPT\n");
+-		event = PE_EVT_RCVD_ACCEPT;
+-		if (pe->prev_evt == PE_EVT_SEND_REQUEST) {
+-			ret = pe_fwdpkt_snkport(pe, pkt, event);
+-			if (ret < 0) {
+-				pr_err("PE: Error in handling pkt\n");
+-				goto error;
+-			}
+-		}
+-		break;
+-	case PD_CTRL_MSG_REJECT:
+-		/* sent by recipient of the PR_Swap, DR_Swap, VCONN_Swap
+-		 * without DR cap rcving Get_Sync_Cap in src, Get_Source_Cap
+-		 * in snk */
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_REJECT\n");
+-		event = PE_EVT_RCVD_REJECT;
+-		if (pe->prev_evt == PE_EVT_SEND_REQUEST ||
+-			pe->prev_evt == PE_EVT_SEND_GET_SRC_CAP) {
+-			ret = pe_fwdpkt_snkport(pe, pkt, event);
+-			if (ret < 0) {
+-				pr_err("PE: Error in handling pkt\n");
+-				goto error;
+-			}
+-		}
+-		break;
+-	case PD_CTRL_MSG_PING:
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_PING\n");
+-		event = PE_EVT_RCVD_PING;
+-		if (pe->prev_evt == PE_EVT_RCVD_WAIT) {
+-			ret = pe_fwdpkt_snkport(pe, pkt, event);
+-			if (ret < 0) {
+-				pr_err("PE: Error in handling pkt\n");
+-				goto error;
+-			}
+-		}
++
++	switch (evt) {
++	case PE_EVT_RCVD_SRC_CAP:
++	case PE_EVT_RCVD_REQUEST:
++	case PE_EVT_RCVD_BIST:
++	case PE_EVT_RCVD_SNK_CAP:
++		p = pe_get_active_src_or_snk_policy(&pe->policy_list);
+ 		break;
+-	case PD_CTRL_MSG_PS_RDY:
+-		/* Response for GotoMin: Stop PSTransitionTimer Start
+-		 * SinkActivityTimer (optional) */
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_PS_RDY\n");
+-		event = PE_EVT_RCVD_PS_RDY;
+-		if (pe->prev_evt == PE_EVT_RCVD_ACCEPT ||
+-			pe->prev_evt == PE_EVT_RCVD_WAIT) {
+-			ret = pe_fwdpkt_snkport(pe, pkt, event);
+-			if (ret < 0) {
+-				pr_err("PE: Error in handling pkt\n");
+-				goto error;
+-			}
++	case PE_EVT_RCVD_VDM:
++		p = pe_get_policy(pe, POLICY_TYPE_DISPLAY);
++		if (!p) {
++			pr_err("PE: No display pe to forward VDM msgs\n");
++			break;
+ 		}
+-		break;
+-	case PD_CTRL_MSG_GET_SRC_CAP:
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_GET_SRC_CAP\n");
+-		break;
+-	case PD_CTRL_MSG_GET_SINK_CAP:
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_GET_SINK_CAP\n");
+-		event = PE_EVT_RCVD_GET_SINK_CAP;
+-		ret = pe_fwdpkt_snkport(pe, pkt, event);
+-		if (ret < 0) {
+-			pr_err("PE: Error in handling pkt\n");
+-			goto error;
++		if (!pe_is_policy_active(p)) {
++			pr_err("PE: DispPE not active to forward VDM msgs\n");
++			p = NULL;
+ 		}
+ 		break;
+-	case PD_CTRL_MSG_DR_SWAP:
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_DR_SWAP\n");
+-		break;
+-	case PD_CTRL_MSG_PR_SWAP:
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_PR_SWAP\n");
+-		break;
+-	case PD_CTRL_MSG_VCONN_SWAP:
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_VCONN_SWAP\n");
+-		break;
+-	case PD_CTRL_MSG_WAIT:
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_WAIT\n");
+-		event = PE_EVT_RCVD_WAIT;
+-		if (pe->prev_evt == PE_EVT_SEND_REQUEST) {
+-			ret = pe_fwdpkt_snkport(pe, pkt, event);
+-			if (ret < 0) {
+-				pr_err("PE: Error in handling pkt\n");
+-				goto error;
+-			}
+-		}
++	default:
++		pr_warn("PE:%s: Invalid data msg, event=%d\n", __func__, evt);
++		pe_dump_data_msg(pkt);
++	}
++
++	if (p && p->rcv_pkt)
++		ret = p->rcv_pkt(p, pkt, evt);
++	else
++		ret = -ENODEV;
++	return ret;
++}
++
++static int policy_engine_process_ctrl_msg(struct policy_engine *pe,
++				enum pe_event evt, struct pd_packet *pkt)
++{
++	struct policy *p = NULL;
++	int ret = 0;
++
++	switch (evt) {
++	case PE_EVT_RCVD_GOODCRC:
++		p = pe_get_running_policy(&pe->policy_list);
++		if (!p)
++			pr_err("PE:No running policy to forward GCRC msgs\n");
+ 		break;
+-	case PD_CTRL_MSG_SOFT_RESET:
+-		/* Reset state dependent behavior */
+-		pr_debug("PE: Ctrl msg received - PD_CTRL_MSG_SOFT_RESET\n");
++	case PE_EVT_RCVD_GOTOMIN:
++	case PE_EVT_RCVD_ACCEPT:
++	case PE_EVT_RCVD_REJECT:
++	case PE_EVT_RCVD_PING:
++	case PE_EVT_RCVD_PS_RDY:
++	case PE_EVT_RCVD_GET_SRC_CAP:
++	case PE_EVT_RCVD_GET_SINK_CAP:
++	case PE_EVT_RCVD_DR_SWAP:
++	case PE_EVT_RCVD_PR_SWAP:
++	case PE_EVT_RCVD_VCONN_SWAP:
++	case PE_EVT_RCVD_WAIT:
++		pr_debug("PE:%s: Ctrl msg received\n", __func__);
++		p = pe_get_active_src_or_snk_policy(&pe->policy_list);
++		if (!p)
++			pr_err("PE:No active policy to forward Ctrl msgs\n");
+ 		break;
+-	case PD_CTRL_MSG_RESERVED_0:
+ 	default:
+-		pr_debug("PE: Ctrl msg received (%d) - Unknown\n",
+-				pkt->header.msg_type);
+-		goto event_unknown;
+-		break;
++		pr_warn("PE:%s:Not a valid ctrl msg to process, event=%d\n",
++				__func__, evt);
++		pe_dump_header(&pkt->header);
+ 	}
+-
+-event_unknown:
+-error:
++	if (p && p->rcv_pkt)
++		ret = p->rcv_pkt(p, pkt, evt);
++	else
++		ret = -ENODEV;
+ 	return ret;
+ }
+ 
+@@ -274,8 +186,6 @@ static void pe_dump_header(struct pd_pkt_header *header)
+ 	pr_info("PE: Reserved B15 - 0x%x\n", header->rsvd_b);
+ 	pr_info("=============================================");
+ #endif /* DBG */
+-
+-	return;
+ }
+ 
+ static void pe_dump_data_msg(struct pd_packet *pkt)
+@@ -293,111 +203,14 @@ static void pe_dump_data_msg(struct pd_packet *pkt)
+ 					i+1, data_buf[i]);
+ 	}
+ #endif /* DBG */
+-	return;
+-}
+-
+-static int pe_process_rcv_msg(struct policy_engine *pe,
+-					struct pd_packet *pkt)
+-{
+-	int ret;
+-
+-	if (pkt == NULL) {
+-		pr_err("PE: %s No data Found!\n", __func__);
+-		return -ENODATA;
+-	}
+-
+-	pe_dump_header(&pkt->header);
+-
+-	if (IS_DATA_MSG(&pkt->header)) {
+-		pe_dump_data_msg(pkt);
+-
+-		if (IS_DATA_VDM(&pkt->header)) {
+-			/* TODO: forward the vdm packet to the dsppe to handle
+-			 * it out */
+-		}
+-
+-		ret = pe_handle_data_msg(pe, pkt);
+-		if (ret < 0) {
+-			pr_err("PE: handling data msg failed.\n");
+-			goto fail;
+-		}
+-
+-	} else if (IS_CTRL_MSG(&pkt->header)) {
+-		pe_dump_data_msg(pkt);
+-
+-		/* Control Message Received */
+-		ret = pe_handle_ctrl_msg(pe, pkt);
+-		if (ret < 0) {
+-			pr_err("PE: handling ctrl msg failed.\n");
+-			goto fail;
+-		}
+-	} else {
+-		/* Invalid data which doesn't occur */
+-		pe_dump_header(&pkt->header);
+-		ret = -EINVAL;
+-		goto fail;
+-	}
+-
+-	return 0;
+-fail:
+-	return ret;
+-}
+-
+-static void pe_proto_worker(struct work_struct *work)
+-{
+-	struct policy_engine *pe =
+-			container_of(work, struct policy_engine, proto_work);
+-	struct pe_proto_evt *evt, *tmp;
+-	unsigned long flags;
+-	int ret;
+-	struct list_head new_list;
+-
+-	if (list_empty(&pe->proto_queue))
+-		return;
+-
+-	spin_lock_irqsave(&pe->proto_queue_lock, flags);
+-	list_replace_init(&pe->proto_queue, &new_list);
+-	spin_unlock_irqrestore(&pe->proto_queue_lock, flags);
+-
+-	list_for_each_entry_safe(evt, tmp, &new_list, node) {
+-		mutex_lock(&pe->protowk_lock);
+-		/* do parsing the message packet received from protocol */
+-		ret = pe_process_rcv_msg(pe, &evt->pkt);
+-		if (ret)
+-			pr_err("PE: Error in parsing protocol message\n");
+-
+-		mutex_unlock(&pe->protowk_lock);
+-		kfree(evt);
+-	}
+ }
+ 
+-static int pe_process_msg(struct policy_engine *pe, struct pd_packet *pkt)
+-{
+-	struct pe_proto_evt *evt;
+-
+-	if (!pkt)
+-		return -EINVAL;
+-
+-	evt = kzalloc(sizeof(*evt), GFP_ATOMIC);
+-	if (!evt) {
+-		pr_err("PE: failed to allocate memory for Protocol event\n");
+-		return -ENOMEM;
+-	}
+-	memcpy(&evt->pkt, pkt, sizeof(struct pd_packet));
+-	INIT_LIST_HEAD(&evt->node);
+-	list_add_tail(&evt->node, &pe->proto_queue);
+-	queue_work(system_nrt_wq, &pe->proto_work);
+-
+-	return 0;
+-}
+-
+-static int pe_fwdcmd_snkport(struct policy_engine *pe, enum pe_event evt)
++static int pe_fwdcmd_to_policy(struct policy_engine *pe, enum pe_event evt)
+ {
+ 	struct policy *p;
+ 	int ret = 0;
+ 
+-	pe->prev_evt = evt;
+-	p = find_active_policy(&pe->policy_list);
++	p = pe_get_active_src_or_snk_policy(&pe->policy_list);
+ 	if (!p) {
+ 		pr_err("PE: No Active policy!\n");
+ 		return -EINVAL;
+@@ -413,28 +226,21 @@ static int pe_fwdcmd_snkport(struct policy_engine *pe, enum pe_event evt)
+ 	return ret;
+ }
+ 
+-static int pe_process_cmd(struct policy_engine *pe, int cmd)
++static int policy_engine_process_cmd(struct policy_engine *pe,
++				enum pe_event evt)
+ {
+ 	int ret = 0;
+-	enum pe_event event;
+ 
+-	switch (cmd) {
+-	case PD_CMD_HARD_RESET:
+-		pr_debug("PE: %s PD_CMD_HARD_RESET\n", __func__);
+-		event  = PE_EVT_RCVD_HARD_RESET;
+-		ret = pe_fwdcmd_snkport(pe, event);
+-		if (ret < 0)
+-			pr_err("PE: Error in handling cmd\n");
+-		break;
+-	case PD_CMD_HARD_RESET_COMPLETE:
+-		pr_debug("PE: %s PD_CMD_HARD_RESET_COMPLETE\n", __func__);
+-		event = PE_EVT_RCVD_HARD_RESET_COMPLETE;
+-		ret = pe_fwdcmd_snkport(pe, event);
++	pr_debug("PE: %s - cmd %d\n", __func__, evt);
++	switch (evt) {
++	case PE_EVT_RCVD_HARD_RESET:
++	case PE_EVT_RCVD_HARD_RESET_COMPLETE:
++		ret = pe_fwdcmd_to_policy(pe, evt);
+ 		if (ret < 0)
+ 			pr_err("PE: Error in handling cmd\n");
+ 		break;
+ 	default:
+-		pr_debug("PE: %s - cmd %d\n", __func__, cmd);
++		ret = -EINVAL;
+ 		break;
+ 	}
+ 
+@@ -615,30 +421,43 @@ static int pe_send_packet(struct policy_engine *pe, void *data, int len,
+ {
+ 	int ret = 0;
+ 
+-	if (!pe->is_pd_connected) {
++	if (!pe_get_pd_state(pe)) {
+ 		ret = -EINVAL;
+-		pr_err("PE: PD Disconnected!\n");
+-		goto error;
++		goto snd_pkt_err;
+ 	}
+ 
+ 	switch (evt) {
++	case PE_EVT_SEND_GOTOMIN:
++	case PE_EVT_SEND_ACCEPT:
++	case PE_EVT_SEND_REJECT:
++	case PE_EVT_SEND_PING:
++	case PE_EVT_SEND_PS_RDY:
++	case PE_EVT_SEND_GET_SRC_CAP:
++	case PE_EVT_SEND_GET_SINK_CAP:
++	case PE_EVT_SEND_DR_SWAP:
++	case PE_EVT_SEND_PR_SWAP:
++	case PE_EVT_SEND_VCONN_SWAP:
++	case PE_EVT_SEND_WAIT:
++	case PE_EVT_SEND_SRC_CAP:
+ 	case PE_EVT_SEND_REQUEST:
++	case PE_EVT_SEND_BIST:
+ 	case PE_EVT_SEND_SNK_CAP:
+-	case PE_EVT_SEND_GET_SRC_CAP:
++	case PE_EVT_SEND_VDM:
+ 	case PE_EVT_SEND_HARD_RESET:
+ 	case PE_EVT_SEND_PROTOCOL_RESET:
++	case PE_EVT_SEND_SOFT_RESET:
+ 		break;
+ 	default:
+-		goto error;
++		ret = -EINVAL;
++		goto snd_pkt_err;
+ 	}
+ 
+ 	/* Send the pd_packet to protocol directly to request
+ 	 * sink power cap */
+ 	if (pe && pe->prot && pe->prot->policy_fwd_pkt)
+ 		pe->prot->policy_fwd_pkt(pe->prot, msg_type, data, len);
+-	pe->prev_evt = evt;
+ 
+-error:
++snd_pkt_err:
+ 	return ret;
+ }
+ 
+@@ -656,12 +475,27 @@ static struct policy *__pe_find_policy(struct list_head *list,
+ 	return ERR_PTR(-ENODEV);
+ }
+ 
+-static void pe_update_state(struct policy_engine *pe, int policy_type,
+-				int state)
++static void pe_policy_status_changed(struct policy_engine *pe, int policy_type,
++				int status)
+ {
+-	if (pe) {
+-		pe->policy_in_use = policy_type;
+-		pe->state = state;
++	struct policy *p;
++
++	if (!pe)
++		return;
++	/* Handle the source policy status change */
++	if ((policy_type == POLICY_TYPE_SOURCE)
++		&& ((status == POLICY_STATUS_SUCCESS)
++		|| (status == POLICY_STATUS_FAIL))) {
++		p = pe_get_policy(pe, POLICY_TYPE_DISPLAY);
++		/* Start the display policy */
++		if (!p) {
++			pr_err("PE:%s:No Display policy found\n", __func__);
++			return;
++		}
++		if (p->start) {
++			pr_info("PE:%s:Stating disp policy\n", __func__);
++			p->start(p);
++		}
+ 	}
+ }
+ 
+@@ -685,8 +519,7 @@ static void pe_init_policy(struct work_struct *work)
+ 			}
+ 			list_add_tail(&policy->list, &pe->policy_list);
+ 			break;
+-		/* TODO: Should be handled POLICY_TYPE_SINK and
+-		 * POLICY_TYPE_DISPLAY policies as well */
++		/* TODO: Need to add support for display and source pe init */
+ 		default:
+ 			/* invalid, dont add it to policy */
+ 			pr_err("PE: Unknown policy type %d\n",
+@@ -704,13 +537,43 @@ static void pe_policy_work(struct work_struct *work)
+ 						policy_work);
+ 	struct policy *p;
+ 
+-	p = __pe_find_policy(&pe->policy_list, pe->policy_in_use);
+-
+-	if (!IS_ERR_OR_NULL(p)) {
+-		if (pe->state == POLICY_STATE_ONLINE)
++	switch (pe->cbl_type) {
++	case CABLE_TYPE_CONSUMER:
++		/* Start sink policy */
++		p = pe_get_policy(pe, POLICY_TYPE_SINK);
++		if (!p) {
++			pr_err("PE: No SINK policy to start on UFP connect\n");
++			break;
++		}
++		if (p->state != POLICY_STATE_ONLINE)
++			p->start(p);
++		else
++			pr_warn("PE: SINK policy is already active!!!\n");
++		break;
++	case CABLE_TYPE_PROVIDER:
++		/* Start source policy.
++		 * Display pe should be started after source pe complete.
++		 */
++		p = pe_get_policy(pe, POLICY_TYPE_SOURCE);
++		if (!p) {
++			pr_err("PE: No SOURCE policy to start on DFP connect\n");
++			break;
++		}
++		if (p->state != POLICY_STATE_ONLINE)
+ 			p->start(p);
+-		else if (pe->state == POLICY_STATE_OFFLINE)
+-			p->stop(p);
++		else
++			pr_warn("PE: SOURCE policy is already active!!!\n");
++		break;
++	case CABLE_TYPE_UNKNOWN:
++		/* Stop all active policies */
++		list_for_each_entry(p, &pe->policy_list, list) {
++			if (p && (p->state == POLICY_STATE_ONLINE))
++				p->stop(p);
++		}
++		break;
++	default:
++		pr_err("%s: Unknown cable_type=%d\n",
++			__func__, pe->cbl_type);
+ 	}
+ }
+ 
+@@ -723,8 +586,9 @@ static int sink_port_event(struct notifier_block *nb, unsigned long event,
+ 	int cable_state;
+ 
+ 	cable_state = extcon_get_cable_state(edev, "USB_TYPEC_UFP");
+-	pe->policy_in_use = POLICY_TYPE_SINK;
+-	pe->state = cable_state ? POLICY_STATE_ONLINE : POLICY_STATE_OFFLINE;
++	pr_info("%s:USB_TYPEC_UFP event with cable_state=%d\n",
++			__func__, cable_state);
++	pe->cbl_type = cable_state ? CABLE_TYPE_CONSUMER : CABLE_TYPE_UNKNOWN;
+ 	schedule_work(&pe->policy_work);
+ 	return 0;
+ }
+@@ -738,8 +602,9 @@ static int source_port_event(struct notifier_block *nb, unsigned long event,
+ 	int cable_state;
+ 
+ 	cable_state = extcon_get_cable_state(edev, "USB_TYPEC_DFP");
+-	pe->policy_in_use = POLICY_TYPE_SOURCE;
+-	pe->state = cable_state ? POLICY_STATE_ONLINE : POLICY_STATE_OFFLINE;
++	pr_info("%s:USB_TYPEC_DFP event with cable_state=%d\n",
++			__func__, cable_state);
++	pe->cbl_type = cable_state ? CABLE_TYPE_PROVIDER : CABLE_TYPE_UNKNOWN;
+ 	schedule_work(&pe->policy_work);
+ 	return  0;
+ }
+@@ -759,9 +624,10 @@ static struct pe_operations ops = {
+ 	.get_vbus_state = pe_get_vbus_state,
+ 	.get_pd_state = pe_get_pd_state,
+ 	.set_pd_state = pe_set_pd_state,
+-	.process_msg = pe_process_msg,
+-	.process_cmd = pe_process_cmd,
+-	.update_policy_engine = pe_update_state,
++	.process_data_msg = policy_engine_process_data_msg,
++	.process_ctrl_msg = policy_engine_process_ctrl_msg,
++	.process_cmd = policy_engine_process_cmd,
++	.policy_status_changed = pe_policy_status_changed,
+ };
+ 
+ int policy_engine_bind_dpm(struct devpolicy_mgr *dpm)
+@@ -788,12 +654,6 @@ int policy_engine_bind_dpm(struct devpolicy_mgr *dpm)
+ 	}
+ 	INIT_LIST_HEAD(&pe->list);
+ 
+-	/* worker init for protocol message handling */
+-	INIT_LIST_HEAD(&pe->proto_queue);
+-	INIT_WORK(&pe->proto_work, pe_proto_worker);
+-	spin_lock_init(&pe->proto_queue_lock);
+-
+-	mutex_init(&pe->protowk_lock);
+ 	retval = protocol_bind_pe(pe);
+ 	if (retval) {
+ 		pr_err("PE: failed to bind pe to protocol\n");
+diff --git a/drivers/usb/typec/pd/policy_engine.h b/drivers/usb/typec/pd/policy_engine.h
+index dbf4e34b5af0..758e767c4fd9 100644
+--- a/drivers/usb/typec/pd/policy_engine.h
++++ b/drivers/usb/typec/pd/policy_engine.h
+@@ -288,8 +288,9 @@ enum policy_state {
+ 
+ enum policy_status {
+ 	POLICY_STATUS_UNKNOWN,
+-	POLICY_STATUS_STOPPED,
+-	POLICY_STATUS_STARTED,
++	POLICY_STATUS_RUNNING,
++	POLICY_STATUS_FAIL,
++	POLICY_STATUS_SUCCESS,
+ };
+ 
+ struct policy {
+@@ -297,6 +298,7 @@ struct policy {
+ 	struct policy_engine *pe;
+ 	struct list_head list;
+ 	enum policy_status status;
++	enum policy_state state;
+ 	void *priv;
+ 	int (*start)(struct policy *p);
+ 	int (*stop)(struct policy *p);
+@@ -310,19 +312,14 @@ struct policy_engine {
+ 	struct pd_prot *prot;
+ 	struct notifier_block proto_nb;
+ 	struct notifier_block dpm_nb;
+-	struct mutex protowk_lock;
+ 	struct mutex dpmwk_lock;
+ 	struct mutex pe_lock;
+-	struct list_head proto_queue;
+ 	struct list_head dpm_queue;
+-	struct work_struct proto_work;
+ 	struct work_struct dpm_work;
+ 	struct devpolicy_mgr *dpm;
+ 	struct pe_operations *ops;
+ 	struct list_head list;
+ 
+-	enum pe_event prev_evt;
+-	spinlock_t proto_queue_lock;
+ 	spinlock_t dpm_queue_lock;
+ 
+ 	struct pd_policy *supported_policies;
+@@ -334,8 +331,7 @@ struct policy_engine {
+ 	struct work_struct policy_init_work;
+ 
+ 	struct list_head policy_list;
+-	enum policy_type policy_in_use;
+-	enum policy_state state;
++	enum cable_type cbl_type;
+ 	bool is_pd_connected;
+ };
+ 
+@@ -361,9 +357,12 @@ struct pe_operations {
+ 	enum cable_state (*get_vbus_state)(struct policy_engine *pe);
+ 	int (*set_pd_state)(struct policy_engine *pe, bool state);
+ 	bool (*get_pd_state)(struct policy_engine *pe);
+-	int (*process_msg)(struct policy_engine *pe, struct pd_packet *data);
+-	int (*process_cmd)(struct policy_engine *pe, int cmd);
+-	void (*update_policy_engine)(struct policy_engine *pe, int policy_type,
++	int (*process_data_msg)(struct policy_engine *pe, enum pe_event evt,
++				struct pd_packet *data);
++	int (*process_ctrl_msg)(struct policy_engine *pe, enum pe_event evt,
++				struct pd_packet *data);
++	int (*process_cmd)(struct policy_engine *pe, enum pe_event cmd);
++	void (*policy_status_changed)(struct policy_engine *pe, int policy_type,
+ 					int state);
+ };
+ 
+@@ -484,6 +483,13 @@ static inline int policy_send_packet(struct policy *p, void *data, int len,
+ 	return -ENOTSUPP;
+ }
+ 
++static inline void pe_notify_policy_status_changed(struct policy *p,
++			int type, int status)
++{
++	if (p && p->pe && p->pe->ops && p->pe->ops->policy_status_changed)
++		p->pe->ops->policy_status_changed(p->pe, type, status);
++}
++
+ static inline enum cable_state policy_get_vbus_state(struct policy *p)
+ {
+ 	if (p && p->pe && p->pe->ops && p->pe->ops->get_vbus_state)
+@@ -520,7 +526,7 @@ static inline void policy_engine_unbind_dpm(struct devpolicy_mgr *dpm)
+ { }
+ #endif /* CONFIG_USBC_PD && CONFIG_USBC_PD_POLICY */
+ 
+-static inline int pe_send_cmd(struct policy_engine *pe, int cmd)
++static inline int pe_process_cmd(struct policy_engine *pe, enum pe_event cmd)
+ {
+ 	if (pe && pe->ops && pe->ops->process_cmd)
+ 		return pe->ops->process_cmd(pe, cmd);
+@@ -528,10 +534,22 @@ static inline int pe_send_cmd(struct policy_engine *pe, int cmd)
+ 	return -ENOTSUPP;
+ }
+ 
+-static inline int pe_send_msg(struct policy_engine *pe, struct pd_packet *pkt)
++static inline int pe_process_data_msg(struct policy_engine *pe,
++					enum pe_event evt,
++					struct pd_packet *pkt)
++{
++	if (pe && pe->ops && pe->ops->process_data_msg)
++		return pe->ops->process_data_msg(pe, evt, pkt);
++
++	return -ENOTSUPP;
++}
++
++static inline int pe_process_ctrl_msg(struct policy_engine *pe,
++					enum pe_event evt,
++					struct pd_packet *pkt)
+ {
+-	if (pe && pe->ops && pe->ops->process_msg)
+-		return pe->ops->process_msg(pe, pkt);
++	if (pe && pe->ops && pe->ops->process_ctrl_msg)
++		return pe->ops->process_ctrl_msg(pe, evt, pkt);
+ 
+ 	return -ENOTSUPP;
+ }
+diff --git a/drivers/usb/typec/pd/protocol.c b/drivers/usb/typec/pd/protocol.c
+index 6e436a60b5e6..3c713b4f98f7 100644
+--- a/drivers/usb/typec/pd/protocol.c
++++ b/drivers/usb/typec/pd/protocol.c
+@@ -33,6 +33,11 @@
+ static LIST_HEAD(protocol_list);
+ static DEFINE_SPINLOCK(protocol_lock);
+ 
++struct prot_msg {
++	struct list_head node;
++	struct pd_packet pkt;
++};
++
+ static int pd_extcon_ufp_ntf(struct notifier_block *nb,
+ 				unsigned long event, void *param)
+ {
+@@ -79,11 +84,44 @@ static int pd_extcon_dfp_ntf(struct notifier_block *nb,
+ 	return NOTIFY_OK;
+ }
+ 
++
++static struct prot_msg *prot_alloc_msg(void)
++{
++	struct prot_msg *msg;
++	msg = kzalloc(sizeof(struct prot_msg),
++					GFP_KERNEL);
++	if (msg)
++		INIT_LIST_HEAD(&msg->node);
++	return msg;
++}
++
++static inline void prot_free_msg(struct prot_msg *msg)
++{
++	kfree(msg);
++}
++
++static void prot_clear_rx_msg_list(struct pd_prot *pd)
++{
++	struct prot_msg *msg, *tmp;
++	struct list_head tmp_list;
++
++	if (list_empty(&pd->rx_list))
++		return;
++
++	mutex_lock(&pd->rx_list_lock);
++	list_replace_init(&pd->rx_list, &tmp_list);
++	mutex_unlock(&pd->rx_list_lock);
++
++	list_for_each_entry_safe(msg, tmp, &tmp_list, node)
++		prot_free_msg(msg);
++}
++
+ static void pd_reset_counters(struct pd_prot *pd)
+ {
+ 	mutex_lock(&pd->tx_lock);
+ 	pd->event = PROT_EVENT_NONE;
+ 	pd->tx_msg_id = 0;
++	pd->rx_msg_id = -1;
+ 	pd->retry_counter = 0;
+ 	mutex_unlock(&pd->tx_lock);
+ }
+@@ -102,12 +140,15 @@ static int pd_prot_handle_reset(struct pd_prot *pd, enum typec_phy_evts evt)
+ 	pd->event = PROT_PHY_EVENT_RESET;
+ 	complete(&pd->tx_complete);
+ 	pd_reset_counters(pd);
++	if (pd->phy->reset_pd)
++		pd->phy->reset_pd(pd->phy);
++	prot_clear_rx_msg_list(pd);
+ 	/*TODO: check if the the work is completed */
+ 	pd->event = PROT_PHY_EVENT_NONE;
+ 
+ 	if (evt == PROT_PHY_EVENT_HARD_RST)
+ 		/* notify policy */
+-		pe_send_cmd(pd->pe, PD_CMD_HARD_RESET);
++		pe_process_cmd(pd->pe, PE_EVT_RCVD_HARD_RESET);
+ 
+ 	return 0;
+ }
+@@ -135,17 +176,30 @@ static void pd_prot_tx_work(struct pd_prot *prot)
+ 
+ }
+ 
++static inline int prot_rx_reset(struct pd_prot *pd)
++{
++	pd_reset_counters(pd);
++	/* Reset the phy */
++	return pd_prot_reset_phy(pd);
++}
++
+ static int pd_prot_rcv_pkt_from_policy(struct pd_prot *prot, u8 msg_type,
+ 						void *buf, int len)
+ {
+ 	struct pd_packet *pkt;
+ 
+-	if (msg_type == PD_CMD_HARD_RESET)
+-		return pd_prot_reset_phy(prot);
+-	else if (msg_type == PD_CMD_PROTOCOL_RESET)
++	if (msg_type == PD_CMD_HARD_RESET) {
++		pd_prot_flush_fifo(prot, FIFO_TYPE_RX);
++		prot_clear_rx_msg_list(prot);
++		return prot_rx_reset(prot);
++	} else if (msg_type == PD_CMD_PROTOCOL_RESET) {
++		pd_prot_flush_fifo(prot, FIFO_TYPE_RX);
++		prot_clear_rx_msg_list(prot);
+ 		return pd_tx_fsm_state(prot, PROT_TX_PHY_LAYER_RESET);
++	}
+ 
+ 	pkt = &prot->tx_buf;
++	memset(pkt, 0, sizeof(struct pd_packet));
+ 	pkt->header.msg_type = msg_type;
+ 	pkt->header.data_role = prot->new_data_role;
+ 	if (prot->pd_version == 2)
+@@ -179,82 +233,196 @@ static void pd_tx_discard_msg(struct pd_prot *pd)
+ 	if (pd->tx_msg_id >= PD_MAX_MSG_ID)
+ 		pd->tx_msg_id = 0;
+ 	mutex_unlock(&pd->tx_lock);
+-	pd->cur_tx_state = PROT_TX_PHY_LAYER_RESET;
++	pd_tx_fsm_state(pd, PROT_TX_PHY_LAYER_RESET);
+ }
+ 
+-static void pd_prot_rx_work(struct pd_prot *pd)
++static int prot_fwd_ctrlmsg_to_pe(struct pd_prot *pd, struct prot_msg *msg)
+ {
+-	s32 msg_id;
+-	struct pd_packet *buf;
++	enum pe_event event = PE_EVT_RCVD_NONE;
+ 
+-	/* wait for goodcrc sent */
+-	if (!pd->phy->support_auto_goodcrc)
+-		wait_for_completion(&pd->tx_complete);
++	switch (msg->pkt.header.msg_type) {
++	case PD_CTRL_MSG_GOODCRC:
++		event = PE_EVT_RCVD_GOODCRC;
++		break;
++	case PD_CTRL_MSG_GOTOMIN:
++		event = PE_EVT_RCVD_GOTOMIN;
++		break;
++	case PD_CTRL_MSG_ACCEPT:
++		event = PE_EVT_RCVD_ACCEPT;
++		break;
++	case PD_CTRL_MSG_REJECT:
++		event = PE_EVT_RCVD_REJECT;
++		break;
++	case PD_CTRL_MSG_PING:
++		event = PE_EVT_RCVD_PING;
++		break;
++	case PD_CTRL_MSG_PS_RDY:
++		event = PE_EVT_RCVD_PS_RDY;
++		break;
++	case PD_CTRL_MSG_GET_SRC_CAP:
++		event = PE_EVT_RCVD_GET_SRC_CAP;
++		break;
++	case PD_CTRL_MSG_GET_SINK_CAP:
++		event = PE_EVT_RCVD_GET_SINK_CAP;
++		break;
++	case PD_CTRL_MSG_DR_SWAP:
++		event = PE_EVT_RCVD_DR_SWAP;
++		break;
++	case PD_CTRL_MSG_PR_SWAP:
++		event = PE_EVT_RCVD_PR_SWAP;
++		break;
++	case PD_CTRL_MSG_VCONN_SWAP:
++		event = PE_EVT_RCVD_VCONN_SWAP;
++		break;
++	case PD_CTRL_MSG_WAIT:
++		event = PE_EVT_RCVD_WAIT;
++		break;
++	case PD_CTRL_MSG_SOFT_RESET:
++		/*This should be already handled, dont not forward to pe*/
++		break;
++	default:
++		dev_warn(pd->phy->dev, "%s:Unknown msg received, msg_type=%d\n",
++				__func__, msg->pkt.header.msg_type);
++	}
+ 
+-	if (pd->event == PROT_PHY_EVENT_RESET)
+-		return;
++	if (event != PE_EVT_RCVD_NONE) {
++		/* Forward the msg to policy engine. */
++		pe_process_ctrl_msg(pd->pe, event, &msg->pkt);
++		return 0;
++	}
++	return -EINVAL;
++}
+ 
+-	buf = &pd->cached_rx_buf;
++static int prot_fwd_datamsg_to_pe(struct pd_prot *pd, struct prot_msg *msg)
++{
++	enum pe_event event = PE_EVT_RCVD_NONE;
+ 
+-	msg_id = PD_MSG_ID(&buf->header);
++	switch (msg->pkt.header.msg_type) {
++	case PD_DATA_MSG_SRC_CAP:
++		event = PE_EVT_RCVD_SRC_CAP;
++		break;
++	case PD_DATA_MSG_REQUEST:
++		event = PE_EVT_RCVD_REQUEST;
++		break;
++	case PD_DATA_MSG_BIST:
++		event = PE_EVT_RCVD_BIST;
++		break;
++	case PD_DATA_MSG_SINK_CAP:
++		event = PE_EVT_RCVD_SNK_CAP;
++		break;
++	case PD_DATA_MSG_VENDOR_DEF:
++		event = PE_EVT_RCVD_VDM;
++		break;
++	default:
++		dev_warn(pd->phy->dev, "%s:Unknown msg received, msg_type=%d\n",
++				__func__, msg->pkt.header.msg_type);
++	}
+ 
+-	if (pd->rx_msg_id != msg_id) {
+-		pd_tx_discard_msg(pd);
+-		pd->rx_msg_id = msg_id;
++	if (event != PE_EVT_RCVD_NONE) {
++		/* Forward the msg to policy engine */
++		pe_process_data_msg(pd->pe, event, &msg->pkt);
++		return 0;
++	}
++	return -EINVAL;
+ 
+-		/* notify policy */
+-		pe_send_msg(pd->pe, buf);
++}
++
++static void pd_prot_handle_rx_msg(struct pd_prot *pd, struct prot_msg *msg)
++{
++
++	/* wait for goodcrc sent */
++	if (!pd->phy->support_auto_goodcrc)
++		wait_for_completion(&pd->tx_complete);
++
++	if (IS_DATA_MSG(&msg->pkt.header))
++		prot_fwd_datamsg_to_pe(pd, msg);
++	else if (IS_CTRL_MSG(&msg->pkt.header))
++		prot_fwd_ctrlmsg_to_pe(pd, msg);
++	else
++		dev_warn(pd->phy->dev,
++			"%s:Unknown msg type received, msg_type=%d\n",
++			__func__, msg->pkt.header.msg_type);
++	if (!pd->phy->support_auto_goodcrc)
++		reinit_completion(&pd->tx_complete);
++}
++
++static void prot_process_rx_work(struct work_struct *work)
++{
++	struct pd_prot *pd = container_of(work, struct pd_prot, proc_rx_msg);
++	struct prot_msg *msg;
++
++	/* Dequeue all the messages in the rx list and process them.
++	 * Note: Do not use list_for_each_entry_safe() as HARD_RESET
++	 * may delete the list and may cuase error.
++	 */
++	mutex_lock(&pd->rx_list_lock);
++	while (!list_empty(&pd->rx_list)) {
++		msg = list_first_entry(&pd->rx_list,
++					struct prot_msg, node);
++		list_del(&msg->node);
++		/* Unlock the mutex while processing the msg*/
++		mutex_unlock(&pd->rx_list_lock);
++
++		pd_prot_handle_rx_msg(pd, msg);
++		prot_free_msg(msg);
++
++		mutex_lock(&pd->rx_list_lock);
+ 	}
++	mutex_unlock(&pd->rx_list_lock);
+ }
+ 
+-static inline void prot_rx_reset(struct pd_prot *pd)
++static int pd_prot_add_msg_rx_list(struct pd_prot *pd,
++				struct pd_packet *pkt, int len)
+ {
+-	pd_reset_counters(pd);
+-	pd_prot_reset_phy(pd); /* flush both the fifo */
++	struct prot_msg *msg;
++
++	msg = prot_alloc_msg();
++	if (!msg) {
++		dev_err(pd->phy->dev,
++			"failed to allocate mem for rx msg\n");
++		return -ENOMEM;
++	}
++	memcpy(&msg->pkt, pkt, len);
++	mutex_lock(&pd->rx_list_lock);
++
++	/* Add the message to the rx list */
++	list_add_tail(&msg->node, &pd->rx_list);
++	mutex_unlock(&pd->rx_list_lock);
++	schedule_work(&pd->proc_rx_msg);
++	return 0;
+ }
+ 
+ static void pd_prot_phy_rcv(struct pd_prot *pd)
+ {
+ 	struct pd_packet rcv_buf;
+-	int len, event, send_good_crc, msg_type, msg_id;
++	int len, send_good_crc, msg_type, msg_id;
+ 
+ 	mutex_lock(&pd->rx_data_lock);
+ 
++	memset(&rcv_buf, 0, sizeof(struct pd_packet));
+ 	len = pd_prot_recv_phy_packet(pd, &rcv_buf);
+ 	if (len == 0)
+-		goto end;
++		goto phy_rcv_end;
+ 
+ 	msg_type = PD_MSG_TYPE(&rcv_buf.header);
++	if (msg_type == PD_CTRL_MSG_RESERVED_0)
++		goto phy_rcv_end;
++
+ 	msg_id = PD_MSG_ID(&rcv_buf.header);
+ 	send_good_crc = 1;
+-	switch (msg_type) {
+-	case PD_CTRL_MSG_SOFT_RESET:
+-		prot_rx_reset(pd);
+-		break;
+-	case PD_CTRL_MSG_PING:
+-		break;
+-	case PD_CTRL_MSG_GOODCRC:
+-		if (!IS_CTRL_MSG(&rcv_buf.header))
+-			/* data message (source capability :)) */
+-			break;
+-		send_good_crc = 0;
+-		if (msg_id == pd->tx_msg_id) {
+-			pd->tx_msg_id = (pd->tx_msg_id + 1) % PD_MAX_MSG_ID;
+-			event = PROT_EVENT_NONE;
+-			/* notify policy */
+-		} else {
+-			event = PROT_EVENT_MSGID_MISMATCH;
++
++	if (IS_CTRL_MSG(&rcv_buf.header)) {
++		if (msg_type == PD_CTRL_MSG_SOFT_RESET)
++			prot_rx_reset(pd);
++		else if (msg_type == PD_CTRL_MSG_GOODCRC) {
++			send_good_crc = 0;
++			if (msg_id == pd->tx_msg_id) {
++				pd->tx_msg_id = (msg_id + 1) % PD_MAX_MSG_ID;
++				pd_prot_add_msg_rx_list(pd, &rcv_buf, len);
++			} else
++				dev_warn(pd->phy->dev, "GCRC msg id not matching\n");
++			complete(&pd->tx_complete);
+ 		}
+-		mutex_lock(&pd->tx_lock);
+-		pd->event = event;
+-		mutex_unlock(&pd->tx_lock);
+-		complete(&pd->tx_complete);
+-		break;
+-	default:
+-		/*  process all other messages */
+-		dev_dbg(pd->phy->dev, "PROT: %s msg_type: %d\n",
+-				__func__, msg_type);
+-		break;
+ 	}
+ 
+ 	if (send_good_crc) {
+@@ -262,13 +430,21 @@ static void pd_prot_phy_rcv(struct pd_prot *pd)
+ 			reinit_completion(&pd->tx_complete);
+ 			prot_rx_send_goodcrc(pd, msg_id);
+ 		}
+-		memcpy(&pd->cached_rx_buf, &rcv_buf, len);
+-		pd_prot_rx_work(pd);
+-
+-		if (!pd->phy->support_auto_goodcrc)
+-			reinit_completion(&pd->tx_complete);
++		/* Check of the message is already received by comparing
++		 * current msg id with previous msg id. Discard already
++		 * reveived messages.
++		 */
++		if (pd->rx_msg_id != msg_id) {
++			pd_tx_discard_msg(pd);
++			pd->rx_msg_id = msg_id;
++			pd_prot_add_msg_rx_list(pd, &rcv_buf, len);
++		} else {
++			dev_warn(pd->phy->dev,
++				"%s:This msg is already received\n",
++				__func__);
++		}
+ 	}
+-end:
++phy_rcv_end:
+ 	mutex_unlock(&pd->rx_data_lock);
+ }
+ 
+@@ -301,13 +477,17 @@ static void pd_notify_protocol(struct typec_phy *phy, unsigned long event)
+ 	case PROT_PHY_EVENT_GOODCRC_SENT:
+ 		dev_dbg(phy->dev, "%s: PROT_PHY_EVENT_GOODCRC_SENT\n",
+ 				__func__);
++		pd_prot_phy_rcv(pd);
+ 		break;
+ 	case PROT_PHY_EVENT_HARD_RST: /* recv HRD_RST */
+ 	case PROT_PHY_EVENT_SOFT_RST:
++		dev_dbg(phy->dev, "%s: PROT_PHY_EVENT_SOFT/HARD_RST\n",
++				__func__);
+ 		pd_prot_handle_reset(pd, event);
+ 		/* wait for activity complete */
+ 		break;
+ 	case PROT_PHY_EVENT_TX_FAIL:
++		dev_dbg(phy->dev, "%s: PROT_PHY_EVENT_TX_FAIL\n", __func__);
+ 		mutex_lock(&pd->tx_lock);
+ 		pd->event = PROT_EVENT_TX_FAIL;
+ 		mutex_unlock(&pd->tx_lock);
+@@ -316,8 +496,10 @@ static void pd_notify_protocol(struct typec_phy *phy, unsigned long event)
+ 	case PROT_PHY_EVENT_SOFT_RST_FAIL:
+ 		break;
+ 	case PROT_PHY_EVENT_TX_HARD_RST: /* sent HRD_RST */
++		dev_dbg(phy->dev, "%s: PROT_PHY_EVENT_TX_HARD_RST\n",
++				__func__);
+ 		/* Hard reset complete signaling */
+-		pe_send_cmd(pd->pe, PD_CMD_HARD_RESET_COMPLETE);
++		pe_process_cmd(pd->pe, PE_EVT_RCVD_HARD_RESET_COMPLETE);
+ 		break;
+ 	default:
+ 		break;
+@@ -422,6 +604,10 @@ int protocol_bind_dpm(struct typec_phy *phy)
+ 	prot->policy_fwd_pkt = pd_prot_rcv_pkt_from_policy;
+ 	list_add_tail(&prot->list, &protocol_list);
+ 
++	INIT_LIST_HEAD(&prot->rx_list);
++	INIT_WORK(&prot->proc_rx_msg, prot_process_rx_work);
++	mutex_init(&prot->rx_list_lock);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(protocol_bind_dpm);
+@@ -453,6 +639,13 @@ void protocol_unbind_dpm(struct typec_phy *phy)
+ 		}
+ 	}
+ 	spin_unlock(&protocol_lock);
++
++	/* Clear the rx list and reset phy */
++	pd_reset_counters(prot);
++	prot_clear_rx_msg_list(prot);
++	pd_prot_flush_fifo(prot, FIFO_TYPE_TX);
++	pd_prot_flush_fifo(prot, FIFO_TYPE_RX);
++	pd_prot_reset_phy(prot);
+ }
+ EXPORT_SYMBOL_GPL(protocol_unbind_dpm);
+ 
+diff --git a/drivers/usb/typec/pd/protocol.h b/drivers/usb/typec/pd/protocol.h
+index 0b57cc51baa1..67094410a2a8 100644
+--- a/drivers/usb/typec/pd/protocol.h
++++ b/drivers/usb/typec/pd/protocol.h
+@@ -41,10 +41,9 @@ struct pd_prot {
+ 	u8 assumed_pwr_role;
+ 	u8 event;
+ 	u8 tx_msg_id;
+-	s32 rx_msg_id;
+ 	u8 retry_counter;
+-
+ 	u8 cur_tx_state;
++	int rx_msg_id;
+ 	struct pd_packet tx_buf;
+ 	struct pd_packet cached_rx_buf;
+ 
+@@ -58,6 +57,11 @@ struct pd_prot {
+ 	struct list_head list;
+ 	struct work_struct cable_event_work;
+ 
++	/* list and worker to process received messages */
++	struct list_head rx_list;
++	struct work_struct proc_rx_msg;
++	struct mutex rx_list_lock;
++
+ 	struct extcon_specific_cable_nb cable_ufp;
+ 	struct extcon_specific_cable_nb cable_dfp;
+ 	struct notifier_block ufp_nb;
+diff --git a/drivers/usb/typec/pd/sink_port_pe.c b/drivers/usb/typec/pd/sink_port_pe.c
+index 3896e6a13e41..cf20a8f2de09 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.c
++++ b/drivers/usb/typec/pd/sink_port_pe.c
+@@ -242,7 +242,7 @@ static int snkpe_start(struct sink_port_pe *sink)
+ 		complete(&sink->nrt_complete);
+ 		return 0;
+ 	}
+-	sink->p->status = POLICY_STATUS_STARTED;
++	sink->p->status = POLICY_STATUS_RUNNING;
+ 
+ 	/*---------- Start of Sink Port PE --------------*/
+ 	/* get the vbus state, in case of boot of vbus */
+@@ -280,8 +280,11 @@ static int snkpe_start(struct sink_port_pe *sink)
+ static inline int sink_port_policy_start(struct policy *p)
+ {
+ 	struct sink_port_pe *sink = p->priv;
+-	sink->cur_state = PE_SNK_STARTUP;
+ 
++	pr_debug("SNKPE: %s\n", __func__);
++
++	sink->cur_state = PE_SNK_STARTUP;
++	sink->p->state = POLICY_STATE_ONLINE;
+ 	return snkpe_start(sink);
+ }
+ 
+@@ -293,7 +296,8 @@ int sink_port_policy_stop(struct policy *p)
+ 	/* reset HardResetCounter to zero upon vbus disconnect.
+ 	 */
+ 	sink->hard_reset_count = 0;
+-	sink->p->status = POLICY_STATUS_STOPPED;
++	sink->p->status = POLICY_STATUS_UNKNOWN;
++	sink->p->state = POLICY_STATE_OFFLINE;
+ 	sink->is_vbus_connected = false;
+ 	policy_set_pd_state(p, false);
+ 
+@@ -754,6 +758,8 @@ struct policy *sink_port_policy_init(struct policy_engine *pe)
+ 	}
+ 
+ 	p->type = POLICY_TYPE_SINK;
++	p->state = POLICY_STATE_OFFLINE;
++	p->status = POLICY_STATUS_UNKNOWN;
+ 	p->pe = pe;
+ 	p->rcv_pkt = sink_port_policy_rcv_pkt;
+ 	p->rcv_cmd = sink_port_policy_rcv_cmd;
+@@ -787,7 +793,8 @@ static void sink_port_policy_exit(struct policy *p)
+ 	if (p) {
+ 		snkpe = p->priv;
+ 		if (snkpe) {
+-			snkpe->p->status = POLICY_STATUS_STOPPED;
++			snkpe->p->status = POLICY_STATUS_UNKNOWN;
++			snkpe->p->state = POLICY_STATE_OFFLINE;
+ 			kfifo_free(&snkpe->pkt_fifo);
+ 			kfree(snkpe);
+ 			kfree(p);
+-- 
+1.9.1
+

@@ -1,0 +1,94 @@
+From 40d0e36ffce3ccee816115e042e8b5780f40a558 Mon Sep 17 00:00:00 2001
+Message-Id: <40d0e36ffce3ccee816115e042e8b5780f40a558.1436312509.git.chang-joon.lee@intel.com>
+In-Reply-To: <d7f55a0f6423e9b14861f607af19ccac4e7f31d5.1436312509.git.chang-joon.lee@intel.com>
+References: <d7f55a0f6423e9b14861f607af19ccac4e7f31d5.1436312509.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 3 Jun 2015 12:45:53 +0100
+Subject: [PATCH 15/15] SQUASHME! [VPG]: drm/i915: Fix for IRQ seqno cache
+ clashing with TDR
+
+The scheduler's interrupt handler can be called many times for a single
+interrupt (the completion interrupts for multiple batches can occur
+back to back so the scheduler handles the last one but then gets
+called again for each in turn). To avoid doing lots of unnecessary
+processing, the scheduler caches the last read seqno value and early
+exits from the handler if it has not changed.
+
+However, the TDR reset causes the seqno to start again from the
+beginning. In the case of two back to back TDR events, that means two
+batch buffers will be submitted with the same seqno value. The
+scheduler will therefore not process the second one.
+
+This patch adds a reset of the cache (to the invalid seqno value)
+during the TDR reset. Thus the subsequent completion event is
+guaranteed to be processed irrespective of its new or old seqno value.
+The cache has also been extended to be per ring to improve its
+efficiency.
+
+This patch could be squashed in to the one that originally
+added the interrupt handler:
+  commit cf85d962397659a36a6b3b58854abaa67b6eb77b
+  Author: John Harrison <John.C.Harrison@Intel.com>
+  Date: Tue Apr 1 16:27:39 2014 +0100
+  Subject: FOR_UPSTREAM [VPG]: drm/i915: Start of GPU scheduler
+  Change-Id: I1e08f59e650a3c2bbaaa9de7627da33849b06106
+
+Change-Id: I2addad6e595c68c97897488e80d73e9a7deb6e91
+For: VIZ-1587
+For: VIZ-4741
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_scheduler.c | 7 ++++---
+ drivers/gpu/drm/i915/i915_scheduler.h | 1 +
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 9fc6200..b3bfb60 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -547,6 +547,8 @@ void i915_scheduler_kill_all(struct drm_device *dev)
+ 		}
+ 	}
+ 
++	memset(scheduler->last_irq_seqno, 0, sizeof(scheduler->last_irq_seqno));
++
+ 	spin_unlock_irqrestore(&scheduler->lock, flags);
+ 
+ 	queue_work(dev_priv->wq, &dev_priv->mm.scheduler_work);
+@@ -628,7 +630,6 @@ int i915_scheduler_handle_irq(struct intel_engine_cs *ring)
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	struct i915_scheduler   *scheduler = dev_priv->scheduler;
+ 	unsigned long       flags;
+-	static uint32_t     last_seqno;
+ 	uint32_t            seqno;
+ 
+ 	seqno = ring->get_seqno(ring, false);
+@@ -638,11 +639,11 @@ int i915_scheduler_handle_irq(struct intel_engine_cs *ring)
+ 	if (i915.scheduler_override & i915_so_direct_submit)
+ 		return 0;
+ 
+-	if (seqno == last_seqno) {
++	if (seqno == scheduler->last_irq_seqno[ring->id]) {
+ 		/* Why are there sometimes multiple interrupts per seqno? */
+ 		return 0;
+ 	}
+-	last_seqno = seqno;
++	scheduler->last_irq_seqno[ring->id] = seqno;
+ 
+ 	spin_lock_irqsave(&scheduler->lock, flags);
+ 	i915_scheduler_seqno_complete(ring, seqno);
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index a3fd7eb..61df49d 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -121,6 +121,7 @@ struct i915_scheduler {
+ 	uint32_t            flags[I915_NUM_RINGS];
+ 	spinlock_t          lock;
+ 	uint32_t            index;
++	uint32_t            last_irq_seqno[I915_NUM_RINGS];
+ 
+ 	/* Tuning parameters: */
+ 	uint32_t            priority_level_max;
+-- 
+1.9.1
+

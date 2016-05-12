@@ -1,0 +1,416 @@
+From f8ef0dd2e38697811516ee2c56a658cb97c82cd3 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Wed, 9 Sep 2015 17:23:27 +0530
+Subject: [PATCH] USBC_PD: Fix PD hang on disconnect during pr swap.
+
+On PR_SWAP error, as the CC pull-up/pull-down has changed
+as part of swap, device should be moved to CC toggle mode
+to settle at proper state( eiter UFP or DFP).
+Hence any error during pr swap should be treated as cable
+disconnect and start the toggling.
+
+Change-Id: I4cafaf92d9c894129b97cef86c77c34f39cdd1ee
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-18212
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+---
+ drivers/usb/typec/pd/devpolicy_mgr.c | 67 +++++++++++++----------------
+ drivers/usb/typec/pd/policy_engine.c | 14 ++++++
+ drivers/usb/typec/pd/policy_engine.h |  1 +
+ drivers/usb/typec/pd/sink_port_pe.c  | 17 ++++++--
+ drivers/usb/typec/pd/src_port_pe.c   | 82 +++++++++++++++++++++++-------------
+ 5 files changed, 111 insertions(+), 70 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/devpolicy_mgr.c b/drivers/usb/typec/pd/devpolicy_mgr.c
+index 1f11a2f..aa31c1b 100644
+--- a/drivers/usb/typec/pd/devpolicy_mgr.c
++++ b/drivers/usb/typec/pd/devpolicy_mgr.c
+@@ -533,26 +533,6 @@ static void dpm_update_power_role(struct devpolicy_mgr *dpm,
+ 		}
+ 		break;
+ 	case POWER_ROLE_SINK:
+-		if (cur_prole == POWER_ROLE_SWAP
+-			&& prev_prole == POWER_ROLE_SINK) {
+-			/* PR swap from SINK to SRC failed.
+-			 * Pull-Down the CC line.
+-			 */
+-			set_pu_pd = true;
+-			pu_pd = false;
+-		} else if (cur_prole == POWER_ROLE_SOURCE
+-				&& prev_prole == POWER_ROLE_SWAP) {
+-			/* During PR SWAP from SNK to SRC, after source
+-			 * is enabled, the other device failed to switch
+-			 * to sink and did send PS_RDY ontime. So switch
+-			 * back from src to snk.
+-			 */
+-			set_pu_pd = true;
+-			pu_pd = false;
+-			dpm->provider_state = CABLE_DETACHED;
+-			dpm_notify_cable_state(dpm, "USB_TYPEC_SRC",
+-						CABLE_DETACHED);
+-		}
+ 		dpm->consumer_state = CABLE_ATTACHED;
+ 		/* Send SNK connect */
+ 		cbl_type = "USB_TYPEC_SNK";
+@@ -560,14 +540,6 @@ static void dpm_update_power_role(struct devpolicy_mgr *dpm,
+ 		break;
+ 
+ 	case POWER_ROLE_SOURCE:
+-		if (cur_prole == POWER_ROLE_SWAP
+-			&& prev_prole == POWER_ROLE_SOURCE) {
+-			/* PR SWAP from SRC to SNK failed and falling
+-			 * back to SRC, Pull-Up the CC line
+-			 */
+-			set_pu_pd = true;
+-			pu_pd = true;
+-		}
+ 		dpm->provider_state = CABLE_ATTACHED;
+ 		/* Send SRC connect */
+ 		cbl_type = "USB_TYPEC_SRC";
+@@ -590,9 +562,12 @@ static void dpm_update_power_role(struct devpolicy_mgr *dpm,
+ 	}
+ 	dpm->prev_prole = cur_prole;
+ 	dpm->cur_prole = prole;
+-	dpm_notify_cable_state(dpm, cbl_type, cbl_state);
++
++	if (cbl_type != NULL)
++		dpm_notify_cable_state(dpm, cbl_type, cbl_state);
+ 	if (set_pu_pd)
+ 		dpm_set_pu_pd(dpm, pu_pd);
++
+ update_prole_err:
+ 	mutex_unlock(&dpm->role_lock);
+ 
+@@ -617,6 +592,8 @@ static void dpm_handle_ext_cable_event(struct devpolicy_mgr *dpm,
+ 					struct cable_event *evt)
+ {
+ 	enum devpolicy_mgr_events dpm_evt = DEVMGR_EVENT_NONE;
++	enum pwr_role prole;
++	enum data_role drole;
+ 
+ 		pr_debug("DPM:%s: Cable type=%s - %s\n", __func__,
+ 			((evt->cbl_type == CABLE_TYPE_CONSUMER) ? "Consumer" :
+@@ -628,32 +605,48 @@ static void dpm_handle_ext_cable_event(struct devpolicy_mgr *dpm,
+ 		if (evt->cbl_type == CABLE_TYPE_CONSUMER
+ 			&& evt->cbl_state != dpm->consumer_state) {
+ 			dpm->consumer_state = evt->cbl_state;
+-			if (evt->cbl_state == CABLE_ATTACHED)
++			if (evt->cbl_state == CABLE_ATTACHED) {
+ 				dpm_evt = DEVMGR_EVENT_UFP_CONNECTED;
+-			else if (evt->cbl_state == CABLE_DETACHED)
++				drole = DATA_ROLE_UFP;
++				prole = POWER_ROLE_SINK;
++			} else if (evt->cbl_state == CABLE_DETACHED) {
+ 				dpm_evt = DEVMGR_EVENT_UFP_DISCONNECTED;
+-			else
++				drole = DATA_ROLE_NONE;
++				prole = POWER_ROLE_NONE;
++			} else
+ 				pr_warn("DPM:%s: Unknown consumer state=%d\n",
+ 					__func__, evt->cbl_state);
+ 
+ 		} else if (evt->cbl_type == CABLE_TYPE_PROVIDER
+ 			&& evt->cbl_state != dpm->provider_state) {
+ 			dpm->provider_state = evt->cbl_state;
+-			if (evt->cbl_state == CABLE_ATTACHED)
++			if (evt->cbl_state == CABLE_ATTACHED) {
+ 				dpm_evt = DEVMGR_EVENT_DFP_CONNECTED;
+-			else if (evt->cbl_state == CABLE_DETACHED)
++				drole = DATA_ROLE_DFP;
++				prole = POWER_ROLE_SOURCE;
++			} else if (evt->cbl_state == CABLE_DETACHED) {
+ 				dpm_evt = DEVMGR_EVENT_DFP_DISCONNECTED;
+-			else
++				drole = DATA_ROLE_NONE;
++				prole = POWER_ROLE_NONE;
++			} else
+ 				pr_warn("DPM:%s: Unknown consumer state=%d\n",
+ 					__func__, evt->cbl_state);
+ 		} else
+ 			pr_debug("DPM: consumer/provider state not changed\n");
+ 
+-		mutex_unlock(&dpm->role_lock);
+ 
+ 		/* Notify policy engine on valid event*/
+-		if (dpm_evt != DEVMGR_EVENT_NONE)
++		if (dpm_evt != DEVMGR_EVENT_NONE) {
++			dpm->prev_drole = dpm->cur_drole;
++			dpm->cur_drole = drole;
++
++			dpm->prev_prole = dpm->cur_prole;
++			dpm->cur_prole = prole;
++			mutex_unlock(&dpm->role_lock);
++
+ 			dpm_notify_policy_evt(dpm, dpm_evt);
++		} else
++			mutex_unlock(&dpm->role_lock);
+ 
+ }
+ 
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 9ebb1d1..8582e9d 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -531,6 +531,7 @@ static void pe_policy_status_changed(struct policy_engine *pe,
+ 	enum pwr_role prole;
+ 	int ret;
+ 
++	pr_debug("PE:%s: Change event=%d\n", __func__, status);
+ 	if (!pe)
+ 		return;
+ 	switch (status) {
+@@ -599,6 +600,19 @@ static void pe_policy_status_changed(struct policy_engine *pe,
+ 					__func__, ptype);
+ 		break;
+ 
++	case PE_STATUS_CHANGE_PR_SWAP_FAIL:
++		/* As PR_SWAP changes the CC pull-up and pull-down,
++		 * swap fail should be treated as disconnect and enable
++		 * the CC toggle in DRP mode.
++		 */
++		pe_set_power_role(pe, POWER_ROLE_NONE);
++		pe_set_data_role(pe, DATA_ROLE_NONE);
++		/* Stop all active policies */
++		list_for_each_entry(p, &pe->policy_list, list) {
++			if (p && (p->state == POLICY_STATE_ONLINE))
++				p->stop(p);
++		}
++		break;
+ 	default:
+ 		pr_debug("PE:%s: Not processing state change evt=%d\n",
+ 					__func__, status);
+diff --git a/drivers/usb/typec/pd/policy_engine.h b/drivers/usb/typec/pd/policy_engine.h
+index 4d9b7a0..f8d22be 100644
+--- a/drivers/usb/typec/pd/policy_engine.h
++++ b/drivers/usb/typec/pd/policy_engine.h
+@@ -301,6 +301,7 @@ enum pe_status_change_evt {
+ 	PE_STATUS_CHANGE_DP_SUCCESS,
+ 	PE_STATUS_CHANGE_DR_CHANGED,
+ 	PE_STATUS_CHANGE_PR_CHANGED,
++	PE_STATUS_CHANGE_PR_SWAP_FAIL,
+ };
+ 
+ struct pe_port_partner_caps {
+diff --git a/drivers/usb/typec/pd/sink_port_pe.c b/drivers/usb/typec/pd/sink_port_pe.c
+index 64d9b64..f67e0b3 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.c
++++ b/drivers/usb/typec/pd/sink_port_pe.c
+@@ -59,6 +59,19 @@ static void snkpe_reset_params(struct sink_port_pe *sink)
+ 	sink->pp_is_ext_pwrd = 0;
+ }
+ 
++/* PR_SWAP fail handling is different from reset on timeout error.
++ * During PR_SWAP as the CC pull-up is changed, on failure there is
++ * no guarentee that this device still act as source. Hence this
++ * failure should be treated as disconnect and start toggle in DRP.
++ */
++static void snkpe_handle_pr_swap_fail(struct sink_port_pe *sink)
++{
++	snkpe_reset_params(sink);
++	pr_err("SNKPE:%s: Notifying PR_SWAP_FAIL to PE\n", __func__);
++	pe_notify_policy_status_changed(&sink->p,
++			POLICY_TYPE_SINK, PE_STATUS_CHANGE_PR_SWAP_FAIL);
++}
++
+ static int snkpe_get_req_cap(struct sink_port_pe *sink,
+ 					struct pd_packet *pkt,
+ 					struct power_cap *pcap,
+@@ -676,9 +689,7 @@ static void snkpe_handle_pss_transition_off(struct sink_port_pe *sink)
+ 
+ trans_off_err:
+ 	pr_err("SNKPE: Error in pss_transition_off %d\n", ret);
+-	/* Move to PE_SNK_Hard_Reset state */
+-	snkpe_update_state(sink, PE_SNK_HARD_RESET);
+-	schedule_work(&sink->timer_work);
++	snkpe_handle_pr_swap_fail(sink);
+ 	return;
+ }
+ 
+diff --git a/drivers/usb/typec/pd/src_port_pe.c b/drivers/usb/typec/pd/src_port_pe.c
+index 62dc4ee..1e02820 100644
+--- a/drivers/usb/typec/pd/src_port_pe.c
++++ b/drivers/usb/typec/pd/src_port_pe.c
+@@ -112,6 +112,21 @@ static void src_pe_do_pe_reset_on_error(struct src_port_pe *src_pe)
+ 	schedule_delayed_work(&src_pe->start_comm, 0);
+ }
+ 
++/* PR_SWAP fail handling is different from reset on timeout error.
++ * During PR_SWAP as the CC pull-up is changed, on failure there is
++ * no guarentee that this device still act as source. Hence this
++ * failure should be treated as disconnect and start toggle in DRP.
++ */
++static void src_pe_handle_pr_swap_fail(struct src_port_pe *src_pe)
++{
++	mutex_lock(&src_pe->pe_lock);
++	src_pe_reset_policy_engine(src_pe);
++	mutex_unlock(&src_pe->pe_lock);
++	log_info("Notifying PR_SWAP_FAIL to PE");
++	pe_notify_policy_status_changed(&src_pe->p,
++			POLICY_TYPE_SOURCE, PE_STATUS_CHANGE_PR_SWAP_FAIL);
++}
++
+ static int src_pe_send_srccap_cmd(struct src_port_pe *src_pe)
+ {
+ 	int ret;
+@@ -209,24 +224,23 @@ static int src_pe_handle_sink_transition_to_off(struct src_port_pe *src_pe)
+ 	ret = src_pe_sink_transition_wait_for_vbus_off(src_pe);
+ 	if (ret < 0) {
+ 		log_err("Failed to disable the VBUS, HARD_RESET\n");
+-		goto trans_to_off_fail;
++		goto trans_to_swap_fail;
+ 	}
+ 
+ 	ret = src_pe_handle_snk_source_off(src_pe);
+ 	if (ret < 0) {
+ 		log_err("Failed to send PD_RDY\n");
+-		goto trans_to_off_fail;
++		goto trans_to_swap_fail;
+ 	}
+ 
+-	return 0;
++	/* wait for ps_rdy from port partner. */
++	schedule_work(&src_pe->msg_work);
+ 
+-trans_to_off_fail:
+-	/* Change the role back to source */
+-	policy_set_power_role(&src_pe->p, POWER_ROLE_SOURCE);
++	return 0;
+ 
+ trans_to_swap_fail:
+-	/* As role swap accepted, reset state & send hard reset */
+-	src_pe_do_pe_reset_on_error(src_pe);
++	/* As role swap accepted, handle pr swap fail*/
++	src_pe_handle_pr_swap_fail(src_pe);
+ 	return ret;
+ }
+ 
+@@ -421,17 +435,8 @@ src_pe_handle_gcrc(struct src_port_pe *src_pe, struct pd_packet *pkt)
+ 		schedule_work(&src_pe->msg_work);
+ 		break;
+ 	case PE_PRS_SRC_SNK_ACCEPT_PR_SWAP:
+-		log_dbg("SRC_SNK_ACCEPT_PR_SWAP -> SRC_SNK_TRANSITION_TO_OFF");
+-		schedule_work(&src_pe->msg_work);
+-		break;
+ 	case PE_PRS_SRC_SNK_SEND_PR_SWAP:
+-		/* work schedule after rcv good crc for PR_SWAP to
+-		 * recevice Accept */
+-		schedule_work(&src_pe->msg_work);
+-		break;
+ 	case PE_PRS_SRC_SNK_SOURCE_OFF:
+-		log_dbg("PE_PRS_SRC_SNK_SOURCE_OFF -> PE_SNK_STARTUP");
+-		schedule_work(&src_pe->msg_work);
+ 		break;
+ 	case PE_DRS_DFP_UFP_ACCEPT_DR_SWAP:
+ 	case PE_DRS_UFP_DFP_ACCEPT_DR_SWAP:
+@@ -464,13 +469,24 @@ static int src_pe_handle_request_cmd(struct src_port_pe *src_pe)
+ 
+ static int src_pe_pr_swap_ok(struct src_port_pe *src_pe)
+ {
+-	if (src_pe->state != PE_PRS_SRC_SNK_EVALUATE_PR_SWAP)
+-		return -EINVAL;
++	int ret;
+ 
+ 	mutex_lock(&src_pe->pe_lock);
+ 	src_pe->state = PE_PRS_SRC_SNK_ACCEPT_PR_SWAP;
+ 	mutex_unlock(&src_pe->pe_lock);
+-	return src_pe_send_accept_cmd(src_pe);
++	ret = src_pe_send_accept_cmd(src_pe);
++	if (ret) {
++		log_err("Failed to send Accept for dr swap");
++		goto swap_ok_error;
++	}
++	schedule_work(&src_pe->msg_work);
++	return 0;
++
++swap_ok_error:
++	mutex_lock(&src_pe->pe_lock);
++	src_pe->state = SRC_PE_STATE_PD_CONFIGURED;
++	mutex_unlock(&src_pe->pe_lock);
++	return ret;
+ }
+ 
+ static int src_pe_handle_pr_swap(struct src_port_pe *src_pe)
+@@ -523,6 +539,8 @@ static int src_pe_rcv_request(struct policy *srcp, enum pe_event evt)
+ 		mutex_unlock(&src_pe->pe_lock);
+ 		policy_send_packet(&src_pe->p, NULL, 0,
+ 					PD_CTRL_MSG_PR_SWAP, evt);
++		/* Schedule worker to wait for Accept/Reject and process*/
++		schedule_work(&src_pe->msg_work);
+ 		break;
+ 	case PE_EVT_SEND_DR_SWAP:
+ 		ret = src_pe_handle_trigger_dr_swap(src_pe);
+@@ -573,10 +591,11 @@ src_pe_rcv_pkt(struct policy *srcp, struct pd_packet *pkt, enum pe_event evt)
+ 		ret = src_pe_handle_request_cmd(src_pe);
+ 		break;
+ 	case PE_EVT_RCVD_PR_SWAP:
+-		if (src_pe->state != ERROR_RECOVERY) {
++		if (src_pe->state == SRC_PE_STATE_PD_CONFIGURED) {
+ 			ret = src_pe_handle_pr_swap(src_pe);
+ 		} else {
+-			log_err("State Machine is in Error Recovery Mode!\n");
++			log_err("PR_SWAP cannot process in state =%d",
++					src_pe->state);
+ 			ret = -EINVAL;
+ 		}
+ 		break;
+@@ -635,6 +654,9 @@ int src_pe_rcv_cmd(struct policy *srcp, enum pe_event evt)
+ 	return ret;
+ }
+ 
++/* This function will wait for accept/reject from port partner after
++ * DR_SWAP sent and  handle the responce.
++ */
+ static int src_pe_handle_after_prswap_sent(struct src_port_pe *src_pe)
+ {
+ 	unsigned long timeout;
+@@ -650,8 +672,10 @@ static int src_pe_handle_after_prswap_sent(struct src_port_pe *src_pe)
+ 		log_err("SRT time expired, move to READY");
+ 		goto error;
+ 	}
+-	if (src_pe->last_rcv_evt != PE_EVT_RCVD_ACCEPT)
++	if (src_pe->last_rcv_evt != PE_EVT_RCVD_ACCEPT) {
++		log_info("PR_SWAP not accepted by port partner");
+ 		goto error;
++	}
+ 
+ 	mutex_unlock(&src_pe->pe_lock);
+ 	ret = src_pe_handle_sink_transition_to_off(src_pe);
+@@ -664,6 +688,7 @@ error:
+ 	reinit_completion(&src_pe->srt_complete);
+ 	return ret;
+ }
++
+ static int src_pe_snk_source_off_waitfor_psrdy(struct src_port_pe *src_pe)
+ {
+ 	unsigned long timeout;
+@@ -675,17 +700,13 @@ static int src_pe_snk_source_off_waitfor_psrdy(struct src_port_pe *src_pe)
+ 	 * cur_state */
+ 	ret = wait_for_completion_timeout(&src_pe->psso_complete, timeout);
+ 	if (ret == 0) {
+-		log_err("PSSO time expired Sending PD_CMD_HARD_RESET");
+-		mutex_lock(&src_pe->pe_lock);
+-		src_pe->cmd_retry = 0;
+-		mutex_unlock(&src_pe->pe_lock);
+-		/* Change the role back to source */
+-		policy_set_power_role(&src_pe->p, POWER_ROLE_SOURCE);
+-		src_pe_do_pe_reset_on_error(src_pe);
++		log_err("PSSO time expired during pr_swap");
++		src_pe_handle_pr_swap_fail(src_pe);
+ 		goto error;
+ 	}
+ 
+ 	/* RR Swap success, set role as sink and switch policy */
++	log_dbg("PE_PRS_SRC_SNK_SOURCE_OFF -> PE_SNK_STARTUP");
+ 	policy_set_power_role(&src_pe->p, POWER_ROLE_SINK);
+ 	log_dbg("Notifying power role change\n");
+ 	pe_notify_policy_status_changed(&src_pe->p,
+@@ -750,6 +771,7 @@ static void src_pe_msg_worker(struct work_struct *work)
+ 		src_pe_handle_after_prswap_sent(src_pe);
+ 		break;
+ 	case PE_PRS_SRC_SNK_ACCEPT_PR_SWAP:
++		log_dbg("SRC_SNK_ACCEPT_PR_SWAP -> SRC_SNK_TRANSITION_TO_OFF");
+ 		src_pe_handle_sink_transition_to_off(src_pe);
+ 		break;
+ 	case PE_PRS_SRC_SNK_SOURCE_OFF:
+-- 
+1.9.1
+

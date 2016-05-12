@@ -1,0 +1,148 @@
+From 8a69b8c9bea9476564e14ea822920ec7854d98a1 Mon Sep 17 00:00:00 2001
+Message-Id: <8a69b8c9bea9476564e14ea822920ec7854d98a1.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 25 Nov 2014 16:19:05 +0000
+Subject: [PATCH 21/63] REVERTME [VPG]: drm/i915: Update native sync creation
+ to use requests
+
+More seqno to request conversions. Note that this patch merely changes
+the create function parameters. It does not update the native sync
+implementation to be request based rather than seqno based.
+
+Note: The native sync code in question was added in the following
+patch:
+  REVERTME [VPG]: drm/i915: Refactored native sync code for better file splits
+  commit id: 7f6f43d460784c9d86cb334c35b2ebdd15f7a850
+
+Therefore this patch could be squashed into that one and/or dropped
+when that patch is dropped.
+
+Change-Id: I9007b9c833d096e275db01bd289cfbd6079ba414
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    5 +----
+ drivers/gpu/drm/i915/intel_lrc.c           |    5 +----
+ drivers/gpu/drm/i915/intel_sync.c          |    8 +++++---
+ drivers/gpu/drm/i915/intel_sync.h          |    6 ++++--
+ 4 files changed, 11 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index e321ed3..7f4e5bf 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1053,7 +1053,6 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 	int instp_mode;
+ 	u32 instp_mask;
+ 	int i, ret = 0;
+-	u32 seqno;
+ 	void *priv_data = NULL;
+ 	u32 priv_length = 0;
+ 	int fd_fence_complete = -1;
+@@ -1131,8 +1130,6 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 	if (ret)
+ 		goto error;
+ 
+-	seqno = ring->outstanding_lazy_seqno;
+-
+ #ifdef CONFIG_SYNC
+ 	if (args->flags & I915_EXEC_WAIT_FENCE) {
+ 		/* Validate the fence wait parameter but don't do the wait until
+@@ -1157,7 +1154,7 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 		/* Caller has requested a sync fence.
+ 		 * User interrupts will be enabled to make sure that
+ 		 * the timeline is signalled on completion. */
+-		ret = i915_sync_create_fence(ring, seqno,
++		ret = i915_sync_create_fence(ring, intel_ring_get_request(ring),
+ 					     &fd_fence_complete,
+ 					     args->flags & I915_EXEC_RING_MASK);
+ 		if (ret) {
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index c6af21c..b2161dc 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -919,7 +919,6 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	int instp_mode;
+ 	u32 instp_mask;
+ 	int ret;
+-	u32 seqno;
+ 	int fd_fence_complete = -1;
+ 	u32 priv_data = 0;
+ 
+@@ -986,8 +985,6 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	if (ret)
+ 		return ret;
+ 
+-	seqno = ring->outstanding_lazy_seqno;
+-
+ #ifdef CONFIG_SYNC
+ 	if (args->flags & I915_EXEC_WAIT_FENCE) {
+ 		/* Validate the fence wait parameter but don't do the wait until
+@@ -1012,7 +1009,7 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 		/* Caller has requested a sync fence.
+ 		 * User interrupts will be enabled to make sure that
+ 		 * the timeline is signalled on completion. */
+-		ret = i915_sync_create_fence(ring, seqno,
++		ret = i915_sync_create_fence(ring, intel_ring_get_request(ring),
+ 					     &fd_fence_complete,
+ 					     args->flags & I915_EXEC_RING_MASK);
+ 		if (ret) {
+diff --git a/drivers/gpu/drm/i915/intel_sync.c b/drivers/gpu/drm/i915/intel_sync.c
+index 395f4f2..3db81ca 100644
+--- a/drivers/gpu/drm/i915/intel_sync.c
++++ b/drivers/gpu/drm/i915/intel_sync.c
+@@ -222,7 +222,8 @@ void i915_sync_reset_timelines(struct drm_i915_private *dev_priv)
+ 	}
+ }
+ 
+-int i915_sync_create_fence(struct intel_engine_cs *ring, u32 seqno,
++int i915_sync_create_fence(struct intel_engine_cs *ring,
++			   struct drm_i915_gem_request *req,
+ 			   int *fd_out, u64 ring_mask)
+ {
+ 	struct sync_pt *pt;
+@@ -231,12 +232,13 @@ int i915_sync_create_fence(struct intel_engine_cs *ring, u32 seqno,
+ 
+ 	BUG_ON(!ring->timeline);
+ 
+-	pt = i915_sync_pt_create(ring->timeline, seqno,
++	pt = i915_sync_pt_create(ring->timeline,
++				 i915_gem_request_get_seqno(req),
+ 				 ring->timeline->pvt.cycle,
+ 				 ring_mask);
+ 	if (!pt) {
+ 		DRM_DEBUG_DRIVER("Failed to create sync point for %d/%u\n",
+-					ring->id, seqno);
++				 ring->id, i915_gem_request_get_seqno(req));
+ 		return -ENOMEM;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/intel_sync.h b/drivers/gpu/drm/i915/intel_sync.h
+index 123d5a8..7d5e57d 100644
+--- a/drivers/gpu/drm/i915/intel_sync.h
++++ b/drivers/gpu/drm/i915/intel_sync.h
+@@ -68,7 +68,8 @@ void i915_sync_timeline_destroy(struct intel_engine_cs *ring);
+ 
+ void i915_sync_reset_timelines(struct drm_i915_private *dev_priv);
+ 
+-int i915_sync_create_fence(struct intel_engine_cs *ring, u32 seqno,
++int i915_sync_create_fence(struct intel_engine_cs *ring,
++			   struct drm_i915_gem_request *req,
+ 			   int *fd_out, u64 ring_mask);
+ 
+ void i915_sync_timeline_advance(struct intel_engine_cs *ring);
+@@ -96,7 +97,8 @@ void i915_sync_reset_timelines(struct drm_i915_private *dev_priv)
+ 
+ }
+ 
+-static int i915_sync_create_fence(struct intel_engine_cs *ring, u32 seqno,
++static int i915_sync_create_fence(struct intel_engine_cs *ring,
++				  struct drm_i915_gem_request *req,
+ 				  int *fd_out, u64 ring_mask)
+ {
+ 	return 0;
+-- 
+1.7.9.5
+

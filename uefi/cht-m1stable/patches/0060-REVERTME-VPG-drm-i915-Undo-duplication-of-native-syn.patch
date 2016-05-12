@@ -1,0 +1,247 @@
+From 04928d91bc9c3b9bbba594e47d90a7297fd2dfc5 Mon Sep 17 00:00:00 2001
+Message-Id: <04928d91bc9c3b9bbba594e47d90a7297fd2dfc5.1421835211.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 26 Nov 2014 18:23:43 +0000
+Subject: [PATCH 60/63] REVERTME [VPG]: drm/i915: Undo duplication of native
+ sync code
+
+The native sync code in the execbuffer interface is duplicated in both the
+legacy submission and the execlist submission paths. The native sync code itself
+is identical. The only reason for duplicating it is that it required the seqno
+(now request) to be allocated first and this was only happening after the legacy
+vs execlist code path split. However, that allocation now happens early on in
+the common code path. Thus the native sync code can also be moved back into the
+common code path and the duplication removed.
+
+The duplication occurred in commit:
+  REVERTME [VPG]: drm/i915: Refactored native sync code for better file splits
+  commit id: 7f6f43d460784c9d86cb334c35b2ebdd15f7a850
+
+So this patch could be squashed into that commit and/or dropped if that commit
+is dropped.
+
+Change-Id: Ib49e33fc427e9cb556cbf10aa0c43d8ed502987c
+For: VIZ-1587
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   96 +++++++++++++++-------------
+ drivers/gpu/drm/i915/intel_lrc.c           |   45 -------------
+ 2 files changed, 52 insertions(+), 89 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index ff007e0..7b8207f 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1053,7 +1053,6 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 	int instp_mode;
+ 	u32 instp_mask;
+ 	int i, ret = 0;
+-	int fd_fence_complete = -1;
+ 	bool watchdog_running = 0;
+ 
+ 	if (args->num_cliprects != 0) {
+@@ -1136,44 +1135,6 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 		watchdog_running = 1;
+ 	}
+ 
+-#ifdef CONFIG_SYNC
+-	if (args->flags & I915_EXEC_WAIT_FENCE) {
+-		/* Validate the fence wait parameter but don't do the wait until
+-		 * a scheduler arrives. Otherwise the entire universe stalls. */
+-		int fd_fence_wait = (int) args->rsvd2;
+-
+-		if (fd_fence_wait < 0) {
+-			DRM_ERROR("Wait fence for ring %d has invalid id %d\n",
+-				  (int) ring->id, fd_fence_wait);
+-		} else {
+-			struct sync_fence *fence_wait;
+-
+-			fence_wait = sync_fence_fdget(fd_fence_wait);
+-			if (fence_wait == NULL)
+-				DRM_ERROR("Invalid wait fence %d\n",
+-					  fd_fence_wait);
+-		}
+-	}
+-#endif
+-
+-	if (args->flags & I915_EXEC_REQUEST_FENCE) {
+-		/* Caller has requested a sync fence.
+-		 * User interrupts will be enabled to make sure that
+-		 * the timeline is signalled on completion. */
+-		ret = i915_sync_create_fence(ring, intel_ring_get_request(ring),
+-					     &fd_fence_complete,
+-					     args->flags & I915_EXEC_RING_MASK);
+-		if (ret) {
+-			DRM_ERROR("Fence creation failed for ring %d\n",
+-				  ring->id);
+-			args->rsvd2 = (__u64) -1;
+-			goto error;
+-		}
+-
+-		/* Return the fence through the rsvd2 field */
+-		args->rsvd2 = (__u64) fd_fence_complete;
+-	}
+-
+ 	ret = i915_gem_execbuffer_move_to_gpu(ring, vmas);
+ 	if (ret)
+ 		goto error;
+@@ -1308,11 +1269,6 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ error:
+ 	kfree(cliprects);
+ 
+-	if (ret && fd_fence_complete != -1) {
+-		sys_close(fd_fence_complete);
+-		args->rsvd2 = (__u64) -1;
+-	}
+-
+ 	return ret;
+ }
+ 
+@@ -1384,6 +1340,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	u32 dispatch_flags;
+ 	int ret;
+ 	bool need_relocs, batch_pinned = false;
++	int fd_fence_complete = -1;
+ 
+ 	if (!i915_gem_check_execbuffer(args))
+ 		return -EINVAL;
+@@ -1551,6 +1508,48 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto err;
+ 
++#ifdef CONFIG_SYNC
++	if (args->flags & I915_EXEC_WAIT_FENCE) {
++		/*
++		 * Validate the fence wait parameter but don't do the wait until
++		 * a scheduler arrives. Otherwise the entire universe stalls.
++		 */
++		int fd_fence_wait = (int) args->rsvd2;
++
++		if (fd_fence_wait < 0) {
++			DRM_ERROR("Wait fence for ring %d has invalid id %d\n",
++				  (int) ring->id, fd_fence_wait);
++		} else {
++			struct sync_fence *fence_wait;
++
++			fence_wait = sync_fence_fdget(fd_fence_wait);
++			if (fence_wait == NULL)
++				DRM_ERROR("Invalid wait fence %d\n",
++					  fd_fence_wait);
++		}
++	}
++#endif
++
++	if (args->flags & I915_EXEC_REQUEST_FENCE) {
++		/*
++		 * Caller has requested a sync fence.
++		 * User interrupts will be enabled to make sure that
++		 * the timeline is signalled on completion.
++		 */
++		ret = i915_sync_create_fence(ring, intel_ring_get_request(ring),
++					     &fd_fence_complete,
++					     args->flags & I915_EXEC_RING_MASK);
++		if (ret) {
++			DRM_ERROR("Fence creation failed for ring %d\n",
++				  ring->id);
++			args->rsvd2 = (__u64) -1;
++			goto err;
++		}
++
++		/* Return the fence through the rsvd2 field */
++		args->rsvd2 = (__u64) fd_fence_complete;
++	}
++
+ 	ret = dev_priv->gt.do_execbuf(dev, file, ring, ctx, args,
+ 				      &eb->vmas, batch_obj, exec_start,
+ 				      dispatch_flags);
+@@ -1575,6 +1574,15 @@ pre_mutex_err:
+ 	/* intel_gpu_busy should also get a ref, so it will free when the device
+ 	 * is really idle. */
+ 	intel_runtime_pm_put(dev_priv);
++
++	if (ret) {
++		if (fd_fence_complete != -1)
++			sys_close(fd_fence_complete);
++
++		if (args->flags & I915_EXEC_REQUEST_FENCE)
++			args->rsvd2 = (__u64) -1;
++	}
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 778d472..d96c4b1 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1324,7 +1324,6 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	int instp_mode;
+ 	u32 instp_mask;
+ 	int ret;
+-	int fd_fence_complete = -1;
+ 	bool watchdog_running = 0;
+ 
+ 	instp_mode = args->flags & I915_EXEC_CONSTANTS_MASK;
+@@ -1387,44 +1386,6 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 		return -EINVAL;
+ 	}
+ 
+-#ifdef CONFIG_SYNC
+-	if (args->flags & I915_EXEC_WAIT_FENCE) {
+-		/* Validate the fence wait parameter but don't do the wait until
+-		 * a scheduler arrives. Otherwise the entire universe stalls. */
+-		int fd_fence_wait = (int) args->rsvd2;
+-
+-		if (fd_fence_wait < 0) {
+-			DRM_ERROR("Wait fence for ring %d has invalid id %d\n",
+-				  (int) ring->id, fd_fence_wait);
+-		} else {
+-			struct sync_fence *fence_wait;
+-
+-			fence_wait = sync_fence_fdget(fd_fence_wait);
+-			if (fence_wait == NULL)
+-				DRM_ERROR("Invalid wait fence %d\n",
+-					  fd_fence_wait);
+-		}
+-	}
+-#endif
+-
+-	if (args->flags & I915_EXEC_REQUEST_FENCE) {
+-		/* Caller has requested a sync fence.
+-		 * User interrupts will be enabled to make sure that
+-		 * the timeline is signalled on completion. */
+-		ret = i915_sync_create_fence(ring, intel_ring_get_request(ring),
+-					     &fd_fence_complete,
+-					     args->flags & I915_EXEC_RING_MASK);
+-		if (ret) {
+-			DRM_ERROR("Fence creation failed for ring %d\n",
+-				  ring->id);
+-			args->rsvd2 = (__u64) -1;
+-			return ret;
+-		}
+-
+-		/* Return the fence through the rsvd2 field */
+-		args->rsvd2 = (__u64) fd_fence_complete;
+-	}
+-
+ 	ret = execlists_move_to_gpu(ringbuf, vmas);
+ 	if (ret)
+ 		goto error;
+@@ -1504,12 +1465,6 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	return 0;
+ 
+ error:
+-	if (fd_fence_complete != -1)
+-		sys_close(fd_fence_complete);
+-
+-	if (args->flags & I915_EXEC_REQUEST_FENCE)
+-		args->rsvd2 = (__u64) -1;
+-
+ 	return ret;
+ }
+ 
+-- 
+1.7.9.5
+

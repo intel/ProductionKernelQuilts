@@ -1,0 +1,152 @@
+From 6be622683f9f532d4819a2208d36b7766191bc17 Mon Sep 17 00:00:00 2001
+From: Ilkka Koskinen <ilkka.koskinen@intel.com>
+Date: Thu, 6 Nov 2014 16:00:13 -0800
+Subject: [PATCH 13/15] atomisp_gmin: Separate VCM from sensor driver
+
+Adds support for dynamically choose VCM based on the
+information received from ACPI.
+
+Change-Id: Id4c0d1eb3e1cb2e634e813c00d3d5333abfdfad6
+Signed-off-by: Angie Lai <angie.lai@intel.com>
+Signed-off-by: Ilkka Koskinen <ilkka.koskinen@intel.com>
+---
+ .../x86/platform/intel-mid/atomisp_gmin_platform.c | 41 ++++++++++++++++++++++
+ include/linux/atomisp_gmin_platform.h              |  2 ++
+ include/linux/atomisp_platform.h                   | 23 ++++++++++++
+ 3 files changed, 66 insertions(+)
+
+diff --git a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+index a0082a3..5bb0dde 100644
+--- a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
++++ b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+@@ -112,6 +112,8 @@ static int v2p8_gpio = V2P8_GPIO_UNSET;
+ enum { V1P8_GPIO_UNSET = -2, V1P8_GPIO_NONE = -1 };
+ static int v1p8_gpio = V1P8_GPIO_UNSET;
+ 
++static LIST_HEAD(vcm_devices);
++static DEFINE_MUTEX(vcm_lock);
+ 
+ static struct gmin_subdev *find_gmin_subdev(struct v4l2_subdev *subdev);
+ 
+@@ -581,6 +583,31 @@ static int gmin_csi_cfg(struct v4l2_subdev *sd, int flag)
+ 				 gs->csi_fmt, gs->csi_bayer, flag);
+ }
+ 
++static struct camera_vcm_control *gmin_get_vcm_ctrl(struct v4l2_subdev *subdev,
++						char *camera_module)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(subdev);
++	struct gmin_subdev *gs = find_gmin_subdev(subdev);
++	struct camera_vcm_control *vcm;
++
++	if (client == NULL || gs == NULL)
++		return NULL;
++
++	if (!camera_module)
++		return NULL;
++
++	mutex_lock(&vcm_lock);
++	list_for_each_entry(vcm, &vcm_devices, list) {
++		if (!strcmp(camera_module, vcm->camera_module)) {
++			mutex_unlock(&vcm_lock);
++			return vcm;
++		}
++	}
++
++	mutex_unlock(&vcm_lock);
++	return NULL;
++}
++
+ static struct camera_sensor_platform_data gmin_plat = {
+ 	.gpio0_ctrl = gmin_gpio0_ctrl,
+ 	.gpio1_ctrl = gmin_gpio1_ctrl,
+@@ -590,6 +617,7 @@ static struct camera_sensor_platform_data gmin_plat = {
+ 	.platform_init = gmin_platform_init,
+ 	.platform_deinit = gmin_platform_deinit,
+ 	.csi_cfg = gmin_csi_cfg,
++	.get_vcm_ctrl = gmin_get_vcm_ctrl,
+ };
+ 
+ struct camera_sensor_platform_data *gmin_camera_platform_data(
+@@ -605,6 +633,19 @@ struct camera_sensor_platform_data *gmin_camera_platform_data(
+ }
+ EXPORT_SYMBOL_GPL(gmin_camera_platform_data);
+ 
++int atomisp_gmin_register_vcm_control(struct camera_vcm_control *vcmCtrl)
++{
++	if (!vcmCtrl)
++		return -EINVAL;
++
++	mutex_lock(&vcm_lock);
++	list_add_tail(&vcmCtrl->list, &vcm_devices);
++	mutex_unlock(&vcm_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(atomisp_gmin_register_vcm_control);
++
+ /* Retrieves a device-specific configuration variable.  The dev
+  * argument should be a device with an ACPI companion, as all
+  * configuration is based on firmware ID. */
+diff --git a/include/linux/atomisp_gmin_platform.h b/include/linux/atomisp_gmin_platform.h
+index 118c73e..2bd1466 100644
+--- a/include/linux/atomisp_gmin_platform.h
++++ b/include/linux/atomisp_gmin_platform.h
+@@ -34,4 +34,6 @@ struct camera_sensor_platform_data *gmin_camera_platform_data(
+ 		enum atomisp_input_format csi_format,
+ 		enum atomisp_bayer_order csi_bayer);
+ 
++int atomisp_gmin_register_vcm_control(struct camera_vcm_control *);
++
+ #endif
+diff --git a/include/linux/atomisp_platform.h b/include/linux/atomisp_platform.h
+index bd44829..78b0ff2 100644
+--- a/include/linux/atomisp_platform.h
++++ b/include/linux/atomisp_platform.h
+@@ -29,6 +29,8 @@
+ #define MAX_SENSORS_PER_PORT 4
+ #define MAX_STREAMS_PER_CHANNEL 2
+ 
++#define CAMERA_MODULE_ID_LEN 64
++
+ enum atomisp_bayer_order {
+ 	atomisp_bayer_order_grbg,
+ 	atomisp_bayer_order_rggb,
+@@ -188,6 +190,25 @@ struct atomisp_input_stream_info {
+ 	struct atomisp_isys_config_info isys_info[MAX_STREAMS_PER_CHANNEL];
+ };
+ 
++struct camera_vcm_control;
++struct camera_vcm_ops {
++	int (*power_up)(struct v4l2_subdev *sd, struct camera_vcm_control *vcm);
++	int (*power_down)(struct v4l2_subdev *sd,
++			struct camera_vcm_control *vcm);
++	int (*queryctrl)(struct v4l2_subdev *sd, struct v4l2_queryctrl *qc,
++			struct camera_vcm_control *vcm);
++	int (*g_ctrl)(struct v4l2_subdev *sd, struct v4l2_control *ctrl,
++			struct camera_vcm_control *vcm);
++	int (*s_ctrl)(struct v4l2_subdev *sd, struct v4l2_control *ctrl,
++			struct camera_vcm_control *vcm);
++};
++
++struct camera_vcm_control {
++	char camera_module[CAMERA_MODULE_ID_LEN];
++	struct camera_vcm_ops *ops;
++	struct list_head list;
++};
++
+ struct camera_sensor_platform_data {
+ 	int (*gpio_ctrl)(struct v4l2_subdev *subdev, int flag);
+ 	int (*flisclk_ctrl)(struct v4l2_subdev *subdev, int flag);
+@@ -208,6 +229,8 @@ struct camera_sensor_platform_data {
+ 	int (*gpio1_ctrl)(struct v4l2_subdev *subdev, int on);
+ 	int (*v1p8_ctrl)(struct v4l2_subdev *subdev, int on);
+ 	int (*v2p8_ctrl)(struct v4l2_subdev *subdev, int on);
++	struct camera_vcm_control * (*get_vcm_ctrl)(struct v4l2_subdev *subdev,
++						    char *module_id);
+ #endif
+ };
+ 
+-- 
+2.1.0
+

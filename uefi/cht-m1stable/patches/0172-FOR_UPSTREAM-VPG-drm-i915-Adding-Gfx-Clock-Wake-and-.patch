@@ -1,0 +1,239 @@
+From 501267278a184175863a431cd47948adefed5048 Mon Sep 17 00:00:00 2001
+Message-Id: <501267278a184175863a431cd47948adefed5048.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Sagar Kamble <sagar.a.kamble@intel.com>
+Date: Mon, 28 Jul 2014 17:15:14 +0530
+Subject: [PATCH 172/312] FOR_UPSTREAM [VPG]: drm/i915: Adding Gfx Clock, Wake
+ and Gunit save/restore logic in PM suspend/resume
+ paths.
+
+Sequence to get gfx clocks on/off, allow/disallow wake and save/restore of gunit registers need to be followed in
+PM suspend and resume path similar to runtime suspend and resume.
+
+Issue: GMIN-2507
+Change-Id: I15cfdeeec9c976d9839bb281f809664f4a0c78a2
+Signed-off-by: Sagar Kamble <sagar.a.kamble@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.c  |   87 +++++++++++++++++++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_drv.h  |    1 +
+ drivers/gpu/drm/i915/intel_drv.h |    6 +++
+ 3 files changed, 87 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index e009420..de20c29 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -502,6 +502,26 @@ static int i915_drm_freeze(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_crtc *crtc;
++	u32 mask;
++	int err = 0;
++
++	/* Following sequence from vlv_runtime_suspend */
++	if (IS_VALLEYVIEW(dev)) {
++		/*
++		 * Bspec defines the following GT well on flags as debug only,
++		 * so don't treat them as hard failures.
++		 */
++		(void)vlv_wait_for_gt_wells(dev_priv, false);
++
++		mask = VLV_GTLC_RENDER_CTX_EXISTS | VLV_GTLC_MEDIA_CTX_EXISTS;
++		WARN_ON((I915_READ(VLV_GTLC_WAKE_CTRL) & mask) != mask);
++
++		vlv_check_no_gt_access(dev_priv);
++
++		err = vlv_force_gfx_clock(dev_priv, true);
++		if (err)
++			goto err1;
++	}
+ 
+ 	/* ignore lid events during suspend */
+ 	mutex_lock(&dev_priv->modeset_restore_lock);
+@@ -546,6 +566,10 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 
+ 	i915_gem_suspend_gtt_mappings(dev);
+ 
++	/* Save Gunit State */
++	if (IS_VALLEYVIEW(dev))
++		vlv_save_gunit_s0ix_state(dev_priv);
++
+ 	i915_save_state(dev);
+ 
+ 	intel_uncore_forcewake_reset(dev, false);
+@@ -559,7 +583,27 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 
+ 	intel_display_set_init_power(dev_priv, false);
+ 
+-	return 0;
++	/* Clear Allow Wake Bit so that none of the
++	 * force/demand wake requests
++	 */
++	if (IS_VALLEYVIEW(dev)) {
++		err = vlv_allow_gt_wake(dev_priv, false);
++		if (err)
++			goto err2;
++
++		/* Release graphics clocks */
++		vlv_force_gfx_clock(dev_priv, false);
++	}
++	return err;
++err2:
++	/* For safety always re-enable waking and disable gfx clock forcing */
++	if (IS_VALLEYVIEW(dev))
++		vlv_allow_gt_wake(dev_priv, true);
++err1:
++	if (IS_VALLEYVIEW(dev))
++		vlv_force_gfx_clock(dev_priv, false);
++
++	return err;
+ }
+ 
+ int i915_suspend(struct drm_device *dev, pm_message_t state)
+@@ -607,6 +651,26 @@ void intel_console_resume(struct work_struct *work)
+ static int i915_drm_thaw_early(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	int ret = 0;
++	int err;
++
++	/*
++	 * Following sequence from vlv_runtime_resume. Clock is released
++	 * in i915_drm_thaw.
++	 * If any of the steps fail just try to continue, that's the best we
++	 * can do at this point. Return the first error code (which will also
++	 * leave RPM permanently disabled).
++	 */
++
++	if (IS_VALLEYVIEW(dev)) {
++		ret = vlv_force_gfx_clock(dev_priv, true);
++
++		vlv_restore_gunit_s0ix_state(dev_priv);
++
++		err = vlv_allow_gt_wake(dev_priv, true);
++		if (!ret)
++			ret = err;
++	}
+ 
+ 	if (IS_HASWELL(dev) || IS_BROADWELL(dev))
+ 		hsw_disable_pc8(dev_priv);
+@@ -615,7 +679,7 @@ static int i915_drm_thaw_early(struct drm_device *dev)
+ 	intel_uncore_sanitize(dev);
+ 	intel_power_domains_init_hw(dev_priv);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int __i915_drm_thaw(struct drm_device *dev, bool restore_gtt_mappings)
+@@ -684,9 +748,15 @@ static int __i915_drm_thaw(struct drm_device *dev, bool restore_gtt_mappings)
+ 
+ 	sysfs_notify(&dev->primary->kdev->kobj, NULL, "thaw");
+ 
++	if (IS_VALLEYVIEW(dev)) {
++		/* Release graphics clocks turned on in thaw_early*/
++		vlv_force_gfx_clock(dev_priv, false);
++	}
++
+ 	return 0;
+ }
+ 
++
+ static int i915_drm_thaw(struct drm_device *dev)
+ {
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET))
+@@ -1017,7 +1087,7 @@ static int hsw_runtime_resume(struct drm_i915_private *dev_priv)
+  * a black-box for the driver. Further investigation is needed to reduce the
+  * saved/restored registers even further, by following the same 3 criteria.
+  */
+-static void vlv_save_gunit_s0ix_state(struct drm_i915_private *dev_priv)
++void vlv_save_gunit_s0ix_state(struct drm_i915_private *dev_priv)
+ {
+ 	struct vlv_s0ix_state *s = &dev_priv->vlv_s0ix_state;
+ 	int i;
+@@ -1087,6 +1157,7 @@ static void vlv_save_gunit_s0ix_state(struct drm_i915_private *dev_priv)
+ 	s->gu_ctl0		= I915_READ(VLV_GU_CTL0);
+ 	s->gu_ctl1		= I915_READ(VLV_GU_CTL1);
+ 	s->clock_gate_dis2	= I915_READ(VLV_GUNIT_CLOCK_GATE2);
++	s->dpio_cfg_data	= I915_READ(DPIO_CTL);
+ 
+ 	/*
+ 	 * Not saving any of:
+@@ -1097,7 +1168,7 @@ static void vlv_save_gunit_s0ix_state(struct drm_i915_private *dev_priv)
+ 	 */
+ }
+ 
+-static void vlv_restore_gunit_s0ix_state(struct drm_i915_private *dev_priv)
++void vlv_restore_gunit_s0ix_state(struct drm_i915_private *dev_priv)
+ {
+ 	struct vlv_s0ix_state *s = &dev_priv->vlv_s0ix_state;
+ 	u32 val;
+@@ -1181,6 +1252,8 @@ static void vlv_restore_gunit_s0ix_state(struct drm_i915_private *dev_priv)
+ 	I915_WRITE(VLV_GU_CTL0,			s->gu_ctl0);
+ 	I915_WRITE(VLV_GU_CTL1,			s->gu_ctl1);
+ 	I915_WRITE(VLV_GUNIT_CLOCK_GATE2,	s->clock_gate_dis2);
++	I915_WRITE(DPIO_CTL,			s->dpio_cfg_data);
++
+ }
+ 
+ int vlv_force_gfx_clock(struct drm_i915_private *dev_priv, bool force_on)
+@@ -1220,7 +1293,7 @@ int vlv_force_gfx_clock(struct drm_i915_private *dev_priv, bool force_on)
+ #undef COND
+ }
+ 
+-static int vlv_allow_gt_wake(struct drm_i915_private *dev_priv, bool allow)
++int vlv_allow_gt_wake(struct drm_i915_private *dev_priv, bool allow)
+ {
+ 	u32 val;
+ 	int err = 0;
+@@ -1241,7 +1314,7 @@ static int vlv_allow_gt_wake(struct drm_i915_private *dev_priv, bool allow)
+ #undef COND
+ }
+ 
+-static int vlv_wait_for_gt_wells(struct drm_i915_private *dev_priv,
++int vlv_wait_for_gt_wells(struct drm_i915_private *dev_priv,
+ 				 bool wait_for_on)
+ {
+ 	u32 mask;
+@@ -1271,7 +1344,7 @@ static int vlv_wait_for_gt_wells(struct drm_i915_private *dev_priv,
+ #undef COND
+ }
+ 
+-static void vlv_check_no_gt_access(struct drm_i915_private *dev_priv)
++void vlv_check_no_gt_access(struct drm_i915_private *dev_priv)
+ {
+ 	if (!(I915_READ(VLV_GTLC_PW_STATUS) & VLV_GTLC_ALLOWWAKEERR))
+ 		return;
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 63f289d..8adc37b 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -916,6 +916,7 @@ struct vlv_s0ix_state {
+ 	u32 gu_ctl0;
+ 	u32 gu_ctl1;
+ 	u32 clock_gate_dis2;
++	u32 dpio_cfg_data;
+ };
+ 
+ #ifdef CONFIG_DEBUG_FS
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index fddaf62..21968d2 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1051,6 +1051,12 @@ void intel_init_drrs_idleness_detection(struct drm_device *dev,
+ 		struct intel_connector *connector);
+ void intel_update_drrs(struct drm_device *dev);
+ void intel_disable_drrs(struct drm_device *dev);
++int vlv_wait_for_gt_wells(struct drm_i915_private *dev_priv,
++				 bool wait_for_on);
++void vlv_check_no_gt_access(struct drm_i915_private *dev_priv);
++void vlv_save_gunit_s0ix_state(struct drm_i915_private *dev_priv);
++void vlv_restore_gunit_s0ix_state(struct drm_i915_private *dev_priv);
++int vlv_allow_gt_wake(struct drm_i915_private *dev_priv, bool allow);
+ 
+ /* intel_sdvo.c */
+ bool intel_sdvo_init(struct drm_device *dev, uint32_t sdvo_reg, bool is_sdvob);
+-- 
+1.7.9.5
+

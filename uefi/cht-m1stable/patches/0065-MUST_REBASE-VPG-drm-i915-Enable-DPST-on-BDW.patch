@@ -1,0 +1,360 @@
+From 4598acf764ad35eaf7eb10c0a2bf302ee29a1682 Mon Sep 17 00:00:00 2001
+Message-Id: <4598acf764ad35eaf7eb10c0a2bf302ee29a1682.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Daisy Sun <daisy.sun@intel.com>
+Date: Mon, 20 Jan 2014 19:00:09 +0530
+Subject: [PATCH 065/312] MUST_REBASE [VPG]: drm/i915: Enable DPST on BDW
+
+Major change is to enable DPST feature on Broadwell.
+Also, defines a register structure which will be populated
+according to the platform in use.
+Due to DPST IP concerns, this patch cannot be upstreamed.
+
+Conflicts:
+	drivers/gpu/drm/i915/i915_dpst.c
+	drivers/gpu/drm/i915/i915_drv.h
+
+Signed-off-by: Daisy Sun <daisy.sun@intel.com>
+Reviewed-on: https://android.intel.com/167127
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Tested-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+
+Cherry-picked from embargoed branch.
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+
+Pulled from ABT/kernel-internal to GMin/gmin.
+Conflicts:
+	drivers/gpu/drm/i915/i915_dpst.c
+	drivers/gpu/drm/i915/i915_drv.c
+	drivers/gpu/drm/i915/i915_irq.c
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Change-Id: Ic3bc527b84bf6f49858df527a10302eea33818b7
+---
+ drivers/gpu/drm/i915/i915_dpst.c |   73 ++++++++++++++++++++++++++++----------
+ drivers/gpu/drm/i915/i915_drv.c  |    1 +
+ drivers/gpu/drm/i915/i915_drv.h  |    4 ++-
+ drivers/gpu/drm/i915/i915_irq.c  |   17 ++++++---
+ drivers/gpu/drm/i915/i915_reg.h  |   15 +++++++-
+ include/uapi/drm/i915_drm.h      |    2 +-
+ 6 files changed, 87 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dpst.c b/drivers/gpu/drm/i915/i915_dpst.c
+index 2fa33d7..a9de5ae 100644
+--- a/drivers/gpu/drm/i915/i915_dpst.c
++++ b/drivers/gpu/drm/i915/i915_dpst.c
+@@ -93,7 +93,7 @@ i915_dpst_enable_hist_interrupt(struct drm_device *dev)
+ 
+ 	/* Wait for VBLANK since the histogram enabling logic takes affect
+ 	 * at the next vblank */
+-	intel_wait_for_vblank(dev, PIPE_A);
++	intel_wait_for_vblank(dev, dev_priv->dpst.pipe);
+ 
+ 	/* Clear pending interrupt bit. Clearing the pending interrupt bit
+ 	 * must be not be done at the same time as enabling the
+@@ -177,20 +177,21 @@ i915_dpst_apply_luma(struct drm_device *dev,
+ 		struct dpst_initialize_context *ioctl_data)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_connector *i_connector = get_intel_connector_on_edp(dev);
++	struct intel_connector *i_connector;
+ 	struct intel_panel *panel;
+ 
+ 	u32 diet_factor, i;
+ 	u32 blm_hist_ctl;
+ 	unsigned long spin_lock_flags;
+ 
+-	if (NULL == i_connector)
+-		return -EINVAL;
+-	panel = &i_connector->panel;
+-
+ 	/* This is an invalid call if we are disabled by the user */
+ 	if (!dev_priv->dpst.user_enable)
++			return -EINVAL;
++
++	i_connector = get_intel_connector_on_edp(dev);
++	if (NULL == i_connector)
+ 		return -EINVAL;
++	panel = &i_connector->panel;
+ 
+ 	/* This is not an invalid call if we are disabled by the kernel,
+ 	 * because kernel disabling is transparent to the user and can easily
+@@ -310,8 +311,9 @@ i915_dpst_get_bin_data(struct drm_device *dev,
+ 		blm_hist_bin = I915_READ(dev_priv->dpst.reg.blm_hist_bin);
+ 
+ 		if (!(blm_hist_bin & BUSY_BIT)) {
+-			ioctl_data->hist_status.histogram_bins.
+-				status[index] = blm_hist_bin & BIN_COUNT_MASK;
++			ioctl_data->hist_status.histogram_bins.status[index]
++				= blm_hist_bin
++					& dev_priv->dpst.reg.blm_hist_bin_count_mask;
+ 		} else {
+ 			/* Engine is busy. Reset index to 0 to grab
+ 			 * fresh histogram data */
+@@ -333,14 +335,26 @@ static int i915_dpst_update_registers(struct drm_device *dev)
+ 		dev_priv->dpst.reg.blm_hist_ctl = BLM_HIST_CTL;
+ 		dev_priv->dpst.reg.blm_hist_guard = BLM_HIST_GUARD;
+ 		dev_priv->dpst.reg.blm_hist_bin = BLM_HIST_BIN;
++		dev_priv->dpst.reg.blm_hist_bin_count_mask = BIN_COUNT_MASK_4M;
+ 	} else if (IS_VALLEYVIEW(dev)) {
+ 		dev_priv->dpst.reg.blm_hist_ctl = VLV_BLC_HIST_CTL(PIPE_A);
+ 		dev_priv->dpst.reg.blm_hist_guard = VLV_BLC_HIST_GUARD(PIPE_A);
+ 		dev_priv->dpst.reg.blm_hist_bin = VLV_BLC_HIST_BIN(PIPE_A);
++		dev_priv->dpst.reg.blm_hist_bin_count_mask = BIN_COUNT_MASK_4M;
++	} else if (IS_BROADWELL(dev)) {
++		dev_priv->dpst.reg.blm_hist_ctl =
++				BDW_DPST_CTL_PIPE(dev_priv->dpst.pipe);
++		dev_priv->dpst.reg.blm_hist_guard =
++				BDW_DPST_GUARD_PIPE(dev_priv->dpst.pipe);
++		dev_priv->dpst.reg.blm_hist_bin =
++				BDW_DPST_BIN_PIPE(dev_priv->dpst.pipe);
++		dev_priv->dpst.reg.blm_hist_bin_count_mask =
++				BIN_COUNT_MASK_16M;
+ 	} else {
+ 		DRM_ERROR("DPST not supported on this platform\n");
+ 		return -EINVAL;
+ 	}
++
+ 	return 0;
+ };
+ 
+@@ -353,16 +367,32 @@ i915_dpst_init(struct drm_device *dev,
+ 	struct drm_display_mode *mode = NULL;
+ 	u32 blm_hist_guard, gb_val;
+ 	struct pid *cur_pid;
++	struct intel_connector *i_connector = get_intel_connector_on_edp(dev);
++
++	if (NULL == i_connector)
++		return -EINVAL;
++
++	dev_priv->dpst.pipe =
++		to_intel_crtc(i_connector->encoder->base.crtc)->pipe;
++
++	if (0 != i915_dpst_update_registers(dev))
++		return -EINVAL;
+ 
+ 	/* Get information about current display mode */
+-	crtc = intel_get_crtc_for_pipe(dev, PIPE_A);
++	crtc = intel_get_crtc_for_pipe(dev, dev_priv->dpst.pipe);
+ 	if (crtc) {
+ 		mode = intel_crtc_mode_get(dev, crtc);
+ 		if (mode) {
+ 			gb_val = (DEFAULT_GUARDBAND_VAL *
+ 					mode->hdisplay * mode->vdisplay)/1000;
+ 
+-			ioctl_data->init_data.threshold_gb = gb_val;
++			/* BDW+, threshold will * 4 by hardware automatically*/
++			if (BIN_COUNT_MASK_16M ==
++					dev_priv->dpst.reg.blm_hist_bin_count_mask)
++				ioctl_data->init_data.threshold_gb = gb_val / 4;
++			else
++				ioctl_data->init_data.threshold_gb = gb_val;
++
+ 			ioctl_data->init_data.image_res =
+ 					mode->hdisplay*mode->vdisplay;
+ 		}
+@@ -393,15 +423,17 @@ u32
+ i915_dpst_get_brightness(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_connector *i_connector;
+ 	struct intel_panel *panel;
+-	struct intel_connector *i_connector = get_intel_connector_on_edp(dev);
+-	if (NULL == i_connector)
+-		return -EINVAL;
+-	panel = &i_connector->panel;
+ 
+ 	if (!dev_priv->dpst.enabled)
+ 		return 0;
+ 
++	i_connector = get_intel_connector_on_edp(dev);
++	if (NULL == i_connector)
++		return -EINVAL;
++	panel = &i_connector->panel;
++
+ 	/* return the last (non-dpst) set backlight level */
+ 	return panel->backlight.level;
+ }
+@@ -411,13 +443,14 @@ void
+ i915_dpst_set_brightness(struct drm_device *dev, u32 brightness_val)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_connector *i_connector = get_intel_connector_on_edp(dev);
+ 	u32 backlight_level = brightness_val;
++	struct intel_connector *i_connector;
+ 
+-	if (NULL == i_connector)
++	if (!dev_priv->dpst.enabled)
+ 		return;
+ 
+-	if (!dev_priv->dpst.enabled)
++	i_connector = get_intel_connector_on_edp(dev);
++	if (NULL == i_connector)
+ 		return;
+ 
+ 	/* Calculate the backlight after it has been reduced by "dpst
+@@ -430,10 +463,14 @@ i915_dpst_set_brightness(struct drm_device *dev, u32 brightness_val)
+ }
+ 
+ void
+-i915_dpst_irq_handler(struct drm_device *dev)
++i915_dpst_irq_handler(struct drm_device *dev, enum pipe pipe)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
++	/* Check if user-mode need to be aware of this interrupt */
++	if (pipe != dev_priv->dpst.pipe)
++		return;
++
+ 	/* Notify user mode of the interrupt */
+ 	if (dev_priv->dpst.pid != NULL) {
+ 		if (kill_pid_info(dev_priv->dpst.signal, SEND_SIG_FORCED,
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index c2cb9db..cfbc023 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -322,6 +322,7 @@ static const struct intel_device_info intel_broadwell_m_info = {
+ 	.has_llc = 1,
+ 	.has_ddi = 1,
+ 	.has_fbc = 1,
++	.has_dpst = 1,
+ 	GEN_DEFAULT_PIPEOFFSETS,
+ 	IVB_CURSOR_OFFSETS,
+ };
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index dfac30c..cf607c6 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1361,6 +1361,7 @@ struct i915_dpst_registers {
+ 	uint32_t blm_hist_guard;
+ 	uint32_t blm_hist_ctl;
+ 	uint32_t blm_hist_bin;
++	uint32_t blm_hist_bin_count_mask;
+ };
+ 
+ struct drm_i915_private {
+@@ -1474,6 +1475,7 @@ struct drm_i915_private {
+ 	/* DPST information */
+ 	struct {
+ 		struct pid *pid;
++		enum pipe pipe;
+ 		u32 signal;
+ 		u32 blc_adjustment;
+ 		bool user_enable;	/* user client wishes to enable */
+@@ -2639,8 +2641,8 @@ int i915_dpst_context(struct drm_device *dev, void *data,
+ 			struct drm_file *file_priv);
+ u32 i915_dpst_get_brightness(struct drm_device *dev);
+ void i915_dpst_set_brightness(struct drm_device *dev, u32 brightness_val);
+-void i915_dpst_irq_handler(struct drm_device *dev);
+ int i915_dpst_set_kernel_disable(struct drm_device *dev, bool km_disable);
++void i915_dpst_irq_handler(struct drm_device *dev, enum pipe);
+ void intel_panel_actually_set_backlight(struct intel_connector *conn, u32 level);
+ 
+ /* intel_acpi.c */
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index dd2c85a..4041e59 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1809,7 +1809,7 @@ static void valleyview_pipestat_irq_handler(struct drm_device *dev, u32 iir)
+ 			i9xx_pipe_crc_irq_handler(dev, pipe);
+ 
+ 		if (pipe_stats[pipe] & PIPE_DPST_EVENT_STATUS)
+-			i915_dpst_irq_handler(dev);
++			i915_dpst_irq_handler(dev, pipe);
+ 
+ 		if (pipe_stats[pipe] & PIPE_FIFO_UNDERRUN_STATUS &&
+ 		    intel_set_cpu_fifo_underrun_reporting(dev, pipe, false))
+@@ -2127,7 +2127,7 @@ static void ivb_display_irq_handler(struct drm_device *dev, u32 de_iir)
+ 		intel_opregion_asle_intr(dev);
+ 
+ 	if (de_iir & DE_DPST_HISTOGRAM_IVB)
+-		i915_dpst_irq_handler(dev);
++		i915_dpst_irq_handler(dev, PIPE_A);
+ 
+ 	for_each_pipe(pipe) {
+ 		if (de_iir & (DE_PIPE_VBLANK_IVB(pipe)))
+@@ -2276,6 +2276,9 @@ static irqreturn_t gen8_irq_handler(int irq, void *arg)
+ 		if (pipe_iir & GEN8_PIPE_VBLANK)
+ 			intel_pipe_handle_vblank(dev, pipe);
+ 
++		if (pipe_iir & GEN8_PIPE_DPST_INTERRUPT)
++			i915_dpst_irq_handler(dev, pipe);
++
+ 		if (pipe_iir & GEN8_PIPE_PRIMARY_FLIP_DONE) {
+ 			intel_prepare_page_flip(dev, pipe);
+ 			intel_finish_page_flip_plane(dev, pipe);
+@@ -3513,9 +3516,15 @@ static void gen8_de_irq_postinstall(struct drm_i915_private *dev_priv)
+ 	uint32_t de_pipe_masked = GEN8_PIPE_PRIMARY_FLIP_DONE |
+ 		GEN8_PIPE_CDCLK_CRC_DONE |
+ 		GEN8_DE_PIPE_IRQ_FAULT_ERRORS;
+-	uint32_t de_pipe_enables = de_pipe_masked | GEN8_PIPE_VBLANK |
+-		GEN8_PIPE_FIFO_UNDERRUN;
++	uint32_t de_pipe_enables;
+ 	int pipe;
++
++	if (I915_HAS_DPST(dev))
++		de_pipe_masked |= GEN8_PIPE_DPST_INTERRUPT;
++
++	de_pipe_enables = de_pipe_masked | GEN8_PIPE_VBLANK |
++					GEN8_PIPE_FIFO_UNDERRUN;
++
+ 	dev_priv->de_irq_mask[PIPE_A] = ~de_pipe_masked;
+ 	dev_priv->de_irq_mask[PIPE_B] = ~de_pipe_masked;
+ 	dev_priv->de_irq_mask[PIPE_C] = ~de_pipe_masked;
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 3caaf24..7ebf64f 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -4581,6 +4581,7 @@ enum punit_power_well {
+ #define  GEN8_PIPE_FIFO_UNDERRUN	(1 << 31)
+ #define  GEN8_PIPE_CDCLK_CRC_ERROR	(1 << 29)
+ #define  GEN8_PIPE_CDCLK_CRC_DONE	(1 << 28)
++#define  GEN8_PIPE_DPST_INTERRUPT	(1 << 12)
+ #define  GEN8_PIPE_CURSOR_FAULT		(1 << 10)
+ #define  GEN8_PIPE_SPRITE_FAULT		(1 << 9)
+ #define  GEN8_PIPE_PRIMARY_FAULT	(1 << 8)
+@@ -5811,12 +5812,24 @@ enum punit_power_well {
+ #define  BIN_REGISTER_INDEX_MASK	0x7F
+ #define BLM_HIST_BIN				0x48264
+ #define  BUSY_BIT					(1<<31)
+-#define  BIN_COUNT_MASK				0x3FFFFF
++#define  BIN_COUNT_MASK_4M			0x3FFFFF
++#define  BIN_COUNT_MASK_16M			0xFFFFFF
+ #define BLM_HIST_GUARD				0x48268
+ #define  HISTOGRAM_INTERRUPT_ENABLE	(1<<31)
+ #define  HISTOGRAM_EVENT_STATUS		(1<<30)
+ #define HIST_BIN_COUNT				32
+ 
++#define BDW_DPST_BIN_PIPE_A			0x490C4
++#define BDW_DPST_CTL_PIPE_A			0x490C0
++#define BDW_DPST_GUARD_PIPE_A		0x490C8
++
++#define BDW_DPST_BIN_PIPE(pipe) \
++	(BDW_DPST_BIN_PIPE_A + (0x100 * (pipe)))
++#define BDW_DPST_CTL_PIPE(pipe) \
++	(BDW_DPST_CTL_PIPE_A + (0x100 * (pipe)))
++#define BDW_DPST_GUARD_PIPE(pipe) \
++	(BDW_DPST_GUARD_PIPE_A + (0x100 * (pipe)))
++
+ /* DisplayPort Transport Control */
+ #define DP_TP_CTL_A			0x64040
+ #define DP_TP_CTL_B			0x64140
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 63d350b..8347bc8 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -278,7 +278,7 @@ struct csc_coeff {
+ #define DRM_I915_SET_PLANE_180_ROTATION 0x36
+ #define DRM_I915_ENABLE_PLANE_RESERVED_REG_BIT_2	0x37
+ #define DRM_I915_SET_CSC		0x39
+-#define DRM_I915_DPST_CONTEXT   0x3b
++#define DRM_I915_DPST_CONTEXT		0x3b
+ #define DRM_I915_GEM_ACCESS_USERDATA	0x3c
+ #define DRM_I915_SET_PLANE_ALPHA	0x3d
+ #define DRM_I915_PERFMON		0x3e
+-- 
+1.7.9.5
+

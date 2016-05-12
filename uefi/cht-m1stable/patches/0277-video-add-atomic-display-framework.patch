@@ -1,0 +1,4722 @@
+From 8d42dc6780e673d3f41009466182a7ddc1063d01 Mon Sep 17 00:00:00 2001
+From: Greg Hackmann <ghackmann@google.com>
+Date: Wed, 22 May 2013 14:23:10 -0700
+Subject: [PATCH 277/634] video: add atomic display framework
+
+Change-Id: I693257e269a99012cd0dbb57576ac222869cf4c7
+Signed-off-by: Greg Hackmann <ghackmann@google.com>
+---
+ drivers/video/Kconfig          |    1 +
+ drivers/video/Makefile         |    1 +
+ drivers/video/adf/Kconfig      |    4 +
+ drivers/video/adf/Makefile     |   11 +
+ drivers/video/adf/adf.c        | 1066 ++++++++++++++++++++++++++++++++++++++++
+ drivers/video/adf/adf.h        |   74 +++
+ drivers/video/adf/adf_client.c |  764 ++++++++++++++++++++++++++++
+ drivers/video/adf/adf_fops.c   |  843 +++++++++++++++++++++++++++++++
+ drivers/video/adf/adf_fops.h   |   37 ++
+ drivers/video/adf/adf_fops32.c |  208 ++++++++
+ drivers/video/adf/adf_fops32.h |   74 +++
+ drivers/video/adf/adf_format.c |  280 +++++++++++
+ drivers/video/adf/adf_sysfs.c  |  284 +++++++++++
+ drivers/video/adf/adf_sysfs.h  |   33 ++
+ drivers/video/adf/adf_trace.h  |   93 ++++
+ include/uapi/video/adf.h       |  254 ++++++++++
+ include/video/adf.h            |  439 +++++++++++++++++
+ include/video/adf_client.h     |   57 +++
+ include/video/adf_format.h     |   26 +
+ 19 files changed, 4549 insertions(+)
+ create mode 100644 drivers/video/adf/Kconfig
+ create mode 100644 drivers/video/adf/Makefile
+ create mode 100644 drivers/video/adf/adf.c
+ create mode 100644 drivers/video/adf/adf.h
+ create mode 100644 drivers/video/adf/adf_client.c
+ create mode 100644 drivers/video/adf/adf_fops.c
+ create mode 100644 drivers/video/adf/adf_fops.h
+ create mode 100644 drivers/video/adf/adf_fops32.c
+ create mode 100644 drivers/video/adf/adf_fops32.h
+ create mode 100644 drivers/video/adf/adf_format.c
+ create mode 100644 drivers/video/adf/adf_sysfs.c
+ create mode 100644 drivers/video/adf/adf_sysfs.h
+ create mode 100644 drivers/video/adf/adf_trace.h
+ create mode 100644 include/uapi/video/adf.h
+ create mode 100644 include/video/adf.h
+ create mode 100644 include/video/adf_client.h
+ create mode 100644 include/video/adf_format.h
+
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index dade5b7..e90061f 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -2490,6 +2490,7 @@ source "drivers/video/omap2/Kconfig"
+ source "drivers/video/exynos/Kconfig"
+ source "drivers/video/mmp/Kconfig"
+ source "drivers/video/backlight/Kconfig"
++source "drivers/video/adf/Kconfig"
+ 
+ if VT
+ 	source "drivers/video/console/Kconfig"
+diff --git a/drivers/video/Makefile b/drivers/video/Makefile
+index ae17ddf..accf67a 100644
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -12,6 +12,7 @@ fb-y                              := fbmem.o fbmon.o fbcmap.o fbsysfs.o \
+                                      modedb.o fbcvt.o
+ fb-objs                           := $(fb-y)
+ 
++obj-$(CONFIG_ADF)		  += adf/
+ obj-$(CONFIG_VT)		  += console/
+ obj-$(CONFIG_LOGO)		  += logo/
+ obj-y				  += backlight/
+diff --git a/drivers/video/adf/Kconfig b/drivers/video/adf/Kconfig
+new file mode 100644
+index 0000000..0131dfb
+--- /dev/null
++++ b/drivers/video/adf/Kconfig
+@@ -0,0 +1,4 @@
++menuconfig ADF
++	depends on SYNC
++	depends on DMA_SHARED_BUFFER
++	tristate "Atomic Display Framework"
+diff --git a/drivers/video/adf/Makefile b/drivers/video/adf/Makefile
+new file mode 100644
+index 0000000..62679a0
+--- /dev/null
++++ b/drivers/video/adf/Makefile
+@@ -0,0 +1,11 @@
++ccflags-y := -Idrivers/staging/android
++
++CFLAGS_adf.o := -I$(src)
++
++obj-$(CONFIG_ADF) += adf.o \
++	adf_client.o \
++	adf_fops.o \
++	adf_format.o \
++	adf_sysfs.o
++
++obj-$(CONFIG_COMPAT) += adf_fops32.o
+diff --git a/drivers/video/adf/adf.c b/drivers/video/adf/adf.c
+new file mode 100644
+index 0000000..4e35960
+--- /dev/null
++++ b/drivers/video/adf/adf.c
+@@ -0,0 +1,1066 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ * adf_modeinfo_{set_name,set_vrefresh} modified from
++ * drivers/gpu/drm/drm_modes.c
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/device.h>
++#include <linux/idr.h>
++#include <linux/highmem.h>
++#include <linux/memblock.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++
++#include <video/adf_format.h>
++
++#include "sw_sync.h"
++#include "sync.h"
++
++#include "adf.h"
++#include "adf_fops.h"
++#include "adf_sysfs.h"
++
++#define CREATE_TRACE_POINTS
++#include "adf_trace.h"
++
++#define ADF_SHORT_FENCE_TIMEOUT (1 * MSEC_PER_SEC)
++#define ADF_LONG_FENCE_TIMEOUT (10 * MSEC_PER_SEC)
++
++static void adf_fence_wait(struct adf_device *dev, struct sync_fence *fence)
++{
++	/* sync_fence_wait() dumps debug information on timeout.  Experience
++	   has shown that if the pipeline gets stuck, a short timeout followed
++	   by a longer one provides useful information for debugging. */
++	int err = sync_fence_wait(fence, ADF_SHORT_FENCE_TIMEOUT);
++	if (err >= 0)
++		return;
++
++	if (err == -ETIME)
++		err = sync_fence_wait(fence, ADF_LONG_FENCE_TIMEOUT);
++
++	if (err < 0)
++		dev_warn(&dev->base.dev, "error waiting on fence: %d\n", err);
++}
++
++void adf_buffer_cleanup(struct adf_buffer *buf)
++{
++	size_t i;
++	for (i = 0; i < ARRAY_SIZE(buf->dma_bufs); i++)
++		if (buf->dma_bufs[i])
++			dma_buf_put(buf->dma_bufs[i]);
++
++	if (buf->acquire_fence)
++		sync_fence_put(buf->acquire_fence);
++}
++
++void adf_buffer_mapping_cleanup(struct adf_buffer_mapping *mapping,
++		struct adf_buffer *buf)
++{
++	/* calling adf_buffer_mapping_cleanup() is safe even if mapping is
++	   uninitialized or partially-initialized, as long as it was
++	   zeroed on allocation */
++	size_t i;
++	for (i = 0; i < ARRAY_SIZE(mapping->sg_tables); i++) {
++		if (mapping->sg_tables[i])
++			dma_buf_unmap_attachment(mapping->attachments[i],
++					mapping->sg_tables[i], DMA_TO_DEVICE);
++		if (mapping->attachments[i])
++			dma_buf_detach(buf->dma_bufs[i],
++					mapping->attachments[i]);
++	}
++}
++
++void adf_post_cleanup(struct adf_device *dev, struct adf_pending_post *post)
++{
++	size_t i;
++
++	if (post->state)
++		dev->ops->state_free(dev, post->state);
++
++	for (i = 0; i < post->config.n_bufs; i++) {
++		adf_buffer_mapping_cleanup(&post->config.mappings[i],
++				&post->config.bufs[i]);
++		adf_buffer_cleanup(&post->config.bufs[i]);
++	}
++
++	kfree(post->config.custom_data);
++	kfree(post->config.mappings);
++	kfree(post->config.bufs);
++	kfree(post);
++}
++
++static void adf_sw_advance_timeline(struct adf_device *dev)
++{
++#ifdef CONFIG_SW_SYNC
++	sw_sync_timeline_inc(dev->timeline, 1);
++#else
++	BUG();
++#endif
++}
++
++static void adf_post_work_func(struct kthread_work *work)
++{
++	struct adf_device *dev =
++			container_of(work, struct adf_device, post_work);
++	struct adf_pending_post *post, *next;
++	struct list_head saved_list;
++
++	mutex_lock(&dev->post_lock);
++	memcpy(&saved_list, &dev->post_list, sizeof(saved_list));
++	list_replace_init(&dev->post_list, &saved_list);
++	mutex_unlock(&dev->post_lock);
++
++	list_for_each_entry_safe(post, next, &saved_list, head) {
++		int i;
++
++		for (i = 0; i < post->config.n_bufs; i++) {
++			struct sync_fence *fence =
++					post->config.bufs[i].acquire_fence;
++			if (fence)
++				adf_fence_wait(dev, fence);
++		}
++
++		dev->ops->post(dev, &post->config, post->state);
++
++		if (dev->ops->advance_timeline)
++			dev->ops->advance_timeline(dev, &post->config,
++					post->state);
++		else
++			adf_sw_advance_timeline(dev);
++
++		list_del(&post->head);
++		if (dev->onscreen)
++			adf_post_cleanup(dev, dev->onscreen);
++		dev->onscreen = post;
++	}
++}
++
++void adf_attachment_free(struct adf_attachment_list *attachment)
++{
++	list_del(&attachment->head);
++	kfree(attachment);
++}
++
++struct adf_event_refcount *adf_obj_find_event_refcount(struct adf_obj *obj,
++		enum adf_event_type type)
++{
++	struct rb_root *root = &obj->event_refcount;
++	struct rb_node **new = &(root->rb_node);
++	struct rb_node *parent = NULL;
++	struct adf_event_refcount *refcount;
++
++	while (*new) {
++		refcount = container_of(*new, struct adf_event_refcount, node);
++		parent = *new;
++
++		if (refcount->type > type)
++			new = &(*new)->rb_left;
++		else if (refcount->type < type)
++			new = &(*new)->rb_right;
++		else
++			return refcount;
++	}
++
++	refcount = kzalloc(sizeof(*refcount), GFP_KERNEL);
++	if (!refcount)
++		return NULL;
++	refcount->type = type;
++
++	rb_link_node(&refcount->node, parent, new);
++	rb_insert_color(&refcount->node, root);
++	return refcount;
++}
++
++/**
++ * adf_event_get - increase the refcount for an event
++ *
++ * @obj: the object that produces the event
++ * @type: the event type
++ *
++ * ADF will call the object's set_event() op if needed.  ops are allowed
++ * to sleep, so adf_event_get() must NOT be called from an atomic context.
++ *
++ * Returns 0 if successful, or -%EINVAL if the object does not support the
++ * requested event type.
++ */
++int adf_event_get(struct adf_obj *obj, enum adf_event_type type)
++{
++	struct adf_event_refcount *refcount;
++	int old_refcount;
++	int ret;
++
++	ret = adf_obj_check_supports_event(obj, type);
++	if (ret < 0)
++		return ret;
++
++	mutex_lock(&obj->event_lock);
++
++	refcount = adf_obj_find_event_refcount(obj, type);
++	if (!refcount) {
++		ret = -ENOMEM;
++		goto done;
++	}
++
++	old_refcount = refcount->refcount++;
++
++	if (old_refcount == 0) {
++		obj->ops->set_event(obj, type, true);
++		trace_adf_event_enable(obj, type);
++	}
++
++done:
++	mutex_unlock(&obj->event_lock);
++	return ret;
++}
++EXPORT_SYMBOL(adf_event_get);
++
++/**
++ * adf_event_put - decrease the refcount for an event
++ *
++ * @obj: the object that produces the event
++ * @type: the event type
++ *
++ * ADF will call the object's set_event() op if needed.  ops are allowed
++ * to sleep, so adf_event_put() must NOT be called from an atomic context.
++ *
++ * Returns 0 if successful, -%EINVAL if the object does not support the
++ * requested event type, or -%EALREADY if the refcount is already 0.
++ */
++int adf_event_put(struct adf_obj *obj, enum adf_event_type type)
++{
++	struct adf_event_refcount *refcount;
++	int old_refcount;
++	int ret;
++
++	ret = adf_obj_check_supports_event(obj, type);
++	if (ret < 0)
++		return ret;
++
++
++	mutex_lock(&obj->event_lock);
++
++	refcount = adf_obj_find_event_refcount(obj, type);
++	if (!refcount) {
++		ret = -ENOMEM;
++		goto done;
++	}
++
++	old_refcount = refcount->refcount--;
++
++	if (WARN_ON(old_refcount == 0)) {
++		refcount->refcount++;
++		ret = -EALREADY;
++	} else if (old_refcount == 1) {
++		obj->ops->set_event(obj, type, false);
++		trace_adf_event_disable(obj, type);
++	}
++
++done:
++	mutex_unlock(&obj->event_lock);
++	return ret;
++}
++EXPORT_SYMBOL(adf_event_put);
++
++/**
++ * adf_vsync_wait - wait for a vsync event on a display interface
++ *
++ * @intf: the display interface
++ * @timeout: timeout in jiffies (0 = wait indefinitely)
++ *
++ * adf_vsync_wait() may sleep, so it must NOT be called from an atomic context.
++ *
++ * This function returns -%ERESTARTSYS if it is interrupted by a signal.
++ * If @timeout == 0 then this function returns 0 on vsync. If @timeout > 0 then
++ * this function returns the number of remaining jiffies or -%ETIMEDOUT on
++ * timeout.
++ */
++int adf_vsync_wait(struct adf_interface *intf, long timeout)
++{
++	ktime_t timestamp;
++	int ret;
++	unsigned long flags;
++
++	read_lock_irqsave(&intf->vsync_lock, flags);
++	timestamp = intf->vsync_timestamp;
++	read_unlock_irqrestore(&intf->vsync_lock, flags);
++
++	adf_vsync_get(intf);
++	if (timeout) {
++		ret = wait_event_interruptible_timeout(intf->vsync_wait,
++				!ktime_equal(timestamp,
++						intf->vsync_timestamp),
++				msecs_to_jiffies(timeout));
++		if (ret == 0 && ktime_equal(timestamp, intf->vsync_timestamp))
++			ret = -ETIMEDOUT;
++	} else {
++		ret = wait_event_interruptible(intf->vsync_wait,
++				!ktime_equal(timestamp,
++						intf->vsync_timestamp));
++	}
++	adf_vsync_put(intf);
++
++	return ret;
++}
++EXPORT_SYMBOL(adf_vsync_wait);
++
++static void adf_event_queue(struct adf_obj *obj, struct adf_event *event)
++{
++	struct adf_file *file;
++	unsigned long flags;
++
++	trace_adf_event(obj, event->type);
++
++	spin_lock_irqsave(&obj->file_lock, flags);
++
++	list_for_each_entry(file, &obj->file_list, head)
++		if (test_bit(event->type, file->event_subscriptions))
++			adf_file_queue_event(file, event);
++
++	spin_unlock_irqrestore(&obj->file_lock, flags);
++}
++
++/**
++ * adf_event_notify - notify userspace of a driver-private event
++ *
++ * @obj: the ADF object that produced the event
++ * @event: the event
++ *
++ * adf_event_notify() may be called safely from an atomic context.  It will
++ * copy @event if needed, so @event may point to a variable on the stack.
++ *
++ * Drivers must NOT call adf_event_notify() for vsync and hotplug events.
++ * ADF provides adf_vsync_notify() and
++ * adf_hotplug_notify_{connected,disconnected}() for these events.
++ */
++int adf_event_notify(struct adf_obj *obj, struct adf_event *event)
++{
++	if (WARN_ON(event->type == ADF_EVENT_VSYNC ||
++			event->type == ADF_EVENT_HOTPLUG))
++		return -EINVAL;
++
++	adf_event_queue(obj, event);
++	return 0;
++}
++EXPORT_SYMBOL(adf_event_notify);
++
++/**
++ * adf_vsync_notify - notify ADF of a display interface's vsync event
++ *
++ * @intf: the display interface
++ * @timestamp: the time the vsync occurred
++ *
++ * adf_vsync_notify() may be called safely from an atomic context.
++ */
++void adf_vsync_notify(struct adf_interface *intf, ktime_t timestamp)
++{
++	unsigned long flags;
++	struct adf_vsync_event event;
++
++	write_lock_irqsave(&intf->vsync_lock, flags);
++	intf->vsync_timestamp = timestamp;
++	write_unlock_irqrestore(&intf->vsync_lock, flags);
++
++	wake_up_interruptible_all(&intf->vsync_wait);
++
++	event.base.type = ADF_EVENT_VSYNC;
++	event.base.length = sizeof(event);
++	event.timestamp = ktime_to_ns(timestamp);
++	adf_event_queue(&intf->base, &event.base);
++}
++EXPORT_SYMBOL(adf_vsync_notify);
++
++void adf_hotplug_notify(struct adf_interface *intf, bool connected,
++		struct drm_mode_modeinfo *modelist, size_t n_modes)
++{
++	unsigned long flags;
++	struct adf_hotplug_event event;
++	struct drm_mode_modeinfo *old_modelist;
++
++	write_lock_irqsave(&intf->hotplug_modelist_lock, flags);
++	old_modelist = intf->modelist;
++	intf->hotplug_detect = connected;
++	intf->modelist = modelist;
++	intf->n_modes = n_modes;
++	write_unlock_irqrestore(&intf->hotplug_modelist_lock, flags);
++
++	kfree(old_modelist);
++
++	event.base.length = sizeof(event);
++	event.base.type = ADF_EVENT_HOTPLUG;
++	event.connected = connected;
++	adf_event_queue(&intf->base, &event.base);
++}
++
++/**
++ * adf_hotplug_notify_connected - notify ADF of a display interface being
++ * connected to a display
++ *
++ * @intf: the display interface
++ * @modelist: hardware modes supported by display
++ * @n_modes: length of modelist
++ *
++ * @modelist is copied as needed, so it may point to a variable on the stack.
++ *
++ * adf_hotplug_notify_connected() may NOT be called safely from an atomic
++ * context.
++ *
++ * Returns 0 on success or error code (<0) on error.
++ */
++int adf_hotplug_notify_connected(struct adf_interface *intf,
++		struct drm_mode_modeinfo *modelist, size_t n_modes)
++{
++	struct drm_mode_modeinfo *modelist_copy;
++
++	if (n_modes > ADF_MAX_MODES)
++		return -ENOMEM;
++
++	modelist_copy = kzalloc(sizeof(modelist_copy[0]) * n_modes,
++			GFP_KERNEL);
++	if (!modelist_copy)
++		return -ENOMEM;
++	memcpy(modelist_copy, modelist, sizeof(modelist_copy[0]) * n_modes);
++
++	adf_hotplug_notify(intf, true, modelist_copy, n_modes);
++	return 0;
++}
++EXPORT_SYMBOL(adf_hotplug_notify_connected);
++
++/**
++ * adf_hotplug_notify_disconnected - notify ADF of a display interface being
++ * disconnected from a display
++ *
++ * @intf: the display interface
++ *
++ * adf_hotplug_notify_disconnected() may be called safely from an atomic
++ * context.
++ */
++void adf_hotplug_notify_disconnected(struct adf_interface *intf)
++{
++	adf_hotplug_notify(intf, false, NULL, 0);
++}
++EXPORT_SYMBOL(adf_hotplug_notify_disconnected);
++
++static int adf_obj_init(struct adf_obj *obj, enum adf_obj_type type,
++		struct idr *idr, struct adf_device *parent,
++		const struct adf_obj_ops *ops, const char *fmt, va_list args)
++{
++	if (ops && ops->supports_event && !ops->set_event) {
++		pr_err("%s: %s implements supports_event but not set_event\n",
++				__func__, adf_obj_type_str(type));
++		return -EINVAL;
++	}
++
++	if (idr) {
++		int ret = idr_alloc(idr, obj, 0, 0, GFP_KERNEL);
++		if (ret < 0) {
++			pr_err("%s: allocating object id failed: %d\n",
++					__func__, ret);
++			return ret;
++		}
++		obj->id = ret;
++	} else {
++		obj->id = -1;
++	}
++
++	vscnprintf(obj->name, sizeof(obj->name), fmt, args);
++
++	obj->type = type;
++	obj->ops = ops;
++	obj->parent = parent;
++	mutex_init(&obj->event_lock);
++	obj->event_refcount = RB_ROOT;
++	spin_lock_init(&obj->file_lock);
++	INIT_LIST_HEAD(&obj->file_list);
++	return 0;
++}
++
++static void adf_obj_destroy(struct adf_obj *obj, struct idr *idr)
++{
++	struct rb_node *node = rb_first(&obj->event_refcount);
++
++	while (node) {
++		struct adf_event_refcount *refcount =
++				container_of(node, struct adf_event_refcount,
++						node);
++		kfree(refcount);
++		node = rb_first(&obj->event_refcount);
++	}
++
++	mutex_destroy(&obj->event_lock);
++	if (idr)
++		idr_remove(idr, obj->id);
++}
++
++/**
++ * adf_device_init - initialize ADF-internal data for a display device
++ * and create sysfs entries
++ *
++ * @dev: the display device
++ * @parent: the device's parent device
++ * @ops: the device's associated ops
++ * @fmt: formatting string for the display device's name
++ *
++ * @fmt specifies the device's sysfs filename and the name returned to
++ * userspace through the %ADF_GET_DEVICE_DATA ioctl.
++ *
++ * Returns 0 on success or error code (<0) on failure.
++ */
++int adf_device_init(struct adf_device *dev, struct device *parent,
++		const struct adf_device_ops *ops, const char *fmt, ...)
++{
++	int ret;
++	va_list args;
++
++	if (!ops->validate || !ops->post) {
++		pr_err("%s: device must implement validate and post\n",
++				__func__);
++		return -EINVAL;
++	}
++
++	if (!ops->complete_fence && !ops->advance_timeline) {
++		if (!IS_ENABLED(CONFIG_SW_SYNC)) {
++			pr_err("%s: device requires sw_sync but it is not enabled in the kernel\n",
++					__func__);
++			return -EINVAL;
++		}
++	} else if (!(ops->complete_fence && ops->advance_timeline)) {
++		pr_err("%s: device must implement both complete_fence and advance_timeline, or implement neither\n",
++				__func__);
++		return -EINVAL;
++	}
++
++	memset(dev, 0, sizeof(*dev));
++
++	va_start(args, fmt);
++	ret = adf_obj_init(&dev->base, ADF_OBJ_DEVICE, NULL, dev, &ops->base,
++			fmt, args);
++	va_end(args);
++	if (ret < 0)
++		return ret;
++
++	dev->dev = parent;
++	dev->ops = ops;
++	idr_init(&dev->overlay_engines);
++	idr_init(&dev->interfaces);
++	mutex_init(&dev->client_lock);
++	INIT_LIST_HEAD(&dev->post_list);
++	mutex_init(&dev->post_lock);
++	init_kthread_worker(&dev->post_worker);
++	INIT_LIST_HEAD(&dev->attached);
++	INIT_LIST_HEAD(&dev->attach_allowed);
++
++	dev->post_thread = kthread_run(kthread_worker_fn,
++			&dev->post_worker, dev->base.name);
++	if (IS_ERR(dev->post_thread)) {
++		ret = PTR_ERR(dev->post_thread);
++		dev->post_thread = NULL;
++
++		pr_err("%s: failed to run config posting thread: %d\n",
++				__func__, ret);
++		goto err;
++	}
++	init_kthread_work(&dev->post_work, adf_post_work_func);
++
++	ret = adf_device_sysfs_init(dev);
++	if (ret < 0)
++		goto err;
++
++	return 0;
++
++err:
++	adf_device_destroy(dev);
++	return ret;
++}
++EXPORT_SYMBOL(adf_device_init);
++
++/**
++ * adf_device_destroy - clean up ADF-internal data for a display device
++ *
++ * @dev: the display device
++ */
++void adf_device_destroy(struct adf_device *dev)
++{
++	struct adf_attachment_list *entry, *next;
++
++	idr_destroy(&dev->interfaces);
++	idr_destroy(&dev->overlay_engines);
++
++	if (dev->post_thread) {
++		flush_kthread_worker(&dev->post_worker);
++		kthread_stop(dev->post_thread);
++	}
++
++	if (dev->onscreen)
++		adf_post_cleanup(dev, dev->onscreen);
++	adf_device_sysfs_destroy(dev);
++	list_for_each_entry_safe(entry, next, &dev->attach_allowed, head) {
++		adf_attachment_free(entry);
++	}
++	list_for_each_entry_safe(entry, next, &dev->attached, head) {
++		adf_attachment_free(entry);
++	}
++	mutex_destroy(&dev->post_lock);
++	mutex_destroy(&dev->client_lock);
++	adf_obj_destroy(&dev->base, NULL);
++}
++EXPORT_SYMBOL(adf_device_destroy);
++
++/**
++ * adf_interface_init - initialize ADF-internal data for a display interface
++ * and create sysfs entries
++ *
++ * @intf: the display interface
++ * @dev: the interface's "parent" display device
++ * @type: interface type (see enum @adf_interface_type)
++ * @idx: which interface of type @type;
++ *	e.g. interface DSI.1 -> @type=%ADF_INTF_TYPE_DSI, @idx=1
++ * @ops: the interface's associated ops
++ * @fmt: formatting string for the display interface's name
++ *
++ * @dev must have previously been initialized with adf_device_init().
++ *
++ * @fmt affects the name returned to userspace through the
++ * %ADF_GET_INTERFACE_DATA ioctl.  It does not affect the sysfs filename,
++ * which is derived from @dev's name.
++ *
++ * Returns 0 on success or error code (<0) on failure.
++ */
++int adf_interface_init(struct adf_interface *intf, struct adf_device *dev,
++		enum adf_interface_type type, u32 idx,
++		const struct adf_interface_ops *ops, const char *fmt, ...)
++{
++	int ret;
++	va_list args;
++
++	if (dev->n_interfaces == ADF_MAX_INTERFACES) {
++		pr_err("%s: parent device %s has too many interfaces\n",
++				__func__, dev->base.name);
++		return -ENOMEM;
++	}
++
++	if (type >= ADF_INTF_MEMORY && type <= ADF_INTF_TYPE_DEVICE_CUSTOM) {
++		pr_err("%s: invalid interface type %u\n", __func__, type);
++		return -EINVAL;
++	}
++
++	memset(intf, 0, sizeof(*intf));
++
++	va_start(args, fmt);
++	ret = adf_obj_init(&intf->base, ADF_OBJ_INTERFACE, &dev->interfaces,
++			dev, ops ? &ops->base : NULL, fmt, args);
++	va_end(args);
++	if (ret < 0)
++		return ret;
++
++	intf->type = type;
++	intf->idx = idx;
++	intf->ops = ops;
++	init_waitqueue_head(&intf->vsync_wait);
++	rwlock_init(&intf->vsync_lock);
++	rwlock_init(&intf->hotplug_modelist_lock);
++
++	ret = adf_interface_sysfs_init(intf);
++	if (ret < 0)
++		goto err;
++	dev->n_interfaces++;
++
++	return 0;
++
++err:
++	adf_obj_destroy(&intf->base, &dev->interfaces);
++	return ret;
++}
++EXPORT_SYMBOL(adf_interface_init);
++
++/**
++ * adf_interface_destroy - clean up ADF-internal data for a display interface
++ *
++ * @intf: the display interface
++ */
++void adf_interface_destroy(struct adf_interface *intf)
++{
++	struct adf_device *dev = adf_interface_parent(intf);
++	struct adf_attachment_list *entry, *next;
++
++	mutex_lock(&dev->client_lock);
++	list_for_each_entry_safe(entry, next, &dev->attach_allowed, head) {
++		if (entry->attachment.interface == intf) {
++			adf_attachment_free(entry);
++			dev->n_attach_allowed--;
++		}
++	}
++	list_for_each_entry_safe(entry, next, &dev->attached, head) {
++		if (entry->attachment.interface == intf) {
++			adf_device_detach_op(dev,
++					entry->attachment.overlay_engine, intf);
++			adf_attachment_free(entry);
++			dev->n_attached--;
++		}
++	}
++	kfree(intf->modelist);
++	adf_interface_sysfs_destroy(intf);
++	adf_obj_destroy(&intf->base, &dev->interfaces);
++	dev->n_interfaces--;
++	mutex_unlock(&dev->client_lock);
++}
++EXPORT_SYMBOL(adf_interface_destroy);
++
++static bool adf_overlay_engine_has_custom_formats(
++		const struct adf_overlay_engine_ops *ops)
++{
++	size_t i;
++	for (i = 0; i < ops->n_supported_formats; i++)
++		if (!adf_format_is_standard(ops->supported_formats[i]))
++			return true;
++	return false;
++}
++
++/**
++ * adf_overlay_engine_init - initialize ADF-internal data for an
++ * overlay engine and create sysfs entries
++ *
++ * @eng: the overlay engine
++ * @dev: the overlay engine's "parent" display device
++ * @ops: the overlay engine's associated ops
++ * @fmt: formatting string for the overlay engine's name
++ *
++ * @dev must have previously been initialized with adf_device_init().
++ *
++ * @fmt affects the name returned to userspace through the
++ * %ADF_GET_OVERLAY_ENGINE_DATA ioctl.  It does not affect the sysfs filename,
++ * which is derived from @dev's name.
++ *
++ * Returns 0 on success or error code (<0) on failure.
++ */
++int adf_overlay_engine_init(struct adf_overlay_engine *eng,
++		struct adf_device *dev,
++		const struct adf_overlay_engine_ops *ops, const char *fmt, ...)
++{
++	int ret;
++	va_list args;
++
++	if (!ops->supported_formats) {
++		pr_err("%s: overlay engine must support at least one format\n",
++				__func__);
++		return -EINVAL;
++	}
++
++	if (adf_overlay_engine_has_custom_formats(ops) &&
++			!dev->ops->validate_custom_format) {
++		pr_err("%s: overlay engine has custom formats but parent device %s does not implement validate_custom_format\n",
++				__func__, dev->base.name);
++		return -EINVAL;
++	}
++
++	memset(eng, 0, sizeof(*eng));
++
++	va_start(args, fmt);
++	ret = adf_obj_init(&eng->base, ADF_OBJ_OVERLAY_ENGINE,
++			&dev->overlay_engines, dev, &ops->base, fmt, args);
++	va_end(args);
++	if (ret < 0)
++		return ret;
++
++	eng->ops = ops;
++
++	ret = adf_overlay_engine_sysfs_init(eng);
++	if (ret < 0)
++		goto err;
++
++	return 0;
++
++err:
++	adf_obj_destroy(&eng->base, &dev->overlay_engines);
++	return ret;
++}
++EXPORT_SYMBOL(adf_overlay_engine_init);
++
++/**
++ * adf_interface_destroy - clean up ADF-internal data for an overlay engine
++ *
++ * @eng: the overlay engine
++ */
++void adf_overlay_engine_destroy(struct adf_overlay_engine *eng)
++{
++	struct adf_device *dev = adf_overlay_engine_parent(eng);
++	struct adf_attachment_list *entry, *next;
++
++	mutex_lock(&dev->client_lock);
++	list_for_each_entry_safe(entry, next, &dev->attach_allowed, head) {
++		if (entry->attachment.overlay_engine == eng) {
++			adf_attachment_free(entry);
++			dev->n_attach_allowed--;
++		}
++	}
++	list_for_each_entry_safe(entry, next, &dev->attached, head) {
++		if (entry->attachment.overlay_engine == eng) {
++			adf_device_detach_op(dev, eng,
++					entry->attachment.interface);
++			adf_attachment_free(entry);
++			dev->n_attached--;
++		}
++	}
++	adf_overlay_engine_sysfs_destroy(eng);
++	adf_obj_destroy(&eng->base, &dev->overlay_engines);
++	mutex_unlock(&dev->client_lock);
++}
++EXPORT_SYMBOL(adf_overlay_engine_destroy);
++
++struct adf_attachment_list *adf_attachment_find(struct list_head *list,
++		struct adf_overlay_engine *eng, struct adf_interface *intf)
++{
++	struct adf_attachment_list *entry;
++	list_for_each_entry(entry, list, head) {
++		if (entry->attachment.interface == intf &&
++				entry->attachment.overlay_engine == eng)
++			return entry;
++	}
++	return NULL;
++}
++
++int adf_attachment_validate(struct adf_device *dev,
++		struct adf_overlay_engine *eng, struct adf_interface *intf)
++{
++	struct adf_device *intf_dev = adf_interface_parent(intf);
++	struct adf_device *eng_dev = adf_overlay_engine_parent(eng);
++
++	if (intf_dev != dev) {
++		dev_err(&dev->base.dev, "can't attach interface %s belonging to device %s\n",
++				intf->base.name, intf_dev->base.name);
++		return -EINVAL;
++	}
++
++	if (eng_dev != dev) {
++		dev_err(&dev->base.dev, "can't attach overlay engine %s belonging to device %s\n",
++				eng->base.name, eng_dev->base.name);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/**
++ * adf_attachment_allow - add a new entry to the list of allowed
++ * attachments
++ *
++ * @dev: the parent device
++ * @eng: the overlay engine
++ * @intf: the interface
++ *
++ * adf_attachment_allow() indicates that the underlying display hardware allows
++ * @intf to scan out @eng's output.  It is intended to be called at
++ * driver initialization for each supported overlay engine + interface pair.
++ *
++ * Returns 0 on success, -%EALREADY if the entry already exists, or -errno on
++ * any other failure.
++ */
++int adf_attachment_allow(struct adf_device *dev,
++		struct adf_overlay_engine *eng, struct adf_interface *intf)
++{
++	int ret;
++	struct adf_attachment_list *entry = NULL;
++
++	ret = adf_attachment_validate(dev, eng, intf);
++	if (ret < 0)
++		return ret;
++
++	mutex_lock(&dev->client_lock);
++
++	if (dev->n_attach_allowed == ADF_MAX_ATTACHMENTS) {
++		ret = -ENOMEM;
++		goto done;
++	}
++
++	if (adf_attachment_find(&dev->attach_allowed, eng, intf)) {
++		ret = -EALREADY;
++		goto done;
++	}
++
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry) {
++		ret = -ENOMEM;
++		goto done;
++	}
++
++	entry->attachment.interface = intf;
++	entry->attachment.overlay_engine = eng;
++	list_add_tail(&entry->head, &dev->attach_allowed);
++	dev->n_attach_allowed++;
++
++done:
++	mutex_unlock(&dev->client_lock);
++	if (ret < 0)
++		kfree(entry);
++
++	return ret;
++}
++
++/**
++ * adf_obj_type_str - string representation of an adf_obj_type
++ *
++ * @type: the object type
++ */
++const char *adf_obj_type_str(enum adf_obj_type type)
++{
++	switch (type) {
++	case ADF_OBJ_OVERLAY_ENGINE:
++		return "overlay engine";
++
++	case ADF_OBJ_INTERFACE:
++		return "interface";
++
++	case ADF_OBJ_DEVICE:
++		return "device";
++
++	default:
++		return "unknown";
++	}
++}
++EXPORT_SYMBOL(adf_obj_type_str);
++
++/**
++ * adf_interface_type_str - string representation of an adf_interface's type
++ *
++ * @intf: the interface
++ */
++const char *adf_interface_type_str(struct adf_interface *intf)
++{
++	switch (intf->type) {
++	case ADF_INTF_DSI:
++		return "DSI";
++
++	case ADF_INTF_eDP:
++		return "eDP";
++
++	case ADF_INTF_DPI:
++		return "DPI";
++
++	case ADF_INTF_VGA:
++		return "VGA";
++
++	case ADF_INTF_DVI:
++		return "DVI";
++
++	case ADF_INTF_HDMI:
++		return "HDMI";
++
++	case ADF_INTF_MEMORY:
++		return "memory";
++
++	default:
++		if (intf->type >= ADF_INTF_TYPE_DEVICE_CUSTOM) {
++			if (intf->ops && intf->ops->type_str)
++				return intf->ops->type_str(intf);
++			return "custom";
++		}
++		return "unknown";
++	}
++}
++EXPORT_SYMBOL(adf_interface_type_str);
++
++/**
++ * adf_event_type_str - string representation of an adf_event_type
++ *
++ * @obj: ADF object that produced the event
++ * @type: event type
++ */
++const char *adf_event_type_str(struct adf_obj *obj, enum adf_event_type type)
++{
++	switch (type) {
++	case ADF_EVENT_VSYNC:
++		return "vsync";
++
++	case ADF_EVENT_HOTPLUG:
++		return "hotplug";
++
++	default:
++		if (type >= ADF_EVENT_DEVICE_CUSTOM) {
++			if (obj->ops && obj->ops->event_type_str)
++				return obj->ops->event_type_str(obj, type);
++			return "custom";
++		}
++		return "unknown";
++	}
++}
++EXPORT_SYMBOL(adf_event_type_str);
++
++/**
++ * adf_format_str - string representation of an ADF/DRM fourcc format
++ *
++ * @format: format fourcc
++ * @buf: target buffer for the format's string representation
++ */
++void adf_format_str(u32 format, char buf[ADF_FORMAT_STR_SIZE])
++{
++	buf[0] = format & 0xFF;
++	buf[1] = (format >> 8) & 0xFF;
++	buf[2] = (format >> 16) & 0xFF;
++	buf[3] = (format >> 24) & 0xFF;
++	buf[4] = '\0';
++}
++EXPORT_SYMBOL(adf_format_str);
++
++void adf_modeinfo_set_name(struct drm_mode_modeinfo *mode)
++{
++	bool interlaced = mode->flags & DRM_MODE_FLAG_INTERLACE;
++
++	snprintf(mode->name, DRM_DISPLAY_MODE_LEN, "%dx%d%s",
++		 mode->hdisplay, mode->vdisplay,
++		 interlaced ? "i" : "");
++}
++
++void adf_modeinfo_set_vrefresh(struct drm_mode_modeinfo *mode)
++{
++	int refresh = 0;
++	unsigned int calc_val;
++
++	if (mode->vrefresh > 0)
++		return;
++
++	if (mode->htotal <= 0 || mode->vtotal <= 0)
++		return;
++
++	/* work out vrefresh the value will be x1000 */
++	calc_val = (mode->clock * 1000);
++	calc_val /= mode->htotal;
++	refresh = (calc_val + mode->vtotal / 2) / mode->vtotal;
++
++	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
++		refresh *= 2;
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		refresh /= 2;
++	if (mode->vscan > 1)
++		refresh /= mode->vscan;
++
++	mode->vrefresh = refresh;
++}
++
++static int __init adf_init(void)
++{
++	int err;
++
++	err = adf_sysfs_init();
++	if (err < 0)
++		return err;
++
++	return 0;
++}
++
++static void __exit adf_exit(void)
++{
++	adf_sysfs_destroy();
++}
++
++module_init(adf_init);
++module_exit(adf_exit);
+diff --git a/drivers/video/adf/adf.h b/drivers/video/adf/adf.h
+new file mode 100644
+index 0000000..402e9c2
+--- /dev/null
++++ b/drivers/video/adf/adf.h
+@@ -0,0 +1,74 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __VIDEO_ADF_ADF_H
++#define __VIDEO_ADF_ADF_H
++
++#include <linux/idr.h>
++#include <linux/list.h>
++#include <video/adf.h>
++#include "sync.h"
++
++struct adf_event_refcount {
++	struct rb_node node;
++	enum adf_event_type type;
++	int refcount;
++};
++
++void adf_buffer_cleanup(struct adf_buffer *buf);
++void adf_buffer_mapping_cleanup(struct adf_buffer_mapping *mapping,
++		struct adf_buffer *buf);
++void adf_post_cleanup(struct adf_device *dev, struct adf_pending_post *post);
++
++struct adf_attachment_list *adf_attachment_find(struct list_head *list,
++		struct adf_overlay_engine *eng, struct adf_interface *intf);
++int adf_attachment_validate(struct adf_device *dev,
++		struct adf_overlay_engine *eng, struct adf_interface *intf);
++void adf_attachment_free(struct adf_attachment_list *attachment);
++
++struct adf_event_refcount *adf_obj_find_event_refcount(struct adf_obj *obj,
++		enum adf_event_type type);
++
++void adf_modeinfo_set_name(struct drm_mode_modeinfo *mode);
++void adf_modeinfo_set_vrefresh(struct drm_mode_modeinfo *mode);
++
++static inline int adf_obj_check_supports_event(struct adf_obj *obj,
++		enum adf_event_type type)
++{
++	if (!obj->ops || !obj->ops->supports_event)
++		return -EOPNOTSUPP;
++	if (!obj->ops->supports_event(obj, type))
++		return -EINVAL;
++	return 0;
++}
++
++static inline int adf_device_attach_op(struct adf_device *dev,
++		struct adf_overlay_engine *eng, struct adf_interface *intf)
++{
++	if (!dev->ops->attach)
++		return 0;
++
++	return dev->ops->attach(dev, eng, intf);
++}
++
++static inline int adf_device_detach_op(struct adf_device *dev,
++		struct adf_overlay_engine *eng, struct adf_interface *intf)
++{
++	if (!dev->ops->detach)
++		return 0;
++
++	return dev->ops->detach(dev, eng, intf);
++}
++
++#endif /* __VIDEO_ADF_ADF_H */
+diff --git a/drivers/video/adf/adf_client.c b/drivers/video/adf/adf_client.c
+new file mode 100644
+index 0000000..f52b29d
+--- /dev/null
++++ b/drivers/video/adf/adf_client.c
+@@ -0,0 +1,764 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/kthread.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++
++#include "sw_sync.h"
++
++#include <video/adf.h>
++#include <video/adf_client.h>
++#include <video/adf_format.h>
++
++#include "adf.h"
++
++static inline bool vsync_active(u8 state)
++{
++	return state == DRM_MODE_DPMS_ON || state == DRM_MODE_DPMS_STANDBY;
++}
++
++/**
++ * adf_interface_blank - set interface's DPMS state
++ *
++ * @intf: the interface
++ * @state: one of %DRM_MODE_DPMS_*
++ *
++ * Returns 0 on success or -errno on failure.
++ */
++int adf_interface_blank(struct adf_interface *intf, u8 state)
++{
++	struct adf_device *dev = adf_interface_parent(intf);
++	u8 prev_state;
++	bool disable_vsync;
++	bool enable_vsync;
++	int ret = 0;
++	struct adf_event_refcount *vsync_refcount;
++
++	if (!intf->ops || !intf->ops->blank)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&dev->client_lock);
++	if (state != DRM_MODE_DPMS_ON)
++		flush_kthread_worker(&dev->post_worker);
++	mutex_lock(&intf->base.event_lock);
++
++	vsync_refcount = adf_obj_find_event_refcount(&intf->base,
++			ADF_EVENT_VSYNC);
++	if (!vsync_refcount) {
++		ret = -ENOMEM;
++		goto done;
++	}
++
++	prev_state = intf->dpms_state;
++	if (prev_state == state) {
++		ret = -EBUSY;
++		goto done;
++	}
++
++	disable_vsync = vsync_active(prev_state) &&
++			!vsync_active(state) &&
++			vsync_refcount->refcount;
++	enable_vsync = !vsync_active(prev_state) &&
++			vsync_active(state) &&
++			vsync_refcount->refcount;
++
++	if (disable_vsync)
++		intf->base.ops->set_event(&intf->base, ADF_EVENT_VSYNC,
++				false);
++
++	ret = intf->ops->blank(intf, state);
++	if (ret < 0) {
++		if (disable_vsync)
++			intf->base.ops->set_event(&intf->base, ADF_EVENT_VSYNC,
++					true);
++		goto done;
++	}
++
++	if (enable_vsync)
++		intf->base.ops->set_event(&intf->base, ADF_EVENT_VSYNC,
++				true);
++
++	intf->dpms_state = state;
++done:
++	mutex_unlock(&intf->base.event_lock);
++	mutex_unlock(&dev->client_lock);
++	return ret;
++}
++EXPORT_SYMBOL(adf_interface_blank);
++
++/**
++ * adf_interface_blank - get interface's current DPMS state
++ *
++ * @intf: the interface
++ *
++ * Returns one of %DRM_MODE_DPMS_*.
++ */
++u8 adf_interface_dpms_state(struct adf_interface *intf)
++{
++	struct adf_device *dev = adf_interface_parent(intf);
++	u8 dpms_state;
++
++	mutex_lock(&dev->client_lock);
++	dpms_state = intf->dpms_state;
++	mutex_unlock(&dev->client_lock);
++
++	return dpms_state;
++}
++EXPORT_SYMBOL(adf_interface_dpms_state);
++
++/**
++ * adf_interface_current_mode - get interface's current display mode
++ *
++ * @intf: the interface
++ * @mode: returns the current mode
++ */
++void adf_interface_current_mode(struct adf_interface *intf,
++		struct drm_mode_modeinfo *mode)
++{
++	struct adf_device *dev = adf_interface_parent(intf);
++
++	mutex_lock(&dev->client_lock);
++	memcpy(mode, &intf->current_mode, sizeof(*mode));
++	mutex_unlock(&dev->client_lock);
++}
++EXPORT_SYMBOL(adf_interface_current_mode);
++
++/**
++ * adf_interface_modelist - get interface's modelist
++ *
++ * @intf: the interface
++ * @modelist: storage for the modelist (optional)
++ * @n_modes: length of @modelist
++ *
++ * If @modelist is not NULL, adf_interface_modelist() will copy up to @n_modes
++ * modelist entries into @modelist.
++ *
++ * Returns the length of the modelist.
++ */
++size_t adf_interface_modelist(struct adf_interface *intf,
++		struct drm_mode_modeinfo *modelist, size_t n_modes)
++{
++	unsigned long flags;
++	size_t retval;
++
++	read_lock_irqsave(&intf->hotplug_modelist_lock, flags);
++	if (modelist)
++		memcpy(modelist, intf->modelist, sizeof(modelist[0]) *
++				min(n_modes, intf->n_modes));
++	retval = intf->n_modes;
++	read_unlock_irqrestore(&intf->hotplug_modelist_lock, flags);
++
++	return retval;
++}
++EXPORT_SYMBOL(adf_interface_modelist);
++
++/**
++ * adf_interface_set_mode - set interface's display mode
++ *
++ * @intf: the interface
++ * @mode: the new mode
++ *
++ * Returns 0 on success or -errno on failure.
++ */
++int adf_interface_set_mode(struct adf_interface *intf,
++		struct drm_mode_modeinfo *mode)
++{
++	struct adf_device *dev = adf_interface_parent(intf);
++	int ret = 0;
++
++	if (!intf->ops || !intf->ops->modeset)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&dev->client_lock);
++	flush_kthread_worker(&dev->post_worker);
++
++	ret = intf->ops->modeset(intf, mode);
++	if (ret < 0)
++		goto done;
++
++	memcpy(&intf->current_mode, mode, sizeof(*mode));
++done:
++	mutex_unlock(&dev->client_lock);
++	return ret;
++}
++EXPORT_SYMBOL(adf_interface_set_mode);
++
++/**
++ * adf_interface_screen_size - get size of screen connected to interface
++ *
++ * @intf: the interface
++ * @width_mm: returns the screen width in mm
++ * @height_mm: returns the screen width in mm
++ *
++ * Returns 0 on success or -errno on failure.
++ */
++int adf_interface_get_screen_size(struct adf_interface *intf, u16 *width_mm,
++		u16 *height_mm)
++{
++	struct adf_device *dev = adf_interface_parent(intf);
++	int ret;
++
++	if (!intf->ops || !intf->ops->screen_size)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&dev->client_lock);
++	ret = intf->ops->screen_size(intf, width_mm, height_mm);
++	mutex_unlock(&dev->client_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL(adf_interface_get_screen_size);
++
++/**
++ * adf_overlay_engine_supports_format - returns whether a format is in an
++ * overlay engine's supported list
++ *
++ * @eng: the overlay engine
++ * @format: format fourcc
++ */
++bool adf_overlay_engine_supports_format(struct adf_overlay_engine *eng,
++		u32 format)
++{
++	size_t i;
++	for (i = 0; i < eng->ops->n_supported_formats; i++)
++		if (format == eng->ops->supported_formats[i])
++			return true;
++
++	return false;
++}
++EXPORT_SYMBOL(adf_overlay_engine_supports_format);
++
++static int adf_buffer_validate(struct adf_buffer *buf)
++{
++	struct adf_overlay_engine *eng = buf->overlay_engine;
++	struct device *dev = &eng->base.dev;
++	u8 hsub, vsub, num_planes, i;
++
++	if (!adf_overlay_engine_supports_format(eng, buf->format)) {
++		char format_str[ADF_FORMAT_STR_SIZE];
++		adf_format_str(buf->format, format_str);
++		dev_err(dev, "unsupported format %s\n", format_str);
++		return -EINVAL;
++	}
++
++	if (!adf_format_is_standard(buf->format)) {
++		struct adf_device *parent = adf_overlay_engine_parent(eng);
++		return parent->ops->validate_custom_format(parent, buf);
++	}
++
++	hsub = adf_format_horz_chroma_subsampling(buf->format);
++	vsub = adf_format_vert_chroma_subsampling(buf->format);
++	num_planes = adf_format_num_planes(buf->format);
++
++	if (num_planes != buf->n_planes) {
++		char format_str[ADF_FORMAT_STR_SIZE];
++		adf_format_str(buf->format, format_str);
++		dev_err(dev, "%u planes expected for format %s but %u planes provided\n",
++				num_planes, format_str, buf->n_planes);
++		return -EINVAL;
++	}
++
++	if (buf->w == 0 || buf->w % hsub) {
++		dev_err(dev, "bad buffer width %u\n", buf->w);
++		return -EINVAL;
++	}
++
++	if (buf->h == 0 || buf->h % vsub) {
++		dev_err(dev, "bad buffer height %u\n", buf->h);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < num_planes; i++) {
++		u32 width = buf->w / (i != 0 ? hsub : 1);
++		u32 height = buf->h / (i != 0 ? vsub : 1);
++		u8 cpp = adf_format_plane_cpp(buf->format, i);
++
++		if (buf->pitch[i] < (u64) width * cpp) {
++			dev_err(dev, "plane %u pitch is shorter than buffer width (pitch = %u, width = %u, bpp = %u)\n",
++					i, buf->pitch[i], width, cpp * 8);
++			return -EINVAL;
++		}
++
++		if ((u64) height * buf->pitch[i] + buf->offset[i] >
++				buf->dma_bufs[i]->size) {
++			dev_err(dev, "plane %u buffer too small (height = %u, pitch = %u, offset = %u, size = %zu)\n",
++					i, height, buf->pitch[i],
++					buf->offset[i], buf->dma_bufs[i]->size);
++		}
++	}
++
++	return 0;
++}
++
++static int adf_buffer_map(struct adf_device *dev, struct adf_buffer *buf,
++		struct adf_buffer_mapping *mapping)
++{
++	int ret = 0;
++	size_t i;
++
++	for (i = 0; i < buf->n_planes; i++) {
++		struct dma_buf_attachment *attachment;
++		struct sg_table *sg_table;
++
++		attachment = dma_buf_attach(buf->dma_bufs[i], dev->dev);
++		if (IS_ERR(attachment)) {
++			ret = PTR_ERR(attachment);
++			dev_err(&dev->base.dev, "attaching plane %u failed: %d\n",
++					i, ret);
++			goto done;
++		}
++		mapping->attachments[i] = attachment;
++
++		sg_table = dma_buf_map_attachment(attachment, DMA_TO_DEVICE);
++		if (IS_ERR(sg_table)) {
++			ret = PTR_ERR(sg_table);
++			dev_err(&dev->base.dev, "mapping plane %u failed: %d",
++					i, ret);
++			goto done;
++		} else if (!sg_table) {
++			ret = -ENOMEM;
++			dev_err(&dev->base.dev, "mapping plane %u failed\n", i);
++			goto done;
++		}
++		mapping->sg_tables[i] = sg_table;
++	}
++
++done:
++	if (ret < 0)
++		adf_buffer_mapping_cleanup(mapping, buf);
++
++	return ret;
++}
++
++static struct sync_fence *adf_sw_complete_fence(struct adf_device *dev)
++{
++	struct sync_pt *pt;
++	struct sync_fence *complete_fence;
++
++	if (!dev->timeline) {
++		dev->timeline = sw_sync_timeline_create(dev->base.name);
++		if (!dev->timeline)
++			return ERR_PTR(-ENOMEM);
++		dev->timeline_max = 1;
++	}
++
++	dev->timeline_max++;
++	pt = sw_sync_pt_create(dev->timeline, dev->timeline_max);
++	if (!pt)
++		goto err_pt_create;
++	complete_fence = sync_fence_create(dev->base.name, pt);
++	if (!complete_fence)
++		goto err_fence_create;
++
++	return complete_fence;
++
++err_fence_create:
++	sync_pt_free(pt);
++err_pt_create:
++	dev->timeline_max--;
++	return ERR_PTR(-ENOSYS);
++}
++
++/**
++ * adf_device_post - flip to a new set of buffers
++ *
++ * @dev: device targeted by the flip
++ * @intfs: interfaces targeted by the flip
++ * @n_intfs: number of targeted interfaces
++ * @bufs: description of buffers displayed
++ * @n_bufs: number of buffers displayed
++ * @custom_data: driver-private data
++ * @custom_data_size: size of driver-private data
++ *
++ * adf_device_post() will copy @intfs, @bufs, and @custom_data, so they may
++ * point to variables on the stack.  adf_device_post() also takes its own
++ * reference on each of the dma-bufs in @bufs.  The adf_device_post_nocopy()
++ * variant transfers ownership of these resources to ADF instead.
++ *
++ * On success, returns a sync fence which signals when the buffers are removed
++ * from the screen.  On failure, returns ERR_PTR(-errno).
++ */
++struct sync_fence *adf_device_post(struct adf_device *dev,
++		struct adf_interface **intfs, size_t n_intfs,
++		struct adf_buffer *bufs, size_t n_bufs, void *custom_data,
++		size_t custom_data_size)
++{
++	struct adf_interface **intfs_copy = NULL;
++	struct adf_buffer *bufs_copy = NULL;
++	void *custom_data_copy = NULL;
++	struct sync_fence *ret;
++	size_t i;
++
++	intfs_copy = kzalloc(sizeof(intfs_copy[0]) * n_intfs, GFP_KERNEL);
++	if (!intfs_copy)
++		return ERR_PTR(-ENOMEM);
++
++	bufs_copy = kzalloc(sizeof(bufs_copy[0]) * n_bufs, GFP_KERNEL);
++	if (!bufs_copy) {
++		ret = ERR_PTR(-ENOMEM);
++		goto err_alloc;
++	}
++
++	custom_data_copy = kzalloc(custom_data_size, GFP_KERNEL);
++	if (!custom_data_copy) {
++		ret = ERR_PTR(-ENOMEM);
++		goto err_alloc;
++	}
++
++	for (i = 0; i < n_bufs; i++) {
++		size_t j;
++		for (j = 0; j < bufs[i].n_planes; j++)
++			get_dma_buf(bufs[i].dma_bufs[j]);
++	}
++
++	memcpy(intfs_copy, intfs, sizeof(intfs_copy[0]) * n_intfs);
++	memcpy(bufs_copy, bufs, sizeof(bufs_copy[0]) * n_bufs);
++	memcpy(custom_data_copy, custom_data, custom_data_size);
++
++	ret = adf_device_post_nocopy(dev, intfs_copy, n_intfs, bufs_copy,
++			n_bufs, custom_data_copy, custom_data_size);
++	if (IS_ERR(ret))
++		goto err_post;
++
++	return ret;
++
++err_post:
++	for (i = 0; i < n_bufs; i++) {
++		size_t j;
++		for (j = 0; j < bufs[i].n_planes; j++)
++			dma_buf_put(bufs[i].dma_bufs[j]);
++	}
++err_alloc:
++	kfree(custom_data_copy);
++	kfree(bufs_copy);
++	kfree(intfs_copy);
++	return ret;
++}
++EXPORT_SYMBOL(adf_device_post);
++
++/**
++ * adf_device_post_nocopy - flip to a new set of buffers
++ *
++ * adf_device_post_nocopy() has the same behavior as adf_device_post(),
++ * except ADF does not copy @intfs, @bufs, or @custom_data, and it does
++ * not take an extra reference on the dma-bufs in @bufs.
++ *
++ * @intfs, @bufs, and @custom_data must point to buffers allocated by
++ * kmalloc().  On success, ADF takes ownership of these buffers and the dma-bufs
++ * in @bufs, and will kfree()/dma_buf_put() them when they are no longer needed.
++ * On failure, adf_device_post_nocopy() does NOT take ownership of these
++ * buffers or the dma-bufs, and the caller must clean them up.
++ *
++ * adf_device_post_nocopy() is mainly intended for implementing ADF's ioctls.
++ * Clients may find the nocopy variant useful in limited cases, but most should
++ * call adf_device_post() instead.
++ */
++struct sync_fence *adf_device_post_nocopy(struct adf_device *dev,
++		struct adf_interface **intfs, size_t n_intfs,
++		struct adf_buffer *bufs, size_t n_bufs,
++		void *custom_data, size_t custom_data_size)
++{
++	struct adf_pending_post *cfg;
++	struct adf_buffer_mapping *mappings;
++	struct sync_fence *ret;
++	size_t i;
++	int err;
++
++	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
++	if (!cfg)
++		return ERR_PTR(-ENOMEM);
++
++	mappings = kzalloc(sizeof(mappings[0]) * n_bufs, GFP_KERNEL);
++	if (!mappings) {
++		ret = ERR_PTR(-ENOMEM);
++		goto err_alloc;
++	}
++
++	mutex_lock(&dev->client_lock);
++
++	for (i = 0; i < n_bufs; i++) {
++		err = adf_buffer_validate(&bufs[i]);
++		if (err < 0) {
++			ret = ERR_PTR(err);
++			goto err_buf;
++		}
++
++		err = adf_buffer_map(dev, &bufs[i], &mappings[i]);
++		if (err < 0) {
++			ret = ERR_PTR(err);
++			goto err_buf;
++		}
++	}
++
++	INIT_LIST_HEAD(&cfg->head);
++	cfg->config.n_bufs = n_bufs;
++	cfg->config.bufs = bufs;
++	cfg->config.mappings = mappings;
++	cfg->config.custom_data = custom_data;
++	cfg->config.custom_data_size = custom_data_size;
++
++	err = dev->ops->validate(dev, &cfg->config, &cfg->state);
++	if (err < 0) {
++		ret = ERR_PTR(err);
++		goto err_buf;
++	}
++
++	mutex_lock(&dev->post_lock);
++
++	if (dev->ops->complete_fence)
++		ret = dev->ops->complete_fence(dev, &cfg->config,
++				cfg->state);
++	else
++		ret = adf_sw_complete_fence(dev);
++
++	if (IS_ERR(ret))
++		goto err_fence;
++
++	list_add_tail(&cfg->head, &dev->post_list);
++	queue_kthread_work(&dev->post_worker, &dev->post_work);
++	mutex_unlock(&dev->post_lock);
++	mutex_unlock(&dev->client_lock);
++	kfree(intfs);
++	return ret;
++
++err_fence:
++	mutex_unlock(&dev->post_lock);
++
++err_buf:
++	for (i = 0; i < n_bufs; i++)
++		adf_buffer_mapping_cleanup(&mappings[i], &bufs[i]);
++
++	mutex_unlock(&dev->client_lock);
++	kfree(mappings);
++
++err_alloc:
++	kfree(cfg);
++	return ret;
++}
++EXPORT_SYMBOL(adf_device_post_nocopy);
++
++static void adf_attachment_list_to_array(struct adf_device *dev,
++		struct list_head *src, struct adf_attachment *dst, size_t size)
++{
++	struct adf_attachment_list *entry;
++	size_t i = 0;
++
++	if (!dst)
++		return;
++
++	list_for_each_entry(entry, src, head) {
++		if (i == size)
++			return;
++		dst[i] = entry->attachment;
++		i++;
++	}
++}
++
++/**
++ * adf_device_attachments - get device's list of active attachments
++ *
++ * @dev: the device
++ * @attachments: storage for the attachment list (optional)
++ * @n_attachments: length of @attachments
++ *
++ * If @attachments is not NULL, adf_device_attachments() will copy up to
++ * @n_attachments entries into @attachments.
++ *
++ * Returns the length of the active attachment list.
++ */
++size_t adf_device_attachments(struct adf_device *dev,
++		struct adf_attachment *attachments, size_t n_attachments)
++{
++	size_t retval;
++
++	mutex_lock(&dev->client_lock);
++	adf_attachment_list_to_array(dev, &dev->attached, attachments,
++			n_attachments);
++	retval = dev->n_attached;
++	mutex_unlock(&dev->client_lock);
++
++	return retval;
++}
++EXPORT_SYMBOL(adf_device_attachments);
++
++/**
++ * adf_device_attachments_allowed - get device's list of allowed attachments
++ *
++ * @dev: the device
++ * @attachments: storage for the attachment list (optional)
++ * @n_attachments: length of @attachments
++ *
++ * If @attachments is not NULL, adf_device_attachments_allowed() will copy up to
++ * @n_attachments entries into @attachments.
++ *
++ * Returns the length of the allowed attachment list.
++ */
++size_t adf_device_attachments_allowed(struct adf_device *dev,
++		struct adf_attachment *attachments, size_t n_attachments)
++{
++	size_t retval;
++
++	mutex_lock(&dev->client_lock);
++	adf_attachment_list_to_array(dev, &dev->attach_allowed, attachments,
++			n_attachments);
++	retval = dev->n_attach_allowed;
++	mutex_unlock(&dev->client_lock);
++
++	return retval;
++}
++EXPORT_SYMBOL(adf_device_attachments_allowed);
++
++/**
++ * adf_device_attached - return whether an overlay engine and interface are
++ * attached
++ *
++ * @dev: the parent device
++ * @eng: the overlay engine
++ * @intf: the interface
++ */
++bool adf_device_attached(struct adf_device *dev, struct adf_overlay_engine *eng,
++		struct adf_interface *intf)
++{
++	struct adf_attachment_list *attachment;
++
++	mutex_lock(&dev->client_lock);
++	attachment = adf_attachment_find(&dev->attached, eng, intf);
++	mutex_unlock(&dev->client_lock);
++
++	return attachment != NULL;
++}
++EXPORT_SYMBOL(adf_device_attached);
++
++/**
++ * adf_device_attach_allowed - return whether the ADF device supports attaching
++ * an overlay engine and interface
++ *
++ * @dev: the parent device
++ * @eng: the overlay engine
++ * @intf: the interface
++ */
++bool adf_device_attach_allowed(struct adf_device *dev,
++		struct adf_overlay_engine *eng, struct adf_interface *intf)
++{
++	struct adf_attachment_list *attachment;
++
++	mutex_lock(&dev->client_lock);
++	attachment = adf_attachment_find(&dev->attach_allowed, eng, intf);
++	mutex_unlock(&dev->client_lock);
++
++	return attachment != NULL;
++}
++EXPORT_SYMBOL(adf_device_attach_allowed);
++/**
++ * adf_device_attach - attach an overlay engine to an interface
++ *
++ * @dev: the parent device
++ * @eng: the overlay engine
++ * @intf: the interface
++ *
++ * Returns 0 on success, -%EINVAL if attaching @intf and @eng is not allowed,
++ * -%EALREADY if @intf and @eng are already attached, or -errno on any other
++ * failure.
++ */
++int adf_device_attach(struct adf_device *dev, struct adf_overlay_engine *eng,
++		struct adf_interface *intf)
++{
++	int ret;
++	struct adf_attachment_list *attachment = NULL;
++
++	ret = adf_attachment_validate(dev, eng, intf);
++	if (ret < 0)
++		return ret;
++
++	mutex_lock(&dev->client_lock);
++
++	if (dev->n_attached == ADF_MAX_ATTACHMENTS) {
++		ret = -ENOMEM;
++		goto done;
++	}
++
++	if (!adf_attachment_find(&dev->attach_allowed, eng, intf)) {
++		ret = -EINVAL;
++		goto done;
++	}
++
++	if (adf_attachment_find(&dev->attached, eng, intf)) {
++		ret = -EALREADY;
++		goto done;
++	}
++
++	ret = adf_device_attach_op(dev, eng, intf);
++	if (ret < 0)
++		goto done;
++
++	attachment = kzalloc(sizeof(*attachment), GFP_KERNEL);
++	if (!attachment) {
++		ret = -ENOMEM;
++		goto done;
++	}
++
++	attachment->attachment.interface = intf;
++	attachment->attachment.overlay_engine = eng;
++	list_add_tail(&attachment->head, &dev->attached);
++	dev->n_attached++;
++
++done:
++	mutex_unlock(&dev->client_lock);
++	if (ret < 0)
++		kfree(attachment);
++
++	return ret;
++}
++EXPORT_SYMBOL(adf_device_attach);
++
++/**
++ * adf_device_detach - detach an overlay engine from an interface
++ *
++ * @dev: the parent device
++ * @eng: the overlay engine
++ * @intf: the interface
++ *
++ * Returns 0 on success, -%EINVAL if @intf and @eng are not attached,
++ * or -errno on any other failure.
++ */
++int adf_device_detach(struct adf_device *dev, struct adf_overlay_engine *eng,
++		struct adf_interface *intf)
++{
++	int ret;
++	struct adf_attachment_list *attachment;
++
++	ret = adf_attachment_validate(dev, eng, intf);
++	if (ret < 0)
++		return ret;
++
++	mutex_lock(&dev->client_lock);
++
++	attachment = adf_attachment_find(&dev->attached, eng, intf);
++	if (!attachment) {
++		ret = -EINVAL;
++		goto done;
++	}
++
++	ret = adf_device_detach_op(dev, eng, intf);
++	if (ret < 0)
++		goto done;
++
++	adf_attachment_free(attachment);
++	dev->n_attached--;
++done:
++	mutex_unlock(&dev->client_lock);
++	return ret;
++}
++EXPORT_SYMBOL(adf_device_detach);
+diff --git a/drivers/video/adf/adf_fops.c b/drivers/video/adf/adf_fops.c
+new file mode 100644
+index 0000000..90b234a
+--- /dev/null
++++ b/drivers/video/adf/adf_fops.c
+@@ -0,0 +1,843 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/bitops.h>
++#include <linux/circ_buf.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/poll.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#include <video/adf_client.h>
++#include <video/adf_format.h>
++
++#include "sw_sync.h"
++#include "sync.h"
++
++#include "adf.h"
++#include "adf_fops.h"
++#include "adf_sysfs.h"
++
++#ifdef CONFIG_COMPAT
++#include "adf_fops32.h"
++#endif
++
++static int adf_obj_set_event(struct adf_obj *obj, struct adf_file *file,
++		struct adf_set_event __user *arg)
++{
++	struct adf_set_event data;
++	bool enabled;
++	unsigned long flags;
++	int err;
++
++	if (copy_from_user(&data, arg, sizeof(data)))
++		return -EFAULT;
++
++	err = adf_obj_check_supports_event(obj, data.type);
++	if (err < 0)
++		return err;
++
++	spin_lock_irqsave(&obj->file_lock, flags);
++	if (data.enabled)
++		enabled = test_and_set_bit(data.type,
++				file->event_subscriptions);
++	else
++		enabled = test_and_clear_bit(data.type,
++				file->event_subscriptions);
++	spin_unlock_irqrestore(&obj->file_lock, flags);
++
++	if (data.enabled == enabled)
++		return -EALREADY;
++
++	if (data.enabled)
++		adf_event_get(obj, data.type);
++	else
++		adf_event_put(obj, data.type);
++
++	return 0;
++}
++
++static int adf_obj_copy_custom_data_to_user(struct adf_obj *obj,
++		void __user *dst, size_t *dst_size)
++{
++	void *custom_data;
++	size_t custom_data_size;
++	int ret;
++
++	if (!obj->ops || !obj->ops->custom_data) {
++		dev_dbg(&obj->dev, "%s: no custom_data op\n", __func__);
++		return 0;
++	}
++
++	custom_data = kzalloc(ADF_MAX_CUSTOM_DATA_SIZE, GFP_KERNEL);
++	if (!custom_data)
++		return -ENOMEM;
++
++	ret = obj->ops->custom_data(obj, custom_data, &custom_data_size);
++	if (ret < 0)
++		goto done;
++
++	if (copy_to_user(dst, custom_data, min(*dst_size, custom_data_size))) {
++		ret = -EFAULT;
++		goto done;
++	}
++	*dst_size = custom_data_size;
++
++done:
++	kfree(custom_data);
++	return ret;
++}
++
++static int adf_eng_get_data(struct adf_overlay_engine *eng,
++		struct adf_overlay_engine_data __user *arg)
++{
++	struct adf_device *dev = adf_overlay_engine_parent(eng);
++	struct adf_overlay_engine_data data;
++	int ret = 0;
++
++	if (copy_from_user(&data, arg, sizeof(data)))
++		return -EFAULT;
++
++	strlcpy(data.name, eng->base.name, sizeof(data.name));
++
++	mutex_lock(&dev->client_lock);
++	ret = adf_obj_copy_custom_data_to_user(&eng->base, arg->custom_data,
++			&data.custom_data_size);
++	mutex_unlock(&dev->client_lock);
++
++	if (ret < 0)
++		return ret;
++
++	if (copy_to_user(arg, &data, sizeof(data)))
++		return -EFAULT;
++
++	return 0;
++}
++
++static int adf_buffer_import(struct adf_device *dev,
++		struct adf_buffer_config __user *cfg, struct adf_buffer *buf)
++{
++	struct adf_buffer_config user_buf;
++	size_t i;
++	int ret = 0;
++
++	if (copy_from_user(&user_buf, cfg, sizeof(user_buf)))
++		return -EFAULT;
++
++	memset(buf, 0, sizeof(*buf));
++
++	if (user_buf.n_planes > ADF_MAX_PLANES) {
++		dev_err(&dev->base.dev, "invalid plane count %u\n",
++				user_buf.n_planes);
++		return -EINVAL;
++	}
++
++	buf->overlay_engine = idr_find(&dev->overlay_engines,
++			user_buf.overlay_engine);
++	if (!buf->overlay_engine) {
++		dev_err(&dev->base.dev, "invalid overlay engine id %u\n",
++				user_buf.overlay_engine);
++		return -ENOENT;
++	}
++
++	buf->w = user_buf.w;
++	buf->h = user_buf.h;
++	buf->format = user_buf.format;
++	for (i = 0; i < user_buf.n_planes; i++) {
++		buf->dma_bufs[i] = dma_buf_get(user_buf.fd[i]);
++		if (IS_ERR(buf->dma_bufs[i])) {
++			ret = PTR_ERR(buf->dma_bufs[i]);
++			dev_err(&dev->base.dev, "importing dma_buf fd %llu failed: %d\n",
++					user_buf.fd[i], ret);
++			buf->dma_bufs[i] = NULL;
++			goto done;
++		}
++		buf->offset[i] = user_buf.offset[i];
++		buf->pitch[i] = user_buf.pitch[i];
++	}
++	buf->n_planes = user_buf.n_planes;
++
++	if (user_buf.acquire_fence >= 0) {
++		buf->acquire_fence = sync_fence_fdget(user_buf.acquire_fence);
++		if (!buf->acquire_fence) {
++			dev_err(&dev->base.dev, "getting fence fd %lld failed\n",
++					user_buf.acquire_fence);
++			ret = -EINVAL;
++			goto done;
++		}
++	}
++
++done:
++	if (ret < 0)
++		adf_buffer_cleanup(buf);
++	return ret;
++}
++
++static int adf_device_post_config(struct adf_device *dev,
++		struct adf_post_config __user *arg)
++{
++	struct sync_fence *complete_fence;
++	int complete_fence_fd;
++	struct adf_buffer *bufs = NULL;
++	struct adf_interface **intfs = NULL;
++	size_t n_intfs, n_bufs, i;
++	void *custom_data = NULL;
++	size_t custom_data_size;
++	int ret = 0;
++
++	complete_fence_fd = get_unused_fd();
++	if (complete_fence_fd < 0)
++		return complete_fence_fd;
++
++	if (get_user(n_intfs, &arg->n_interfaces)) {
++		ret = -EFAULT;
++		goto err_get_user;
++	}
++
++	if (n_intfs > ADF_MAX_INTERFACES) {
++		ret = -EINVAL;
++		goto err_get_user;
++	}
++
++	if (get_user(n_bufs, &arg->n_bufs)) {
++		ret = -EFAULT;
++		goto err_get_user;
++	}
++
++	if (n_bufs > ADF_MAX_BUFFERS) {
++		ret = -EINVAL;
++		goto err_get_user;
++	}
++
++	if (get_user(custom_data_size, &arg->custom_data_size)) {
++		ret = -EFAULT;
++		goto err_get_user;
++	}
++
++	if (custom_data_size > ADF_MAX_CUSTOM_DATA_SIZE) {
++		ret = -EINVAL;
++		goto err_get_user;
++	}
++
++	if (n_intfs) {
++		intfs = kmalloc(sizeof(intfs[0]) * n_intfs, GFP_KERNEL);
++		if (!intfs) {
++			ret = -ENOMEM;
++			goto err_get_user;
++		}
++	}
++
++	for (i = 0; i < n_intfs; i++) {
++		u32 intf_id;
++		if (get_user(intf_id, &arg->interfaces[i])) {
++			ret = -EFAULT;
++			goto err_get_user;
++		}
++
++		intfs[i] = idr_find(&dev->interfaces, intf_id);
++		if (!intfs[i]) {
++			ret = -EINVAL;
++			goto err_get_user;
++		}
++	}
++
++	if (n_bufs) {
++		bufs = kzalloc(sizeof(bufs[0]) * n_bufs, GFP_KERNEL);
++		if (!bufs) {
++			ret = -ENOMEM;
++			goto err_get_user;
++		}
++	}
++
++	for (i = 0; i < n_bufs; i++) {
++		ret = adf_buffer_import(dev, &arg->bufs[i], &bufs[i]);
++		if (ret < 0) {
++			memset(&bufs[i], 0, sizeof(bufs[i]));
++			goto err_import;
++		}
++	}
++
++	if (custom_data_size) {
++		custom_data = kzalloc(custom_data_size, GFP_KERNEL);
++		if (!custom_data) {
++			ret = -ENOMEM;
++			goto err_import;
++		}
++
++		if (copy_from_user(custom_data, arg->custom_data,
++				custom_data_size)) {
++			ret = -EFAULT;
++			goto err_import;
++		}
++	}
++
++	if (put_user(complete_fence_fd, &arg->complete_fence)) {
++		ret = -EFAULT;
++		goto err_import;
++	}
++
++	complete_fence = adf_device_post_nocopy(dev, intfs, n_intfs, bufs,
++			n_bufs, custom_data, custom_data_size);
++	if (IS_ERR(complete_fence)) {
++		ret = PTR_ERR(complete_fence);
++		goto err_import;
++	}
++
++	sync_fence_install(complete_fence, complete_fence_fd);
++	return 0;
++
++err_import:
++	for (i = 0; i < n_bufs; i++)
++		adf_buffer_cleanup(&bufs[i]);
++
++err_get_user:
++	kfree(custom_data);
++	kfree(bufs);
++	kfree(intfs);
++	put_unused_fd(complete_fence_fd);
++	return ret;
++}
++
++static int adf_copy_attachment_list_to_user(
++		struct adf_attachment_config __user *to, size_t n_to,
++		struct adf_attachment *from, size_t n_from)
++{
++	struct adf_attachment_config *temp;
++	size_t n = min(n_to, n_from);
++	size_t i;
++	int ret = 0;
++
++	if (!n)
++		return 0;
++
++	temp = kzalloc(n * sizeof(temp[0]), GFP_KERNEL);
++	if (!temp)
++		return -ENOMEM;
++
++	for (i = 0; i < n; i++) {
++		temp[i].interface = from[i].interface->base.id;
++		temp[i].overlay_engine = from[i].overlay_engine->base.id;
++	}
++
++	if (copy_to_user(to, temp, n * sizeof(to[0]))) {
++		ret = -EFAULT;
++		goto done;
++	}
++
++done:
++	kfree(temp);
++	return ret;
++}
++
++static int adf_device_get_data(struct adf_device *dev,
++		struct adf_device_data __user *arg)
++{
++	struct adf_device_data data;
++	size_t n_attach;
++	struct adf_attachment *attach = NULL;
++	size_t n_allowed_attach;
++	struct adf_attachment *allowed_attach = NULL;
++	int ret = 0;
++
++	if (copy_from_user(&data, arg, sizeof(data)))
++		return -EFAULT;
++
++	if (data.n_attachments > ADF_MAX_ATTACHMENTS ||
++			data.n_allowed_attachments > ADF_MAX_ATTACHMENTS)
++		return -EINVAL;
++
++	strlcpy(data.name, dev->base.name, sizeof(data.name));
++
++	if (data.n_attachments) {
++		attach = kzalloc(data.n_attachments * sizeof(attach[0]),
++				GFP_KERNEL);
++		if (!attach)
++			return -ENOMEM;
++	}
++	n_attach = adf_device_attachments(dev, attach, data.n_attachments);
++
++	if (data.n_allowed_attachments) {
++		allowed_attach = kzalloc(data.n_allowed_attachments *
++				sizeof(allowed_attach[0]), GFP_KERNEL);
++		if (!allowed_attach) {
++			ret = -ENOMEM;
++			goto done;
++		}
++	}
++	n_allowed_attach = adf_device_attachments_allowed(dev, allowed_attach,
++			data.n_allowed_attachments);
++
++	mutex_lock(&dev->client_lock);
++	ret = adf_obj_copy_custom_data_to_user(&dev->base, arg->custom_data,
++			&data.custom_data_size);
++	mutex_unlock(&dev->client_lock);
++
++	if (ret < 0)
++		goto done;
++
++	ret = adf_copy_attachment_list_to_user(arg->attachments,
++			data.n_attachments, attach, n_attach);
++	if (ret < 0)
++		goto done;
++
++	ret = adf_copy_attachment_list_to_user(arg->allowed_attachments,
++			data.n_allowed_attachments, allowed_attach,
++			n_allowed_attach);
++	if (ret < 0)
++		goto done;
++
++	data.n_attachments = n_attach;
++	data.n_allowed_attachments = n_allowed_attach;
++
++	if (copy_to_user(arg, &data, sizeof(data)))
++		ret = -EFAULT;
++
++done:
++	kfree(allowed_attach);
++	kfree(attach);
++	return ret;
++}
++
++static int adf_device_handle_attachment(struct adf_device *dev,
++		struct adf_attachment_config __user *arg, bool attach)
++{
++	struct adf_attachment_config data;
++	struct adf_overlay_engine *eng;
++	struct adf_interface *intf;
++
++	if (copy_from_user(&data, arg, sizeof(data)))
++		return -EFAULT;
++
++	eng = idr_find(&dev->overlay_engines, data.overlay_engine);
++	if (!eng) {
++		dev_err(&dev->base.dev, "invalid overlay engine id %u\n",
++				data.overlay_engine);
++		return -EINVAL;
++	}
++
++	intf = idr_find(&dev->interfaces, data.interface);
++	if (!intf) {
++		dev_err(&dev->base.dev, "invalid interface id %u\n",
++				data.interface);
++		return -EINVAL;
++	}
++
++	if (attach)
++		return adf_device_attach(dev, eng, intf);
++	else
++		return adf_device_detach(dev, eng, intf);
++}
++
++static int adf_intf_set_mode(struct adf_interface *intf,
++		struct drm_mode_modeinfo __user *arg)
++{
++	struct drm_mode_modeinfo mode;
++
++	if (copy_from_user(&mode, arg, sizeof(mode)))
++		return -EFAULT;
++
++	return adf_interface_set_mode(intf, &mode);
++}
++
++static int adf_intf_get_data(struct adf_interface *intf,
++		struct adf_interface_data __user *arg)
++{
++	struct adf_device *dev = adf_interface_parent(intf);
++	struct adf_interface_data data;
++	struct drm_mode_modeinfo *modelist;
++	size_t modelist_size;
++	int err;
++	int ret = 0;
++	unsigned long flags;
++
++	if (copy_from_user(&data, arg, sizeof(data)))
++		return -EFAULT;
++
++	strlcpy(data.name, intf->base.name, sizeof(data.name));
++
++	data.type = intf->type;
++	data.id = intf->idx;
++
++	err = adf_interface_get_screen_size(intf, &data.width_mm,
++			&data.height_mm);
++	if (err < 0) {
++		data.width_mm = 0;
++		data.height_mm = 0;
++	}
++
++	modelist = kmalloc(sizeof(modelist[0]) * ADF_MAX_MODES, GFP_KERNEL);
++	if (!modelist)
++		return -ENOMEM;
++
++	mutex_lock(&dev->client_lock);
++	read_lock_irqsave(&intf->hotplug_modelist_lock, flags);
++	data.hotplug_detect = intf->hotplug_detect;
++	modelist_size = min(data.n_available_modes, intf->n_modes) *
++			sizeof(intf->modelist[0]);
++	memcpy(modelist, intf->modelist, modelist_size);
++	data.n_available_modes = intf->n_modes;
++	read_unlock_irqrestore(&intf->hotplug_modelist_lock, flags);
++
++	if (copy_to_user(arg->available_modes, modelist, modelist_size)) {
++		ret = -EFAULT;
++		goto done;
++	}
++
++	data.dpms_state = intf->dpms_state;
++	memcpy(&data.current_mode, &intf->current_mode,
++			sizeof(intf->current_mode));
++
++	ret = adf_obj_copy_custom_data_to_user(&intf->base, arg->custom_data,
++			&data.custom_data_size);
++done:
++	mutex_unlock(&dev->client_lock);
++	kfree(modelist);
++
++	if (ret < 0)
++		return ret;
++
++	if (copy_to_user(arg, &data, sizeof(data)))
++		ret = -EFAULT;
++
++	return ret;
++}
++
++static inline long adf_obj_custom_ioctl(struct adf_obj *obj, unsigned int cmd,
++		unsigned long arg)
++{
++	if (obj->ops && obj->ops->ioctl)
++		return obj->ops->ioctl(obj, cmd, arg);
++	return -ENOTTY;
++}
++
++static long adf_overlay_engine_ioctl(struct adf_overlay_engine *eng,
++		struct adf_file *file, unsigned int cmd, unsigned long arg)
++{
++	switch (cmd) {
++	case ADF_SET_EVENT:
++		return adf_obj_set_event(&eng->base, file,
++				(struct adf_set_event __user *)arg);
++
++	case ADF_GET_OVERLAY_ENGINE_DATA:
++		return adf_eng_get_data(eng,
++			(struct adf_overlay_engine_data __user *)arg);
++
++	case ADF_BLANK:
++	case ADF_POST_CONFIG:
++	case ADF_SET_MODE:
++	case ADF_GET_DEVICE_DATA:
++	case ADF_GET_INTERFACE_DATA:
++	case ADF_ATTACH:
++	case ADF_DETACH:
++		return -EINVAL;
++
++	default:
++		return adf_obj_custom_ioctl(&eng->base, cmd, arg);
++	}
++}
++
++static long adf_interface_ioctl(struct adf_interface *intf,
++		struct adf_file *file, unsigned int cmd, unsigned long arg)
++{
++	switch (cmd) {
++	case ADF_SET_EVENT:
++		return adf_obj_set_event(&intf->base, file,
++				(struct adf_set_event __user *)arg);
++
++	case ADF_BLANK:
++		return adf_interface_blank(intf, arg);
++
++	case ADF_SET_MODE:
++		return adf_intf_set_mode(intf,
++				(struct drm_mode_modeinfo __user *)arg);
++
++	case ADF_GET_INTERFACE_DATA:
++		return adf_intf_get_data(intf,
++				(struct adf_interface_data __user *)arg);
++
++	case ADF_POST_CONFIG:
++	case ADF_GET_DEVICE_DATA:
++	case ADF_GET_OVERLAY_ENGINE_DATA:
++	case ADF_ATTACH:
++	case ADF_DETACH:
++		return -EINVAL;
++
++	default:
++		return adf_obj_custom_ioctl(&intf->base, cmd, arg);
++	}
++}
++
++static long adf_device_ioctl(struct adf_device *dev, struct adf_file *file,
++		unsigned int cmd, unsigned long arg)
++{
++	switch (cmd) {
++	case ADF_SET_EVENT:
++		return adf_obj_set_event(&dev->base, file,
++				(struct adf_set_event __user *)arg);
++
++	case ADF_POST_CONFIG:
++		return adf_device_post_config(dev,
++				(struct adf_post_config __user *)arg);
++
++	case ADF_GET_DEVICE_DATA:
++		return adf_device_get_data(dev,
++				(struct adf_device_data __user *)arg);
++
++	case ADF_ATTACH:
++		return adf_device_handle_attachment(dev,
++				(struct adf_attachment_config __user *)arg,
++				true);
++
++	case ADF_DETACH:
++		return adf_device_handle_attachment(dev,
++				(struct adf_attachment_config __user *)arg,
++				false);
++
++	case ADF_BLANK:
++	case ADF_SET_MODE:
++	case ADF_GET_INTERFACE_DATA:
++	case ADF_GET_OVERLAY_ENGINE_DATA:
++		return -EINVAL;
++
++	default:
++		return adf_obj_custom_ioctl(&dev->base, cmd, arg);
++	}
++}
++
++static int adf_file_open(struct inode *inode, struct file *file)
++{
++	struct adf_obj *obj;
++	struct adf_file *fpriv = NULL;
++	unsigned long flags;
++	int ret = 0;
++
++	obj = adf_obj_sysfs_find(iminor(inode));
++	if (!obj)
++		return -ENODEV;
++
++	dev_dbg(&obj->dev, "opening %s\n", dev_name(&obj->dev));
++
++	if (!try_module_get(obj->parent->ops->owner)) {
++		dev_err(&obj->dev, "getting owner module failed\n");
++		return -ENODEV;
++	}
++
++	fpriv = kzalloc(sizeof(*fpriv), GFP_KERNEL);
++	if (!fpriv) {
++		ret = -ENOMEM;
++		goto done;
++	}
++
++	INIT_LIST_HEAD(&fpriv->head);
++	fpriv->obj = obj;
++	init_waitqueue_head(&fpriv->event_wait);
++
++	file->private_data = fpriv;
++
++	if (obj->ops && obj->ops->open) {
++		ret = obj->ops->open(obj, inode, file);
++		if (ret < 0)
++			goto done;
++	}
++
++	spin_lock_irqsave(&obj->file_lock, flags);
++	list_add_tail(&fpriv->head, &obj->file_list);
++	spin_unlock_irqrestore(&obj->file_lock, flags);
++
++done:
++	if (ret < 0) {
++		kfree(fpriv);
++		module_put(obj->parent->ops->owner);
++	}
++	return ret;
++}
++
++static int adf_file_release(struct inode *inode, struct file *file)
++{
++	struct adf_file *fpriv = file->private_data;
++	struct adf_obj *obj = fpriv->obj;
++	enum adf_event_type event_type;
++	unsigned long flags;
++
++	if (obj->ops && obj->ops->release)
++		obj->ops->release(obj, inode, file);
++
++	spin_lock_irqsave(&obj->file_lock, flags);
++	list_del(&fpriv->head);
++	spin_unlock_irqrestore(&obj->file_lock, flags);
++
++	for_each_set_bit(event_type, fpriv->event_subscriptions,
++			ADF_EVENT_TYPE_MAX) {
++		adf_event_put(obj, event_type);
++	}
++
++	kfree(fpriv);
++	module_put(obj->parent->ops->owner);
++
++	dev_dbg(&obj->dev, "released %s\n", dev_name(&obj->dev));
++	return 0;
++}
++
++long adf_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct adf_file *fpriv = file->private_data;
++	struct adf_obj *obj = fpriv->obj;
++	long ret = -EINVAL;
++
++	dev_dbg(&obj->dev, "%s ioctl %u\n", dev_name(&obj->dev), _IOC_NR(cmd));
++
++	switch (obj->type) {
++	case ADF_OBJ_OVERLAY_ENGINE:
++		ret = adf_overlay_engine_ioctl(adf_obj_to_overlay_engine(obj),
++				fpriv, cmd, arg);
++		break;
++
++	case ADF_OBJ_INTERFACE:
++		ret = adf_interface_ioctl(adf_obj_to_interface(obj), fpriv, cmd,
++				arg);
++		break;
++
++	case ADF_OBJ_DEVICE:
++		ret = adf_device_ioctl(adf_obj_to_device(obj), fpriv, cmd, arg);
++		break;
++	}
++
++	return ret;
++}
++
++static inline bool adf_file_event_available(struct adf_file *fpriv)
++{
++	int head = fpriv->event_head;
++	int tail = fpriv->event_tail;
++	return CIRC_CNT(head, tail, sizeof(fpriv->event_buf)) != 0;
++}
++
++void adf_file_queue_event(struct adf_file *fpriv, struct adf_event *event)
++{
++	int head = fpriv->event_head;
++	int tail = fpriv->event_tail;
++	size_t space = CIRC_SPACE(head, tail, sizeof(fpriv->event_buf));
++	size_t space_to_end =
++			CIRC_SPACE_TO_END(head, tail, sizeof(fpriv->event_buf));
++
++	if (space < event->length) {
++		dev_dbg(&fpriv->obj->dev,
++				"insufficient buffer space for event %u\n",
++				event->type);
++		return;
++	}
++
++	if (space_to_end >= event->length) {
++		memcpy(fpriv->event_buf + head, event, event->length);
++	} else {
++		memcpy(fpriv->event_buf + head, event, space_to_end);
++		memcpy(fpriv->event_buf, (u8 *)event + space_to_end,
++				event->length - space_to_end);
++	}
++
++	smp_wmb();
++	fpriv->event_head = (fpriv->event_head + event->length) &
++			(sizeof(fpriv->event_buf) - 1);
++	wake_up_interruptible_all(&fpriv->event_wait);
++}
++
++static ssize_t adf_file_copy_to_user(struct adf_file *fpriv,
++		char __user *buffer, size_t buffer_size)
++{
++	int head, tail;
++	u8 *event_buf;
++	size_t cnt, cnt_to_end, copy_size = 0;
++	ssize_t ret = 0;
++	unsigned long flags;
++
++	event_buf = kmalloc(min(buffer_size, sizeof(fpriv->event_buf)),
++			GFP_KERNEL);
++	if (!event_buf)
++		return -ENOMEM;
++
++	spin_lock_irqsave(&fpriv->obj->file_lock, flags);
++
++	if (!adf_file_event_available(fpriv))
++		goto out;
++
++	head = fpriv->event_head;
++	tail = fpriv->event_tail;
++
++	cnt = CIRC_CNT(head, tail, sizeof(fpriv->event_buf));
++	cnt_to_end = CIRC_CNT_TO_END(head, tail, sizeof(fpriv->event_buf));
++	copy_size = min(buffer_size, cnt);
++
++	if (cnt_to_end >= copy_size) {
++		memcpy(event_buf, fpriv->event_buf + tail, copy_size);
++	} else {
++		memcpy(event_buf, fpriv->event_buf + tail, cnt_to_end);
++		memcpy(event_buf + cnt_to_end, fpriv->event_buf,
++				copy_size - cnt_to_end);
++	}
++
++	fpriv->event_tail = (fpriv->event_tail + copy_size) &
++			(sizeof(fpriv->event_buf) - 1);
++
++out:
++	spin_unlock_irqrestore(&fpriv->obj->file_lock, flags);
++	if (copy_size) {
++		if (copy_to_user(buffer, event_buf, copy_size))
++			ret = -EFAULT;
++		else
++			ret = copy_size;
++	}
++	kfree(event_buf);
++	return ret;
++}
++
++ssize_t adf_file_read(struct file *filp, char __user *buffer,
++		 size_t count, loff_t *offset)
++{
++	struct adf_file *fpriv = filp->private_data;
++	int err;
++
++	err = wait_event_interruptible(fpriv->event_wait,
++			adf_file_event_available(fpriv));
++	if (err < 0)
++		return err;
++
++	return adf_file_copy_to_user(fpriv, buffer, count);
++}
++
++unsigned int adf_file_poll(struct file *filp, struct poll_table_struct *wait)
++{
++	struct adf_file *fpriv = filp->private_data;
++	unsigned int mask = 0;
++
++	poll_wait(filp, &fpriv->event_wait, wait);
++
++	if (adf_file_event_available(fpriv))
++		mask |= POLLIN | POLLRDNORM;
++
++	return mask;
++}
++
++const struct file_operations adf_fops = {
++	.owner = THIS_MODULE,
++	.unlocked_ioctl = adf_file_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = adf_file_compat_ioctl,
++#endif
++	.open = adf_file_open,
++	.release = adf_file_release,
++	.llseek = default_llseek,
++	.read = adf_file_read,
++	.poll = adf_file_poll,
++};
+diff --git a/drivers/video/adf/adf_fops.h b/drivers/video/adf/adf_fops.h
+new file mode 100644
+index 0000000..90a3a74
+--- /dev/null
++++ b/drivers/video/adf/adf_fops.h
+@@ -0,0 +1,37 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __VIDEO_ADF_ADF_FOPS_H
++#define __VIDEO_ADF_ADF_FOPS_H
++
++#include <linux/bitmap.h>
++#include <linux/fs.h>
++
++extern const struct file_operations adf_fops;
++
++struct adf_file {
++	struct list_head head;
++	struct adf_obj *obj;
++
++	DECLARE_BITMAP(event_subscriptions, ADF_EVENT_TYPE_MAX);
++	u8 event_buf[4096];
++	int event_head;
++	int event_tail;
++	wait_queue_head_t event_wait;
++};
++
++void adf_file_queue_event(struct adf_file *file, struct adf_event *event);
++long adf_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
++
++#endif /* __VIDEO_ADF_ADF_FOPS_H */
+diff --git a/drivers/video/adf/adf_fops32.c b/drivers/video/adf/adf_fops32.c
+new file mode 100644
+index 0000000..a7d5381
+--- /dev/null
++++ b/drivers/video/adf/adf_fops32.c
+@@ -0,0 +1,208 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/uaccess.h>
++#include <video/adf.h>
++
++#include "adf_fops.h"
++#include "adf_fops32.h"
++
++long adf_compat_post_config(struct file *file,
++		struct adf_post_config32 __user *arg)
++{
++	struct adf_post_config32 cfg32;
++	struct adf_post_config __user *cfg;
++	int ret;
++
++	if (copy_from_user(&cfg32, arg, sizeof(cfg32)))
++		return -EFAULT;
++
++	cfg = compat_alloc_user_space(sizeof(*cfg));
++	if (!access_ok(VERIFY_WRITE, cfg, sizeof(*cfg)))
++		return -EFAULT;
++
++	if (put_user(cfg32.n_interfaces, &cfg->n_interfaces) ||
++			put_user(compat_ptr(cfg32.interfaces),
++					&cfg->interfaces) ||
++			put_user(cfg32.n_bufs, &cfg->n_bufs) ||
++			put_user(compat_ptr(cfg32.bufs), &cfg->bufs) ||
++			put_user(cfg32.custom_data_size,
++					&cfg->custom_data_size) ||
++			put_user(compat_ptr(cfg32.custom_data),
++					&cfg->custom_data))
++		return -EFAULT;
++
++	ret = adf_file_ioctl(file, ADF_POST_CONFIG, (unsigned long)cfg);
++	if (ret < 0)
++		return ret;
++
++	if (copy_in_user(&arg->complete_fence, &cfg->complete_fence,
++			sizeof(cfg->complete_fence)))
++		return -EFAULT;
++
++	return 0;
++}
++
++long adf_compat_get_device_data(struct file *file,
++		struct adf_device_data32 __user *arg)
++{
++	struct adf_device_data32 data32;
++	struct adf_device_data __user *data;
++	int ret;
++
++	if (copy_from_user(&data32, arg, sizeof(data32)))
++		return -EFAULT;
++
++	data = compat_alloc_user_space(sizeof(*data));
++	if (!access_ok(VERIFY_WRITE, data, sizeof(*data)))
++		return -EFAULT;
++
++	if (put_user(data32.n_attachments, &data->n_attachments) ||
++			put_user(compat_ptr(data32.attachments),
++					&data->attachments) ||
++			put_user(data32.n_allowed_attachments,
++					&data->n_allowed_attachments) ||
++			put_user(compat_ptr(data32.allowed_attachments),
++					&data->allowed_attachments) ||
++			put_user(data32.custom_data_size,
++					&data->custom_data_size) ||
++			put_user(compat_ptr(data32.custom_data),
++					&data->custom_data))
++		return -EFAULT;
++
++	ret = adf_file_ioctl(file, ADF_GET_DEVICE_DATA32, (unsigned long)data);
++	if (ret < 0)
++		return ret;
++
++	if (copy_in_user(arg->name, data->name, sizeof(arg->name)) ||
++			copy_in_user(&arg->n_attachments, &data->n_attachments,
++					sizeof(arg->n_attachments)) ||
++			copy_in_user(&arg->n_allowed_attachments,
++					&data->n_allowed_attachments,
++					sizeof(arg->n_allowed_attachments)) ||
++			copy_in_user(&arg->custom_data_size,
++					&data->custom_data_size,
++					sizeof(arg->custom_data_size)))
++		return -EFAULT;
++
++	return 0;
++}
++
++long adf_compat_get_interface_data(struct file *file,
++		struct adf_interface_data32 __user *arg)
++{
++	struct adf_interface_data32 data32;
++	struct adf_interface_data __user *data;
++	int ret;
++
++	if (copy_from_user(&data32, arg, sizeof(data32)))
++		return -EFAULT;
++
++	data = compat_alloc_user_space(sizeof(*data));
++	if (!access_ok(VERIFY_WRITE, data, sizeof(*data)))
++		return -EFAULT;
++
++	if (put_user(data32.n_available_modes, &data->n_available_modes) ||
++			put_user(compat_ptr(data32.available_modes),
++					&data->available_modes) ||
++			put_user(data32.custom_data_size,
++					&data->custom_data_size) ||
++			put_user(compat_ptr(data32.custom_data),
++					&data->custom_data))
++		return -EFAULT;
++
++	ret = adf_file_ioctl(file, ADF_GET_DEVICE_DATA32, (unsigned long)data);
++	if (ret < 0)
++		return ret;
++
++	if (copy_in_user(arg->name, data->name, sizeof(arg->name)) ||
++			copy_in_user(&arg->type, &data->type,
++					sizeof(arg->type)) ||
++			copy_in_user(&arg->id, &data->id, sizeof(arg->id)) ||
++			copy_in_user(&arg->dpms_state, &data->dpms_state,
++					sizeof(arg->dpms_state)) ||
++			copy_in_user(&arg->hotplug_detect,
++					&data->hotplug_detect,
++					sizeof(arg->hotplug_detect)) ||
++			copy_in_user(&arg->width_mm, &data->width_mm,
++					sizeof(arg->width_mm)) ||
++			copy_in_user(&arg->height_mm, &data->height_mm,
++					sizeof(arg->height_mm)) ||
++			copy_in_user(&arg->current_mode, &data->current_mode,
++					sizeof(arg->current_mode)) ||
++			copy_in_user(&arg->n_available_modes,
++					&data->n_available_modes,
++					sizeof(arg->n_available_modes)) ||
++			copy_in_user(&arg->custom_data_size,
++					&data->custom_data_size,
++					sizeof(arg->custom_data_size)))
++		return -EFAULT;
++
++	return 0;
++}
++
++long adf_compat_get_overlay_engine_data(struct file *file,
++		struct adf_overlay_engine_data32 __user *arg)
++{
++	struct adf_overlay_engine_data32 data32;
++	struct adf_overlay_engine_data __user *data;
++	int ret;
++
++	if (copy_from_user(&data32, arg, sizeof(data32)))
++		return -EFAULT;
++
++	data = compat_alloc_user_space(sizeof(*data));
++	if (!access_ok(VERIFY_WRITE, data, sizeof(*data)))
++		return -EFAULT;
++
++	if (put_user(data32.custom_data_size, &data->custom_data_size) ||
++			put_user(compat_ptr(data32.custom_data),
++					&data->custom_data))
++		return -EFAULT;
++
++	ret = adf_file_ioctl(file, ADF_GET_OVERLAY_ENGINE_DATA,
++			(unsigned long)data);
++	if (ret < 0)
++		return ret;
++
++	if (copy_in_user(arg->name, data->name, sizeof(arg->name)) ||
++			copy_in_user(&arg->custom_data_size,
++					&data->custom_data_size,
++					sizeof(arg->custom_data_size)))
++		return -EFAULT;
++
++	return 0;
++}
++
++long adf_file_compat_ioctl(struct file *file, unsigned int cmd,
++		unsigned long arg)
++{
++	switch (cmd) {
++	case ADF_POST_CONFIG32:
++		return adf_compat_post_config(file, compat_ptr(arg));
++
++	case ADF_GET_DEVICE_DATA32:
++		return adf_compat_get_device_data(file, compat_ptr(arg));
++
++	case ADF_GET_INTERFACE_DATA32:
++		return adf_compat_get_interface_data(file, compat_ptr(arg));
++
++	case ADF_GET_OVERLAY_ENGINE_DATA32:
++		return adf_compat_get_overlay_engine_data(file,
++				compat_ptr(arg));
++
++	default:
++		return adf_file_ioctl(file, cmd, arg);
++	}
++}
+diff --git a/drivers/video/adf/adf_fops32.h b/drivers/video/adf/adf_fops32.h
+new file mode 100644
+index 0000000..c3e9c22
+--- /dev/null
++++ b/drivers/video/adf/adf_fops32.h
+@@ -0,0 +1,74 @@
++#ifndef __VIDEO_ADF_ADF_FOPS32_H
++#define __VIDEO_ADF_ADF_FOPS32_H
++
++#include <linux/compat.h>
++#include <linux/ioctl.h>
++
++#include <video/adf.h>
++
++#define ADF_POST_CONFIG32 \
++			_IOW('D', 2, struct adf_post_config32)
++#define ADF_GET_DEVICE_DATA32 \
++			_IOR('D', 4, struct adf_device_data32)
++#define ADF_GET_INTERFACE_DATA32 \
++			_IOR('D', 5, struct adf_interface_data32)
++#define ADF_GET_OVERLAY_ENGINE_DATA32 \
++			_IOR('D', 6, struct adf_overlay_engine_data32)
++
++struct adf_post_config32 {
++	compat_size_t n_interfaces;
++	compat_uptr_t interfaces;
++
++	compat_size_t n_bufs;
++	compat_uptr_t bufs;
++
++	compat_size_t custom_data_size;
++	compat_uptr_t custom_data;
++
++	__s64 complete_fence;
++};
++
++struct adf_device_data32 {
++	char name[ADF_NAME_LEN];
++
++	compat_size_t n_attachments;
++	compat_uptr_t attachments;
++
++	compat_size_t n_allowed_attachments;
++	compat_uptr_t allowed_attachments;
++
++	compat_size_t custom_data_size;
++	compat_uptr_t custom_data;
++};
++
++struct adf_interface_data32 {
++	char name[ADF_NAME_LEN];
++
++	__u8 type;
++	__u32 id;
++	/* e.g. type=ADF_INTF_TYPE_DSI, id=1 => DSI.1 */
++
++	__u8 dpms_state;
++	__u8 hotplug_detect;
++	__u16 width_mm;
++	__u16 height_mm;
++
++	struct drm_mode_modeinfo current_mode;
++	compat_size_t n_available_modes;
++	compat_uptr_t available_modes;
++
++	compat_size_t custom_data_size;
++	compat_uptr_t custom_data;
++};
++
++struct adf_overlay_engine_data32 {
++	char name[ADF_NAME_LEN];
++
++	compat_size_t custom_data_size;
++	compat_uptr_t custom_data;
++};
++
++long adf_file_compat_ioctl(struct file *file, unsigned int cmd,
++		unsigned long arg);
++
++#endif /* __VIDEO_ADF_ADF_FOPS32_H */
+diff --git a/drivers/video/adf/adf_format.c b/drivers/video/adf/adf_format.c
+new file mode 100644
+index 0000000..e3f22c7
+--- /dev/null
++++ b/drivers/video/adf/adf_format.c
+@@ -0,0 +1,280 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ * modified from drivers/gpu/drm/drm_crtc.c
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/export.h>
++#include <linux/kernel.h>
++#include <drm/drm_fourcc.h>
++#include <video/adf_format.h>
++
++bool adf_format_is_standard(u32 format)
++{
++	switch (format) {
++	case DRM_FORMAT_C8:
++	case DRM_FORMAT_RGB332:
++	case DRM_FORMAT_BGR233:
++	case DRM_FORMAT_XRGB4444:
++	case DRM_FORMAT_XBGR4444:
++	case DRM_FORMAT_RGBX4444:
++	case DRM_FORMAT_BGRX4444:
++	case DRM_FORMAT_ARGB4444:
++	case DRM_FORMAT_ABGR4444:
++	case DRM_FORMAT_RGBA4444:
++	case DRM_FORMAT_BGRA4444:
++	case DRM_FORMAT_XRGB1555:
++	case DRM_FORMAT_XBGR1555:
++	case DRM_FORMAT_RGBX5551:
++	case DRM_FORMAT_BGRX5551:
++	case DRM_FORMAT_ARGB1555:
++	case DRM_FORMAT_ABGR1555:
++	case DRM_FORMAT_RGBA5551:
++	case DRM_FORMAT_BGRA5551:
++	case DRM_FORMAT_RGB565:
++	case DRM_FORMAT_BGR565:
++	case DRM_FORMAT_RGB888:
++	case DRM_FORMAT_BGR888:
++	case DRM_FORMAT_XRGB8888:
++	case DRM_FORMAT_XBGR8888:
++	case DRM_FORMAT_RGBX8888:
++	case DRM_FORMAT_BGRX8888:
++	case DRM_FORMAT_ARGB8888:
++	case DRM_FORMAT_ABGR8888:
++	case DRM_FORMAT_RGBA8888:
++	case DRM_FORMAT_BGRA8888:
++	case DRM_FORMAT_XRGB2101010:
++	case DRM_FORMAT_XBGR2101010:
++	case DRM_FORMAT_RGBX1010102:
++	case DRM_FORMAT_BGRX1010102:
++	case DRM_FORMAT_ARGB2101010:
++	case DRM_FORMAT_ABGR2101010:
++	case DRM_FORMAT_RGBA1010102:
++	case DRM_FORMAT_BGRA1010102:
++	case DRM_FORMAT_YUYV:
++	case DRM_FORMAT_YVYU:
++	case DRM_FORMAT_UYVY:
++	case DRM_FORMAT_VYUY:
++	case DRM_FORMAT_AYUV:
++	case DRM_FORMAT_NV12:
++	case DRM_FORMAT_NV21:
++	case DRM_FORMAT_NV16:
++	case DRM_FORMAT_NV61:
++	case DRM_FORMAT_YUV410:
++	case DRM_FORMAT_YVU410:
++	case DRM_FORMAT_YUV411:
++	case DRM_FORMAT_YVU411:
++	case DRM_FORMAT_YUV420:
++	case DRM_FORMAT_YVU420:
++	case DRM_FORMAT_YUV422:
++	case DRM_FORMAT_YVU422:
++	case DRM_FORMAT_YUV444:
++	case DRM_FORMAT_YVU444:
++		return true;
++	default:
++		return false;
++	}
++}
++EXPORT_SYMBOL(adf_format_is_standard);
++
++bool adf_format_is_rgb(u32 format)
++{
++	switch (format) {
++	case DRM_FORMAT_C8:
++	case DRM_FORMAT_RGB332:
++	case DRM_FORMAT_BGR233:
++	case DRM_FORMAT_XRGB1555:
++	case DRM_FORMAT_XBGR1555:
++	case DRM_FORMAT_RGBX5551:
++	case DRM_FORMAT_BGRX5551:
++	case DRM_FORMAT_ARGB1555:
++	case DRM_FORMAT_ABGR1555:
++	case DRM_FORMAT_RGBA5551:
++	case DRM_FORMAT_BGRA5551:
++	case DRM_FORMAT_RGB565:
++	case DRM_FORMAT_BGR565:
++	case DRM_FORMAT_RGB888:
++	case DRM_FORMAT_BGR888:
++	case DRM_FORMAT_XRGB8888:
++	case DRM_FORMAT_XBGR8888:
++	case DRM_FORMAT_RGBX8888:
++	case DRM_FORMAT_BGRX8888:
++	case DRM_FORMAT_XRGB2101010:
++	case DRM_FORMAT_XBGR2101010:
++	case DRM_FORMAT_RGBX1010102:
++	case DRM_FORMAT_BGRX1010102:
++	case DRM_FORMAT_ARGB2101010:
++	case DRM_FORMAT_ABGR2101010:
++	case DRM_FORMAT_RGBA1010102:
++	case DRM_FORMAT_BGRA1010102:
++	case DRM_FORMAT_ARGB8888:
++	case DRM_FORMAT_ABGR8888:
++	case DRM_FORMAT_RGBA8888:
++	case DRM_FORMAT_BGRA8888:
++		return true;
++
++	default:
++		return false;
++	}
++}
++EXPORT_SYMBOL(adf_format_is_rgb);
++
++u8 adf_format_num_planes(u32 format)
++{
++	switch (format) {
++	case DRM_FORMAT_YUV410:
++	case DRM_FORMAT_YVU410:
++	case DRM_FORMAT_YUV411:
++	case DRM_FORMAT_YVU411:
++	case DRM_FORMAT_YUV420:
++	case DRM_FORMAT_YVU420:
++	case DRM_FORMAT_YUV422:
++	case DRM_FORMAT_YVU422:
++	case DRM_FORMAT_YUV444:
++	case DRM_FORMAT_YVU444:
++		return 3;
++	case DRM_FORMAT_NV12:
++	case DRM_FORMAT_NV21:
++	case DRM_FORMAT_NV16:
++	case DRM_FORMAT_NV61:
++		return 2;
++	default:
++		return 1;
++	}
++}
++EXPORT_SYMBOL(adf_format_num_planes);
++
++u8 adf_format_bpp(u32 format)
++{
++	switch (format) {
++	case DRM_FORMAT_C8:
++	case DRM_FORMAT_RGB332:
++	case DRM_FORMAT_BGR233:
++		return 8;
++
++	case DRM_FORMAT_XRGB1555:
++	case DRM_FORMAT_XBGR1555:
++	case DRM_FORMAT_RGBX5551:
++	case DRM_FORMAT_BGRX5551:
++	case DRM_FORMAT_ARGB1555:
++	case DRM_FORMAT_ABGR1555:
++	case DRM_FORMAT_RGBA5551:
++	case DRM_FORMAT_BGRA5551:
++	case DRM_FORMAT_RGB565:
++	case DRM_FORMAT_BGR565:
++		return 16;
++
++	case DRM_FORMAT_RGB888:
++	case DRM_FORMAT_BGR888:
++		return 24;
++
++	case DRM_FORMAT_XRGB8888:
++	case DRM_FORMAT_XBGR8888:
++	case DRM_FORMAT_RGBX8888:
++	case DRM_FORMAT_BGRX8888:
++	case DRM_FORMAT_XRGB2101010:
++	case DRM_FORMAT_XBGR2101010:
++	case DRM_FORMAT_RGBX1010102:
++	case DRM_FORMAT_BGRX1010102:
++	case DRM_FORMAT_ARGB2101010:
++	case DRM_FORMAT_ABGR2101010:
++	case DRM_FORMAT_RGBA1010102:
++	case DRM_FORMAT_BGRA1010102:
++	case DRM_FORMAT_ARGB8888:
++	case DRM_FORMAT_ABGR8888:
++	case DRM_FORMAT_RGBA8888:
++	case DRM_FORMAT_BGRA8888:
++		return 32;
++
++	default:
++		pr_debug("%s: unsupported pixel format %u\n", __func__, format);
++		return 0;
++	}
++}
++EXPORT_SYMBOL(adf_format_bpp);
++
++u8 adf_format_plane_cpp(u32 format, int plane)
++{
++	if (plane >= adf_format_num_planes(format))
++		return 0;
++
++	switch (format) {
++	case DRM_FORMAT_YUYV:
++	case DRM_FORMAT_YVYU:
++	case DRM_FORMAT_UYVY:
++	case DRM_FORMAT_VYUY:
++		return 2;
++	case DRM_FORMAT_NV12:
++	case DRM_FORMAT_NV21:
++	case DRM_FORMAT_NV16:
++	case DRM_FORMAT_NV61:
++		return plane ? 2 : 1;
++	case DRM_FORMAT_YUV410:
++	case DRM_FORMAT_YVU410:
++	case DRM_FORMAT_YUV411:
++	case DRM_FORMAT_YVU411:
++	case DRM_FORMAT_YUV420:
++	case DRM_FORMAT_YVU420:
++	case DRM_FORMAT_YUV422:
++	case DRM_FORMAT_YVU422:
++	case DRM_FORMAT_YUV444:
++	case DRM_FORMAT_YVU444:
++		return 1;
++	default:
++		return adf_format_bpp(format) / 8;
++	}
++}
++EXPORT_SYMBOL(adf_format_plane_cpp);
++
++u8 adf_format_horz_chroma_subsampling(u32 format)
++{
++	switch (format) {
++	case DRM_FORMAT_YUV411:
++	case DRM_FORMAT_YVU411:
++	case DRM_FORMAT_YUV410:
++	case DRM_FORMAT_YVU410:
++		return 4;
++	case DRM_FORMAT_YUYV:
++	case DRM_FORMAT_YVYU:
++	case DRM_FORMAT_UYVY:
++	case DRM_FORMAT_VYUY:
++	case DRM_FORMAT_NV12:
++	case DRM_FORMAT_NV21:
++	case DRM_FORMAT_NV16:
++	case DRM_FORMAT_NV61:
++	case DRM_FORMAT_YUV422:
++	case DRM_FORMAT_YVU422:
++	case DRM_FORMAT_YUV420:
++	case DRM_FORMAT_YVU420:
++		return 2;
++	default:
++		return 1;
++	}
++}
++EXPORT_SYMBOL(adf_format_horz_chroma_subsampling);
++
++u8 adf_format_vert_chroma_subsampling(u32 format)
++{
++	switch (format) {
++	case DRM_FORMAT_YUV410:
++	case DRM_FORMAT_YVU410:
++		return 4;
++	case DRM_FORMAT_YUV420:
++	case DRM_FORMAT_YVU420:
++	case DRM_FORMAT_NV12:
++	case DRM_FORMAT_NV21:
++		return 2;
++	default:
++		return 1;
++	}
++}
++EXPORT_SYMBOL(adf_format_vert_chroma_subsampling);
+diff --git a/drivers/video/adf/adf_sysfs.c b/drivers/video/adf/adf_sysfs.c
+new file mode 100644
+index 0000000..567c559
+--- /dev/null
++++ b/drivers/video/adf/adf_sysfs.c
+@@ -0,0 +1,284 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <video/adf_client.h>
++
++#include "adf.h"
++#include "adf_fops.h"
++#include "adf_sysfs.h"
++
++static struct class *adf_class;
++static int adf_major;
++static DEFINE_IDR(adf_minors);
++
++#define dev_to_adf_interface(p) \
++	adf_obj_to_interface(container_of(p, struct adf_obj, dev))
++
++static ssize_t dpms_state_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct adf_interface *intf = dev_to_adf_interface(dev);
++	return scnprintf(buf, PAGE_SIZE, "%u\n",
++			adf_interface_dpms_state(intf));
++}
++
++static ssize_t current_mode_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct adf_interface *intf = dev_to_adf_interface(dev);
++	struct drm_mode_modeinfo mode;
++
++	adf_interface_current_mode(intf, &mode);
++
++	if (mode.name[0]) {
++		return scnprintf(buf, PAGE_SIZE, "%s\n", mode.name);
++	} else {
++		bool interlaced = !!(mode.flags & DRM_MODE_FLAG_INTERLACE);
++		return scnprintf(buf, PAGE_SIZE, "%ux%u%s\n", mode.hdisplay,
++				mode.vdisplay, interlaced ? "i" : "");
++	}
++}
++
++static ssize_t type_show(struct device *dev, struct device_attribute *attr,
++			char *buf)
++{
++	struct adf_interface *intf = dev_to_adf_interface(dev);
++	return scnprintf(buf, PAGE_SIZE, "%s\n",
++			adf_interface_type_str(intf));
++}
++
++static ssize_t vsync_timestamp_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct adf_interface *intf = dev_to_adf_interface(dev);
++	ktime_t timestamp;
++	unsigned long flags;
++
++	read_lock_irqsave(&intf->vsync_lock, flags);
++	memcpy(&timestamp, &intf->vsync_timestamp, sizeof(timestamp));
++	read_unlock_irqrestore(&intf->vsync_lock, flags);
++
++	return scnprintf(buf, PAGE_SIZE, "%llu\n", ktime_to_ns(timestamp));
++}
++
++static ssize_t hotplug_detect_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct adf_interface *intf = dev_to_adf_interface(dev);
++	return scnprintf(buf, PAGE_SIZE, "%u\n", intf->hotplug_detect);
++}
++
++static struct device_attribute adf_interface_attrs[] = {
++	__ATTR_RO(dpms_state),
++	__ATTR_RO(current_mode),
++	__ATTR_RO(hotplug_detect),
++	__ATTR_RO(type),
++	__ATTR_RO(vsync_timestamp),
++};
++
++static char *adf_devnode(struct device *dev, umode_t *mode)
++{
++	return kasprintf(GFP_KERNEL, "adf/%s", dev_name(dev));
++}
++
++int adf_obj_sysfs_init(struct adf_obj *obj, struct device *parent)
++{
++	int ret = idr_alloc(&adf_minors, obj, 0, 0, GFP_KERNEL);
++	if (ret < 0) {
++		pr_err("%s: allocating adf minor failed: %d\n", __func__,
++				ret);
++		return ret;
++	}
++
++	obj->minor = ret;
++	obj->dev.parent = parent;
++	obj->dev.class = adf_class;
++	obj->dev.devt = MKDEV(adf_major, obj->minor);
++
++	ret = device_register(&obj->dev);
++	if (ret < 0) {
++		pr_err("%s: registering adf object failed: %d\n", __func__,
++				ret);
++		goto err_device_register;
++	}
++
++	return 0;
++
++err_device_register:
++	idr_remove(&adf_minors, obj->minor);
++	return ret;
++}
++
++static char *adf_device_devnode(struct device *dev, umode_t *mode,
++		kuid_t *uid, kgid_t *gid)
++{
++	struct adf_obj *obj = container_of(dev, struct adf_obj, dev);
++	return kasprintf(GFP_KERNEL, "adf/%s/device", obj->name);
++}
++
++static char *adf_interface_devnode(struct device *dev, umode_t *mode,
++		kuid_t *uid, kgid_t *gid)
++{
++	struct adf_obj *obj = container_of(dev, struct adf_obj, dev);
++	struct adf_interface *intf = adf_obj_to_interface(obj);
++	struct adf_device *parent = adf_interface_parent(intf);
++	return kasprintf(GFP_KERNEL, "adf/%s/interface%d",
++			parent->base.name, intf->base.id);
++}
++
++static char *adf_overlay_engine_devnode(struct device *dev, umode_t *mode,
++		kuid_t *uid, kgid_t *gid)
++{
++	struct adf_obj *obj = container_of(dev, struct adf_obj, dev);
++	struct adf_overlay_engine *eng = adf_obj_to_overlay_engine(obj);
++	struct adf_device *parent = adf_overlay_engine_parent(eng);
++	return kasprintf(GFP_KERNEL, "adf/%s/overlay-engine%d",
++			parent->base.name, eng->base.id);
++}
++
++static void adf_noop_release(struct device *dev)
++{
++}
++
++static struct device_type adf_device_type = {
++	.name = "adf_device",
++	.devnode = adf_device_devnode,
++	.release = adf_noop_release,
++};
++
++static struct device_type adf_interface_type = {
++	.name = "adf_interface",
++	.devnode = adf_interface_devnode,
++	.release = adf_noop_release,
++};
++
++static struct device_type adf_overlay_engine_type = {
++	.name = "adf_overlay_engine",
++	.devnode = adf_overlay_engine_devnode,
++	.release = adf_noop_release,
++};
++
++int adf_device_sysfs_init(struct adf_device *dev)
++{
++	dev->base.dev.type = &adf_device_type;
++	dev_set_name(&dev->base.dev, "%s", dev->base.name);
++	return adf_obj_sysfs_init(&dev->base, dev->dev);
++}
++
++int adf_interface_sysfs_init(struct adf_interface *intf)
++{
++	struct adf_device *parent = adf_interface_parent(intf);
++	size_t i, j;
++	int ret;
++
++	intf->base.dev.type = &adf_interface_type;
++	dev_set_name(&intf->base.dev, "%s-interface%d", parent->base.name,
++			intf->base.id);
++
++	ret = adf_obj_sysfs_init(&intf->base, &parent->base.dev);
++	if (ret < 0)
++		return ret;
++
++	for (i = 0; i < ARRAY_SIZE(adf_interface_attrs); i++) {
++		ret = device_create_file(&intf->base.dev,
++				&adf_interface_attrs[i]);
++		if (ret < 0) {
++			dev_err(&intf->base.dev, "creating sysfs attribute %s failed: %d\n",
++					adf_interface_attrs[i].attr.name, ret);
++			goto err;
++		}
++	}
++
++	return 0;
++
++err:
++	for (j = 0; j < i; j++)
++		device_remove_file(&intf->base.dev, &adf_interface_attrs[j]);
++	return ret;
++}
++
++int adf_overlay_engine_sysfs_init(struct adf_overlay_engine *eng)
++{
++	struct adf_device *parent = adf_overlay_engine_parent(eng);
++
++	eng->base.dev.type = &adf_overlay_engine_type;
++	dev_set_name(&eng->base.dev, "%s-overlay-engine%d", parent->base.name,
++			eng->base.id);
++
++	return adf_obj_sysfs_init(&eng->base, &parent->base.dev);
++}
++
++struct adf_obj *adf_obj_sysfs_find(int minor)
++{
++	return idr_find(&adf_minors, minor);
++}
++
++void adf_obj_sysfs_destroy(struct adf_obj *obj)
++{
++	idr_remove(&adf_minors, obj->minor);
++	device_unregister(&obj->dev);
++}
++
++void adf_device_sysfs_destroy(struct adf_device *dev)
++{
++	adf_obj_sysfs_destroy(&dev->base);
++}
++
++void adf_interface_sysfs_destroy(struct adf_interface *intf)
++{
++	size_t i;
++
++	for (i = 0; i < ARRAY_SIZE(adf_interface_attrs); i++)
++		device_remove_file(&intf->base.dev, &adf_interface_attrs[i]);
++	adf_obj_sysfs_destroy(&intf->base);
++}
++
++void adf_overlay_engine_sysfs_destroy(struct adf_overlay_engine *eng)
++{
++	adf_obj_sysfs_destroy(&eng->base);
++}
++
++int adf_sysfs_init(void)
++{
++	struct class *class;
++	int ret;
++
++	class = class_create(THIS_MODULE, "adf");
++	if (IS_ERR(class)) {
++		ret = PTR_ERR(class);
++		pr_err("%s: creating class failed: %d\n", __func__, ret);
++		return ret;
++	}
++
++	ret = register_chrdev(0, "adf", &adf_fops);
++	if (ret < 0) {
++		pr_err("%s: registering device failed: %d\n", __func__, ret);
++		goto err_chrdev;
++	}
++
++	class->devnode = adf_devnode;
++	adf_class = class;
++	adf_major = ret;
++	return 0;
++
++err_chrdev:
++	class_destroy(adf_class);
++	return ret;
++}
++
++void adf_sysfs_destroy(void)
++{
++	idr_destroy(&adf_minors);
++	class_destroy(adf_class);
++}
+diff --git a/drivers/video/adf/adf_sysfs.h b/drivers/video/adf/adf_sysfs.h
+new file mode 100644
+index 0000000..0613ac3
+--- /dev/null
++++ b/drivers/video/adf/adf_sysfs.h
+@@ -0,0 +1,33 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __VIDEO_ADF_ADF_SYSFS_H
++#define __VIDEO_ADF_ADF_SYSFS_H
++
++struct adf_device;
++struct adf_interface;
++struct adf_overlay_engine;
++
++int adf_device_sysfs_init(struct adf_device *dev);
++void adf_device_sysfs_destroy(struct adf_device *dev);
++int adf_interface_sysfs_init(struct adf_interface *intf);
++void adf_interface_sysfs_destroy(struct adf_interface *intf);
++int adf_overlay_engine_sysfs_init(struct adf_overlay_engine *eng);
++void adf_overlay_engine_sysfs_destroy(struct adf_overlay_engine *eng);
++struct adf_obj *adf_obj_sysfs_find(int minor);
++
++int adf_sysfs_init(void);
++void adf_sysfs_destroy(void);
++
++#endif /* __VIDEO_ADF_ADF_SYSFS_H */
+diff --git a/drivers/video/adf/adf_trace.h b/drivers/video/adf/adf_trace.h
+new file mode 100644
+index 0000000..3cb2a84
+--- /dev/null
++++ b/drivers/video/adf/adf_trace.h
+@@ -0,0 +1,93 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM adf
++
++#if !defined(__VIDEO_ADF_ADF_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define __VIDEO_ADF_ADF_TRACE_H
++
++#include <linux/tracepoint.h>
++#include <video/adf.h>
++
++TRACE_EVENT(adf_event,
++	TP_PROTO(struct adf_obj *obj, enum adf_event_type type),
++	TP_ARGS(obj, type),
++
++	TP_STRUCT__entry(
++		__string(name, obj->name)
++		__field(enum adf_event_type, type)
++		__array(char, type_str, 32)
++	),
++	TP_fast_assign(
++		__assign_str(name, obj->name);
++		__entry->type = type;
++		strlcpy(__entry->type_str, adf_event_type_str(obj, type),
++				sizeof(__entry->type_str));
++	),
++	TP_printk("obj=%s type=%u (%s)",
++			__get_str(name),
++			__entry->type,
++			__entry->type_str)
++);
++
++TRACE_EVENT(adf_event_enable,
++	TP_PROTO(struct adf_obj *obj, enum adf_event_type type),
++	TP_ARGS(obj, type),
++
++	TP_STRUCT__entry(
++		__string(name, obj->name)
++		__field(enum adf_event_type, type)
++		__array(char, type_str, 32)
++	),
++	TP_fast_assign(
++		__assign_str(name, obj->name);
++		__entry->type = type;
++		strlcpy(__entry->type_str, adf_event_type_str(obj, type),
++				sizeof(__entry->type_str));
++	),
++	TP_printk("obj=%s type=%u (%s)",
++			__get_str(name),
++			__entry->type,
++			__entry->type_str)
++);
++
++TRACE_EVENT(adf_event_disable,
++	TP_PROTO(struct adf_obj *obj, enum adf_event_type type),
++	TP_ARGS(obj, type),
++
++	TP_STRUCT__entry(
++		__string(name, obj->name)
++		__field(enum adf_event_type, type)
++		__array(char, type_str, 32)
++	),
++	TP_fast_assign(
++		__assign_str(name, obj->name);
++		__entry->type = type;
++		strlcpy(__entry->type_str, adf_event_type_str(obj, type),
++				sizeof(__entry->type_str));
++	),
++	TP_printk("obj=%s type=%u (%s)",
++			__get_str(name),
++			__entry->type,
++			__entry->type_str)
++);
++
++#endif /* __VIDEO_ADF_ADF_TRACE_H */
++
++#undef TRACE_INCLUDE_PATH
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_PATH .
++#define TRACE_INCLUDE_FILE adf_trace
++#include <trace/define_trace.h>
+diff --git a/include/uapi/video/adf.h b/include/uapi/video/adf.h
+new file mode 100644
+index 0000000..757465b
+--- /dev/null
++++ b/include/uapi/video/adf.h
+@@ -0,0 +1,254 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _UAPI_VIDEO_ADF_H_
++#define _UAPI_VIDEO_ADF_H_
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#include <drm/drm_fourcc.h>
++#include <drm/drm_mode.h>
++
++#define ADF_NAME_LEN 32
++#define ADF_MAX_CUSTOM_DATA_SIZE PAGE_SIZE
++
++enum adf_interface_type {
++	ADF_INTF_DSI = 0,
++	ADF_INTF_eDP = 1,
++	ADF_INTF_DPI = 2,
++	ADF_INTF_VGA = 3,
++	ADF_INTF_DVI = 4,
++	ADF_INTF_HDMI = 5,
++	ADF_INTF_MEMORY = 6,
++	ADF_INTF_TYPE_DEVICE_CUSTOM = 128,
++	ADF_INTF_TYPE_MAX = (~(__u32)0),
++};
++
++enum adf_event_type {
++	ADF_EVENT_VSYNC = 0,
++	ADF_EVENT_HOTPLUG = 1,
++	ADF_EVENT_DEVICE_CUSTOM = 128,
++	ADF_EVENT_TYPE_MAX = 255,
++};
++
++/**
++ * struct adf_set_event - start or stop subscribing to ADF events
++ *
++ * @type: the type of event to (un)subscribe
++ * @enabled: subscribe or unsubscribe
++ *
++ * After subscribing to an event, userspace may poll() the ADF object's fd
++ * to wait for events or read() to consume the event's data.
++ *
++ * ADF reserves event types 0 to %ADF_EVENT_DEVICE_CUSTOM-1 for its own events.
++ * Devices may use event types %ADF_EVENT_DEVICE_CUSTOM to %ADF_EVENT_TYPE_MAX-1
++ * for driver-private events.
++ */
++struct adf_set_event {
++	__u8 type;
++	__u8 enabled;
++};
++
++/**
++ * struct adf_event - common header for ADF event data
++ *
++ * @type: event type
++ * @length: total size of event data, header inclusive
++ */
++struct adf_event {
++	__u8 type;
++	__u32 length;
++};
++
++/**
++ * struct adf_vsync_event - ADF vsync event
++ *
++ * @base: event header (see &struct adf_event)
++ * @timestamp: time of vsync event, in nanoseconds
++ */
++struct adf_vsync_event {
++	struct adf_event base;
++	__u64 timestamp;
++};
++
++/**
++ * struct adf_vsync_event - ADF display hotplug event
++ *
++ * @base: event header (see &struct adf_event)
++ * @connected: whether a display is now connected to the interface
++ */
++struct adf_hotplug_event {
++	struct adf_event base;
++	__u8 connected;
++};
++
++#define ADF_MAX_PLANES 4
++/**
++ * struct adf_buffer_config - description of buffer displayed by adf_post_config
++ *
++ * @overlay_engine: id of the target overlay engine
++ * @w: width of display region in pixels
++ * @h: height of display region in pixels
++ * @format: DRM-style fourcc, see drm_fourcc.h for standard formats
++ * @fd: dma_buf fd for each plane
++ * @offset: location of first pixel to scan out, in bytes
++ * @pitch: stride (i.e. length of a scanline including padding) in bytes
++ * @n_planes: number of planes in buffer
++ * @acquire_fence: sync_fence fd which will clear when the buffer is
++ *	ready for display, or <0 if the buffer is already ready
++ */
++struct adf_buffer_config {
++	__u32 overlay_engine;
++
++	__u32 w;
++	__u32 h;
++	__u32 format;
++
++	__s64 fd[ADF_MAX_PLANES];
++	__u32 offset[ADF_MAX_PLANES];
++	__u32 pitch[ADF_MAX_PLANES];
++	__u8 n_planes;
++
++	__s64 acquire_fence;
++};
++#define ADF_MAX_BUFFERS (PAGE_SIZE / sizeof(struct adf_buffer_config))
++
++/**
++ * struct adf_post_config - request to flip to a new set of buffers
++ *
++ * @n_interfaces: number of interfaces targeted by the flip (input)
++ * @interfaces: ids of interfaces targeted by the flip (input)
++ * @n_bufs: number of buffers displayed (input)
++ * @bufs: description of buffers displayed (input)
++ * @custom_data_size: size of driver-private data (input)
++ * @custom_data: driver-private data (input)
++ * @complete_fence: sync_fence fd which will clear when this
++ *	configuration has left the screen (output)
++ */
++struct adf_post_config {
++	size_t n_interfaces;
++	__u32 __user *interfaces;
++
++	size_t n_bufs;
++	struct adf_buffer_config __user *bufs;
++
++	size_t custom_data_size;
++	void __user *custom_data;
++
++	__s64 complete_fence;
++};
++#define ADF_MAX_INTERFACES (PAGE_SIZE / sizeof(__u32))
++
++/**
++ * struct adf_attachment_config - description of attachment between an overlay
++ * engine and an interface
++ *
++ * @overlay_engine: id of the overlay engine
++ * @interface: id of the interface
++ */
++struct adf_attachment_config {
++	__u32 overlay_engine;
++	__u32 interface;
++};
++
++/**
++ * struct adf_device_data - describes a display device
++ *
++ * @name: display device's name
++ * @n_attachments: the number of current attachments
++ * @attachments: list of current attachments
++ * @n_allowed_attachments: the number of allowed attachments
++ * @allowed_attachments: list of allowed attachments
++ * @custom_data_size: size of driver-private data
++ * @custom_data: driver-private data
++ */
++struct adf_device_data {
++	char name[ADF_NAME_LEN];
++
++	size_t n_attachments;
++	struct adf_attachment_config __user *attachments;
++
++	size_t n_allowed_attachments;
++	struct adf_attachment_config __user *allowed_attachments;
++
++	size_t custom_data_size;
++	void __user *custom_data;
++};
++#define ADF_MAX_ATTACHMENTS (PAGE_SIZE / sizeof(struct adf_attachment))
++
++/**
++ * struct adf_device_data - describes a display interface
++ *
++ * @name: display interface's name
++ * @type: interface type (see enum @adf_interface_type)
++ * @id: which interface of type @type;
++ *	e.g. interface DSI.1 -> @type=@ADF_INTF_TYPE_DSI, @id=1
++ * @dpms_state: DPMS state (one of @DRM_MODE_DPMS_* defined in drm_mode.h)
++ * @hotplug_detect: whether a display is plugged in
++ * @width_mm: screen width in millimeters, or 0 if unknown
++ * @height_mm: screen height in millimeters, or 0 if unknown
++ * @current_mode: current display mode
++ * @n_available_modes: the number of hardware display modes
++ * @available_modes: list of hardware display modes
++ * @custom_data_size: size of driver-private data
++ * @custom_data: driver-private data
++ */
++struct adf_interface_data {
++	char name[ADF_NAME_LEN];
++
++	__u32 type;
++	__u32 id;
++	/* e.g. type=ADF_INTF_TYPE_DSI, id=1 => DSI.1 */
++
++	__u8 dpms_state;
++	__u8 hotplug_detect;
++	__u16 width_mm;
++	__u16 height_mm;
++
++	struct drm_mode_modeinfo current_mode;
++	size_t n_available_modes;
++	struct drm_mode_modeinfo __user *available_modes;
++
++	size_t custom_data_size;
++	void __user *custom_data;
++};
++#define ADF_MAX_MODES (PAGE_SIZE / sizeof(struct drm_mode_modeinfo))
++
++/**
++ * struct adf_overlay_engine_data - describes an overlay engine
++ *
++ * @name: overlay engine's name
++ * @custom_data_size: size of driver-private data
++ * @custom_data: driver-private data
++ */
++struct adf_overlay_engine_data {
++	char name[ADF_NAME_LEN];
++
++	size_t custom_data_size;
++	void __user *custom_data;
++};
++
++#define ADF_SET_EVENT		_IOW('D', 0, struct adf_set_event)
++#define ADF_BLANK		_IOW('D', 1, __u8)
++#define ADF_POST_CONFIG		_IOW('D', 2, struct adf_post_config)
++#define ADF_SET_MODE		_IOW('D', 3, struct drm_mode_modeinfo)
++#define ADF_GET_DEVICE_DATA	_IOR('D', 4, struct adf_device_data)
++#define ADF_GET_INTERFACE_DATA	_IOR('D', 5, struct adf_interface_data)
++#define ADF_GET_OVERLAY_ENGINE_DATA \
++				_IOR('D', 6, struct adf_overlay_engine_data)
++#define ADF_ATTACH		_IOW('D', 9, struct adf_attachment_config)
++#define ADF_DETACH		_IOW('D', 10, struct adf_attachment_config)
++
++#endif /* _UAPI_VIDEO_ADF_H_ */
+diff --git a/include/video/adf.h b/include/video/adf.h
+new file mode 100644
+index 0000000..c09d8df
+--- /dev/null
++++ b/include/video/adf.h
+@@ -0,0 +1,439 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _VIDEO_ADF_H
++#define _VIDEO_ADF_H
++
++#include <linux/device.h>
++#include <linux/dma-buf.h>
++#include <linux/idr.h>
++#include <linux/kref.h>
++#include <linux/kthread.h>
++#include <linux/ktime.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/scatterlist.h>
++#include <linux/sched.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++#include <uapi/video/adf.h>
++#include "sync.h"
++
++struct adf_obj;
++struct adf_obj_ops;
++struct adf_device;
++struct adf_device_ops;
++struct adf_interface;
++struct adf_interface_ops;
++struct adf_overlay_engine;
++struct adf_overlay_engine_ops;
++
++/**
++ * struct adf_buffer - buffer displayed by adf_post
++ *
++ * @overlay_engine: target overlay engine
++ * @w: width of display region in pixels
++ * @h: height of display region in pixels
++ * @format: DRM-style fourcc, see drm_fourcc.h for standard formats
++ * @dma_bufs: dma_buf for each plane
++ * @offset: location of first pixel to scan out, in bytes
++ * @pitch: length of a scanline including padding, in bytes
++ * @n_planes: number of planes in buffer
++ * @acquire_fence: sync_fence which will clear when the buffer is
++ *	ready for display
++ *
++ * &struct adf_buffer is the in-kernel counterpart to the userspace-facing
++ * &struct adf_buffer_config.
++ */
++struct adf_buffer {
++	struct adf_overlay_engine *overlay_engine;
++
++	u32 w;
++	u32 h;
++	u32 format;
++
++	struct dma_buf *dma_bufs[ADF_MAX_PLANES];
++	u32 offset[ADF_MAX_PLANES];
++	u32 pitch[ADF_MAX_PLANES];
++	u8 n_planes;
++
++	struct sync_fence *acquire_fence;
++};
++
++/**
++ * struct adf_buffer_mapping - state for mapping a &struct adf_buffer into the
++ * display device
++ *
++ * @attachments: dma-buf attachment for each plane
++ * @sg_tables: SG tables for each plane
++ */
++struct adf_buffer_mapping {
++	struct dma_buf_attachment *attachments[ADF_MAX_PLANES];
++	struct sg_table *sg_tables[ADF_MAX_PLANES];
++};
++
++/**
++ * struct adf_post - request to flip to a new set of buffers
++ *
++ * @n_bufs: number of buffers displayed
++ * @bufs: buffers displayed
++ * @mappings: in-device mapping state for each buffer
++ * @custom_data_size: size of driver-private data
++ * @custom_data: driver-private data
++ *
++ * &struct adf_post is the in-kernel counterpart to the userspace-facing
++ * &struct adf_post_config.
++ */
++struct adf_post {
++	size_t n_bufs;
++	struct adf_buffer *bufs;
++	struct adf_buffer_mapping *mappings;
++
++	size_t custom_data_size;
++	void *custom_data;
++};
++
++/**
++ * struct adf_attachment - description of attachment between an overlay engine
++ * and an interface
++ *
++ * @overlay_engine: the overlay engine
++ * @interface: the interface
++ *
++ * &struct adf_attachment is the in-kernel counterpart to the userspace-facing
++ * &struct adf_attachment_config.
++ */
++struct adf_attachment {
++	struct adf_overlay_engine *overlay_engine;
++	struct adf_interface *interface;
++};
++
++struct adf_pending_post {
++	struct list_head head;
++	struct adf_post config;
++	void *state;
++};
++
++enum adf_obj_type {
++	ADF_OBJ_OVERLAY_ENGINE = 0,
++	ADF_OBJ_INTERFACE = 1,
++	ADF_OBJ_DEVICE = 2,
++};
++
++/**
++ * struct adf_obj_ops - common ADF object implementation ops
++ *
++ * @open: handle opening the object's device node
++ * @release: handle releasing an open file
++ * @ioctl: handle custom ioctls
++ *
++ * @supports_event: return whether the object supports generating events of type
++ *	@type
++ * @set_event: enable or disable events of type @type
++ * @event_type_str: return a string representation of custom event @type
++ *	(@type >= %ADF_EVENT_DEVICE_CUSTOM).
++ *
++ * @custom_data: copy up to %ADF_MAX_CUSTOM_DATA_SIZE bytes of driver-private
++ *	data into @data (allocated by ADF) and return the number of copied bytes
++ *	in @size.  Return 0 on success or an error code (<0) on failure.
++ */
++struct adf_obj_ops {
++	/* optional */
++	int (*open)(struct adf_obj *obj, struct inode *inode,
++			struct file *file);
++	/* optional */
++	void (*release)(struct adf_obj *obj, struct inode *inode,
++			struct file *file);
++	/* optional */
++	long (*ioctl)(struct adf_obj *obj, unsigned int cmd, unsigned long arg);
++
++	/* optional */
++	bool (*supports_event)(struct adf_obj *obj, enum adf_event_type type);
++	/* required if supports_event is implemented */
++	void (*set_event)(struct adf_obj *obj, enum adf_event_type type,
++			bool enabled);
++	/* optional */
++	const char *(*event_type_str)(struct adf_obj *obj,
++			enum adf_event_type type);
++
++	/* optional */
++	int (*custom_data)(struct adf_obj *obj, void *data, size_t *size);
++};
++
++struct adf_obj {
++	enum adf_obj_type type;
++	char name[ADF_NAME_LEN];
++	struct adf_device *parent;
++
++	const struct adf_obj_ops *ops;
++
++	struct device dev;
++
++	struct spinlock file_lock;
++	struct list_head file_list;
++
++	struct mutex event_lock;
++	struct rb_root event_refcount;
++
++	int id;
++	int minor;
++};
++
++/**
++ * struct adf_device_ops - display device implementation ops
++ *
++ * @owner: device's module
++ * @base: common operations (see &struct adf_obj_ops)
++ *
++ * @attach: attach overlay engine @eng to interface @intf.  Return 0 on success
++ *	or error code (<0) on failure.
++ * @detach: detach overlay engine @eng from interface @intf.  Return 0 on
++ *	success or error code (<0) on failure.
++ *
++ * @validate_custom_format: validate the number and size of planes
++ *	in buffers with a custom format (i.e., not one of the @DRM_FORMAT_*
++ *	types defined in drm/drm_fourcc.h).  Return 0 if the buffer is valid or
++ *	an error code (<0) otherwise.
++ *
++ * @validate: validate that the proposed configuration @cfg is legal.  The
++ *	driver may optionally allocate and return some driver-private state in
++ *	@driver_state, which will be passed to the corresponding post().  The
++ *	driver may NOT commit any changes to hardware.  Return 0 if @cfg is
++ *	valid or an error code (<0) otherwise.
++ * @complete_fence: create a hardware-backed sync fence to be signaled when
++ *	@cfg is removed from the screen.  If unimplemented, ADF automatically
++ *	creates an sw_sync fence.  Return the sync fence on success or a
++ *	PTR_ERR() on failure.
++ * @post: flip @cfg onto the screen.  Wait for the display to begin scanning out
++ *	@cfg before returning.
++ * @advance_timeline: signal the sync fence for the last configuration to leave
++ *	the display.  If unimplemented, ADF automatically advances an sw_sync
++ *	timeline.
++ * @state_free: free driver-private state allocated during validate()
++ */
++struct adf_device_ops {
++	/* required */
++	struct module *owner;
++	const struct adf_obj_ops base;
++
++	/* optional */
++	int (*attach)(struct adf_device *dev, struct adf_overlay_engine *eng,
++			struct adf_interface *intf);
++	/* optional */
++	int (*detach)(struct adf_device *dev, struct adf_overlay_engine *eng,
++			struct adf_interface *intf);
++
++	/* required if any of the device's overlay engines supports at least one
++	   custom format */
++	int (*validate_custom_format)(struct adf_device *dev,
++			struct adf_buffer *buf);
++
++	/* required */
++	int (*validate)(struct adf_device *dev, struct adf_post *cfg,
++			void **driver_state);
++	/* optional */
++	struct sync_fence *(*complete_fence)(struct adf_device *dev,
++			struct adf_post *cfg, void *driver_state);
++	/* required */
++	void (*post)(struct adf_device *dev, struct adf_post *cfg,
++			void *driver_state);
++	/* required if complete_fence is implemented */
++	void (*advance_timeline)(struct adf_device *dev,
++			struct adf_post *cfg, void *driver_state);
++	/* required if validate allocates driver state */
++	void (*state_free)(struct adf_device *dev, void *driver_state);
++};
++
++struct adf_attachment_list {
++	struct adf_attachment attachment;
++	struct list_head head;
++};
++
++struct adf_device {
++	struct adf_obj base;
++	struct device *dev;
++
++	const struct adf_device_ops *ops;
++
++	struct mutex client_lock;
++
++	struct idr interfaces;
++	size_t n_interfaces;
++	struct idr overlay_engines;
++
++	struct list_head post_list;
++	struct mutex post_lock;
++	struct kthread_worker post_worker;
++	struct task_struct *post_thread;
++	struct kthread_work post_work;
++
++	struct list_head attached;
++	size_t n_attached;
++	struct list_head attach_allowed;
++	size_t n_attach_allowed;
++
++	struct adf_pending_post *onscreen;
++
++	struct sw_sync_timeline *timeline;
++	int timeline_max;
++};
++
++/**
++ * struct adf_interface_ops - display interface implementation ops
++ *
++ * @base: common operations (see &struct adf_obj_ops)
++ *
++ * @blank: change the display's DPMS state.  Return 0 on success or error
++ *	code (<0) on failure.
++ *
++ * @modeset: change the interface's mode.  @mode is not necessarily part of the
++ *	modelist passed to adf_hotplug_notify_connected(); the driver may
++ *	accept or reject custom modes at its discretion.  Return 0 on success or
++ *	error code (<0) if the mode could not be set.
++ *
++ * @screen_size: copy the screen dimensions in millimeters into @width_mm
++ *	and @height_mm.  Return 0 on success or error code (<0) if the display
++ *	dimensions are unknown.
++ *
++ * @type_str: return a string representation of custom @intf->type
++ *	(@intf->type >= @ADF_INTF_TYPE_DEVICE_CUSTOM).
++ */
++struct adf_interface_ops {
++	const struct adf_obj_ops base;
++
++	/* optional */
++	int (*blank)(struct adf_interface *intf, u8 state);
++
++	/* optional */
++	int (*modeset)(struct adf_interface *intf,
++			struct drm_mode_modeinfo *mode);
++
++	/* optional */
++	int (*screen_size)(struct adf_interface *intf, u16 *width_mm,
++			u16 *height_mm);
++
++	/* optional */
++	const char *(*type_str)(struct adf_interface *intf);
++};
++
++struct adf_interface {
++	struct adf_obj base;
++	const struct adf_interface_ops *ops;
++
++	struct drm_mode_modeinfo current_mode;
++
++	enum adf_interface_type type;
++	u32 idx;
++
++	wait_queue_head_t vsync_wait;
++	ktime_t vsync_timestamp;
++	rwlock_t vsync_lock;
++
++	u8 dpms_state;
++
++	bool hotplug_detect;
++	struct drm_mode_modeinfo *modelist;
++	size_t n_modes;
++	rwlock_t hotplug_modelist_lock;
++};
++
++/**
++ * struct adf_interface_ops - overlay engine implementation ops
++ *
++ * @base: common operations (see &struct adf_obj_ops)
++ *
++ * @supported_formats: list of fourccs the overlay engine can scan out
++ * @n_supported_formats: length of supported_formats
++ */
++struct adf_overlay_engine_ops {
++	const struct adf_obj_ops base;
++
++	/* required */
++	const u32 *supported_formats;
++	/* required */
++	const size_t n_supported_formats;
++};
++
++struct adf_overlay_engine {
++	struct adf_obj base;
++
++	const struct adf_overlay_engine_ops *ops;
++};
++
++#define adf_obj_to_device(ptr) \
++	container_of((ptr), struct adf_device, base)
++
++#define adf_obj_to_interface(ptr) \
++	container_of((ptr), struct adf_interface, base)
++
++#define adf_obj_to_overlay_engine(ptr) \
++	container_of((ptr), struct adf_overlay_engine, base)
++
++int __printf(4, 5) adf_device_init(struct adf_device *dev,
++		struct device *parent, const struct adf_device_ops *ops,
++		const char *fmt, ...);
++void adf_device_destroy(struct adf_device *dev);
++int __printf(6, 7) adf_interface_init(struct adf_interface *intf,
++		struct adf_device *dev, enum adf_interface_type type, u32 idx,
++		const struct adf_interface_ops *ops, const char *fmt, ...);
++void adf_interface_destroy(struct adf_interface *intf);
++static inline struct adf_device *adf_interface_parent(
++		struct adf_interface *intf)
++{
++	return intf->base.parent;
++}
++int __printf(4, 5) adf_overlay_engine_init(struct adf_overlay_engine *eng,
++		struct adf_device *dev,
++		const struct adf_overlay_engine_ops *ops, const char *fmt, ...);
++void adf_overlay_engine_destroy(struct adf_overlay_engine *eng);
++static inline struct adf_device *adf_overlay_engine_parent(
++		struct adf_overlay_engine *eng)
++{
++	return eng->base.parent;
++}
++
++int adf_attachment_allow(struct adf_device *dev, struct adf_overlay_engine *eng,
++		struct adf_interface *intf);
++
++const char *adf_obj_type_str(enum adf_obj_type type);
++const char *adf_interface_type_str(struct adf_interface *intf);
++const char *adf_event_type_str(struct adf_obj *obj, enum adf_event_type type);
++
++#define ADF_FORMAT_STR_SIZE 5
++void adf_format_str(u32 format, char buf[ADF_FORMAT_STR_SIZE]);
++
++int adf_event_get(struct adf_obj *obj, enum adf_event_type type);
++int adf_event_put(struct adf_obj *obj, enum adf_event_type type);
++int adf_event_notify(struct adf_obj *obj, struct adf_event *event);
++
++static inline void adf_vsync_get(struct adf_interface *intf)
++{
++	adf_event_get(&intf->base, ADF_EVENT_VSYNC);
++}
++
++static inline void adf_vsync_put(struct adf_interface *intf)
++{
++	adf_event_put(&intf->base, ADF_EVENT_VSYNC);
++}
++
++int adf_vsync_wait(struct adf_interface *intf, long timeout);
++void adf_vsync_notify(struct adf_interface *intf, ktime_t timestamp);
++
++int adf_hotplug_notify_connected(struct adf_interface *intf,
++		struct drm_mode_modeinfo *modelist, size_t n_modes);
++void adf_hotplug_notify_disconnected(struct adf_interface *intf);
++
++#endif /* _VIDEO_ADF_H */
+diff --git a/include/video/adf_client.h b/include/video/adf_client.h
+new file mode 100644
+index 0000000..1e471a4
+--- /dev/null
++++ b/include/video/adf_client.h
+@@ -0,0 +1,57 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _VIDEO_ADF_CLIENT_H_
++#define _VIDEO_ADF_CLIENT_H_
++
++#include <video/adf.h>
++
++int adf_interface_blank(struct adf_interface *intf, u8 state);
++u8 adf_interface_dpms_state(struct adf_interface *intf);
++
++void adf_interface_current_mode(struct adf_interface *intf,
++		struct drm_mode_modeinfo *mode);
++size_t adf_interface_modelist(struct adf_interface *intf,
++		struct drm_mode_modeinfo *modelist, size_t n_modes);
++int adf_interface_set_mode(struct adf_interface *intf,
++		struct drm_mode_modeinfo *mode);
++int adf_interface_get_screen_size(struct adf_interface *intf, u16 *width,
++		u16 *height);
++
++bool adf_overlay_engine_supports_format(struct adf_overlay_engine *eng,
++		u32 format);
++
++size_t adf_device_attachments(struct adf_device *dev,
++		struct adf_attachment *attachments, size_t n_attachments);
++size_t adf_device_attachments_allowed(struct adf_device *dev,
++		struct adf_attachment *attachments, size_t n_attachments);
++bool adf_device_attached(struct adf_device *dev, struct adf_overlay_engine *eng,
++		struct adf_interface *intf);
++bool adf_device_attach_allowed(struct adf_device *dev,
++		struct adf_overlay_engine *eng, struct adf_interface *intf);
++int adf_device_attach(struct adf_device *dev, struct adf_overlay_engine *eng,
++		struct adf_interface *intf);
++int adf_device_detach(struct adf_device *dev, struct adf_overlay_engine *eng,
++		struct adf_interface *intf);
++
++struct sync_fence *adf_device_post(struct adf_device *dev,
++		struct adf_interface **intfs, size_t n_intfs,
++		struct adf_buffer *bufs, size_t n_bufs, void *custom_data,
++		size_t custom_data_size);
++struct sync_fence *adf_device_post_nocopy(struct adf_device *dev,
++		struct adf_interface **intfs, size_t n_intfs,
++		struct adf_buffer *bufs, size_t n_bufs, void *custom_data,
++		size_t custom_data_size);
++
++#endif /* _VIDEO_ADF_CLIENT_H_ */
+diff --git a/include/video/adf_format.h b/include/video/adf_format.h
+new file mode 100644
+index 0000000..e03182c
+--- /dev/null
++++ b/include/video/adf_format.h
+@@ -0,0 +1,26 @@
++/*
++ * Copyright (C) 2013 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _VIDEO_ADF_FORMAT_H
++#define _VIDEO_ADF_FORMAT_H
++
++bool adf_format_is_standard(u32 format);
++bool adf_format_is_rgb(u32 format);
++u8 adf_format_num_planes(u32 format);
++u8 adf_format_bpp(u32 format);
++u8 adf_format_plane_cpp(u32 format, int plane);
++u8 adf_format_horz_chroma_subsampling(u32 format);
++u8 adf_format_vert_chroma_subsampling(u32 format);
++
++#endif /* _VIDEO_ADF_FORMAT_H */
+-- 
+1.9.1
+

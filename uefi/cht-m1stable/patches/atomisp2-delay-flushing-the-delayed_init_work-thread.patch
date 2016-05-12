@@ -1,0 +1,104 @@
+From 3c65aaedf2ddfc6791e323f19fb408b006c69e0b Mon Sep 17 00:00:00 2001
+From: "Liu,Dalei" <daleix.liu@intel.com>
+Date: Tue, 26 Jan 2016 12:24:57 +0800
+Subject: [PATCH 06/13] atomisp2: delay flushing the delayed_init_work thread
+
+delayed_init_work thread is responsible to allocate the left
+raw buffers for ISP pipeline, these buffers are needed for
+any still capture.
+
+If raw lock/unlock feature turned on, streamon video0 device
+does not really mean trigger one capture, it is done by
+a separate IOCTL. Therefore, we do not need to do flushing the
+delayed_init_work thread in the streamon video0, this patch
+delays the flushing to atomisp_exp_id_capture() in which the
+capture is really triggered.
+
+Change-Id: I62461d4d08d2d90e3fb6decf402bdfe560abc05f
+Original-Tracked_On: #H1504151710
+Signed-off-by: Bin Han <bin.b.han@intel.com>
+Signed-off-by: Liu,Dalei <daleix.liu@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/97961
+Reviewed-by: HaiqiangX Yao <haiqiangx.yao@intel.com>
+Build: Dessert M BXT RVP (SC)
+Reviewed-by: GuoqingX Zhang <guoqingx.zhang@intel.com>
+Validation-Android: Wei Tao <wei.tao@intel.com>
+Approver: Tian Shu Qiu <tian.shu.qiu@intel.com>
+Build: Dessert M CHT FFD (SC)
+Integrator: WeiX Meng <weix.meng@intel.com>
+Reviewed-by: WeiX Meng <weix.meng@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-17482
+Signed-off-by: Tao Wei <wei.tao@intel.com>
+Reviewed-on: https://android.intel.com:443/464449
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.c      | 10 +++++++++
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.c    | 25 ++++++++++++++--------
+ 2 files changed, 26 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index 787afb6..d5d7f7c 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -6425,6 +6425,16 @@ int atomisp_exp_id_capture(struct atomisp_sub_device *asd, int *exp_id)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Flush the delayed init work thread */
++	if (asd->delayed_init == ATOMISP_DELAYED_INIT_QUEUED) {
++		flush_work(&asd->delayed_init_work);
++		rt_mutex_unlock(&isp->mutex);
++		if (wait_for_completion_interruptible(
++				&asd->init_done) != 0)
++			return -ERESTARTSYS;
++		rt_mutex_lock(&isp->mutex);
++	}
++
+ 	dev_dbg(isp->dev, "%s exp_id %d\n", __func__, value);
+ 	ret = atomisp_css_exp_id_capture(asd, value);
+ 	if (ret) {
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index f0a4edb..ea562eb 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -1815,15 +1815,6 @@ static int atomisp_streamon(struct file *file, void *fh,
+ 				dev_dbg(isp->dev, "ZSL last preview raw buffer id: %u\n",
+ 					asd->latest_preview_exp_id);
+ 
+-			if (asd->delayed_init == ATOMISP_DELAYED_INIT_QUEUED) {
+-				flush_work(&asd->delayed_init_work);
+-				rt_mutex_unlock(&isp->mutex);
+-				if (wait_for_completion_interruptible(
+-						&asd->init_done) != 0)
+-					return -ERESTARTSYS;
+-				rt_mutex_lock(&isp->mutex);
+-			}
+-
+ 			/* handle per_frame_setting parameter and buffers */
+ 			atomisp_handle_parameter_and_buffer(pipe);
+ 
+@@ -1839,6 +1830,22 @@ static int atomisp_streamon(struct file *file, void *fh,
+ 			 * atomisp_css_exp_id_capture and trigger real capture
+ 			 */
+ 			if (!asd->enable_raw_buffer_lock->val) {
++				/*
++				 * If raw lock/unlock turned on, streamon video0
++				 * does not mean trigger capture, therefore
++				 * we can delay flushing the delayed_init_work
++				 * until 1st time capture is triggered.
++				 */
++				if (asd->delayed_init ==
++					ATOMISP_DELAYED_INIT_QUEUED) {
++					flush_work(&asd->delayed_init_work);
++					rt_mutex_unlock(&isp->mutex);
++					if (wait_for_completion_interruptible(
++							&asd->init_done) != 0)
++						return -ERESTARTSYS;
++					rt_mutex_lock(&isp->mutex);
++				}
++
+ 				ret = atomisp_css_offline_capture_configure(asd,
+ 					asd->params.offline_parm.num_captures,
+ 					asd->params.offline_parm.skip_frames,
+-- 
+1.9.1
+

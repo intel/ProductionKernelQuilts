@@ -1,0 +1,267 @@
+From 621ab89dd9be5e4e97a6a90f640cbe314fd39e9a Mon Sep 17 00:00:00 2001
+Message-Id: <621ab89dd9be5e4e97a6a90f640cbe314fd39e9a.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Arun Siluvery <arun.siluvery@linux.intel.com>
+Date: Tue, 26 Aug 2014 14:44:50 +0100
+Subject: [PATCH 272/312] FROM_UPSTREAM [VPG]: drm/i915/bdw: Apply workarounds
+ in render ring init function
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For BDW workarounds are currently initialized in init_clock_gating() but
+they are lost during reset, suspend/resume etc; this patch moves the WAs
+that are part of register state context to render ring init fn otherwise
+default context ends up with incorrect values as they don't get initialized
+until init_clock_gating fn.
+
+v2: Add workarounds to golden render state
+This method has its own issues, first of all this is different for
+each gen and it is generated using a tool so adding new workaround
+and mainitaining them across gens is not a straightforward process.
+
+v3: Use LRIs to emit these workarounds (Ville)
+Instead of modifying the golden render state the same LRIs are
+emitted from within the driver.
+
+v4: Use abstract name when exporting gen specific routines (Chris)
+
+Issue: VIZ-4092
+Issue: GMIN-3475
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 86d7f23842f1bce3ab5e8c8d0c676112bbc4c99b
+Change-Id: Iba87c6307ea9e529e833c3ad18fc9227362386a2
+Signed-off-by: Arun Siluvery <arun.siluvery@linux.intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |    6 +++
+ drivers/gpu/drm/i915/intel_pm.c         |   56 ----------------------
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   79 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    2 +
+ 4 files changed, 87 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 1ab0f5b..73082a7 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -766,6 +766,12 @@ done:
+ 	ring->last_context = to;
+ 
+ 	if (uninitialized) {
++		if (ring->init_context) {
++			ret = ring->init_context(ring);
++			if (ret)
++				DRM_ERROR("ring init context: %d\n", ret);
++		}
++
+ 		ret = i915_gem_render_state_init(ring);
+ 		if (ret)
+ 			DRM_ERROR("init render state: %d\n", ret);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 92af74c..324bc30 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -6038,40 +6038,11 @@ static void broadwell_init_clock_gating(struct drm_device *dev)
+ 	/* FIXME(BDW): Check all the w/a, some might only apply to
+ 	 * pre-production hw. */
+ 
+-	/* WaDisablePartialInstShootdown:bdw */
+-	I915_WRITE(GEN8_ROW_CHICKEN,
+-		   _MASKED_BIT_ENABLE(PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE));
+-
+-	/* WaDisableThreadStallDopClockGating:bdw */
+-	/* WaDisableInstructionShootdown:bdw */
+-	/* FIXME: Unclear whether we really need these on production bdw. */
+-	I915_WRITE(GEN8_ROW_CHICKEN,
+-		   _MASKED_BIT_ENABLE(INSTRUCTION_SHOOTDOWN_DISABLE) |
+-		   _MASKED_BIT_ENABLE(STALL_DOP_GATING_DISABLE));
+-
+-	/*
+-	 * This GEN8_CENTROID_PIXEL_OPT_DIS W/A is only needed for
+-	 * pre-production hardware
+-	 */
+-	I915_WRITE(HALF_SLICE_CHICKEN3,
+-		   _MASKED_BIT_ENABLE(GEN8_CENTROID_PIXEL_OPT_DIS));
+-	I915_WRITE(HALF_SLICE_CHICKEN3,
+-		   _MASKED_BIT_ENABLE(GEN8_SAMPLER_POWER_BYPASS_DIS));
+ 	I915_WRITE(GAMTARBMODE, _MASKED_BIT_ENABLE(ARB_MODE_BWGTLB_DISABLE));
+ 
+ 	I915_WRITE(_3D_CHICKEN3,
+ 		   _3D_CHICKEN_SDE_LIMIT_FIFO_POLY_DEPTH(2));
+ 
+-	I915_WRITE(COMMON_SLICE_CHICKEN2,
+-		   _MASKED_BIT_ENABLE(GEN8_CSC2_SBE_VUE_CACHE_CONSERVATIVE));
+-
+-	I915_WRITE(GEN7_HALF_SLICE_CHICKEN1,
+-		   _MASKED_BIT_ENABLE(GEN7_SINGLE_SUBSCAN_DISPATCH_ENABLE));
+-
+-	/* WaDisableDopClockGating:bdw May not be needed for production */
+-	I915_WRITE(GEN7_ROW_CHICKEN2,
+-		   _MASKED_BIT_ENABLE(DOP_CLOCK_GATING_DISABLE));
+-
+ 	/* WaSwitchSolVfFArbitrationPriority:bdw */
+ 	I915_WRITE(GAM_ECOCHK, I915_READ(GAM_ECOCHK) | HSW_ECOCHK_ARB_PRIO_SOL);
+ 
+@@ -6086,35 +6057,12 @@ static void broadwell_init_clock_gating(struct drm_device *dev)
+ 			   BDW_DPRS_MASK_VBLANK_SRD);
+ 	}
+ 
+-	/* Use Force Non-Coherent whenever executing a 3D context. This is a
+-	 * workaround for for a possible hang in the unlikely event a TLB
+-	 * invalidation occurs during a PSD flush.
+-	 * WaDisableFenceDestinationToSLM:bdw
+-	 * WaHdcDisableFetchWhenMasked:bdw
+-	 */
+-	I915_WRITE(HDC_CHICKEN0,
+-		   I915_READ(HDC_CHICKEN0) |
+-		   _MASKED_BIT_ENABLE(HDC_FENCE_DESTINATION_TO_SLM_DISABLE) |
+-		   _MASKED_BIT_ENABLE(HDC_DONOT_FETCH_MEM_WHEN_MASKED) |
+-		   _MASKED_BIT_ENABLE(HDC_FORCE_NON_COHERENT));
+-
+ 	/* WaVSRefCountFullforceMissDisable:bdw */
+ 	/* WaDSRefCountFullforceMissDisable:bdw */
+ 	I915_WRITE(GEN7_FF_THREAD_MODE,
+ 		   I915_READ(GEN7_FF_THREAD_MODE) &
+ 		   ~(GEN8_FF_DS_REF_CNT_FFME | GEN7_FF_VS_REF_CNT_FFME));
+ 
+-	/*
+-	 * BSpec recommends 8x4 when MSAA is used,
+-	 * however in practice 16x4 seems fastest.
+-	 *
+-	 * Note that PS/WM thread counts depend on the WIZ hashing
+-	 * disable bit, which we don't touch here, but it's good
+-	 * to keep in mind (see 3DSTATE_PS and 3DSTATE_WM).
+-	 */
+-	I915_WRITE(GEN7_GT_MODE,
+-		   GEN6_WIZ_HASHING_MASK | GEN6_WIZ_HASHING_16x4);
+-
+ 	I915_WRITE(GEN6_RC_SLEEP_PSMI_CONTROL,
+ 		   _MASKED_BIT_ENABLE(GEN8_RC_SEMA_IDLE_MSG_DISABLE));
+ 
+@@ -6122,10 +6070,6 @@ static void broadwell_init_clock_gating(struct drm_device *dev)
+ 	I915_WRITE(GEN8_UCGCTL6, I915_READ(GEN8_UCGCTL6) |
+ 		   GEN8_SDEUNIT_CLOCK_GATE_DISABLE);
+ 
+-	/* Wa4x4STCOptimizationDisable:bdw */
+-	I915_WRITE(CACHE_MODE_1,
+-		   _MASKED_BIT_ENABLE(GEN8_4x4_STC_OPTIMIZATION_DISABLE));
+-
+ 	/* WaProgramL3SqcReg1Default:bdw */
+ 	I915_WRITE(GEN8_L3SQCREG1, GEN8_L3SQCREG1_DEFAULT_VALUE);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index b38929c..ef99893 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -608,6 +608,84 @@ get_pipe_control_scratch_addr(struct intel_engine_cs *ring)
+ 	return ring->scratch.gtt_offset;
+ }
+ 
++static inline void intel_ring_emit_wa(struct intel_engine_cs *ring,
++				       u32 addr, u32 value)
++{
++	intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
++	intel_ring_emit(ring, addr);
++	intel_ring_emit(ring, value);
++}
++
++static int gen8_init_workarounds(struct intel_engine_cs *ring)
++{
++	int ret;
++
++	/*
++	 * workarounds applied in this fn are part of register state context,
++	 * they need to be re-initialized followed by gpu reset, suspend/resume,
++	 * module reload.
++	 */
++
++	/*
++	 * update the number of dwords required based on the
++	 * actual number of workarounds applied
++	 */
++	ret = intel_ring_begin(ring, 24);
++	if (ret)
++		return ret;
++
++	/* WaDisablePartialInstShootdown:bdw */
++	/* WaDisableThreadStallDopClockGating:bdw */
++	/* FIXME: Unclear whether we really need this on production bdw. */
++	intel_ring_emit_wa(ring, GEN8_ROW_CHICKEN,
++			   _MASKED_BIT_ENABLE(PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE
++					     | STALL_DOP_GATING_DISABLE));
++
++	/* WaDisableDopClockGating:bdw May not be needed for production */
++	intel_ring_emit_wa(ring, GEN7_ROW_CHICKEN2,
++			   _MASKED_BIT_ENABLE(DOP_CLOCK_GATING_DISABLE));
++
++	/*
++	 * This GEN8_CENTROID_PIXEL_OPT_DIS W/A is only needed for
++	 * pre-production hardware
++	 */
++	intel_ring_emit_wa(ring, HALF_SLICE_CHICKEN3,
++			   _MASKED_BIT_ENABLE(GEN8_CENTROID_PIXEL_OPT_DIS
++					      | GEN8_SAMPLER_POWER_BYPASS_DIS));
++
++	intel_ring_emit_wa(ring, GEN7_HALF_SLICE_CHICKEN1,
++			   _MASKED_BIT_ENABLE(GEN7_SINGLE_SUBSCAN_DISPATCH_ENABLE));
++
++	intel_ring_emit_wa(ring, COMMON_SLICE_CHICKEN2,
++			   _MASKED_BIT_ENABLE(GEN8_CSC2_SBE_VUE_CACHE_CONSERVATIVE));
++
++	/* Use Force Non-Coherent whenever executing a 3D context. This is a
++	 * workaround for for a possible hang in the unlikely event a TLB
++	 * invalidation occurs during a PSD flush.
++	 */
++	intel_ring_emit_wa(ring, HDC_CHICKEN0,
++			   _MASKED_BIT_ENABLE(HDC_FORCE_NON_COHERENT));
++
++	/* Wa4x4STCOptimizationDisable:bdw */
++	intel_ring_emit_wa(ring, CACHE_MODE_1,
++			   _MASKED_BIT_ENABLE(GEN8_4x4_STC_OPTIMIZATION_DISABLE));
++
++	/*
++	 * BSpec recommends 8x4 when MSAA is used,
++	 * however in practice 16x4 seems fastest.
++	 *
++	 * Note that PS/WM thread counts depend on the WIZ hashing
++	 * disable bit, which we don't touch here, but it's good
++	 * to keep in mind (see 3DSTATE_PS and 3DSTATE_WM).
++	 */
++	intel_ring_emit_wa(ring, GEN7_GT_MODE,
++			   GEN6_WIZ_HASHING_MASK | GEN6_WIZ_HASHING_16x4);
++
++	intel_ring_advance(ring);
++
++	return 0;
++}
++
+ static int init_render_ring(struct intel_engine_cs *ring)
+ {
+ 	struct drm_device *dev = ring->dev;
+@@ -1972,6 +2050,7 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
+ 		if (INTEL_INFO(dev)->gen == 6)
+ 			ring->flush = gen6_render_ring_flush;
+ 		if (INTEL_INFO(dev)->gen >= 8) {
++			ring->init_context = gen8_init_workarounds;
+ 			ring->flush = gen8_render_ring_flush;
+ 			ring->irq_get = gen8_ring_get_irq;
+ 			ring->irq_put = gen8_ring_put_irq;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index d104515..cb1acb2 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -104,6 +104,8 @@ struct  intel_engine_cs {
+ 
+ 	int		(*init)(struct intel_engine_cs *ring);
+ 
++	int		(*init_context)(struct intel_engine_cs *ring);
++
+ 	void		(*write_tail)(struct intel_engine_cs *ring,
+ 				      u32 value);
+ 	int __must_check (*flush)(struct intel_engine_cs *ring,
+-- 
+1.7.9.5
+

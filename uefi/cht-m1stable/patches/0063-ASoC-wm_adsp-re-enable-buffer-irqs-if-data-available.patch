@@ -1,0 +1,99 @@
+From e798a88ff446922ff2e1368e5885ffc37f7918e4 Mon Sep 17 00:00:00 2001
+From: Richard Fitzgerald <rf@opensource.wolfsonmicro.com>
+Date: Sun, 8 Dec 2013 09:37:48 +0000
+Subject: [PATCH 063/351] ASoC: wm_adsp: re-enable buffer irqs if data
+ available
+
+If the compressed stream irq handler disables interrupts
+from the firmware, it must re-enable them on a subsequent
+stream read.
+
+Change-Id: I29e8e845d3db4d6a314fa287a159435719c971b5
+Signed-off-by: Richard Fitzgerald <rf@opensource.wolfsonmicro.com>
+Signed-off-by: Nikesh Oswal <Nikesh.Oswal@wolfsonmicro.com>
+---
+ sound/soc/codecs/wm_adsp.c |   42 ++++++++++++++++++++++++++++--------------
+ 1 file changed, 28 insertions(+), 14 deletions(-)
+
+diff --git a/sound/soc/codecs/wm_adsp.c b/sound/soc/codecs/wm_adsp.c
+index 30bc01f..8a8b526 100644
+--- a/sound/soc/codecs/wm_adsp.c
++++ b/sound/soc/codecs/wm_adsp.c
+@@ -2679,10 +2679,29 @@ static int wm_adsp_stream_capture(struct wm_adsp *adsp)
+ 	return total_read * WM_ADSP_DATA_WORD_SIZE;
+ }
+ 
++static int wm_adsp_ack_buffer_interrupt(struct wm_adsp *adsp)
++{
++	u32 irq_ack;
++	int ret;
++
++	ret = wm_adsp_host_buffer_read(adsp,
++				       HOST_BUFFER_FIELD(irq_count),
++				       &irq_ack);
++	if (ret < 0)
++		return ret;
++
++	if (!adsp->buffer_drain_pending)
++		irq_ack |= 1;		/* enable further IRQs */
++
++	ret = wm_adsp_host_buffer_write(adsp,
++					HOST_BUFFER_FIELD(irq_ack),
++					irq_ack);
++	return ret;
++}
++
+ int wm_adsp_stream_handle_irq(struct wm_adsp *adsp)
+ {
+ 	int ret, bytes_captured;
+-	u32 irq_ack;
+ 
+ 	ret = wm_adsp_host_buffer_read(adsp,
+ 				       HOST_BUFFER_FIELD(error),
+@@ -2698,18 +2717,7 @@ int wm_adsp_stream_handle_irq(struct wm_adsp *adsp)
+ 	if (bytes_captured < 0)
+ 		return bytes_captured;
+ 
+-	ret = wm_adsp_host_buffer_read(adsp,
+-				       HOST_BUFFER_FIELD(irq_count),
+-				       &irq_ack);
+-	if (ret < 0)
+-		return ret;
+-
+-	if (!adsp->buffer_drain_pending)
+-		irq_ack |= 1;		/* enable further IRQs */
+-
+-	ret = wm_adsp_host_buffer_write(adsp,
+-					HOST_BUFFER_FIELD(irq_ack),
+-					irq_ack);
++	ret = wm_adsp_ack_buffer_interrupt(adsp);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -2720,6 +2728,7 @@ EXPORT_SYMBOL_GPL(wm_adsp_stream_handle_irq);
+ int wm_adsp_stream_read(struct wm_adsp *adsp, char __user *buf, size_t count)
+ {
+ 	int avail, to_end;
++	int ret;
+ 
+ 	if (!adsp->running)
+ 		return -EIO;
+@@ -2757,9 +2766,14 @@ int wm_adsp_stream_read(struct wm_adsp *adsp, char __user *buf, size_t count)
+ 	adsp->capt_buf.tail += count;
+ 	adsp->capt_buf.tail &= adsp->capt_buf_size - 1;
+ 
+-	if (adsp->buffer_drain_pending)
++	if (adsp->buffer_drain_pending) {
+ 		wm_adsp_stream_capture(adsp);
+ 
++		ret = wm_adsp_ack_buffer_interrupt(adsp);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	return count;
+ }
+ EXPORT_SYMBOL_GPL(wm_adsp_stream_read);
+-- 
+1.7.9.5
+

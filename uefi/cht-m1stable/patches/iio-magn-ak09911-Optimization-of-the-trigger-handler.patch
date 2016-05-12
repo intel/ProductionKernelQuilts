@@ -1,0 +1,102 @@
+From 7b9308f71b7bb6a29973abdc3c1d011aaa72f145 Mon Sep 17 00:00:00 2001
+From: arun <arun.radhakrishnan@intel.com>
+Date: Sun, 10 Apr 2016 17:52:49 -0500
+Subject: [PATCH 4/5] iio: magn: ak09911: Optimization of the trigger handler
+
+the data readout frequency was low inspite of using the hrtimer,
+also the % jitter observed within the apps was high.
+It was observed that we were spending considerable time within
+the hrtimer trigger handler in setting the operating mode each time
+and waiting for the data ready to happen. Optimized the function by
+removing the call to wait_conversion_complete_polled and adding poll
+data ready at a faster rate.
+
+Change-Id: I40fe2c3f300d096e2a5d2beedaac788bfcc7e65f
+Tracked-On:https://jira01.devtools.intel.com/browse/OAM-28475
+Signed-off-by: Arun Radhakrishnan <arun.radhakrishnan@intel.com>
+Reviewed-on: https://android.intel.com:443/492688
+---
+ drivers/iio/magnetometer/ak09911.c | 36 ++++++++++++++++++++++++++----------
+ 1 file changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/iio/magnetometer/ak09911.c b/drivers/iio/magnetometer/ak09911.c
+index 783389e..0600ebd 100644
+--- a/drivers/iio/magnetometer/ak09911.c
++++ b/drivers/iio/magnetometer/ak09911.c
+@@ -83,7 +83,7 @@
+ 					AK09911_CNTL2_CONTINUOUS_3_BIT)
+ #define AK09911_CNTL2_CONTINUOUS_SHIFT	1
+ 
+-#define AK09911_MAX_CONVERSION_TIMEOUT		500
++#define AK09911_MAX_CONVERSION_TIMEOUT		100
+ #define AK09911_CONVERSION_DONE_POLL_TIME	10
+ #define AK09911_CNTL2_CONTINUOUS_DEFAULT	0
+ #define IF_USE_REGMAP_INTERFACE			0
+@@ -506,30 +506,44 @@ static const struct regmap_config ak09911_regmap_config = {
+ 	.num_reg_defaults = ARRAY_SIZE(ak09911_reg_defaults),
+ 	.max_register = AK09911_MAX_REGS,
+ };
++
+ static irqreturn_t ak09911_trigger_handler(int irq, void *p)
+ {
+ 	struct iio_poll_func *pf = p;
+ 	struct iio_dev *indio_dev = pf->indio_dev;
+ 	struct ak09911_data *data = iio_priv(indio_dev);
++	struct i2c_client *client = data->client;
+ 	int ret, i=0 ,j=0 ;
+ 	u16 meas_reg;
+ 	s16 raw;
++	int count = AK09911_MAX_CONVERSION_TIMEOUT;
++	u8 read_status;
+ 
+-	ret = ak09911_set_mode(data->client,  AK09911_MODE_CONTINUOUS_4);
+-	if (ret < 0)
+-		goto err;
++	mutex_lock(&data->lock);
++
++	do {
++		ret = i2c_smbus_read_byte_data(client, AK09911_REG_ST1);
++		if (ret < 0) {
++			dev_err(&client->dev, "Error in reading ST1\n");
++			return ret;
++		}
++		read_status = ret & 0x01;
++		if (read_status)
++			break;
++		} while (count--);
++
++	if (count <=  0)
++		dev_err(&client->dev,"timeout reading AK09911_REG_ST1 reg\n");
+ 
+-	ret = wait_conversion_complete_polled(data);
+-	if (ret < 0)
+-		goto err;
+ 
+-	mutex_lock(&data->lock);
+ 	for_each_set_bit(i, indio_dev->active_scan_mask,
+ 		indio_dev->masklength) {
+ 
+ 	ret = i2c_smbus_read_word_data(data->client, ak09911_index_to_reg[i]);
+-	if (ret < 0)
++	if (ret < 0) {
++		dev_err(&client->dev, "Read ERROR\n");
+ 		goto err;
++	}
+ 
+ 	meas_reg = ret;
+ 	/* Endian conversion of the measured values. */
+@@ -543,8 +557,10 @@ static irqreturn_t ak09911_trigger_handler(int irq, void *p)
+ 	/* datasheet recommends reading ST2 register after each
+ 	 * data read operation */
+ 	ret = i2c_smbus_read_byte_data(data->client, AK09911_REG_ST2);
+-	if (ret < 0)
++	if (ret < 0){
++		dev_err(&client->dev, "read AK09911_REG_ST2 ERROR\n");
+ 		goto err;
++	}
+ 
+ 	iio_push_to_buffers_with_timestamp(indio_dev, data->buffer,
+ 					   pf->timestamp);
+-- 
+1.9.1
+

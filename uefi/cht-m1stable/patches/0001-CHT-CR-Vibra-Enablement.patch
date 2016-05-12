@@ -1,0 +1,349 @@
+From 7bcaffe01db9c6b5ddd3daf8903e5d3c5655961e Mon Sep 17 00:00:00 2001
+From: "Bhakte, GurudattaX" <gurudattax.bhakte@intel.com>
+Date: Wed, 11 Feb 2015 18:29:52 +0530
+Subject: [PATCH 01/24] CHT-CR Vibra Enablement.
+
+Added CHT SOC controlled PWM and SOC controlled Vibra.
+
+Change-Id: I516b4aa3c1edb5b43d06778629ab16bf6915769e
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-18331
+Signed-off-by: Bhakte, GurudattaX <gurudattax.bhakte@intel.com>
+---
+ drivers/acpi/acpi_lpss.c                  |  3 +-
+ drivers/input/misc/intel_mid_vibra.c      |  4 +-
+ drivers/input/misc/intel_mid_vibra_acpi.c | 64 ++++++++++++++++++++++++++++---
+ drivers/input/misc/mid_vibra.h            |  2 +-
+ drivers/misc/pwm/pwm_byt_core.c           | 39 ++++++++++++++++---
+ drivers/misc/pwm/pwm_byt_core.h           |  1 +
+ drivers/misc/pwm/pwm_byt_pci.c            |  1 +
+ drivers/misc/pwm/pwm_byt_platdrv.c        |  6 +++
+ include/linux/pwm.h                       |  2 +-
+ 9 files changed, 107 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/acpi/acpi_lpss.c b/drivers/acpi/acpi_lpss.c
+index ffb5a7d..956ad22 100644
+--- a/drivers/acpi/acpi_lpss.c
++++ b/drivers/acpi/acpi_lpss.c
+@@ -198,7 +198,8 @@ static const struct acpi_device_id acpi_lpss_device_ids[] = {
+ 	{ "80862286", (unsigned long)&lpss_dma_desc },
+ 	{ "808622C0", (unsigned long)&lpss_dma_desc },
+ 	{ "8086228E", (unsigned long)&byt_spi_dev_desc },
+-	{ "80862288", }, /* CHT PWM */
++	{ "80862288", }, /* CHT PWM 0 */
++	{ "80862289", }, /* CHT PWM 1 */
+ 
+ 	{ "INT3430", (unsigned long)&lpt_dev_desc },
+ 	{ "INT3431", (unsigned long)&lpt_dev_desc },
+diff --git a/drivers/input/misc/intel_mid_vibra.c b/drivers/input/misc/intel_mid_vibra.c
+index 711ce42..18c4058 100644
+--- a/drivers/input/misc/intel_mid_vibra.c
++++ b/drivers/input/misc/intel_mid_vibra.c
+@@ -1,5 +1,5 @@
+ /*
+- *  intel_mid_vibra_acpi.c - Intel Vibrator for for Intel CherryTrail platform
++ *  intel_mid_vibra.c - Intel Vibrator for Intel CherryTrail platform
+  *
+  *  Copyright (C) 2014 Intel Corp
+  *  Author: B, Jayachandran <jayachandran.b@intel.com>
+@@ -200,7 +200,7 @@ void *mid_vibra_acpi_get_drvdata(const char *hid)
+ }
+ 
+ static const struct acpi_device_id vibra_acpi_ids[] = {
+-	{ "VIBR22A8", (kernel_ulong_t) &pmic_vibra_data_cht },
++	{ "VIBR22A8", (kernel_ulong_t) &vibra_pdata },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(acpi, vibra_acpi_ids);
+diff --git a/drivers/input/misc/intel_mid_vibra_acpi.c b/drivers/input/misc/intel_mid_vibra_acpi.c
+index 1f08d8a..f8b3652 100644
+--- a/drivers/input/misc/intel_mid_vibra_acpi.c
++++ b/drivers/input/misc/intel_mid_vibra_acpi.c
+@@ -30,6 +30,9 @@
+ #include <linux/mfd/intel_soc_pmic.h>
+ #include <linux/input/intel_mid_vibra.h>
+ #include "mid_vibra.h"
++#include <linux/pwm.h>
++#include <linux/io.h>
++#include <linux/dmi.h>
+ 
+ #define CRYSTALCOVE_PMIC_PWM_EN_GPIO_REG        0x2F
+ /* PWM enable gpio register settings: drive type = CMOS; pull disabled */
+@@ -40,7 +43,15 @@
+ 
+ #define CRYSTALCOVE_PMIC_VIBRA_MAX_BASEUNIT	0x7F
+ 
+-struct mid_vibra_pdata pmic_vibra_data_cht = {
++/* for CHT CR SOC controlled vibra */
++#define SE_BASE_ADDRESS 0xFED98000
++#define CFG0_ADDR 0x4408
++#define CFG1_ADDR 0x440C
++#define PERIOD_NS 2000
++#define DUTY_NS_OFF 1000   /* 50 % */
++#define DUTY_NS_ON 500     /* 25 % */
++
++struct mid_vibra_pdata vibra_pdata = {
+ 	.time_divisor	= 0x7f, /* for 50% duty cycle */
+ 	.base_unit	= 0x0,
+ 	.gpio_pwm	= -1,
+@@ -49,6 +60,35 @@ struct mid_vibra_pdata pmic_vibra_data_cht = {
+ 		/* CHT vibra doesnt use gpio enable control */
+ };
+ 
++static int vibra_pwm_configure(struct vibra_info *info, bool enable)
++{
++	struct pwm_chip *chip = find_pwm_dev(1);
++	struct pwm_device *pwm;
++	int pwm_id;
++
++	if (!chip) {
++		pr_err("%s: Could not get pwm chip", __func__);
++		return 0;
++	}
++	pwm_id = chip->pwms[0].pwm;
++	pwm = pwm_request(pwm_id, "byt-pwm");
++	if (!pwm) {
++		pr_err("%s: Could not get pwm device", __func__);
++		return -ENODEV;
++	}
++
++	if (enable) {
++		pr_info("%s: Config and enable vibra  devi\n", __func__);
++		chip->ops->config(chip,  pwm,  DUTY_NS_ON,  PERIOD_NS);
++		chip->ops->enable(chip,  pwm);
++	} else {
++		pr_info("%s: disable  vibra device\n", __func__);
++		chip->ops->config(chip,  pwm,  DUTY_NS_OFF,  PERIOD_NS);
++		chip->ops->enable(chip,  pwm);
++	}
++	return 0;
++}
++
+ static int vibra_pmic_pwm_configure(struct vibra_info *info, bool enable)
+ {
+ 	u8 clk_div;
+@@ -102,6 +142,7 @@ int intel_mid_plat_vibra_probe(struct platform_device *pdev)
+ 	const char *hid;
+ 	struct mid_vibra_pdata *data;
+ 	int ret;
++	const char *board_name;
+ 
+ 	ret = acpi_bus_get_device(handle, &device);
+ 	if (ret) {
+@@ -116,6 +157,14 @@ int intel_mid_plat_vibra_probe(struct platform_device *pdev)
+ 		pr_err("Invalid driver data\n");
+ 		return -ENODEV;
+ 	}
++	board_name = dmi_get_system_info(DMI_BOARD_NAME);
++	if (strcmp(board_name, "Cherry Trail CR") == 0) {
++		pr_info("Cherry Trail CR: intel_mid_plat_vibra_probe\n");
++		/* make sure that the pad is set to native mode */
++		void __iomem *cfg = ioremap_nocache(SE_BASE_ADDRESS, 0x8000);
++		iowrite32(0x10000, cfg + CFG0_ADDR);
++		iounmap(cfg);
++	}
+ 
+ 	if (data->use_gpio_en) {
+ 		if (data->gpio_en < 0) {
+@@ -128,10 +177,15 @@ int intel_mid_plat_vibra_probe(struct platform_device *pdev)
+ 	if (!info)
+ 		return -ENODEV;
+ 
+-	info->pwm_configure = vibra_pmic_pwm_configure;
+-	info->max_base_unit = CRYSTALCOVE_PMIC_VIBRA_MAX_BASEUNIT;
+-	info->max_duty_cycle = INTEL_VIBRA_MAX_TIMEDIVISOR;
+-
++	if (strcmp(board_name, "Cherry Trail CR") == 0) {
++		info->pwm_configure = vibra_pwm_configure;
++		/* WA: Until BIOS set 50% duty cycle on boot */
++		vibra_pwm_configure(info, false);
++	} else {
++		info->pwm_configure = vibra_pmic_pwm_configure;
++		info->max_base_unit = CRYSTALCOVE_PMIC_VIBRA_MAX_BASEUNIT;
++		info->max_duty_cycle = INTEL_VIBRA_MAX_TIMEDIVISOR;
++	}
+ 	if (data->use_gpio_en) {
+ 		pr_debug("%s: using gpio_en: %d", __func__, info->gpio_en);
+ 		ret = gpio_request_one(info->gpio_en, GPIOF_DIR_OUT,
+diff --git a/drivers/input/misc/mid_vibra.h b/drivers/input/misc/mid_vibra.h
+index dd1385d..ce011c1 100644
+--- a/drivers/input/misc/mid_vibra.h
++++ b/drivers/input/misc/mid_vibra.h
+@@ -53,7 +53,7 @@ void *mid_vibra_acpi_get_drvdata(const char *hid);
+ int intel_mid_plat_vibra_probe(struct platform_device *pdev);
+ int intel_mid_plat_vibra_remove(struct platform_device *pdev);
+ 
+-extern struct mid_vibra_pdata pmic_vibra_data_cht;
++extern struct mid_vibra_pdata vibra_pdata;
+ 
+ #define vibra_gpio_set_value(info, v) \
+ {if ((info)->use_gpio_en) \
+diff --git a/drivers/misc/pwm/pwm_byt_core.c b/drivers/misc/pwm/pwm_byt_core.c
+index 796dfa1..fc6d153 100644
+--- a/drivers/misc/pwm/pwm_byt_core.c
++++ b/drivers/misc/pwm/pwm_byt_core.c
+@@ -22,11 +22,13 @@
+ #include <linux/fs.h>
+ #include <linux/pwm.h>
+ #include "pwm_byt_core.h"
++#include <linux/dmi.h>
+ 
+ /* PWM registers and bits definitions */
+ 
+ #define PWMCR(chip)	(chip->mmio_base + 0)
+ #define PWMRESET(chip)	(chip->mmio_base + 0x804)
++#define PWMGENERAL(chip) (chip->mmio_base + 0x808)
+ #define PWMCR_EN	(1 << 31)
+ #define PWMCR_UP	(1 << 30)
+ #define PWMRESET_EN	3
+@@ -88,7 +90,9 @@ static int byt_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
+ 	uint32_t otd;
+ 	uint32_t update;
+ 	int r;
+-
++	uint32_t clock;
++	uint32_t temp;
++	const char *board_name;
+ 	pm_runtime_get_sync(byt_pwm->dev);
+ 
+ 	/* frequency = clock * base_unit/256, so:
+@@ -101,22 +105,37 @@ static int byt_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
+ 	/* one time divison calculation:
+ 	   duty_ns / period_ns = (256 - otd) / 256 */
+ 	otd = 256 - duty_ns * 256 / period_ns;
+-
+ 	mutex_lock(&byt_pwm->lock);
+-
++	board_name = dmi_get_system_info(DMI_BOARD_NAME);
++	if (strcmp(board_name, "Cherry Trail CR") == 0) {
++		pr_debug("Cherry Trail CR: byt_pwm_config\n");
++		/* reset pwm before configuring */
++		iowrite32(PWMRESET_EN, PWMRESET(byt_pwm));
++		/* set clock */
++		clock = ioread32(PWMGENERAL(byt_pwm));
++		if (&byt_pwm->clk_khz == PWM_CHT_CLK_KHZ) {
++			temp = BIT(3);
++			clock &= ~temp;
++		} else {
++			clock |= BIT(3);
++		}
++		iowrite32(clock, PWMGENERAL(byt_pwm));
++	}
+ 	/* update counter */
+ 	update = ioread32(PWMCR(byt_pwm));
+ 	update &= (~PWMCR_OTD_MASK & ~PWMCR_BU_MASK & ~PWMCR_BUF_MASK);
+ 	update |= (otd & 0xff) << PWMCR_OTD_OFFSET;
+ 	update |= (bu & 0xff) << PWMCR_BU_OFFSET;
+ 	update |= (bu_f & 0xff) << PWMCR_BUF_OFFSET;
++	if (strcmp(board_name, "Cherry Trail CR") == 0)
++		update &= 0x00ffffff;
+ 	iowrite32(update, PWMCR(byt_pwm));
+ 
++
+ 	/* set update flag */
+ 	update |= PWMCR_UP;
+ 	iowrite32(update, PWMCR(byt_pwm));
+ 	r = byt_pwm_wait_update_complete(byt_pwm);
+-
+ 	mutex_unlock(&byt_pwm->lock);
+ 
+ 	pm_runtime_mark_last_busy(byt_pwm->dev);
+@@ -155,7 +174,6 @@ static void byt_pwm_disable(struct pwm_chip *chip, struct pwm_device *pwm)
+ 
+ 	val = ioread32(PWMCR(byt_pwm));
+ 	iowrite32(val & ~PWMCR_EN, PWMCR(byt_pwm));
+-
+ 	mutex_unlock(&byt_pwm->lock);
+ 	pm_runtime_mark_last_busy(byt_pwm->dev);
+ 	pm_runtime_put_autosuspend(byt_pwm->dev);
+@@ -179,6 +197,17 @@ static struct byt_pwm_chip *find_pwm_chip(unsigned int pwm_num)
+ 	return NULL;
+ }
+ 
++struct pwm_chip *find_pwm_dev(unsigned int pwm_num)
++{
++	struct byt_pwm_chip *p;
++	list_for_each_entry(p, &pwm_chip_list, list) {
++		if (p->pwm_num == pwm_num)
++			return &p->chip;
++	}
++	return NULL;
++}
++EXPORT_SYMBOL(find_pwm_dev);
++
+ /* directly read a value to a PWM register */
+ int lpio_bl_read(uint8_t pwm_num, uint32_t reg)
+ {
+diff --git a/drivers/misc/pwm/pwm_byt_core.h b/drivers/misc/pwm/pwm_byt_core.h
+index fc01391..05fe999 100644
+--- a/drivers/misc/pwm/pwm_byt_core.h
++++ b/drivers/misc/pwm/pwm_byt_core.h
+@@ -12,6 +12,7 @@
+  */
+ #define PWM_BYT_CLK_KHZ	25000
+ #define PWM_CHT_CLK_KHZ	19200
++#define PWM_CHT_SLOW_CLK_KHZ 32
+ int pwm_byt_init(struct device *pdev, void __iomem *base,
+ 		int pwm_num, unsigned int clk_khz);
+ void pwm_byt_remove(struct device *dev);
+diff --git a/drivers/misc/pwm/pwm_byt_pci.c b/drivers/misc/pwm/pwm_byt_pci.c
+index 70fa3b2..bbf4d69 100644
+--- a/drivers/misc/pwm/pwm_byt_pci.c
++++ b/drivers/misc/pwm/pwm_byt_pci.c
+@@ -73,6 +73,7 @@ static void pwm_byt_pci_remove(struct pci_dev *pdev)
+ }
+ 
+ static const struct pci_device_id pwm_byt_pci_ids[] = {
++	{ PCI_VDEVICE(INTEL, 0x2288), PWM_CHT_CLK_KHZ},
+ 	{ PCI_VDEVICE(INTEL, 0x0F08), PWM_BYT_CLK_KHZ},
+ 	{ PCI_VDEVICE(INTEL, 0x0F09), PWM_BYT_CLK_KHZ},
+ 	{ 0,}
+diff --git a/drivers/misc/pwm/pwm_byt_platdrv.c b/drivers/misc/pwm/pwm_byt_platdrv.c
+index 5faab85..5331491 100644
+--- a/drivers/misc/pwm/pwm_byt_platdrv.c
++++ b/drivers/misc/pwm/pwm_byt_platdrv.c
+@@ -21,11 +21,13 @@
+ #include <linux/platform_device.h>
+ #include <linux/acpi.h>
+ #include "pwm_byt_core.h"
++#include <linux/dmi.h>
+ 
+ #ifdef CONFIG_ACPI
+ static const struct acpi_device_id pwm_byt_acpi_ids[] = {
+ 	{ "80860F09", PWM_BYT_CLK_KHZ },
+ 	{ "80862288", PWM_CHT_CLK_KHZ },
++	{ "80862289", PWM_CHT_CLK_KHZ },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(acpi, pwm_byt_acpi_ids);
+@@ -39,6 +41,7 @@ static int pwm_byt_plat_probe(struct platform_device *pdev)
+ 	int r;
+ 	const struct acpi_device_id *id;
+ 	int clk = PWM_BYT_CLK_KHZ;
++	const char *board_name;
+ 
+ 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!mem) {
+@@ -63,6 +66,9 @@ static int pwm_byt_plat_probe(struct platform_device *pdev)
+ 		if (!strncmp(id->id, dev_name(&pdev->dev), strlen(id->id)))
+ 			clk = id->driver_data;
+ #endif
++	board_name = dmi_get_system_info(DMI_BOARD_NAME);
++	if (strcmp(board_name, "Cherry Trail CR") == 0)
++		clk = PWM_CHT_CLK_KHZ;
+ 	r = pwm_byt_init(&pdev->dev, base, pwm_num, clk);
+ 	if (r)
+ 		goto err_iounmap;
+diff --git a/include/linux/pwm.h b/include/linux/pwm.h
+index 27f6ad4..cbbdd9f 100644
+--- a/include/linux/pwm.h
++++ b/include/linux/pwm.h
+@@ -311,5 +311,5 @@ int lpio_bl_write(uint8_t pwm_num, uint32_t reg, uint32_t val);
+ int lpio_bl_write_bits(uint8_t pwm_num, uint32_t reg, uint32_t val,
+ 		uint32_t mask);
+ int lpio_bl_update(uint8_t pwm_num, uint32_t reg);
+-
++struct pwm_chip *find_pwm_dev(unsigned int pwm_num);
+ #endif /* __LINUX_PWM_H */
+-- 
+1.9.1
+

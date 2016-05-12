@@ -1,0 +1,941 @@
+From 83b24453c93c2940fc39c1b2a81c6f93e66bab54 Mon Sep 17 00:00:00 2001
+Message-Id: <83b24453c93c2940fc39c1b2a81c6f93e66bab54.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: rtshiva <sivakumar.thulasimani@intel.com>
+Date: Wed, 28 Jan 2015 13:53:52 +0530
+Subject: [PATCH 26/95] MUST_REBASE [VPG]: intel/core/vlv: Add CHV DPIO
+ functions
+
+This patch adds a new file, which contains all DPIO programming
+related operations, for CHV.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+Issue: GMINL-5517
+Change-Id: I684de26f22f56ccdb1db126d0c78e951b7cf6050
+Signed-off-by: rtshiva <sivakumar.thulasimani@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/Makefile          |    3 +-
+ drivers/video/adf/intel/core/vlv/chv_dpio.c        |  492 ++++++++++++++++++++
+ .../video/adf/intel/include/core/intel_dc_config.h |   13 +
+ drivers/video/adf/intel/include/core/vlv/dpio.h    |   41 ++
+ .../adf/intel/include/core/vlv/vlv_dc_config.h     |   24 +-
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |  174 +++++++
+ 6 files changed, 744 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/vlv/chv_dpio.c
+ create mode 100644 drivers/video/adf/intel/include/core/vlv/dpio.h
+
+diff --git a/drivers/video/adf/intel/core/vlv/Makefile b/drivers/video/adf/intel/core/vlv/Makefile
+index 2f4875f..e3c88c8 100644
+--- a/drivers/video/adf/intel/core/vlv/Makefile
++++ b/drivers/video/adf/intel/core/vlv/Makefile
+@@ -12,4 +12,5 @@ obj-y := vlv_dc_config.o \
+ 	vlv_dsi_port.o \
+ 	vlv_dsi_port_cmd.o \
+ 	vlv_pipeline.o \
+-	vlv_hdmi_port.o
++	vlv_hdmi_port.o \
++	chv_dpio.o
+diff --git a/drivers/video/adf/intel/core/vlv/chv_dpio.c b/drivers/video/adf/intel/core/vlv/chv_dpio.c
+new file mode 100644
+index 0000000..95cd4f2
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/chv_dpio.c
+@@ -0,0 +1,492 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Created on 15 Dec 2014
++ * Author: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
++ */
++
++#include <drm/drmP.h>
++#include <core/vlv/dpio.h>
++
++enum dpio_channel {
++	DPIO_CH0,
++	DPIO_CH1,
++};
++
++u32 dpio_signal_levels[4][4][5] = {
++	{
++		{0x00000000, 0x00349800, 0x04340000, 0x80800000, 0x02020000},
++		{0x02020000, 0x004d9800, 0x044d0000, 0x80800000, 0x00000000},
++		{0x00000000, 0x00669800, 0x04660000, 0x80800000, 0x02020000},
++		{0x02020000, 0x009a9800, 0x049a0000, 0x80800000, 0x00000000}
++	},
++	{
++		{0x00000000, 0x004e9800, 0x044e0000, 0x55550000, 0x02020000},
++		{0x02020000, 0x00749800, 0x04740000, 0x55550000, 0x00000000},
++		{0x00000000, 0x009a9800, 0x049a0000, 0x55550000, 0x02020000}
++	},
++	{
++		{0x02020000, 0x00689800, 0x04680000, 0x40400000, 0x00000000},
++		{0x00000000, 0x009a9800, 0x049a0000, 0x39390000, 0x02020000}
++	},
++	{
++		{0x00000000, 0x009a9800, 0x049a0000, 0x2b2b0000, 0x02020000}
++	}
++};
++
++static inline struct vlv_dc_config *get_vlv_dc_config(
++	struct vlv_pipeline *disp)
++{
++	/* find the first pipeline object */
++	while (disp->disp_no != 0)
++		disp--;
++
++	return container_of(disp, struct vlv_dc_config, pipeline[0]);
++}
++
++int vlv_disp_to_port(struct vlv_pipeline *pipeline)
++{
++	enum port port_id;
++
++	switch (pipeline->type) {
++	case INTEL_PIPE_DSI:
++		port_id = pipeline->port.dsi_port.port_id;
++		break;
++	case INTEL_PIPE_HDMI:
++		port_id = pipeline->port.hdmi_port.port_id;
++		break;
++	case INTEL_PIPE_DP:
++	case INTEL_PIPE_EDP:
++	default:
++		BUG();
++		return -EINVAL;
++	}
++
++	pr_info("ADF: %s port=%d", __func__, (int)port_id);
++
++	switch (port_id) {
++	case PORT_B:
++	case PORT_D:
++		return DPIO_CH0;
++	case PORT_C:
++		return DPIO_CH1;
++	default:
++		pr_err("%s: invalid port passed for channel retrieval\n",
++			__func__);
++		BUG();
++		break;
++	}
++
++	/* should never reach here */
++	return -EINVAL;
++}
++
++int vlv_pipe_to_channel(enum pipe pipe)
++{
++	switch (pipe) {
++	case PIPE_A:
++	case PIPE_C:
++		return DPIO_CH0;
++	case PIPE_B:
++		return DPIO_CH1;
++	default:
++		pr_err("%s: invalid pipe passed for channel retrieval\n",
++			__func__);
++		BUG();
++	}
++}
++
++void chv_dpio_update_clock(struct intel_pipeline *pipeline,
++		struct intel_clock *clock)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	enum dpio_channel port = vlv_disp_to_port(disp);
++	u32 bestn, bestm1, bestm2, bestp1, bestp2, bestm2_frac;
++	struct vlv_dc_config *config = get_vlv_dc_config(disp);
++	u32  loopfilter;
++	u32 old_val = 0, val = 0;
++	bestn = clock->n;
++	bestm1 = clock->m1;
++	bestm2 = clock->m2 >> 22;
++	bestm2_frac = clock->m2 & 0x3fffff;
++	bestp1 = clock->p1;
++	bestp2 = clock->p2;
++
++	mutex_lock(&config->dpio_lock);
++
++	/* p1 and p2 divider */
++	val = 5 << DPIO_CHV_S1_DIV_SHIFT |
++		bestp1 << DPIO_CHV_P1_DIV_SHIFT |
++		bestp2 << DPIO_CHV_P2_DIV_SHIFT |
++		1 << DPIO_CHV_K_DIV_SHIFT;
++	old_val = vlv_dpio_read(disp->dpio_id, CHV_CMN_DW13(port));
++	pr_err("old = %x new = %x\n", old_val, val);
++	vlv_dpio_write(disp->dpio_id, CHV_CMN_DW13(port), val);
++
++	/* Feedback post-divider - m2 */
++	old_val = vlv_dpio_read(disp->dpio_id, CHV_PLL_DW0(port));
++	pr_err("old = %x new = %x\n", old_val, bestm2);
++	vlv_dpio_write(disp->dpio_id, CHV_PLL_DW0(port), bestm2);
++
++	/* Feedback refclk divider - n and m1 */
++	val = DPIO_CHV_M1_DIV_BY_2 |
++		1 << DPIO_CHV_N_DIV_SHIFT;
++	old_val = vlv_dpio_read(disp->dpio_id, CHV_PLL_DW1(port));
++	pr_err("old = %x new = %x\n", old_val, val);
++	vlv_dpio_write(disp->dpio_id, CHV_PLL_DW1(port), val);
++
++	/* M2 fraction division */
++	old_val = vlv_dpio_read(disp->dpio_id, CHV_PLL_DW2(port));
++	vlv_dpio_write(disp->dpio_id, CHV_PLL_DW2(port), bestm2_frac);
++	pr_err("old = %x new = %x\n", old_val, bestm2_frac);
++
++	/* M2 fraction division enable */
++	val = DPIO_CHV_FRAC_DIV_EN |
++		(2 << DPIO_CHV_FEEDFWD_GAIN_SHIFT);
++	old_val = vlv_dpio_read(disp->dpio_id, CHV_PLL_DW3(port));
++	pr_err("old = %x new = %x\n", old_val, val);
++	vlv_dpio_write(disp->dpio_id, CHV_PLL_DW3(port), val);
++
++	/* Loop filter */
++	loopfilter = 5 << DPIO_CHV_PROP_COEFF_SHIFT |
++		2 << DPIO_CHV_GAIN_CTRL_SHIFT;
++
++	loopfilter |= 11 << DPIO_CHV_INT_COEFF_SHIFT;
++	old_val = vlv_dpio_read(disp->dpio_id, CHV_PLL_DW6(port));
++	pr_err("old = %x new = %x\n", old_val, val);
++	vlv_dpio_write(disp->dpio_id, CHV_PLL_DW6(port), loopfilter);
++
++	/* AFC Recal */
++	vlv_dpio_write(disp->dpio_id, CHV_CMN_DW14(port),
++			vlv_dpio_read(disp->dpio_id, CHV_CMN_DW14(port)) |
++			DPIO_AFC_RECAL);
++
++	mutex_unlock(&config->dpio_lock);
++}
++
++
++void chv_dpio_update_channel(struct intel_pipeline *pipeline)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dc_config *config = get_vlv_dc_config(disp);
++	enum dpio_channel ch = vlv_disp_to_port(disp);
++	u32 val = 0;
++	mutex_lock(&config->dpio_lock);
++
++	/* program left/right clock distribution */
++	if (disp->pipe.pipe_id != PIPE_B) {
++		val = vlv_dpio_read(disp->dpio_id, _CHV_CMN_DW5_CH0);
++		val &= ~(CHV_BUFLEFTENA1_MASK | CHV_BUFRIGHTENA1_MASK);
++		if (ch == DPIO_CH0)
++			val |= CHV_BUFLEFTENA1_FORCE;
++		if (ch == DPIO_CH1)
++			val |= CHV_BUFRIGHTENA1_FORCE;
++		vlv_dpio_write(disp->dpio_id, _CHV_CMN_DW5_CH0, val);
++	} else {
++		val = vlv_dpio_read(disp->dpio_id, _CHV_CMN_DW1_CH1);
++		val &= ~(CHV_BUFLEFTENA2_MASK | CHV_BUFRIGHTENA2_MASK);
++		if (ch == DPIO_CH0)
++			val |= CHV_BUFLEFTENA2_FORCE;
++		if (ch == DPIO_CH1)
++			val |= CHV_BUFRIGHTENA2_FORCE;
++		vlv_dpio_write(disp->dpio_id, _CHV_CMN_DW1_CH1, val);
++	}
++
++	/* program clock channel usage */
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW8(ch));
++	val |= CHV_PCS_USEDCLKCHANNEL_OVRRIDE;
++	if (disp->pipe.pipe_id != PIPE_B)
++		val &= ~CHV_PCS_USEDCLKCHANNEL;
++	else
++		val |= CHV_PCS_USEDCLKCHANNEL;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW8(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW8(ch));
++	val |= CHV_PCS_USEDCLKCHANNEL_OVRRIDE;
++	if (disp->pipe.pipe_id != PIPE_B)
++		val &= ~CHV_PCS_USEDCLKCHANNEL;
++	else
++		val |= CHV_PCS_USEDCLKCHANNEL;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW8(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, CHV_CMN_DW19(ch));
++	if (disp->pipe.pipe_id != PIPE_B)
++		val &= ~CHV_CMN_USEDCLKCHANNEL;
++	else
++		val |= CHV_CMN_USEDCLKCHANNEL;
++	vlv_dpio_write(disp->dpio_id, CHV_CMN_DW19(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, CHV_CMN_DW14(ch));
++	val |= DPIO_DCLKP_EN;
++	vlv_dpio_write(disp->dpio_id, CHV_CMN_DW14(ch), val);
++
++	mutex_unlock(&config->dpio_lock);
++
++	udelay(1);
++}
++
++void chv_dpio_pre_port_enable(struct intel_pipeline *pipeline)
++{
++	int i = 0, val = 0, data = 0;
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dc_config *config = get_vlv_dc_config(disp);
++	enum dpio_channel ch = vlv_disp_to_port(disp);
++
++	mutex_lock(&config->dpio_lock);
++
++	/* allow hardware to manage TX FIFO reset source */
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW11(ch));
++	val &= ~DPIO_LANEDESKEW_STRAP_OVRD;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW11(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW11(ch));
++	val &= ~DPIO_LANEDESKEW_STRAP_OVRD;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW11(ch), val);
++
++	/* Deassert soft data lane reset*/
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW1(ch));
++	val |= CHV_PCS_REQ_SOFTRESET_EN;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW1(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW1(ch));
++	val |= CHV_PCS_REQ_SOFTRESET_EN;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW1(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW0(ch));
++	val |= (DPIO_PCS_TX_LANE2_RESET | DPIO_PCS_TX_LANE1_RESET);
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW0(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW0(ch));
++	val |= (DPIO_PCS_TX_LANE2_RESET | DPIO_PCS_TX_LANE1_RESET);
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW0(ch), val);
++
++	/* Program Tx lane latency optimal setting*/
++	for (i = 0; i < 4; i++) {
++		/* Set the latency optimal bit */
++		data = (i == 1) ? 0x0 : 0x6;
++		vlv_dpio_write(disp->dpio_id, CHV_TX_DW11(ch, i),
++				data << DPIO_FRC_LATENCY_SHFIT);
++
++		/* Set the upar bit */
++		data = (i == 1) ? 0x0 : 0x1;
++		vlv_dpio_write(disp->dpio_id, CHV_TX_DW14(ch, i),
++				data << DPIO_UPAR_SHIFT);
++	}
++
++	if (disp->type != INTEL_PIPE_HDMI) {
++		mutex_unlock(&config->dpio_lock);
++		return;
++	}
++
++	/* FIXME: Fix up value only after power analysis */
++
++	/* Data lane stagger programming */
++
++	/* Clear calc init */
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW10(ch));
++	val &= ~(DPIO_PCS_SWING_CALC_TX0_TX2 | DPIO_PCS_SWING_CALC_TX1_TX3);
++	val &= ~(DPIO_PCS_TX1DEEMP_MASK | DPIO_PCS_TX2DEEMP_MASK);
++	val |= DPIO_PCS_TX1DEEMP_9P5 | DPIO_PCS_TX2DEEMP_9P5;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW10(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW10(ch));
++	val &= ~(DPIO_PCS_SWING_CALC_TX0_TX2 | DPIO_PCS_SWING_CALC_TX1_TX3);
++	val &= ~(DPIO_PCS_TX1DEEMP_MASK | DPIO_PCS_TX2DEEMP_MASK);
++	val |= DPIO_PCS_TX1DEEMP_9P5 | DPIO_PCS_TX2DEEMP_9P5;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW10(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW9(ch));
++	val &= ~(DPIO_PCS_TX1MARGIN_MASK | DPIO_PCS_TX2MARGIN_MASK);
++	val |= DPIO_PCS_TX1MARGIN_000 | DPIO_PCS_TX2MARGIN_000;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW9(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW9(ch));
++	val &= ~(DPIO_PCS_TX1MARGIN_MASK | DPIO_PCS_TX2MARGIN_MASK);
++	val |= DPIO_PCS_TX1MARGIN_000 | DPIO_PCS_TX2MARGIN_000;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW9(ch), val);
++
++	/* FIXME: Program the support xxx V-dB */
++	/* Use 800mV-0dB */
++	for (i = 0; i < 4; i++) {
++		val = vlv_dpio_read(disp->dpio_id, CHV_TX_DW4(ch, i));
++		val &= ~DPIO_SWING_DEEMPH9P5_MASK;
++		val |= 128 << DPIO_SWING_DEEMPH9P5_SHIFT;
++		vlv_dpio_write(disp->dpio_id, CHV_TX_DW4(ch, i), val);
++	}
++
++	for (i = 0; i < 4; i++) {
++		val = vlv_dpio_read(disp->dpio_id, CHV_TX_DW2(ch, i));
++		val &= ~DPIO_SWING_MARGIN000_MASK;
++		val |= 102 << DPIO_SWING_MARGIN000_SHIFT;
++		vlv_dpio_write(disp->dpio_id, CHV_TX_DW2(ch, i), val);
++	}
++
++	/* Disable unique transition scale */
++	for (i = 0; i < 4; i++) {
++		val = vlv_dpio_read(disp->dpio_id, CHV_TX_DW3(ch, i));
++		val &= ~DPIO_TX_UNIQ_TRANS_SCALE_EN;
++		vlv_dpio_write(disp->dpio_id, CHV_TX_DW3(ch, i), val);
++	}
++
++	/* Additional steps for 1200mV-0dB */
++	/* Start swing calculation */
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW10(ch));
++	val |= DPIO_PCS_SWING_CALC_TX0_TX2 | DPIO_PCS_SWING_CALC_TX1_TX3;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW10(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW10(ch));
++	val |= DPIO_PCS_SWING_CALC_TX0_TX2 | DPIO_PCS_SWING_CALC_TX1_TX3;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW10(ch), val);
++
++	/* LRC Bypass */
++	val = vlv_dpio_read(disp->dpio_id, CHV_CMN_DW30);
++	val |= DPIO_LRC_BYPASS;
++	vlv_dpio_write(disp->dpio_id, CHV_CMN_DW30, val);
++
++	mutex_unlock(&config->dpio_lock);
++}
++
++void chv_dpio_lane_reset_en(struct intel_pipeline *pipeline, bool enable)
++{
++	int val = 0, add = 0;
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dc_config *config = get_vlv_dc_config(disp);
++	enum dpio_channel ch = vlv_disp_to_port(disp);
++
++	mutex_lock(&config->dpio_lock);
++
++	/* Propagate soft reset to data lane reset */
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW1(ch));
++	val |= (CHV_PCS_REQ_SOFTRESET_EN | DPIO_PCS_CLK_SOFT_RESET);
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW1(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW1(ch));
++	val |= (CHV_PCS_REQ_SOFTRESET_EN | DPIO_PCS_CLK_SOFT_RESET);
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW1(ch), val);
++
++	if (enable)
++		add = (DPIO_PCS_TX_LANE2_RESET | DPIO_PCS_TX_LANE1_RESET);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW0(ch));
++	val  = add;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW0(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW0(ch));
++	val = add;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW0(ch), val);
++
++	mutex_unlock(&config->dpio_lock);
++}
++
++void chv_dpio_post_disable(struct intel_pipeline *pipeline)
++{
++	int val = 0;
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dc_config *config = get_vlv_dc_config(disp);
++	enum dpio_channel ch = vlv_disp_to_port(disp);
++
++	mutex_lock(&config->dpio_lock);
++
++	/* Propagate soft reset to data lane reset */
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW1(ch));
++	val |= CHV_PCS_REQ_SOFTRESET_EN;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW1(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW1(ch));
++	val |= CHV_PCS_REQ_SOFTRESET_EN;
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW1(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS01_DW0(ch));
++	val &= ~(DPIO_PCS_TX_LANE2_RESET | DPIO_PCS_TX_LANE1_RESET);
++	vlv_dpio_write(disp->dpio_id, VLV_PCS01_DW0(ch), val);
++
++	val = vlv_dpio_read(disp->dpio_id, VLV_PCS23_DW0(ch));
++	val &= ~(DPIO_PCS_TX_LANE2_RESET | DPIO_PCS_TX_LANE1_RESET);
++	vlv_dpio_write(disp->dpio_id, VLV_PCS23_DW0(ch), val);
++
++	mutex_unlock(&config->dpio_lock);
++}
++
++
++void chv_dpio_post_pll_disable(struct intel_pipeline *pipeline)
++{
++	int val = 0;
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dc_config *config = get_vlv_dc_config(disp);
++	enum dpio_channel ch = vlv_disp_to_port(disp);
++
++	mutex_lock(&config->dpio_lock);
++
++	/* Disable 10bit clock to display controller */
++	val = vlv_dpio_read(disp->dpio_id, CHV_CMN_DW14(ch));
++	val &= ~DPIO_DCLKP_EN;
++	vlv_dpio_write(disp->dpio_id, CHV_CMN_DW14(ch), val);
++
++	/* disable left/right clock distribution */
++	if (disp->pipe.pipe_id != PIPE_B) {
++		val = vlv_dpio_read(disp->dpio_id, _CHV_CMN_DW5_CH0);
++		val &= ~(CHV_BUFLEFTENA1_MASK | CHV_BUFRIGHTENA1_MASK);
++		vlv_dpio_write(disp->dpio_id, _CHV_CMN_DW5_CH0, val);
++	} else {
++		val = vlv_dpio_read(disp->dpio_id, _CHV_CMN_DW1_CH1);
++		val &= ~(CHV_BUFLEFTENA2_MASK | CHV_BUFRIGHTENA2_MASK);
++		vlv_dpio_write(disp->dpio_id, _CHV_CMN_DW1_CH1, val);
++	}
++
++	mutex_unlock(&config->dpio_lock);
++}
++
++void chv_dpio_lane_reset(struct intel_pipeline *pipeline)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dc_config *config = get_vlv_dc_config(disp);
++
++	mutex_lock(&config->dpio_lock);
++
++	vlv_dpio_write(disp->dpio_id, 0x8200, 0x00000000);
++	vlv_dpio_write(disp->dpio_id, 0x8204, 0x00e00060);
++
++	mutex_unlock(&config->dpio_lock);
++}
++
++void chv_dpio_signal_levels(struct intel_pipeline *pipeline,
++	u32 deemp, u32 margin)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dc_config *config = get_vlv_dc_config(disp);
++
++	u32 trigreg = 0x8228;
++	u32 reglist[3] = {0};
++	u32 *vallist;
++	reglist[0] = 0x8288;
++	reglist[1] = 0x828C;
++	reglist[2] = 0x8290;
++
++	vallist = dpio_signal_levels[deemp][margin];
++
++	mutex_lock(&config->dpio_lock);
++
++	vlv_dpio_write(disp->dpio_id, trigreg, vallist[0]);
++	vlv_dpio_write(disp->dpio_id, reglist[0], vallist[1]);
++	vlv_dpio_write(disp->dpio_id, reglist[1], vallist[2]);
++	vlv_dpio_write(disp->dpio_id, reglist[2], vallist[3]);
++	vlv_dpio_write(disp->dpio_id, trigreg, vallist[4]);
++
++	mutex_unlock(&config->dpio_lock);
++}
++
++void vlv_dpio_signal_levels(struct intel_pipeline *pipeline,
++	u32 deemp, u32 margin)
++{
++	/* FIXME: to be implemetned */
++	BUG();
++}
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 0d0fad2..d0495fc 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -465,6 +465,19 @@ struct intel_global_status {
+ 	bool plane_status[2][6];
+ };
+ 
++struct intel_clock {
++	/* given values */
++	int n;
++	int m1, m2;
++	int p1, p2;
++
++	/* derived values */
++	int dot;
++	int vco;
++	int m;
++	int p;
++};
++
+ struct intel_pipe {
+ 	struct intel_dc_component base;
+ 	bool primary;
+diff --git a/drivers/video/adf/intel/include/core/vlv/dpio.h b/drivers/video/adf/intel/include/core/vlv/dpio.h
+new file mode 100644
+index 0000000..8cb1c2b
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/vlv/dpio.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright © 2014 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ */
++
++#ifndef _CHV_DPIO_H_
++#define _CHV_DPIO_H_
++
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_dc_regs.h>
++
++void chv_dpio_update_clock(struct intel_pipeline *pipeline,
++		struct intel_clock *clock);
++void chv_dpio_update_channel(struct intel_pipeline *pipeline);
++void chv_dpio_pre_port_enable(struct intel_pipeline *pipeline);
++
++void chv_dpio_set_signal_levels(struct intel_pipeline *pipeline,
++	u32 deemph_reg_value, u32 margin_reg_value);
++void chv_dpio_lane_reset_en(struct intel_pipeline *pipeline, bool enable);
++
++void chv_dpio_post_disable(struct intel_pipeline *pipeline);
++void chv_dpio_post_pll_disable(struct intel_pipeline *pipeline);
++void chv_dpio_lane_reset(struct intel_pipeline *pipeline);
++void chv_dpio_signal_levels(struct intel_pipeline *pipeline,
++	u32 deemp, u32 margin);
++
++
++void vlv_dpio_signal_levels(struct intel_pipeline *pipeline,
++	u32 deemp, u32 margin);
++
++#endif /* _CHV_DPIO_H_ */
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+index c7b5546..1bfb662 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+@@ -20,13 +20,16 @@
+ #include <drm/i915_drm.h>
+ #include <drm/i915_adf.h>
+ #include <core/common/dsi/dsi_pipe.h>
++#include <core/common/hdmi/gen_hdmi_pipe.h>
+ #include <core/vlv/vlv_pri_plane.h>
+ #include <core/vlv/vlv_sp_plane.h>
+ #include <core/vlv/vlv_dpst.h>
+ #include <core/vlv/vlv_dsi_port.h>
++#include <core/vlv/vlv_hdmi_port.h>
+ #include <core/vlv/vlv_pll.h>
+ #include <core/vlv/vlv_pipe.h>
+ #include <core/vlv/vlv_pm.h>
++#include <core/vlv/dpio.h>
+ 
+ #define VLV_N_PLANES	6
+ #define VLV_N_PIPES	2
+@@ -83,6 +86,20 @@ static inline void vlv_flisdsi_write(u32 reg, u32 val)
+ 				reg, &val);
+ }
+ 
++static inline void vlv_dpio_write(u32 port, u32 reg, u32 val)
++{
++	intel_adf_dpio_sideband_rw(INTEL_SIDEBAND_REG_WRITE, port,
++			reg, &val);
++}
++
++static inline u32 vlv_dpio_read(u32 port, u32 reg)
++{
++	u32 val;
++	intel_adf_dpio_sideband_rw(INTEL_SIDEBAND_REG_READ, port,
++			reg, &val);
++	return val;
++}
++
+ static inline void vlv_gpio_nc_write(u32 reg, u32 val)
+ {
+ 	intel_adf_dpio_sideband_rw(INTEL_SIDEBAND_REG_WRITE,
+@@ -124,15 +141,17 @@ struct vlv_pipeline {
+ 	struct vlv_pipe pipe;
+ 	struct vlv_pri_plane pplane;
+ 	struct vlv_sp_plane splane[2];
++	u32 dpio_id;
++	u32 disp_no;
+ 	enum intel_pipe_type type;
+ 	u16 dc_stepping;
+ 	union {
+ 		struct dsi_pipe dsi;
+-		/* later we will have hdmi pipe */
++		struct hdmi_pipe hdmi;
+ 	} gen;
+ 	union {
+ 		struct vlv_dsi_port dsi_port;
+-		/* later we will have hdmi port */
++		struct vlv_hdmi_port hdmi_port;
+ 	} port;
+ 
+ };
+@@ -142,6 +161,7 @@ struct vlv_dc_config {
+ 	u32 max_pipes;
+ 	u32 max_planes;
+ 	struct vlv_dpst dpst;
++	struct mutex dpio_lock;
+ 	/*
+ 	 * FIXME: For other platforms the number of pipes may
+ 	 * vary, which has to be handeled in future
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index 350ffc4..7980e03 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -383,6 +383,7 @@ extern int chv_cursor_offsets[];
+ #define   IOSF_PORT_PUNIT			0x4
+ #define   IOSF_PORT_NC				0x11
+ #define   IOSF_PORT_DPIO			0x12
++#define   IOSF_PORT_DPIO_2			0x1A
+ #define   IOSF_PORT_GPIO_NC			0x13
+ #define   IOSF_PORT_GPIO_SC			0x48
+ #define   IOSF_PORT_GPIO_SUS			0xA8
+@@ -568,18 +569,37 @@ extern int chv_cursor_offsets[];
+ #define _VLV_PCS_DW0_CH1		0x8400
+ #define   DPIO_PCS_TX_LANE2_RESET	(1<<16)
+ #define   DPIO_PCS_TX_LANE1_RESET	(1<<7)
++#define   DPIO_LEFT_TXFIFO_RST_MASTER2	(1<<4)
++#define   DPIO_RIGHT_TXFIFO_RST_MASTER2	(1<<3)
+ #define VLV_PCS_DW0(ch) _PORT(ch, _VLV_PCS_DW0_CH0, _VLV_PCS_DW0_CH1)
+ 
++#define _VLV_PCS01_DW0_CH0		0x200
++#define _VLV_PCS23_DW0_CH0		0x400
++#define _VLV_PCS01_DW0_CH1		0x2600
++#define _VLV_PCS23_DW0_CH1		0x2800
++#define VLV_PCS01_DW0(ch) _PORT(ch, _VLV_PCS01_DW0_CH0, _VLV_PCS01_DW0_CH1)
++#define VLV_PCS23_DW0(ch) _PORT(ch, _VLV_PCS23_DW0_CH0, _VLV_PCS23_DW0_CH1)
++
+ #define _VLV_PCS_DW1_CH0		0x8204
+ #define _VLV_PCS_DW1_CH1		0x8404
++#define   CHV_PCS_REQ_SOFTRESET_EN	(1<<23)
+ #define   DPIO_PCS_CLK_CRI_RXEB_EIOS_EN	(1<<22)
+ #define   DPIO_PCS_CLK_CRI_RXDIGFILTSG_EN (1<<21)
+ #define   DPIO_PCS_CLK_DATAWIDTH_SHIFT	(6)
+ #define   DPIO_PCS_CLK_SOFT_RESET	(1<<5)
+ #define VLV_PCS_DW1(ch) _PORT(ch, _VLV_PCS_DW1_CH0, _VLV_PCS_DW1_CH1)
+ 
++#define _VLV_PCS01_DW1_CH0		0x204
++#define _VLV_PCS23_DW1_CH0		0x404
++#define _VLV_PCS01_DW1_CH1		0x2604
++#define _VLV_PCS23_DW1_CH1		0x2804
++#define VLV_PCS01_DW1(ch) _PORT(ch, _VLV_PCS01_DW1_CH0, _VLV_PCS01_DW1_CH1)
++#define VLV_PCS23_DW1(ch) _PORT(ch, _VLV_PCS23_DW1_CH0, _VLV_PCS23_DW1_CH1)
++
+ #define _VLV_PCS_DW8_CH0		0x8220
+ #define _VLV_PCS_DW8_CH1		0x8420
++#define   CHV_PCS_USEDCLKCHANNEL_OVRRIDE	(1 << 20)
++#define   CHV_PCS_USEDCLKCHANNEL		(1 << 21)
+ #define VLV_PCS_DW8(ch) _PORT(ch, _VLV_PCS_DW8_CH0, _VLV_PCS_DW8_CH1)
+ 
+ #define _VLV_PCS01_DW8_CH0		0x0220
+@@ -591,12 +611,56 @@ extern int chv_cursor_offsets[];
+ 
+ #define _VLV_PCS_DW9_CH0		0x8224
+ #define _VLV_PCS_DW9_CH1		0x8424
++#define   DPIO_PCS_TX2MARGIN_MASK	(0x7<<13)
++#define   DPIO_PCS_TX2MARGIN_000	(0<<13)
++#define   DPIO_PCS_TX2MARGIN_101	(1<<13)
++#define   DPIO_PCS_TX1MARGIN_MASK	(0x7<<10)
++#define   DPIO_PCS_TX1MARGIN_000	(0<<10)
++#define   DPIO_PCS_TX1MARGIN_101	(1<<10)
+ #define	VLV_PCS_DW9(ch) _PORT(ch, _VLV_PCS_DW9_CH0, _VLV_PCS_DW9_CH1)
+ 
++#define _VLV_PCS01_DW9_CH0		0x224
++#define _VLV_PCS23_DW9_CH0		0x424
++#define _VLV_PCS01_DW9_CH1		0x2624
++#define _VLV_PCS23_DW9_CH1		0x2824
++#define VLV_PCS01_DW9(ch) _PORT(ch, _VLV_PCS01_DW9_CH0, _VLV_PCS01_DW9_CH1)
++#define VLV_PCS23_DW9(ch) _PORT(ch, _VLV_PCS23_DW9_CH0, _VLV_PCS23_DW9_CH1)
++
++#define _CHV_PCS_DW10_CH0		0x8228
++#define _CHV_PCS_DW10_CH1		0x8428
++#define   DPIO_PCS_SWING_CALC_TX0_TX2	(1<<30)
++#define   DPIO_PCS_SWING_CALC_TX1_TX3	(1<<31)
++#define   DPIO_PCS_TX2DEEMP_MASK	(0xf<<24)
++#define   DPIO_PCS_TX2DEEMP_9P5		(0<<24)
++#define   DPIO_PCS_TX2DEEMP_6P0		(2<<24)
++#define   DPIO_PCS_TX1DEEMP_MASK	(0xf<<16)
++#define   DPIO_PCS_TX1DEEMP_9P5		(0<<16)
++#define   DPIO_PCS_TX1DEEMP_6P0		(2<<16)
++#define CHV_PCS_DW10(ch) _PORT(ch, _CHV_PCS_DW10_CH0, _CHV_PCS_DW10_CH1)
++
++#define _VLV_PCS01_DW10_CH0		0x0228
++#define _VLV_PCS23_DW10_CH0		0x0428
++#define _VLV_PCS01_DW10_CH1		0x2628
++#define _VLV_PCS23_DW10_CH1		0x2828
++#define VLV_PCS01_DW10(port) _PORT(port, _VLV_PCS01_DW10_CH0, \
++					_VLV_PCS01_DW10_CH1)
++#define VLV_PCS23_DW10(port) _PORT(port, _VLV_PCS23_DW10_CH0, \
++					_VLV_PCS23_DW10_CH1)
++
+ #define _VLV_PCS_DW11_CH0		0x822c
+ #define _VLV_PCS_DW11_CH1		0x842c
++#define   DPIO_LANEDESKEW_STRAP_OVRD	(1<<3)
++#define   DPIO_LEFT_TXFIFO_RST_MASTER	(1<<1)
++#define   DPIO_RIGHT_TXFIFO_RST_MASTER	(1<<0)
+ #define VLV_PCS_DW11(ch) _PORT(ch, _VLV_PCS_DW11_CH0, _VLV_PCS_DW11_CH1)
+ 
++#define _VLV_PCS01_DW11_CH0		0x022c
++#define _VLV_PCS23_DW11_CH0		0x042c
++#define _VLV_PCS01_DW11_CH1		0x262c
++#define _VLV_PCS23_DW11_CH1		0x282c
++#define VLV_PCS01_DW11(ch) _PORT(ch, _VLV_PCS01_DW0_CH0, _VLV_PCS01_DW0_CH1)
++#define VLV_PCS23_DW11(ch) _PORT(ch, _VLV_PCS23_DW0_CH0, _VLV_PCS23_DW0_CH1)
++
+ #define _VLV_PCS_DW12_CH0		0x8230
+ #define _VLV_PCS_DW12_CH1		0x8430
+ #define VLV_PCS_DW12(ch) _PORT(ch, _VLV_PCS_DW12_CH0, _VLV_PCS_DW12_CH1)
+@@ -611,14 +675,25 @@ extern int chv_cursor_offsets[];
+ 
+ #define _VLV_TX_DW2_CH0			0x8288
+ #define _VLV_TX_DW2_CH1			0x8488
++#define   DPIO_SWING_MARGIN000_SHIFT	16
++#define   DPIO_SWING_MARGIN000_MASK	(0xff << DPIO_SWING_MARGIN000_SHIFT)
++#define   DPIO_UNIQ_TRANS_SCALE_SHIFT	8
+ #define VLV_TX_DW2(ch) _PORT(ch, _VLV_TX_DW2_CH0, _VLV_TX_DW2_CH1)
+ 
+ #define _VLV_TX_DW3_CH0			0x828c
+ #define _VLV_TX_DW3_CH1			0x848c
++/* The following bit for CHV phy */
++#define   DPIO_TX_UNIQ_TRANS_SCALE_EN	(1<<27)
++#define   DPIO_SWING_MARGIN101_SHIFT	16
++#define   DPIO_SWING_MARGIN101_MASK	(0xff << DPIO_SWING_MARGIN101_SHIFT)
+ #define VLV_TX_DW3(ch) _PORT(ch, _VLV_TX_DW3_CH0, _VLV_TX_DW3_CH1)
+ 
+ #define _VLV_TX_DW4_CH0			0x8290
+ #define _VLV_TX_DW4_CH1			0x8490
++#define   DPIO_SWING_DEEMPH9P5_SHIFT	24
++#define   DPIO_SWING_DEEMPH9P5_MASK	(0xff << DPIO_SWING_DEEMPH9P5_SHIFT)
++#define   DPIO_SWING_DEEMPH6P0_SHIFT	16
++#define   DPIO_SWING_DEEMPH6P0_MASK	(0xff << DPIO_SWING_DEEMPH6P0_SHIFT)
+ #define VLV_TX_DW4(ch) _PORT(ch, _VLV_TX_DW4_CH0, _VLV_TX_DW4_CH1)
+ 
+ #define _VLV_TX3_DW4_CH0		0x690
+@@ -638,6 +713,96 @@ extern int chv_cursor_offsets[];
+ #define _VLV_TX_DW14_CH1		0x84b8
+ #define VLV_TX_DW14(ch) _PORT(ch, _VLV_TX_DW14_CH0, _VLV_TX_DW14_CH1)
+ 
++/* CHV dpPhy registers */
++#define _CHV_PLL_DW0_CH0		0x8000
++#define _CHV_PLL_DW0_CH1		0x8180
++#define CHV_PLL_DW0(ch) _PIPE(ch, _CHV_PLL_DW0_CH0, _CHV_PLL_DW0_CH1)
++
++#define _CHV_PLL_DW1_CH0		0x8004
++#define _CHV_PLL_DW1_CH1		0x8184
++#define   DPIO_CHV_N_DIV_SHIFT		8
++#define   DPIO_CHV_M1_DIV_BY_2		(0 << 0)
++#define CHV_PLL_DW1(ch) _PIPE(ch, _CHV_PLL_DW1_CH0, _CHV_PLL_DW1_CH1)
++
++#define _CHV_PLL_DW2_CH0		0x8008
++#define _CHV_PLL_DW2_CH1		0x8188
++#define CHV_PLL_DW2(ch) _PIPE(ch, _CHV_PLL_DW2_CH0, _CHV_PLL_DW2_CH1)
++
++#define _CHV_PLL_DW3_CH0		0x800c
++#define _CHV_PLL_DW3_CH1		0x818c
++#define  DPIO_CHV_FRAC_DIV_EN		(1 << 16)
++#define  DPIO_CHV_FIRST_MOD		(0 << 8)
++#define  DPIO_CHV_SECOND_MOD		(1 << 8)
++#define  DPIO_CHV_FEEDFWD_GAIN_SHIFT	0
++#define CHV_PLL_DW3(ch) _PIPE(ch, _CHV_PLL_DW3_CH0, _CHV_PLL_DW3_CH1)
++
++#define _CHV_PLL_DW6_CH0		0x8018
++#define _CHV_PLL_DW6_CH1		0x8198
++#define   DPIO_CHV_GAIN_CTRL_SHIFT	16
++#define	  DPIO_CHV_INT_COEFF_SHIFT	8
++#define   DPIO_CHV_PROP_COEFF_SHIFT	0
++#define CHV_PLL_DW6(ch) _PIPE(ch, _CHV_PLL_DW6_CH0, _CHV_PLL_DW6_CH1)
++
++#define _CHV_CMN_DW5_CH0               0x8114
++#define   CHV_BUFRIGHTENA1_DISABLE	(0 << 20)
++#define   CHV_BUFRIGHTENA1_NORMAL	(1 << 20)
++#define   CHV_BUFRIGHTENA1_FORCE	(3 << 20)
++#define   CHV_BUFRIGHTENA1_MASK		(3 << 20)
++#define   CHV_BUFLEFTENA1_DISABLE	(0 << 22)
++#define   CHV_BUFLEFTENA1_NORMAL	(1 << 22)
++#define   CHV_BUFLEFTENA1_FORCE		(3 << 22)
++#define   CHV_BUFLEFTENA1_MASK		(3 << 22)
++
++#define _CHV_CMN_DW13_CH0		0x8134
++#define _CHV_CMN_DW0_CH1		0x8080
++#define   DPIO_CHV_S1_DIV_SHIFT		21
++#define   DPIO_CHV_P1_DIV_SHIFT		13 /* 3 bits */
++#define   DPIO_CHV_P2_DIV_SHIFT		8  /* 5 bits */
++#define   DPIO_CHV_K_DIV_SHIFT		4
++#define   DPIO_PLL_FREQLOCK		(1 << 1)
++#define   DPIO_PLL_LOCK			(1 << 0)
++#define CHV_CMN_DW13(ch) _PIPE(ch, _CHV_CMN_DW13_CH0, _CHV_CMN_DW0_CH1)
++
++#define _CHV_CMN_DW14_CH0		0x8138
++#define _CHV_CMN_DW1_CH1		0x8084
++#define   DPIO_AFC_RECAL		(1 << 14)
++#define   DPIO_DCLKP_EN			(1 << 13)
++#define   CHV_BUFLEFTENA2_DISABLE	(0 << 17) /* CL2 DW1 only */
++#define   CHV_BUFLEFTENA2_NORMAL	(1 << 17) /* CL2 DW1 only */
++#define   CHV_BUFLEFTENA2_FORCE		(3 << 17) /* CL2 DW1 only */
++#define   CHV_BUFLEFTENA2_MASK		(3 << 17) /* CL2 DW1 only */
++#define   CHV_BUFRIGHTENA2_DISABLE	(0 << 19) /* CL2 DW1 only */
++#define   CHV_BUFRIGHTENA2_NORMAL	(1 << 19) /* CL2 DW1 only */
++#define   CHV_BUFRIGHTENA2_FORCE	(3 << 19) /* CL2 DW1 only */
++#define   CHV_BUFRIGHTENA2_MASK		(3 << 19) /* CL2 DW1 only */
++#define CHV_CMN_DW14(ch) _PIPE(ch, _CHV_CMN_DW14_CH0, _CHV_CMN_DW1_CH1)
++
++#define _CHV_CMN_DW19_CH0		0x814c
++#define _CHV_CMN_DW6_CH1		0x8098
++#define   CHV_CMN_USEDCLKCHANNEL	(1 << 13)
++#define CHV_CMN_DW19(ch) _PIPE(ch, _CHV_CMN_DW19_CH0, _CHV_CMN_DW6_CH1)
++
++#define CHV_CMN_DW30			0x8178
++#define   DPIO_LRC_BYPASS		(1 << 3)
++
++#define _TXLANE(ch, lane, offset) ((ch ? 0x2400 : 0) + \
++					(lane) * 0x200 + (offset))
++
++#define CHV_TX_DW0(ch, lane) _TXLANE(ch, lane, 0x80)
++#define CHV_TX_DW1(ch, lane) _TXLANE(ch, lane, 0x84)
++#define CHV_TX_DW2(ch, lane) _TXLANE(ch, lane, 0x88)
++#define CHV_TX_DW3(ch, lane) _TXLANE(ch, lane, 0x8c)
++#define CHV_TX_DW4(ch, lane) _TXLANE(ch, lane, 0x90)
++#define CHV_TX_DW5(ch, lane) _TXLANE(ch, lane, 0x94)
++#define CHV_TX_DW6(ch, lane) _TXLANE(ch, lane, 0x98)
++#define CHV_TX_DW7(ch, lane) _TXLANE(ch, lane, 0x9c)
++#define CHV_TX_DW8(ch, lane) _TXLANE(ch, lane, 0xa0)
++#define CHV_TX_DW9(ch, lane) _TXLANE(ch, lane, 0xa4)
++#define CHV_TX_DW10(ch, lane) _TXLANE(ch, lane, 0xa8)
++#define CHV_TX_DW11(ch, lane) _TXLANE(ch, lane, 0xac)
++#define   DPIO_FRC_LATENCY_SHFIT	8
++#define CHV_TX_DW14(ch, lane) _TXLANE(ch, lane, 0xb8)
++#define   DPIO_UPAR_SHIFT		30
+ /*
+  * Fence registers
+  */
+@@ -1284,7 +1449,13 @@ extern int chv_cursor_offsets[];
+ #define   DPLL_PORTC_READY_MASK		(0xf << 4)
+ #define   DPLL_PORTB_READY_MASK		(0xf)
+ 
++#define   DPLL_SSC_REF_CLOCK_CHV        (1<<13)
++
+ #define   DPLL_FPA01_P1_POST_DIV_MASK_I830	0x001f0000
++
++#define DPIO_PHY_STATUS                 (VLV_DISPLAY_BASE + 0x6240)
++#define   DPLL_PORTD_READY_MASK         (0xf)
++
+ /*
+  * The i830 generation, in LVDS mode, defines P1 as the bit number set within
+  * this field (only one bit may be set).
+@@ -3074,10 +3245,13 @@ extern int chv_cursor_offsets[];
+ /* Link training mode - select a suitable mode for each stage */
+ #define   DP_LINK_TRAIN_PAT_1		(0 << 28)
+ #define   DP_LINK_TRAIN_PAT_2		(1 << 28)
++#define   DP_LINK_TRAIN_PAT_3_CHV       (1 << 14)
+ #define   DP_LINK_TRAIN_PAT_IDLE	(2 << 28)
+ #define   DP_LINK_TRAIN_OFF		(3 << 28)
+ #define   DP_LINK_TRAIN_MASK		(3 << 28)
+ #define   DP_LINK_TRAIN_SHIFT		28
++#define   DP_LINK_TRAIN_MASK_CHV	((3 << 28) | (1 << 14))
++#define DP_LINK_STATUS_SIZE		6
+ 
+ /* CPT Link training mode */
+ #define   DP_LINK_TRAIN_PAT_1_CPT	(0 << 8)
+-- 
+1.7.9.5
+

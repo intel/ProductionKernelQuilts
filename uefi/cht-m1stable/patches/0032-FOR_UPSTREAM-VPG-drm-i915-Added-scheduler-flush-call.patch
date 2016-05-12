@@ -1,0 +1,145 @@
+From 37cb9ca6cfb81ace5b4ae4820994801b0fd46282 Mon Sep 17 00:00:00 2001
+Message-Id: <37cb9ca6cfb81ace5b4ae4820994801b0fd46282.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 10 Apr 2014 10:50:59 +0100
+Subject: [PATCH 32/61] FOR_UPSTREAM [VPG]: drm/i915: Added scheduler flush
+ calls to ring throttle and idle functions
+
+When requesting that all GPU work is completed, it is now necessary to get the
+scheduler involved in order to flush out work that queued and not yet
+submitted.
+
+Change-Id: I95dcc2a2ee5c1a844748621c333994ddd6cf6a66
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c       |   17 ++++++++++++-
+ drivers/gpu/drm/i915/i915_scheduler.c |   45 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.h |    4 +++
+ 3 files changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 4067d5a..45227d3 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3321,6 +3321,10 @@ int i915_gpu_idle(struct drm_device *dev)
+ 
+ 	/* Flush everything onto the inactive list. */
+ 	for_each_ring(ring, dev_priv, i) {
++		ret = I915_SCHEDULER_FLUSH_ALL(ring, true);
++		if (ret < 0)
++			return ret;
++
+ 		if (!i915.enable_execlists) {
+ 			ret = i915_switch_context(ring, ring->default_context);
+ 			if (ret)
+@@ -4348,12 +4352,23 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 	unsigned long recent_enough = jiffies - msecs_to_jiffies(20);
+ 	struct drm_i915_gem_request *request, *target = NULL;
+ 	unsigned reset_counter;
+-	int ret;
++	int i, ret;
++	struct intel_engine_cs *ring;
+ 
+ 	ret = i915_gem_wait_for_error(dev, &dev_priv->gpu_error);
+ 	if (ret)
+ 		return ret;
+ 
++	for_each_ring(ring, dev_priv, i) {
++		/* Need a mechanism to flush out scheduler entries that were
++		 * submitted more than 'recent_enough' time ago as well! In the
++		 * meantime, just flush everything out to ensure that entries
++		 * can not sit around indefinitely. */
++		ret = I915_SCHEDULER_FLUSH_ALL(ring, false);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	spin_lock(&file_priv->mm.lock);
+ 	list_for_each_entry(request, &file_priv->mm.request_list, client_list) {
+ 		if (time_after_eq(request->emitted_jiffies, recent_enough))
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index c292005..de7a3ce 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -633,6 +633,51 @@ int i915_scheduler_flush_request(struct drm_i915_gem_request *req,
+ 	return flush_count;
+ }
+ 
++int i915_scheduler_flush(struct intel_engine_cs *ring, bool is_locked)
++{
++	struct i915_scheduler_queue_entry *node;
++	struct drm_i915_private           *dev_priv;
++	struct i915_scheduler             *scheduler;
++	unsigned long       flags;
++	bool        found;
++	int         ret;
++	uint32_t    count = 0;
++
++	if (!ring)
++		return -EINVAL;
++
++	dev_priv  = ring->dev->dev_private;
++	scheduler = dev_priv->scheduler;
++
++	if (!scheduler)
++		return 0;
++
++	BUG_ON(is_locked && (scheduler->flags[ring->id] & i915_sf_submitting));
++
++	do {
++		found = false;
++		spin_lock_irqsave(&scheduler->lock, flags);
++		list_for_each_entry(node, &scheduler->node_queue[ring->id], link) {
++			if (!I915_SQS_IS_QUEUED(node))
++				continue;
++
++			found = true;
++			break;
++		}
++		spin_unlock_irqrestore(&scheduler->lock, flags);
++
++		if (found) {
++			ret = i915_scheduler_submit(ring, is_locked);
++			if (ret < 0)
++				return ret;
++
++			count += ret;
++		}
++	} while (found);
++
++	return count;
++}
++
+ void i915_scheduler_priority_bump_clear(struct i915_scheduler *scheduler)
+ {
+ 	struct i915_scheduler_queue_entry *node;
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 0bdf4df..219903c 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -65,6 +65,9 @@ struct i915_scheduler_queue_entry {
+ 	uint32_t                            scheduler_index;
+ };
+ 
++#define I915_SCHEDULER_FLUSH_ALL(ring, locked)                              \
++	i915_scheduler_flush(ring, locked)
++
+ #define I915_SCHEDULER_FLUSH_REQUEST(req, locked)                           \
+ 	i915_scheduler_flush_request(req, locked)
+ 
+@@ -93,6 +96,7 @@ int         i915_scheduler_closefile(struct drm_device *dev,
+ int         i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe);
+ int         i915_scheduler_handle_irq(struct intel_engine_cs *ring);
+ void        i915_gem_scheduler_work_handler(struct work_struct *work);
++int         i915_scheduler_flush(struct intel_engine_cs *ring, bool is_locked);
+ int         i915_scheduler_flush_request(struct drm_i915_gem_request *req,
+ 					 bool is_locked);
+ bool        i915_scheduler_is_request_tracked(struct drm_i915_gem_request *req,
+-- 
+1.7.9.5
+

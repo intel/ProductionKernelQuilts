@@ -1,0 +1,151 @@
+From e4404a1f350fd7e43f295e13696688efddf33c93 Mon Sep 17 00:00:00 2001
+Message-Id: <e4404a1f350fd7e43f295e13696688efddf33c93.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 24 Jul 2014 17:04:12 +0100
+Subject: [PATCH 11/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Initialization for
+ Logical Ring Contexts
+
+For the moment this is just a placeholder, but it shows one of the
+main differences between the good ol' HW contexts and the shiny
+new Logical Ring Contexts: LR contexts allocate  and free their
+own backing objects. Another difference is that the allocation is
+deferred (as the create function name suggests), but that does not
+happen in this patch yet, because for the moment we are only dealing
+with the default context.
+
+Early in the series we had our own gen8_gem_context_init/fini
+functions, but the truth is they now look almost the same as the
+legacy hw context init/fini functions. We can always split them
+later if this ceases to be the case.
+
+Also, we do not fall back to legacy ringbuffers when logical ring
+context initialization fails (not very likely to happen and, even
+if it does, hw contexts would probably fail as well).
+
+v2: Daniel says "explain, do not showcase".
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+[danvet: s/BUG_ON/WARN_ON/.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit ede7d42baeece583c864badb6f9081f4cded6c32)
+
+Change-Id: I8531609a9721c0a4c7d1216928bc67de8a860628
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: ede7d42baeece583c864badb6f9081f4cded6c32
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |   29 +++++++++++++++++++++++------
+ drivers/gpu/drm/i915/intel_lrc.c        |   15 +++++++++++++++
+ drivers/gpu/drm/i915/intel_lrc.h        |    5 +++++
+ 3 files changed, 43 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 7649cf5..c73d6c2 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -182,7 +182,10 @@ void i915_gem_context_free(struct kref *ctx_ref)
+ 						   typeof(*ctx), ref);
+ 	struct i915_hw_ppgtt *ppgtt = NULL;
+ 
+-	if (ctx->legacy_hw_ctx.rcs_state) {
++	if (i915.enable_execlists) {
++		ppgtt = ctx_to_ppgtt(ctx);
++		intel_lr_context_free(ctx);
++	} else if (ctx->legacy_hw_ctx.rcs_state) {
+ 		/* We refcount even the aliasing PPGTT to keep the code symmetric */
+ 		if (USES_PPGTT(ctx->legacy_hw_ctx.rcs_state->base.dev))
+ 			ppgtt = ctx_to_ppgtt(ctx);
+@@ -419,7 +422,11 @@ int i915_gem_context_init(struct drm_device *dev)
+ 	if (WARN_ON(dev_priv->ring[RCS].default_context))
+ 		return 0;
+ 
+-	if (HAS_HW_CONTEXTS(dev)) {
++	if (i915.enable_execlists) {
++		/* NB: intentionally left blank. We will allocate our own
++		 * backing objects as we need them, thank you very much */
++		dev_priv->hw_context_size = 0;
++	} else if (HAS_HW_CONTEXTS(dev)) {
+ 		dev_priv->hw_context_size = round_up(get_context_size(dev), 4096);
+ 		if (dev_priv->hw_context_size > (1<<20)) {
+ 			DRM_DEBUG_DRIVER("Disabling HW Contexts; invalid size %d\n",
+@@ -435,11 +442,20 @@ int i915_gem_context_init(struct drm_device *dev)
+ 		return PTR_ERR(ctx);
+ 	}
+ 
+-	/* NB: RCS will hold a ref for all rings */
+-	for (i = 0; i < I915_NUM_RINGS; i++)
+-		dev_priv->ring[i].default_context = ctx;
++	for (i = 0; i < I915_NUM_RINGS; i++) {
++		struct intel_engine_cs *ring = &dev_priv->ring[i];
++
++		/* NB: RCS will hold a ref for all rings */
++		ring->default_context = ctx;
++
++		/* FIXME: we really only want to do this for initialized rings */
++		if (i915.enable_execlists)
++			intel_lr_context_deferred_create(ctx, ring);
++	}
+ 
+-	DRM_DEBUG_DRIVER("%s context support initialized\n", dev_priv->hw_context_size ? "HW" : "fake");
++	DRM_DEBUG_DRIVER("%s context support initialized\n",
++			i915.enable_execlists ? "LR" :
++			dev_priv->hw_context_size ? "HW" : "fake");
+ 	return 0;
+ }
+ 
+@@ -848,6 +864,7 @@ int i915_gem_context_create_ioctl(struct drm_device *dev, void *data,
+ 	struct intel_context *ctx;
+ 	int ret;
+ 
++	/* FIXME: allow user-created LR contexts as well */
+ 	if (!hw_context_enabled(dev))
+ 		return -ENODEV;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 21f7f1c..09ffb9c 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -51,3 +51,18 @@ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists
+ 
+ 	return 0;
+ }
++
++void intel_lr_context_free(struct intel_context *ctx)
++{
++	/* TODO */
++}
++
++int intel_lr_context_deferred_create(struct intel_context *ctx,
++				     struct intel_engine_cs *ring)
++{
++	WARN_ON(ctx->legacy_hw_ctx.rcs_state != NULL);
++
++	/* TODO */
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index 75ee9c3..3b93572 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -24,6 +24,11 @@
+ #ifndef _INTEL_LRC_H_
+ #define _INTEL_LRC_H_
+ 
++/* Logical Ring Contexts */
++void intel_lr_context_free(struct intel_context *ctx);
++int intel_lr_context_deferred_create(struct intel_context *ctx,
++				     struct intel_engine_cs *ring);
++
+ /* Execlists */
+ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists);
+ 
+-- 
+1.7.9.5
+

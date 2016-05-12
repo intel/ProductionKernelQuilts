@@ -1,0 +1,228 @@
+From 0685a3f184a2120001b20546d4166a590da0aae7 Mon Sep 17 00:00:00 2001
+Message-Id: <0685a3f184a2120001b20546d4166a590da0aae7.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:38 +0000
+Subject: [PATCH 32/63] FROM_UPSTREAM [VPG]: drm/i915: Convert trace functions
+ from seqno to request
+
+All the code above is now using requests not seqnos so it is possible to convert
+the trace functions across. Note that rather than get into problematic reference
+counting issues, the trace code only saves the seqno and ring values from the
+request structure not the structure pointer itself.
+
+Change-Id: I4e4728db0dfb5cb7582c1a737c267cc53ea143d3
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 74328ee51051e73e4952876cc9061ff01530267c
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_gem.c            |   12 +++----
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    4 +--
+ drivers/gpu/drm/i915/i915_trace.h          |   47 ++++++++++++++++------------
+ 3 files changed, 33 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 735dfbb..03c34ac 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1250,8 +1250,7 @@ static int __wait_request(struct drm_i915_gem_request *req,
+ 		return -ENODEV;
+ 
+ 	/* Record current time in case interrupted by signal, or wedged */
+-	trace_i915_gem_request_wait_begin(i915_gem_request_get_ring(req),
+-					  i915_gem_request_get_seqno(req));
++	trace_i915_gem_request_wait_begin(req);
+ 	getrawmonotonic(&before);
+ 	for (;;) {
+ 		struct timer_list timer;
+@@ -1309,8 +1308,7 @@ static int __wait_request(struct drm_i915_gem_request *req,
+ 		}
+ 	}
+ 	getrawmonotonic(&now);
+-	trace_i915_gem_request_wait_end(i915_gem_request_get_ring(req),
+-					i915_gem_request_get_seqno(req));
++	trace_i915_gem_request_wait_end(req);
+ 
+ 	if (!irq_test_in_progress)
+ 		ring->irq_put(ring);
+@@ -2552,7 +2550,7 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 		spin_unlock(&file_priv->mm.lock);
+ 	}
+ 
+-	trace_i915_gem_request_add(ring, request->seqno);
++	trace_i915_gem_request_add(request);
+ 	ring->outstanding_lazy_request = NULL;
+ 
+ 	if (!dev_priv->ums.mm_suspended) {
+@@ -2845,7 +2843,7 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ 		if (!i915_seqno_passed(seqno, request->seqno))
+ 			break;
+ 
+-		trace_i915_gem_request_retire(ring, request->seqno);
++		trace_i915_gem_request_retire(request);
+ 
+ 		/* This is one of the few common intersection points
+ 		 * between legacy ringbuffer submission and execlists:
+@@ -3097,7 +3095,7 @@ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 	if (ret)
+ 		return ret;
+ 
+-	trace_i915_gem_ring_sync_to(from, to, seqno);
++	trace_i915_gem_ring_sync_to(from, to, obj->last_read_req);
+ 	ret = to->semaphore.sync_to(to, from, seqno);
+ 	if (!ret)
+ 		/* We use last_read_req because sync_to()
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index ad693f0..3541e76 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1284,9 +1284,7 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 			goto error;
+ 	}
+ 
+-	trace_i915_gem_ring_dispatch(ring,
+-		    i915_gem_request_get_seqno(intel_ring_get_request(ring)),
+-		    flags);
++	trace_i915_gem_ring_dispatch(intel_ring_get_request(ring), flags);
+ 
+ 	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
+diff --git a/drivers/gpu/drm/i915/i915_trace.h b/drivers/gpu/drm/i915/i915_trace.h
+index f5aa006..66616f7 100644
+--- a/drivers/gpu/drm/i915/i915_trace.h
++++ b/drivers/gpu/drm/i915/i915_trace.h
+@@ -328,8 +328,8 @@ TRACE_EVENT(i915_gem_evict_vm,
+ TRACE_EVENT(i915_gem_ring_sync_to,
+ 	    TP_PROTO(struct intel_engine_cs *from,
+ 		     struct intel_engine_cs *to,
+-		     u32 seqno),
+-	    TP_ARGS(from, to, seqno),
++		     struct drm_i915_gem_request *req),
++	    TP_ARGS(from, to, req),
+ 
+ 	    TP_STRUCT__entry(
+ 			     __field(u32, dev)
+@@ -342,7 +342,7 @@ TRACE_EVENT(i915_gem_ring_sync_to,
+ 			   __entry->dev = from->dev->primary->index;
+ 			   __entry->sync_from = from->id;
+ 			   __entry->sync_to = to->id;
+-			   __entry->seqno = seqno;
++			   __entry->seqno = i915_gem_request_get_seqno(req);
+ 			   ),
+ 
+ 	    TP_printk("dev=%u, sync-from=%u, sync-to=%u, seqno=%u",
+@@ -352,8 +352,8 @@ TRACE_EVENT(i915_gem_ring_sync_to,
+ );
+ 
+ TRACE_EVENT(i915_gem_ring_dispatch,
+-	    TP_PROTO(struct intel_engine_cs *ring, u32 seqno, u32 flags),
+-	    TP_ARGS(ring, seqno, flags),
++	    TP_PROTO(struct drm_i915_gem_request *req, u32 flags),
++	    TP_ARGS(req, flags),
+ 
+ 	    TP_STRUCT__entry(
+ 			     __field(u32, dev)
+@@ -363,11 +363,13 @@ TRACE_EVENT(i915_gem_ring_dispatch,
+ 			     ),
+ 
+ 	    TP_fast_assign(
++			   struct intel_engine_cs *ring =
++						i915_gem_request_get_ring(req);
+ 			   __entry->dev = ring->dev->primary->index;
+ 			   __entry->ring = ring->id;
+-			   __entry->seqno = seqno;
++			   __entry->seqno = i915_gem_request_get_seqno(req);
+ 			   __entry->flags = flags;
+-			   i915_trace_irq_get(ring, seqno);
++			   i915_trace_irq_get(ring, __entry->seqno);
+ 			   ),
+ 
+ 	    TP_printk("dev=%u, ring=%u, seqno=%u, flags=%x",
+@@ -398,8 +400,8 @@ TRACE_EVENT(i915_gem_ring_flush,
+ );
+ 
+ DECLARE_EVENT_CLASS(i915_gem_request,
+-	    TP_PROTO(struct intel_engine_cs *ring, u32 seqno),
+-	    TP_ARGS(ring, seqno),
++	    TP_PROTO(struct drm_i915_gem_request *req),
++	    TP_ARGS(req),
+ 
+ 	    TP_STRUCT__entry(
+ 			     __field(u32, dev)
+@@ -408,9 +410,11 @@ DECLARE_EVENT_CLASS(i915_gem_request,
+ 			     ),
+ 
+ 	    TP_fast_assign(
++			   struct intel_engine_cs *ring =
++						i915_gem_request_get_ring(req);
+ 			   __entry->dev = ring->dev->primary->index;
+ 			   __entry->ring = ring->id;
+-			   __entry->seqno = seqno;
++			   __entry->seqno = i915_gem_request_get_seqno(req);
+ 			   ),
+ 
+ 	    TP_printk("dev=%u, ring=%u, seqno=%u",
+@@ -418,8 +422,8 @@ DECLARE_EVENT_CLASS(i915_gem_request,
+ );
+ 
+ DEFINE_EVENT(i915_gem_request, i915_gem_request_add,
+-	    TP_PROTO(struct intel_engine_cs *ring, u32 seqno),
+-	    TP_ARGS(ring, seqno)
++	    TP_PROTO(struct drm_i915_gem_request *req),
++	    TP_ARGS(req)
+ );
+ 
+ TRACE_EVENT(i915_gem_request_complete,
+@@ -443,13 +447,13 @@ TRACE_EVENT(i915_gem_request_complete,
+ );
+ 
+ DEFINE_EVENT(i915_gem_request, i915_gem_request_retire,
+-	    TP_PROTO(struct intel_engine_cs *ring, u32 seqno),
+-	    TP_ARGS(ring, seqno)
++	    TP_PROTO(struct drm_i915_gem_request *req),
++	    TP_ARGS(req)
+ );
+ 
+ TRACE_EVENT(i915_gem_request_wait_begin,
+-	    TP_PROTO(struct intel_engine_cs *ring, u32 seqno),
+-	    TP_ARGS(ring, seqno),
++	    TP_PROTO(struct drm_i915_gem_request *req),
++	    TP_ARGS(req),
+ 
+ 	    TP_STRUCT__entry(
+ 			     __field(u32, dev)
+@@ -465,10 +469,13 @@ TRACE_EVENT(i915_gem_request_wait_begin,
+ 	     * less desirable.
+ 	     */
+ 	    TP_fast_assign(
++			   struct intel_engine_cs *ring =
++						i915_gem_request_get_ring(req);
+ 			   __entry->dev = ring->dev->primary->index;
+ 			   __entry->ring = ring->id;
+-			   __entry->seqno = seqno;
+-			   __entry->blocking = mutex_is_locked(&ring->dev->struct_mutex);
++			   __entry->seqno = i915_gem_request_get_seqno(req);
++			   __entry->blocking =
++				     mutex_is_locked(&ring->dev->struct_mutex);
+ 			   ),
+ 
+ 	    TP_printk("dev=%u, ring=%u, seqno=%u, blocking=%s",
+@@ -477,8 +484,8 @@ TRACE_EVENT(i915_gem_request_wait_begin,
+ );
+ 
+ DEFINE_EVENT(i915_gem_request, i915_gem_request_wait_end,
+-	    TP_PROTO(struct intel_engine_cs *ring, u32 seqno),
+-	    TP_ARGS(ring, seqno)
++	    TP_PROTO(struct drm_i915_gem_request *req),
++	    TP_ARGS(req)
+ );
+ 
+ DECLARE_EVENT_CLASS(i915_ring,
+-- 
+1.7.9.5
+

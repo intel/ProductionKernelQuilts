@@ -1,0 +1,195 @@
+From 16b025a413ddeb8c2279ffca10e94066217cbd75 Mon Sep 17 00:00:00 2001
+Message-Id: <16b025a413ddeb8c2279ffca10e94066217cbd75.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Akash Goel <akash.goel@intel.com>
+Date: Mon, 23 Dec 2013 15:17:15 +0530
+Subject: [PATCH 121/312] FOR_UPSTREAM [VPG]: drm/i915/vlv: Increase the
+ utilization of stolen memory on VLV
+
+On VLV, 64MB of system memory was being reserved for stolen
+area, but ~8MB of it was being utilized.
+Increased the utilization of Stolen area by allocating
+User created Frame buffers(only X Tiled) from it.
+Any allocation from stolen area is not directly CPU accessible,
+but accessible only through the aperture space.
+User Frame buffers are suitable for allocation from stolen area,
+as its very unlikely that they are accessed from CPU side.
+And its even more unlikely that the Tiled(X) buffers will be
+accessed directly from the CPU side.
+With 1080p sized frame buffers (32 bpp), the allocation of 6-7
+frame buffers itself gives almost the full utilization of
+stolen area.
+
+v2: clean up the comments (Joakim)
+
+Issue: VIZ-3432
+Change-Id: Iaad5ac92241ddfc1e921b1de3ae2179f2abd1c6d
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Reviewed-on: https://android.intel.com/164328
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h        |    1 +
+ drivers/gpu/drm/i915/i915_gem.c        |   21 ++++++++
+ drivers/gpu/drm/i915/i915_gem_stolen.c |   92 ++++++++++++++++++++++++++++++++
+ 3 files changed, 114 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 5ce0a01..aa221f4 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2599,6 +2599,7 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 					       u32 stolen_offset,
+ 					       u32 gtt_offset,
+ 					       u32 size);
++void i915_gem_object_move_to_stolen(struct drm_i915_gem_object *obj);
+ void i915_gem_object_release_stolen(struct drm_i915_gem_object *obj);
+ 
+ /* i915_gem_tiling.c */
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 16463be..06b735a 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4055,6 +4055,27 @@ i915_gem_object_pin(struct drm_i915_gem_object *obj,
+ 	if (WARN_ON(flags & (PIN_GLOBAL | PIN_MAPPABLE) && !i915_is_ggtt(vm)))
+ 		return -EINVAL;
+ 
++	/* Try to allocate the physical space for the GEM object,
++	 * representing the User frame buffer, from the stolen area.
++	 * But if there is no sufficient free space left in stolen
++	 * area, will fallback to shmem.
++	 */
++	if (obj->user_fb == 1) {
++		if (obj->pages == NULL) {
++			if (obj->tiling_mode == I915_TILING_X) {
++				/* Tiled(X) Scanout buffers are more suitable
++				 * for allocation from stolen area, as its very
++				 * unlikely that they will be accessed directly
++				 * from the CPU side and any allocation from
++				 * stolen area is not directly CPU accessible,
++				 * but accessible only through the aperture
++				 * space.
++				 */
++				i915_gem_object_move_to_stolen(obj);
++			}
++		}
++	}
++
+ 	vma = i915_gem_obj_to_vma(obj, vm);
+ 	if (vma) {
+ 		if (WARN_ON(vma->pin_count == DRM_I915_GEM_OBJECT_MAX_PIN_COUNT))
+diff --git a/drivers/gpu/drm/i915/i915_gem_stolen.c b/drivers/gpu/drm/i915/i915_gem_stolen.c
+index 62ef55b..3621953 100644
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -29,6 +29,7 @@
+ #include <drm/drmP.h>
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
++#include <linux/shmem_fs.h>
+ 
+ /*
+  * The BIOS typically reserves some of the system's memory for the exclusive
+@@ -364,6 +365,97 @@ i915_gem_object_create_stolen(struct drm_device *dev, u32 size)
+ 	return NULL;
+ }
+ 
++void
++i915_gem_object_move_to_stolen(struct drm_i915_gem_object *obj)
++{
++	struct drm_device *dev = obj->base.dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_mm_node *stolen;
++	u32 size = obj->base.size;
++	int ret = 0;
++
++	if (!IS_VALLEYVIEW(dev))
++		return;
++
++	if (obj->stolen) {
++		BUG_ON(obj->pages == NULL);
++		return;
++	}
++
++	if (!drm_mm_initialized(&dev_priv->mm.stolen))
++		return;
++
++	if (size == 0)
++		return;
++
++	/* Check if already shmem space has been allocated for the object
++	 * or not. We cannot rely on the value of 'pages' field for this.
++	 * As even though if the 'pages' field is NULL, it does not actually
++	 * indicate that the backing physical space (shmem) is currently not
++	 * reserved for the object, as the object may not get purged/truncated
++	 * on the call to 'put_pages_gtt'.
++	 */
++	if (obj->base.filp) {
++		struct inode *inode = file_inode(obj->base.filp);
++		struct shmem_inode_info *info = SHMEM_I(inode);
++		if (!inode)
++			return;
++		spin_lock(&info->lock);
++		/* The allocted field stores how many data pages are
++		 * allocated to the file.
++		 */
++		ret = info->alloced;
++		spin_unlock(&info->lock);
++		if (ret > 0) {
++			DRM_DEBUG_DRIVER(
++				"Already shmem space allocted, %d pges\n", ret);
++			return;
++		}
++	}
++
++	stolen = kzalloc(sizeof(*stolen), GFP_KERNEL);
++	if (!stolen)
++		return;
++
++	ret = drm_mm_insert_node(&dev_priv->mm.stolen, stolen, size,
++				 4096, DRM_MM_SEARCH_DEFAULT);
++	if (ret) {
++		kfree(stolen);
++		DRM_DEBUG_DRIVER("ran out of stolen space\n");
++		return;
++	}
++
++	/* Set up the object to use the stolen memory,
++	 * backing store no longer managed by shmem layer */
++	drm_gem_object_release(&(obj->base));
++	obj->base.filp = NULL;
++	obj->ops = &i915_gem_object_stolen_ops;
++
++	obj->pages = i915_pages_create_for_stolen(dev,
++						stolen->start, stolen->size);
++	if (obj->pages == NULL)
++		goto cleanup;
++
++	i915_gem_object_pin_pages(obj);
++	list_add_tail(&obj->global_list, &dev_priv->mm.unbound_list);
++	obj->has_dma_mapping = true;
++	obj->stolen = stolen;
++
++	DRM_DEBUG_DRIVER("Obj moved to stolen, ptr = %p, size = %x\n",
++			 obj, size);
++
++	obj->base.read_domains = I915_GEM_DOMAIN_CPU | I915_GEM_DOMAIN_GTT;
++	obj->cache_level = HAS_LLC(dev) ? I915_CACHE_LLC : I915_CACHE_NONE;
++
++	/* No zeroing-out of buffers allocated from stolen area */
++	return;
++
++cleanup:
++	drm_mm_remove_node(stolen);
++	kfree(stolen);
++	return;
++}
++
+ struct drm_i915_gem_object *
+ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 					       u32 stolen_offset,
+-- 
+1.7.9.5
+

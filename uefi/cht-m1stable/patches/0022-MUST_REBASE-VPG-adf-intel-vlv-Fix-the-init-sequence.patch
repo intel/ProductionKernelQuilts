@@ -1,0 +1,143 @@
+From 61bc780259f53a07f3a87ddb43a52818f29a62c5 Mon Sep 17 00:00:00 2001
+Message-Id: <61bc780259f53a07f3a87ddb43a52818f29a62c5.1423172493.git.feitong.yi@intel.com>
+In-Reply-To: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+References: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+From: Gaurav K Singh <gaurav.k.singh@intel.com>
+Date: Wed, 21 Jan 2015 05:17:52 +0530
+Subject: [PATCH 22/29] MUST_REBASE [VPG]: adf/intel/vlv: Fix the init
+ sequence
+
+This patch adds the following fixes:
+1. Fix in interface id counter to support multi display & single
+display on any pipe
+2. Change in attachment logic
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-4868
+Change-Id: Icb39131ecdb6c14b768ec8129eb2753c5324487f
+Signed-off-by: Gaurav K Singh <gaurav.k.singh@intel.com>
+---
+ .../video/adf/intel/include/core/intel_dc_config.h |    2 ++
+ .../video/adf/intel/include/intel_adf_interface.h  |    2 +-
+ drivers/video/adf/intel/intel_adf.c                |   38 ++++++++++++--------
+ drivers/video/adf/intel/intel_adf_interface.c      |    5 +--
+ 4 files changed, 30 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index ef80098..9f459cf 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -28,6 +28,8 @@
+ #define INTEL_DC_MAX_PLANE_COUNT	0xff
+ #define INTEL_DC_MAX_PIPE_COUNT		0xff
+ 
++#define INTEL_ADF_MAX_OVERLAY_ENG_PER_INTF	3
++
+ struct intel_dc_component;
+ struct intel_plane;
+ struct intel_pipe;
+diff --git a/drivers/video/adf/intel/include/intel_adf_interface.h b/drivers/video/adf/intel/include/intel_adf_interface.h
+index f3296ab..f901eb9 100644
+--- a/drivers/video/adf/intel/include/intel_adf_interface.h
++++ b/drivers/video/adf/intel/include/intel_adf_interface.h
+@@ -43,7 +43,7 @@ extern int intel_adf_interface_handle_event(struct intel_adf_interface *intf);
+ extern struct sync_fence *intel_adf_interface_create_vsync_fence(
+ 	struct intel_adf_interface *intf, u32 interval);
+ extern int intel_adf_interface_init(struct intel_adf_interface *intf,
+-	struct intel_adf_device *dev, struct intel_pipe *pipe);
++	struct intel_adf_device *dev, struct intel_pipe *pipe, u32 intf_idx);
+ extern void intel_adf_interface_destroy(struct intel_adf_interface *intf);
+ 
+ #endif /* INTEL_ADF_INTERFACE_H_ */
+diff --git a/drivers/video/adf/intel/intel_adf.c b/drivers/video/adf/intel/intel_adf.c
+index c9fcf68..c99df0c 100644
+--- a/drivers/video/adf/intel/intel_adf.c
++++ b/drivers/video/adf/intel/intel_adf.c
+@@ -23,13 +23,15 @@ static struct intel_adf_interface *create_interfaces(
+ 	struct intel_adf_interface *intfs;
+ 	int err;
+ 	size_t i;
++	u32 intf_idx = 0;
+ 
+ 	intfs = kzalloc(n_pipes * sizeof(*intfs), GFP_KERNEL);
+ 	if (!intfs)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	for (i = 0; i < n_pipes; i++) {
+-		err = intel_adf_interface_init(&intfs[i], dev, pipes[i]);
++		err = intel_adf_interface_init(&intfs[i], dev, pipes[i],
++						intf_idx++);
+ 		if (err)
+ 			goto out_err0;
+ 	}
+@@ -94,20 +96,28 @@ static int create_attachments(struct intel_adf_device *dev,
+ {
+ 	u8 pipe_id, plane_id;
+ 	int err;
+-	size_t i;
+-
+-	for (i = 0; i < n_allowed_attachments; i++) {
+-		pipe_id = allowed_attachments[i].pipe_id;
+-		plane_id = allowed_attachments[i].plane_id;
+-
+-		if (pipe_id >= n_intfs || plane_id >= n_engs)
+-			return -EINVAL;
+-		err = adf_attachment_allow(&dev->base, &engs[plane_id].base,
+-				&intfs[pipe_id].base);
+-		if (err)
+-			return err;
++	u8 max_overlay_eng_per_intf;
++
++	pipe_id = 0;
++	plane_id = 0;
++
++	/* for VLV & CHV, each interface has max of 3 overlay engines */
++	max_overlay_eng_per_intf = INTEL_ADF_MAX_OVERLAY_ENG_PER_INTF;
++
++	while (n_intfs--) {
++		while (max_overlay_eng_per_intf-- && n_engs--) {
++			err = adf_attachment_allow(&dev->base,
++						   &engs[plane_id++].base,
++						   &intfs[pipe_id].base);
++			if (err) {
++				pr_err("ADF:%s error: %d\n", __func__, err);
++				return err;
++			}
++		}
++		pipe_id++;
++		/* Initialised again to 3 for the other interface if active */
++		max_overlay_eng_per_intf = INTEL_ADF_MAX_OVERLAY_ENG_PER_INTF;
+ 	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/video/adf/intel/intel_adf_interface.c b/drivers/video/adf/intel/intel_adf_interface.c
+index fdcd478..b48ea0d 100644
+--- a/drivers/video/adf/intel/intel_adf_interface.c
++++ b/drivers/video/adf/intel/intel_adf_interface.c
+@@ -383,7 +383,8 @@ struct sync_fence *intel_adf_interface_create_vsync_fence(
+ }
+ 
+ int intel_adf_interface_init(struct intel_adf_interface *intf,
+-		struct intel_adf_device *dev, struct intel_pipe *pipe)
++			struct intel_adf_device *dev, struct intel_pipe *pipe,
++			u32 intf_idx)
+ {
+ 	enum adf_interface_type type;
+ 	u32 flags = 0;
+@@ -446,7 +447,7 @@ int intel_adf_interface_init(struct intel_adf_interface *intf,
+ 		pipe->ops->get_vsync_counter(pipe, 0));
+ 
+ 	err = adf_interface_init(&intf->base, &dev->base, type,
+-				(u32)pipe->base.idx, flags,
++				intf_idx, flags,
+ 				&intel_adf_interface_ops, "intel_intf_%s",
+ 				pipe->base.name);
+ 	if (err)
+-- 
+1.7.9.5
+

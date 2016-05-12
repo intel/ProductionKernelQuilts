@@ -1,0 +1,138 @@
+From 0855112054cf0940e3d3efc3c29d2d1b1fc1d945 Mon Sep 17 00:00:00 2001
+From: Gerard Andre <gerard.andre@intel.com>
+Date: Thu, 14 May 2015 14:22:27 +0200
+Subject: [PATCH] [REVERTME] f_fs.c: fix error of usb_eq_dequeue when epfile_io
+ interrupted
+
+ffs_epfile_io might be interrutped by signal and calls
+usb_ep_dequeue. Debug show some cases of write or read
+transfer error after usb_ep_dequeue called, these error
+lead to adb offline. User need unplug usb cable and
+replug it to restore usb connection.
+
+Error case 1:
+Request has complete and been deleted from dwc3 req_queued
+before doing usb_ep_dequeue, ret should be data length
+instead of EINTR.
+
+Error case 2:
+Request is in dwc3 req_queued while doing usb_ep_dequeue,
+hardware can't process END command clearly. If kernel
+forces END command, dwc3 component might be in chaos status.
+
+This patch let gadget wait request done in both cases and
+ret actual data length. We also add a force flag to dequeue,
+we can't force END command in dwc3 driver in this case.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1561
+Change-Id: Idc6fc9f1582e960c6fdcf098eeb99d12bc2a0c23
+Signed-off-by: xiao jin <jin.xiao@intel.com>
+---
+ drivers/usb/gadget/f_fs.c  | 45 ++++++++++++++++++++++++++++++---------------
+ include/linux/usb/gadget.h | 26 ++++++++++++++++++++++++++
+ 2 files changed, 56 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/usb/gadget/f_fs.c b/drivers/usb/gadget/f_fs.c
+index c090d0664ecc..dc13409039a6 100644
+--- a/drivers/usb/gadget/f_fs.c
++++ b/drivers/usb/gadget/f_fs.c
+@@ -675,22 +675,37 @@ static ssize_t ffs_epfile_io(struct file *file,
+ 
+ 		if (unlikely(ret < 0)) {
+ 			/* nop */
+-		} else if (unlikely(wait_for_completion_interruptible(&done))) {
+-			ret = -EINTR;
+-			usb_ep_dequeue(ep->ep, req);
+ 		} else {
+-			/*
+-			 * XXX We may end up silently droping data here.
+-			 * Since data_len (i.e. req->length) may be bigger
+-			 * than len (after being rounded up to maxpacketsize),
+-			 * we may end up with more data then user space has
+-			 * space for.
+-			 */
+-			ret = ep->status;
+-			if (read && ret > 0 &&
+-			    unlikely(copy_to_user(buf, data,
+-						  min_t(size_t, ret, len))))
+-				ret = -EFAULT;
++			ret = wait_for_completion_interruptible(&done);
++			if (ret) {
++				/*
++				 * Hardware can't process END command
++				 * clearly if req has been START. We
++				 * can't force End command.
++				 */
++				ret = usb_ep_dequeue_forced(ep->ep, req, 0);
++				if (ret < 0) {
++					wait_for_completion(&done);
++					ret = 0;
++				} else
++					ret = -EINTR;
++			}
++
++			if (!ret) {
++				/*
++				 * XXX We may end up silently droping data
++				 * here. Since data_len (i.e. req->length)
++				 * may be bigger than len (after being
++				 * rounded up to maxpacketsize), we may end
++				 * up with more data then user space has
++				 * space for.
++				 */
++				ret = ep->status;
++				if (read && ret > 0 &&
++					unlikely(copy_to_user(buf, data,
++						min_t(size_t, ret, len))))
++					ret = -EFAULT;
++			}
+ 		}
+ 	}
+ 
+diff --git a/include/linux/usb/gadget.h b/include/linux/usb/gadget.h
+index 68d8463e0814..d00b7ace7c5a 100644
+--- a/include/linux/usb/gadget.h
++++ b/include/linux/usb/gadget.h
+@@ -132,6 +132,8 @@ struct usb_ep_ops {
+ 	int (*queue) (struct usb_ep *ep, struct usb_request *req,
+ 		gfp_t gfp_flags);
+ 	int (*dequeue) (struct usb_ep *ep, struct usb_request *req);
++	int (*dequeue_forced)(struct usb_ep *ep,
++		struct usb_request *req, int forced);
+ 
+ 	int (*set_halt) (struct usb_ep *ep, int value);
+ 	int (*set_wedge) (struct usb_ep *ep);
+@@ -360,6 +362,30 @@ static inline int usb_ep_dequeue(struct usb_ep *ep, struct usb_request *req)
+ }
+ 
+ /**
++ * usb_ep_dequeue_forced - dequeues with forced flag
++ * @ep:the endpoint associated with the request
++ * @req:the request being canceled
++ * @forced:the flag to force END command
++ *
++ * Some usb driver may send END command at dequeue. But at dequeue, some usb
++ * hardware can't process END command clearly if the req has been START, usb
++ * component might stop working after END command. Without forced flag, caller
++ * need wait for some time to make sure hardware finishes the request.
++ */
++static inline int usb_ep_dequeue_forced(struct usb_ep *ep,
++					struct usb_request *req, int forced)
++{
++	int ret;
++
++	if (ep->ops->dequeue_forced)
++		ret = ep->ops->dequeue_forced(ep, req, forced);
++	else
++		ret = ep->ops->dequeue(ep, req);
++
++	return ret;
++}
++
++/**
+  * usb_ep_set_halt - sets the endpoint halt feature.
+  * @ep: the non-isochronous endpoint being stalled
+  *
+-- 
+1.9.1
+

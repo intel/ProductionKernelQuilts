@@ -1,0 +1,120 @@
+From 440cc8450d9129e03ddd77f978afa2712590b6bf Mon Sep 17 00:00:00 2001
+From: Ecco park <eccopark@broadcom.com>
+Date: Fri, 5 Sep 2014 15:23:56 -0700
+Subject: [PATCH 75/77] net: wireless : bcmdhd use dedicated wake queue for D3
+ ACK
+
+So here is a corner case that could possibly happen:
+1) Host send D3 request and wait for D3 ACK
+2) An ioctl is sent to dongle and host is waiting for ioctl response
+3) D3 ACK comes back and interrupt handler sends out wake up event
+4) dhdmsgbuf_cmplt will wake up, copy out whatever in the response buffer
+  (which may have not been updated by dongle at this point),
+  free the skb according to the pkt id stored in ioct_resp.cmn_hdr.request_id
+5) Because the pktid is outdated,
+  it could be currently used by wl events/ioctl response or even in data path
+Signed-off-by: Ecco park <eccopark@broadcom.com>
+
+Change-Id: I604744c83fa5fce4104ad63d15ecda8ec7a0ed3e
+---
+ drivers/net/wireless/bcmdhd/dhd.h       |  2 ++
+ drivers/net/wireless/bcmdhd/dhd_linux.c | 33 +++++++++++++++++++++++++++++++++
+ drivers/net/wireless/bcmdhd/dhd_pcie.c  |  4 ++--
+ 3 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/bcmdhd/dhd.h b/drivers/net/wireless/bcmdhd/dhd.h
+index ef0f69bf8792..20c569e1da46 100644
+--- a/drivers/net/wireless/bcmdhd/dhd.h
++++ b/drivers/net/wireless/bcmdhd/dhd.h
+@@ -632,6 +632,8 @@ extern int dhd_os_proto_block(dhd_pub_t * pub);
+ extern int dhd_os_proto_unblock(dhd_pub_t * pub);
+ extern int dhd_os_ioctl_resp_wait(dhd_pub_t * pub, uint * condition, bool * pending);
+ extern int dhd_os_ioctl_resp_wake(dhd_pub_t * pub);
++extern int dhd_os_d3ack_wait(dhd_pub_t * pub, uint * condition, bool * pending);
++extern int dhd_os_d3ack_wake(dhd_pub_t * pub);
+ extern unsigned int dhd_os_get_ioctl_resp_timeout(void);
+ extern void dhd_os_set_ioctl_resp_timeout(unsigned int timeout_msec);
+ 
+diff --git a/drivers/net/wireless/bcmdhd/dhd_linux.c b/drivers/net/wireless/bcmdhd/dhd_linux.c
+index 79e5fdb08278..9d78a6efa5b7 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_linux.c
++++ b/drivers/net/wireless/bcmdhd/dhd_linux.c
+@@ -372,6 +372,8 @@ typedef struct dhd_info {
+ 	htsf_t  htsf;
+ #endif
+ 	wait_queue_head_t ioctl_resp_wait;
++	wait_queue_head_t d3ack_wait;
++
+ 	uint32	default_wd_interval;
+ 
+ 	struct timer_list timer;
+@@ -4495,6 +4497,7 @@ dhd_attach(osl_t *osh, struct dhd_bus *bus, uint bus_hdrlen)
+ 
+ 	/* Initialize other structure content */
+ 	init_waitqueue_head(&dhd->ioctl_resp_wait);
++	init_waitqueue_head(&dhd->d3ack_wait);
+ 	init_waitqueue_head(&dhd->ctrl_wait);
+ 
+ 	/* Initialize the spinlocks */
+@@ -6666,6 +6669,36 @@ dhd_os_ioctl_resp_wake(dhd_pub_t *pub)
+ 	return 0;
+ }
+ 
++int
++dhd_os_d3ack_wait(dhd_pub_t *pub, uint *condition, bool *pending)
++{
++	dhd_info_t * dhd = (dhd_info_t *)(pub->info);
++	int timeout;
++
++	/* Convert timeout in millsecond to jiffies */
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27))
++	timeout = msecs_to_jiffies(dhd_ioctl_timeout_msec);
++#else
++	timeout = dhd_ioctl_timeout_msec * HZ / 1000;
++#endif
++
++	DHD_PERIM_UNLOCK(pub);
++	timeout = wait_event_timeout(dhd->d3ack_wait, (*condition), timeout);
++	DHD_PERIM_LOCK(pub);
++
++	return timeout;
++}
++
++int
++dhd_os_d3ack_wake(dhd_pub_t *pub)
++{
++	dhd_info_t *dhd = (dhd_info_t *)(pub->info);
++
++	wake_up(&dhd->d3ack_wait);
++	return 0;
++}
++
++
+ void
+ dhd_os_wd_timer_extend(void *bus, bool extend)
+ {
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie.c b/drivers/net/wireless/bcmdhd/dhd_pcie.c
+index a2f8a9042323..a6675d241019 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie.c
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie.c
+@@ -2720,7 +2720,7 @@ dhdpcie_bus_suspend(struct  dhd_bus *bus, bool state)
+ 		DHD_OS_WAKE_LOCK_WAIVE(bus->dhd);
+ 		dhd_os_set_ioctl_resp_timeout(DEFAULT_IOCTL_RESP_TIMEOUT);
+ 		dhdpcie_send_mb_data(bus, H2D_HOST_D3_INFORM);
+-		timeleft = dhd_os_ioctl_resp_wait(bus->dhd, &bus->wait_for_d3_ack, &pending);
++		timeleft = dhd_os_d3ack_wait(bus->dhd, &bus->wait_for_d3_ack, &pending);
+ 		dhd_os_set_ioctl_resp_timeout(IOCTL_RESP_TIMEOUT);
+ 		DHD_OS_WAKE_LOCK_RESTORE(bus->dhd);
+ 		if (bus->wait_for_d3_ack) {
+@@ -3262,7 +3262,7 @@ dhdpcie_handle_mb_data(dhd_bus_t *bus)
+ 		DHD_ERROR(("D2H_MB_DATA: D3 ACK\n"));
+ 		if (!bus->wait_for_d3_ack) {
+ 			bus->wait_for_d3_ack = 1;
+-			dhd_os_ioctl_resp_wake(bus->dhd);
++			dhd_os_d3ack_wake(bus->dhd);
+ 		}
+ 	}
+ 	if (d2h_mb_data & D2H_DEV_FWHALT)  {
+-- 
+2.0.3
+

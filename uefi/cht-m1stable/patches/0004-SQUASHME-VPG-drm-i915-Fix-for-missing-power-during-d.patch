@@ -1,0 +1,102 @@
+From bd3216756b8cd1efeb123c649eb13cded6094dfc Mon Sep 17 00:00:00 2001
+Message-Id: <bd3216756b8cd1efeb123c649eb13cded6094dfc.1422661123.git.feitong.yi@intel.com>
+In-Reply-To: <655f3b24c05e6bd5aba8a8b208743a6290e46fef.1422661123.git.feitong.yi@intel.com>
+References: <655f3b24c05e6bd5aba8a8b208743a6290e46fef.1422661123.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 13 Jan 2015 11:42:40 +0000
+Subject: [PATCH 4/4] SQUASHME! [VPG]: drm/i915: Fix for missing power during
+ deferred context initialisation
+
+An earlier change to re-organise the batch buffer submission code reduced the
+scope of a pm_get/put pair. Specifically, they previously wrapped the entire
+submission code path from the very start to the very end, now they only wrap the
+actual hardware submission part in the back half.
+
+Unfortunately, this causes a problem in execlist mode as the first time
+validate_context() is called on an execlist context, it goes off to do various
+pieces on initialisation (GTT mappings, pinning, context state, etc). Some of
+that work requires a pm_get() to be in force. The problem was not previously
+spotted as it only occasionally causes an issue. Most times it works fine,
+possible because some other piece of code still has a pm_get() in place or
+because the pm_put() has a time delay before actually disabling anything.
+
+This patch fixes the issue by adding a pm_get/put() pair around the deferred
+context initialisation code.
+
+The original re-organisation patch was:
+	commit c7e4c01f1983bdb1d1e999f48f1117ffbf811f0a
+	Author: John Harrison <John.C.Harrison@Intel.com>
+	Date:   Wed Apr 2 16:57:46 2014 +0100
+
+	FOR_UPSTREAM [VPG]: drm/i915: Prelude to splitting i915_gem_do_execbuffer in two
+
+	The scheduler decouples the submission of batch buffers to the driver with their
+	submission to the hardware. This basically means splitting the execbuffer()
+	function in half. This change rearranges some code ready for the split to
+	occur.
+
+	Change-Id: Icc9c8afaac18821f3eb8a151a49f918f90c068a3
+	For: VIZ-1587
+	Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+
+This patch can be squashed in to that one as it has not yet been accepted
+upstream. The process is still ongoing. So that patch will be updated to include
+this fix as part of the re-work.
+
+Change-Id: Id7b1535dfd8809a2bd5546272de2bbec39da2868
+Issue: GMINL-5159
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/intel_lrc.c |    9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 3cb8300..56483bf 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -2963,13 +2963,15 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	if (ctx->engine[ring->id].state)
+ 		return 0;
+ 
++	intel_runtime_pm_get(dev->dev_private);
++
+ 	context_size = round_up(get_lr_context_size(ring), 4096);
+ 
+ 	ctx_obj = i915_gem_alloc_context_obj(dev, context_size);
+ 	if (IS_ERR(ctx_obj)) {
+ 		ret = PTR_ERR(ctx_obj);
+ 		DRM_DEBUG_DRIVER("Alloc LRC backing obj failed: %d\n", ret);
+-		return ret;
++		goto error_pm;
+ 	}
+ 
+ 	if (is_global_default_ctx) {
+@@ -2978,7 +2980,7 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 			DRM_DEBUG_DRIVER("Pin LRC backing obj failed: %d\n",
+ 					ret);
+ 			drm_gem_object_unreference(&ctx_obj->base);
+-			return ret;
++			goto error_pm;
+ 		}
+ 	}
+ 
+@@ -3055,6 +3057,7 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 		ctx->rcs_initialized = true;
+ 	}
+ 
++	intel_runtime_pm_put(dev->dev_private);
+ 	return 0;
+ 
+ error:
+@@ -3068,6 +3071,8 @@ error_unpin_ctx:
+ 	if (is_global_default_ctx)
+ 		i915_gem_object_ggtt_unpin(ctx_obj);
+ 	drm_gem_object_unreference(&ctx_obj->base);
++error_pm:
++	intel_runtime_pm_put(dev->dev_private);
+ 	return ret;
+ }
+ 
+-- 
+1.7.9.5
+

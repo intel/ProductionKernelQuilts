@@ -1,0 +1,149 @@
+From 7d783a1e4fc4d4546c81decbcba71dddad941e29 Mon Sep 17 00:00:00 2001
+From: Francisco Mendez <francisco.mendez@intel.com>
+Date: Tue, 23 Feb 2016 17:58:32 -0600
+Subject: [PATCH 1/3] ASoC: Intel: jack detection enhacement in rt5645
+
+There are some use cases that are failing because some codec registers
+are set incorrectly. Spurious interruptions are generated when jack is
+removed.
+
+Change-Id: Id38a884020a955eac86369e8ee9a49174e4f9cdb
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-21387
+Depends-On: https://android.intel.com/#/c/467563/
+Signed-off-by: Francisco Mendez <francisco.mendez@intel.com>
+Reviewed-on: https://android.intel.com:443/473723
+---
+ sound/soc/codecs/rt5645.c                  | 14 ++++++--------
+ sound/soc/intel/board/cht_cr_dpcm_rt5645.c | 28 +++++++++++++---------------
+ 2 files changed, 19 insertions(+), 23 deletions(-)
+
+diff --git a/sound/soc/codecs/rt5645.c b/sound/soc/codecs/rt5645.c
+index 0033eae..45942f3 100644
+--- a/sound/soc/codecs/rt5645.c
++++ b/sound/soc/codecs/rt5645.c
+@@ -594,8 +594,7 @@ int rt5645_headset_detect(struct snd_soc_codec *codec, int jack_insert)
+ 	int jack_type, val;
+ 
+ 	if (jack_insert) {
+-		snd_soc_dapm_force_enable_pin(&codec->dapm, "micbias1");
+-		snd_soc_dapm_force_enable_pin(&codec->dapm, "micbias2");
++		snd_soc_write(codec, RT5645_CHARGE_PUMP, 0x0006);
+ 		snd_soc_dapm_force_enable_pin(&codec->dapm, "LDO2");
+ 		snd_soc_dapm_force_enable_pin(&codec->dapm, "Mic Det Power");
+ 		snd_soc_dapm_sync(&codec->dapm);
+@@ -604,6 +603,8 @@ int rt5645_headset_detect(struct snd_soc_codec *codec, int jack_insert)
+ 		snd_soc_write(codec, RT5645_JD_CTRL3, 0x00b0);
+ 		snd_soc_update_bits(codec, RT5645_CJ_CTRL2,
+ 			RT5645_CBJ_MN_JD, 0);
++		snd_soc_update_bits(codec, RT5645_CJ_CTRL1, RT5645_CBJ_BST1_EN,
++			RT5645_CBJ_BST1_EN);
+ 		snd_soc_update_bits(codec, RT5645_CJ_CTRL2,
+ 			RT5645_CBJ_MN_JD, RT5645_CBJ_MN_JD);
+ 		msleep(400);
+@@ -622,9 +623,6 @@ int rt5645_headset_detect(struct snd_soc_codec *codec, int jack_insert)
+ 			jack_type = SND_JACK_HEADSET;
+ 			break;
+ 		default:
+-			snd_soc_dapm_disable_pin(&codec->dapm, "micbias1");
+-			snd_soc_dapm_disable_pin(&codec->dapm, "micbias2");
+-			snd_soc_dapm_disable_pin(&codec->dapm, "LDO2");
+ 			snd_soc_dapm_disable_pin(&codec->dapm, "Mic Det Power");
+ 			snd_soc_dapm_sync(&codec->dapm);
+ 			snd_soc_update_bits(codec, RT5645_INT_IRQ_ST, 0x8, 0x0);
+@@ -632,11 +630,11 @@ int rt5645_headset_detect(struct snd_soc_codec *codec, int jack_insert)
+ 			break;
+ 		}
+ 	} else {
+-		snd_soc_dapm_disable_pin(&codec->dapm, "micbias1");
+-		snd_soc_dapm_disable_pin(&codec->dapm, "micbias2");
+-		snd_soc_dapm_disable_pin(&codec->dapm, "LDO2");
++		snd_soc_update_bits(codec, RT5645_CJ_CTRL1,
++			RT5645_CBJ_BST1_EN, 0);
+ 		snd_soc_dapm_disable_pin(&codec->dapm, "Mic Det Power");
+ 		snd_soc_dapm_sync(&codec->dapm);
++		snd_soc_write(codec, RT5645_INT_IRQ_ST, 0x1100);
+ 		jack_type = 0;
+ 	}
+ 
+diff --git a/sound/soc/intel/board/cht_cr_dpcm_rt5645.c b/sound/soc/intel/board/cht_cr_dpcm_rt5645.c
+index 50bcc18..7362fe2 100644
+--- a/sound/soc/intel/board/cht_cr_dpcm_rt5645.c
++++ b/sound/soc/intel/board/cht_cr_dpcm_rt5645.c
+@@ -42,13 +42,13 @@
+ #define CHT_PLAT_CLK_3_HZ	19200000
+ 
+ #define CHT_INTR_DEBOUNCE               0
+-#define CHT_HS_INSERT_DET_DELAY         500
+-#define CHT_HS_REMOVE_DET_DELAY         500
++#define CHT_HS_INSERT_DET_DELAY         300
++#define CHT_HS_REMOVE_DET_DELAY         400
+ #define CHT_BUTTON_DET_DELAY            100
+ #define CHT_HS_DET_POLL_INTRVL          100
+ #define CHT_BUTTON_EN_DELAY             1500
+ 
+-#define CHT_HS_DET_RETRY_COUNT          6
++#define CHT_HS_DET_RETRY_COUNT          2
+ 
+ struct cht_mc_private {
+ 	struct snd_soc_jack jack;
+@@ -97,26 +97,20 @@ static inline void cht_force_enable_pin(struct snd_soc_codec *codec,
+ static inline void cht_set_codec_power(struct snd_soc_codec *codec,
+ 								int jack_type)
+ {
+-	const char *board_name;
+ 	switch (jack_type) {
+ 	case SND_JACK_HEADSET:
+-		board_name = dmi_get_system_info(DMI_BOARD_NAME);
+-		pr_debug("Setting the micbias for %s\n", board_name);
+-		if (strcmp(board_name, "Cherry Trail FFD") == 0)
+-			cht_force_enable_pin(codec, "micbias1", true);
+-		else
+-			cht_force_enable_pin(codec, "micbias2", true);
++		cht_force_enable_pin(codec, "micbias1", true);
++		cht_force_enable_pin(codec, "micbias2", true);
+ 		cht_force_enable_pin(codec, "JD Power", true);
+-		cht_force_enable_pin(codec, "Mic Det Power", true);
+ 		break;
+ 	case SND_JACK_HEADPHONE:
+ 		cht_force_enable_pin(codec, "JD Power", true);
+-		cht_force_enable_pin(codec, "Mic Det Power", false);
++		cht_force_enable_pin(codec, "micbias1", false);
+ 		cht_force_enable_pin(codec, "micbias2", false);
+ 		break;
+ 	case 0:
+ 		cht_force_enable_pin(codec, "JD Power", false);
+-		cht_force_enable_pin(codec, "Mic Det Power", false);
++		cht_force_enable_pin(codec, "micbias1", false);
+ 		cht_force_enable_pin(codec, "micbias2", false);
+ 		break;
+ 	default:
+@@ -124,12 +118,12 @@ static inline void cht_set_codec_power(struct snd_soc_codec *codec,
+ 	}
+ 	snd_soc_dapm_sync(&codec->dapm);
+ }
++
+ /* Identify the jack type as Headset/Headphone/None */
+ static int cht_check_jack_type(struct snd_soc_jack *jack,
+ 					struct snd_soc_codec *codec)
+ {
+ 	int status, jack_type = 0;
+-	/*const char *board_name;*/
+ 	struct cht_mc_private *ctx = container_of(jack,
+ 					struct cht_mc_private, jack);
+ 
+@@ -154,7 +148,11 @@ static int cht_check_jack_type(struct snd_soc_jack *jack,
+ 	} else
+ 		jack_type = 0;
+ 
+-	pr_debug("Jack type detected:%d\n", jack_type);
++	if (jack_type)
++		pr_info("%s: Jack type detected: %s\n", __func__,
++		(jack_type == SND_JACK_HEADSET) ? "Headset" : "Headphone");
++	else
++		pr_info("%s: No jack device connected\n", __func__);
+ 
+ 	return jack_type;
+ }
+-- 
+1.9.1
+

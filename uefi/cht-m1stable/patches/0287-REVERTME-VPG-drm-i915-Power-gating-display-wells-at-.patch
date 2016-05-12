@@ -1,0 +1,261 @@
+From bd681c951c589702a1926f4241cce609e474d341 Mon Sep 17 00:00:00 2001
+Message-Id: <bd681c951c589702a1926f4241cce609e474d341.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Sagar Kamble <sagar.a.kamble@intel.com>
+Date: Tue, 16 Sep 2014 23:03:36 +0530
+Subject: [PATCH 287/312] REVERTME [VPG]: drm/i915: Power gating display wells
+ at the end of runtime & system suspend
+
+We encountered two situations where Gunit was power gated post power gating of
+display wells in runtime and system suspend without considering PCI state of Gfx device.
+Power well status check, Gunit register save was done after power gating of Gunit
+which is leading to runtime suspend failure and system resume failure.
+With this patch power gating of display wells is deferred to end of system and runtime
+suspend.
+Marking this patch as REVERTME since issue should be ideally fixed in Punit firmware.
+This is workaround suggested by Punit team for the time being. Keeping the wells ON till
+the end of runtime suspend will defer S0ix entry prior to setting PCI state.
+v2: Preserving set_init_power in intel_power_domains_init_hw that was removed in v1.
+v3: Added WARN_ON in runtime and system suspend path to ensure wells are on. (Akash)
+v4: Disabling interrupts before disabling power well (Hetian)
+v5: Compilation fixes.
+v6: GTFIFODBG fix and making changes specific to VLV.
+v7: Added reason for REVERME tag. (Jon)
+
+Issue: GMIN-3323
+Change-Id: Ia19a88669afbf5a9436ac3d4a8f81fb58e96f971
+Signed-off-by: Hetian Fang <hetian.fang@intel.com>
+Signed-off-by: Sagar Kamble <sagar.a.kamble@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.c      |   45 ++++++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_display.c |   17 ++++++++++---
+ drivers/gpu/drm/i915/intel_drv.h     |    4 +++
+ drivers/gpu/drm/i915/intel_pm.c      |   26 +++++++++++++++-----
+ 4 files changed, 81 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 532b53d..598e449 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -511,7 +511,13 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 
+ 	/* We do a lot of poking in a lot of registers, make sure they work
+ 	 * properly. */
+-	intel_display_set_init_power(dev_priv, true);
++	if (IS_VALLEYVIEW(dev))
++		WARN_ON(!dev_priv->power_domains.init_power_on);
++	else {
++		/* We do a lot of poking in a lot of registers, make sure they
++		 * work properly. */
++		intel_display_set_init_power(dev_priv, true);
++	}
+ 
+ 	drm_kms_helper_poll_disable(dev);
+ 
+@@ -528,6 +534,12 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 			return error;
+ 		}
+ 
++		if (IS_VALLEYVIEW(dev)) {
++			spin_lock_irq(&dev_priv->irq_lock);
++			valleyview_disable_display_irqs(dev_priv);
++			spin_unlock_irq(&dev_priv->irq_lock);
++		}
++
+ 		drm_irq_uninstall(dev);
+ 
+ 		intel_suspend_gt_powersave(dev);
+@@ -563,7 +575,8 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 	if (ret)
+ 		WARN(1, "Suspend complete failed: %d\n", ret);
+ 
+-	intel_display_set_init_power(dev_priv, false);
++	if (!IS_VALLEYVIEW(dev))
++		intel_display_set_init_power(dev_priv, false);
+ 
+ 	return 0;
+ }
+@@ -1302,6 +1315,8 @@ static int vlv_suspend_complete(struct drm_i915_private *dev_priv)
+ 	u32 mask;
+ 	int err;
+ 
++	WARN_ON(!dev_priv->power_domains.init_power_on);
++
+ 	/*
+ 	 * Bspec defines the following GT well on flags as debug only, so
+ 	 * don't treat them as hard failures.
+@@ -1326,6 +1341,8 @@ static int vlv_suspend_complete(struct drm_i915_private *dev_priv)
+ 	if (err)
+ 		goto err2;
+ 
++	intel_display_set_init_power(dev_priv, false);
++
+ 	return 0;
+ 
+ err2:
+@@ -1374,6 +1391,8 @@ static int vlv_resume_prepare(struct drm_i915_private *dev_priv,
+ 		i915_gem_restore_fences(dev);
+ 	}
+ 
++	intel_display_set_init_power(dev_priv, true);
++
+ 	return ret;
+ }
+ 
+@@ -1418,6 +1437,11 @@ static int intel_runtime_suspend(struct device *device)
+ 	i915_gem_release_all_mmaps(dev_priv);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
++	if (IS_VALLEYVIEW(dev)) {
++		spin_lock_irq(&dev_priv->irq_lock);
++		valleyview_disable_display_irqs(dev_priv);
++		spin_unlock_irq(&dev_priv->irq_lock);
++	}
+ 	/*
+ 	 * rps.work can't be rearmed here, since we get here only after making
+ 	 * sure the GPU is idle and the RPS freq is set to the minimum. See
+@@ -1450,12 +1474,29 @@ static int intel_runtime_suspend(struct device *device)
+ 	return 0;
+ }
+ 
++#define __raw_i915_read32(dev_priv__, reg__) \
++		readl((dev_priv__)->regs + (reg__))
++#define __raw_i915_write32(dev_priv__, reg__, val__) \
++		writel(val__, (dev_priv__)->regs + (reg__))
++
+ static int intel_runtime_resume(struct device *device)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(device);
+ 	struct drm_device *dev = pci_get_drvdata(pdev);
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int ret;
++	u32 gtfifodbg;
++
++	/*
++	 * FIXME: GTFIFODBG registers gets set to 0x10 post resume from S0iX.
++	 * This leads to warning to be hit in gen6_gt_check_fifodbg from
++	 * __vlv_force_wake_put called from register read first time post
++	 * resume. Clearing it here.
++	*/
++	if (IS_VALLEYVIEW(dev)) {
++		gtfifodbg = __raw_i915_read32(dev_priv, GTFIFODBG);
++		__raw_i915_write32(dev_priv, GTFIFODBG, gtfifodbg);
++	}
+ 
+ 	if (WARN_ON_ONCE(!HAS_RUNTIME_PM(dev)))
+ 		return -ENODEV;
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index b6705a8..5261810 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -4939,13 +4939,23 @@ static unsigned long get_crtc_power_domains(struct drm_crtc *crtc)
+ void intel_display_set_init_power(struct drm_i915_private *dev_priv,
+ 				  bool enable)
+ {
++	struct drm_device *dev = dev_priv->dev;
++
+ 	if (dev_priv->power_domains.init_power_on == enable)
+ 		return;
+ 
+ 	if (enable)
+-		intel_display_power_get(dev_priv, POWER_DOMAIN_INIT);
++		if (IS_VALLEYVIEW(dev))
++			intel_display_power_rpm_get(dev_priv,
++					POWER_DOMAIN_INIT, false);
++		else
++			intel_display_power_get(dev_priv, POWER_DOMAIN_INIT);
+ 	else
+-		intel_display_power_put(dev_priv, POWER_DOMAIN_INIT);
++		if (IS_VALLEYVIEW(dev))
++			intel_display_power_rpm_put(dev_priv,
++					POWER_DOMAIN_INIT, false);
++		else
++			intel_display_power_put(dev_priv, POWER_DOMAIN_INIT);
+ 
+ 	dev_priv->power_domains.init_power_on = enable;
+ }
+@@ -4981,7 +4991,8 @@ static void modeset_update_crtc_power_domains(struct drm_device *dev)
+ 		crtc->enabled_power_domains = pipe_domains[crtc->pipe];
+ 	}
+ 
+-	intel_display_set_init_power(dev_priv, false);
++	if (!IS_VALLEYVIEW(dev))
++		intel_display_set_init_power(dev_priv, false);
+ }
+ 
+ int valleyview_get_vco(struct drm_i915_private *dev_priv)
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 179652e..adcaca4 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1028,6 +1028,10 @@ bool intel_display_power_enabled(struct drm_i915_private *dev_priv,
+ 				 enum intel_display_power_domain domain);
+ bool intel_display_power_enabled_unlocked(struct drm_i915_private *dev_priv,
+ 					  enum intel_display_power_domain domain);
++void intel_display_power_rpm_get(struct drm_i915_private *dev_priv,
++			     enum intel_display_power_domain domain, bool rpm);
++void intel_display_power_rpm_put(struct drm_i915_private *dev_priv,
++			     enum intel_display_power_domain domain, bool rpm);
+ void intel_display_power_get(struct drm_i915_private *dev_priv,
+ 			     enum intel_display_power_domain domain);
+ void intel_display_power_put(struct drm_i915_private *dev_priv,
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index f6ddab3..b283ce3 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -7040,14 +7040,15 @@ mismatch:
+ 		  power_well->count, i915.disable_power_well);
+ }
+ 
+-void intel_display_power_get(struct drm_i915_private *dev_priv,
+-			     enum intel_display_power_domain domain)
++void intel_display_power_rpm_get(struct drm_i915_private *dev_priv,
++			     enum intel_display_power_domain domain, bool rpm)
+ {
+ 	struct i915_power_domains *power_domains;
+ 	struct i915_power_well *power_well;
+ 	int i;
+ 
+-	intel_runtime_pm_get(dev_priv);
++	if (rpm)
++		intel_runtime_pm_get(dev_priv);
+ 
+ 	power_domains = &dev_priv->power_domains;
+ 
+@@ -7068,8 +7069,8 @@ void intel_display_power_get(struct drm_i915_private *dev_priv,
+ 	mutex_unlock(&power_domains->lock);
+ }
+ 
+-void intel_display_power_put(struct drm_i915_private *dev_priv,
+-			     enum intel_display_power_domain domain)
++void intel_display_power_rpm_put(struct drm_i915_private *dev_priv,
++			     enum intel_display_power_domain domain, bool rpm)
+ {
+ 	struct i915_power_domains *power_domains;
+ 	struct i915_power_well *power_well;
+@@ -7096,7 +7097,20 @@ void intel_display_power_put(struct drm_i915_private *dev_priv,
+ 
+ 	mutex_unlock(&power_domains->lock);
+ 
+-	intel_runtime_pm_put(dev_priv);
++	if (rpm)
++		intel_runtime_pm_put(dev_priv);
++}
++
++void intel_display_power_get(struct drm_i915_private *dev_priv,
++				enum intel_display_power_domain domain)
++{
++	intel_display_power_rpm_get(dev_priv, domain, true);
++}
++
++void intel_display_power_put(struct drm_i915_private *dev_priv,
++				enum intel_display_power_domain domain)
++{
++	intel_display_power_rpm_put(dev_priv, domain, true);
+ }
+ 
+ static struct i915_power_domains *hsw_pwr;
+-- 
+1.7.9.5
+

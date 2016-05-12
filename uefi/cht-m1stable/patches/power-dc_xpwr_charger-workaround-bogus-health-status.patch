@@ -1,0 +1,68 @@
+From 98d7c30e218ff0d887eb82951cb9f2b7c67c827a Mon Sep 17 00:00:00 2001
+From: Daniel Leung <daniel.leung@intel.com>
+Date: Tue, 31 Mar 2015 22:42:03 -0700
+Subject: [PATCH] power: dc_xpwr_charger: workaround bogus health status
+
+Sometimes during screen off idle, reading ths power source status
+register would return 0x00, instead of the actual value.
+Although 0x00 a valid value, but we need to make sure 0x00 is not
+a bogus return value. Hence, retry reading if 0x00 is returned.
+
+This ugly workaround alleviates an issue where charger health is
+incorrectly reported as unknown, which causes the charger framework
+to stop charging even though everything works fine.
+
+Change-Id: Ie661927d9f2d614b8e4ea6761ee160cc0ca96573
+Signed-off-by: Daniel Leung <daniel.leung@intel.com>
+---
+ drivers/power/dc_xpwr_charger.c | 31 ++++++++++++++++++++++++++++---
+ 1 file changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/power/dc_xpwr_charger.c b/drivers/power/dc_xpwr_charger.c
+index 5a8d0c7..12f76b8 100644
+--- a/drivers/power/dc_xpwr_charger.c
++++ b/drivers/power/dc_xpwr_charger.c
+@@ -474,12 +474,37 @@ static int get_charger_health(struct pmic_chrg_info *info)
+ {
+ 	int ret, pwr_stat, chrg_stat, pwr_irq;
+ 	int health = POWER_SUPPLY_HEALTH_UNKNOWN;
++	int cnt = 5;
+ 
+ 	ret = pmic_chrg_reg_readb(info, DC_PS_STAT_REG);
+-	if ((ret < 0) || !(ret & PS_STAT_VBUS_PRESENT))
++	if (ret < 0)
+ 		goto health_read_fail;
+-	else
+-		pwr_stat = ret;
++
++	/*
++	 * QUIRK: sometimes during screen off idle,
++	 * reading ths register would return 0x00,
++	 * This is a valid value, but we want to
++	 * make sure 0x00 is not a bogus value.
++	 * Hence, retry reading if 0x00 is returned.
++	 *
++	 * Since pwr_stat is only used to determine
++	 * if VBUS is high, so only care if online.
++	 */
++	while (info->online && (ret == 0) && (cnt--)) {
++		/* wait a bit before reading again */
++		usleep_range(1000, 2000);
++
++		dev_warn(&info->pdev->dev, "ps stat reg read 0x00, maybe bogus\n");
++
++		ret = pmic_chrg_reg_readb(info, DC_PS_STAT_REG);
++		if (ret < 0)
++			goto health_read_fail;
++	}
++
++	if (!(ret & PS_STAT_VBUS_PRESENT))
++		goto health_read_fail;
++
++	pwr_stat = ret;
+ 
+ 	ret = pmic_chrg_reg_readb(info, DC_CHRG_STAT_REG);
+ 	if (ret < 0)
+-- 
+1.9.1
+

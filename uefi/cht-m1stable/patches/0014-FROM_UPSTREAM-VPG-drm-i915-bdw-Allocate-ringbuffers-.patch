@@ -1,0 +1,155 @@
+From 7ffdacc3d341e28d1582a9b2846409b01a601c00 Mon Sep 17 00:00:00 2001
+Message-Id: <7ffdacc3d341e28d1582a9b2846409b01a601c00.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 24 Jul 2014 17:04:15 +0100
+Subject: [PATCH 14/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Allocate
+ ringbuffers for Logical Ring Contexts
+
+As we have said a couple of times by now, logical ring contexts have
+their own ringbuffers: not only the backing pages, but the whole
+management struct.
+
+In a previous version of the series, this was achieved with two separate
+patches:
+drm/i915/bdw: Allocate ringbuffer backing objects for default global LRC
+drm/i915/bdw: Allocate ringbuffer for user-created LRCs
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 84c2377fcee7a43cd964b62143e9a3714130bb0c)
+
+Change-Id: Id4c6871ebc0b93bee78319e91384bc8bca6ec21a
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 84c2377fcee7a43cd964b62143e9a3714130bb0c
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    1 +
+ drivers/gpu/drm/i915/intel_lrc.c        |   38 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    6 ++---
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    4 ++++
+ 4 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 54d1550..0d4b282 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -649,6 +649,7 @@ struct intel_context {
+ 	/* Execlists */
+ 	struct {
+ 		struct drm_i915_gem_object *state;
++		struct intel_ringbuffer *ringbuf;
+ 	} engine[I915_NUM_RINGS];
+ 
+ 	struct list_head link;
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index d036a48..85c967e 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -63,7 +63,11 @@ void intel_lr_context_free(struct intel_context *ctx)
+ 
+ 	for (i = 0; i < I915_NUM_RINGS; i++) {
+ 		struct drm_i915_gem_object *ctx_obj = ctx->engine[i].state;
++		struct intel_ringbuffer *ringbuf = ctx->engine[i].ringbuf;
++
+ 		if (ctx_obj) {
++			intel_destroy_ringbuffer_obj(ringbuf);
++			kfree(ringbuf);
+ 			i915_gem_object_ggtt_unpin(ctx_obj);
+ 			drm_gem_object_unreference(&ctx_obj->base);
+ 		}
+@@ -97,6 +101,7 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_gem_object *ctx_obj;
+ 	uint32_t context_size;
++	struct intel_ringbuffer *ringbuf;
+ 	int ret;
+ 
+ 	WARN_ON(ctx->legacy_hw_ctx.rcs_state != NULL);
+@@ -117,6 +122,39 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 		return ret;
+ 	}
+ 
++	ringbuf = kzalloc(sizeof(*ringbuf), GFP_KERNEL);
++	if (!ringbuf) {
++		DRM_DEBUG_DRIVER("Failed to allocate ringbuffer %s\n",
++				ring->name);
++		i915_gem_object_ggtt_unpin(ctx_obj);
++		drm_gem_object_unreference(&ctx_obj->base);
++		ret = -ENOMEM;
++		return ret;
++	}
++
++	ringbuf->size = 32 * PAGE_SIZE;
++	ringbuf->effective_size = ringbuf->size;
++	ringbuf->head = 0;
++	ringbuf->tail = 0;
++	ringbuf->space = ringbuf->size;
++	ringbuf->last_retired_head = -1;
++
++	/* TODO: For now we put this in the mappable region so that we can reuse
++	 * the existing ringbuffer code which ioremaps it. When we start
++	 * creating many contexts, this will no longer work and we must switch
++	 * to a kmapish interface.
++	 */
++	ret = intel_alloc_ringbuffer_obj(dev, ringbuf);
++	if (ret) {
++		DRM_DEBUG_DRIVER("Failed to allocate ringbuffer obj %s: %d\n",
++				ring->name, ret);
++		kfree(ringbuf);
++		i915_gem_object_ggtt_unpin(ctx_obj);
++		drm_gem_object_unreference(&ctx_obj->base);
++		return ret;
++	}
++
++	ctx->engine[ring->id].ringbuf = ringbuf;
+ 	ctx->engine[ring->id].state = ctx_obj;
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index f30bf6a..7bc6515 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1536,7 +1536,7 @@ static int init_phys_status_page(struct intel_engine_cs *ring)
+ 	return 0;
+ }
+ 
+-static void intel_destroy_ringbuffer_obj(struct intel_ringbuffer *ringbuf)
++void intel_destroy_ringbuffer_obj(struct intel_ringbuffer *ringbuf)
+ {
+ 	if (!ringbuf->obj)
+ 		return;
+@@ -1547,8 +1547,8 @@ static void intel_destroy_ringbuffer_obj(struct intel_ringbuffer *ringbuf)
+ 	ringbuf->obj = NULL;
+ }
+ 
+-static int intel_alloc_ringbuffer_obj(struct drm_device *dev,
+-				      struct intel_ringbuffer *ringbuf)
++int intel_alloc_ringbuffer_obj(struct drm_device *dev,
++			       struct intel_ringbuffer *ringbuf)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	struct drm_i915_gem_object *obj;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 9511943..f75ca63 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -287,6 +287,10 @@ intel_write_status_page(struct intel_engine_cs *ring,
+ #define I915_GEM_HWS_SCRATCH_INDEX	0x30
+ #define I915_GEM_HWS_SCRATCH_ADDR (I915_GEM_HWS_SCRATCH_INDEX << MI_STORE_DWORD_INDEX_SHIFT)
+ 
++void intel_destroy_ringbuffer_obj(struct intel_ringbuffer *ringbuf);
++int intel_alloc_ringbuffer_obj(struct drm_device *dev,
++			       struct intel_ringbuffer *ringbuf);
++
+ void intel_stop_ring_buffer(struct intel_engine_cs *ring);
+ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring);
+ 
+-- 
+1.7.9.5
+

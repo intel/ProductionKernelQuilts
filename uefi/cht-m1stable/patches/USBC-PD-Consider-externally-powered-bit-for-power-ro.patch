@@ -1,0 +1,331 @@
+From d7553d7cb01fb4cca94854c7b5477750790b0f59 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Fri, 7 Aug 2015 21:02:46 +0530
+Subject: [PATCH] USBC-PD: Consider externally powered bit for power role swap
+ request.
+
+After successful pd negotiation in provider mode, source
+should trigger pr_swap if port partner is externally powered
+and supports dual power role.
+In consumer mode, power role swap request to source should be
+processed only if the port partner is not externally powered
+and supports dual power role.
+
+Change-Id: I4a751e39e016b1f23c312a4400cae7888f025faa
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-15962
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+---
+ drivers/usb/typec/pd/policy_engine.c |  2 +
+ drivers/usb/typec/pd/sink_port_pe.c  | 82 +++++++++++++++++++++++++++++-------
+ drivers/usb/typec/pd/sink_port_pe.h  |  5 +++
+ drivers/usb/typec/pd/src_port_pe.c   | 59 ++++++++++++++++++++++++++
+ 4 files changed, 133 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 86509891d850..46f2372ce3e3 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -466,6 +466,7 @@ static int pe_send_packet(struct policy_engine *pe, void *data, int len,
+ 	int ret = 0;
+ 
+ 	if (!pe_get_pd_state(pe)) {
++		pr_debug("PE:%s: Not sending pkt, evt=%d\n", __func__, evt);
+ 		ret = -EINVAL;
+ 		goto snd_pkt_err;
+ 	}
+@@ -498,6 +499,7 @@ static int pe_send_packet(struct policy_engine *pe, void *data, int len,
+ 
+ 	/* Send the pd_packet to protocol directly to request
+ 	 * sink power cap */
++	pr_debug("PE:%s: Sending pkt, evt=%d\n", __func__, evt);
+ 	if (pe && pe->prot && pe->prot->policy_fwd_pkt)
+ 		pe->prot->policy_fwd_pkt(pe->prot, msg_type, data, len);
+ 
+diff --git a/drivers/usb/typec/pd/sink_port_pe.c b/drivers/usb/typec/pd/sink_port_pe.c
+index f1bd81ea4b9d..b79b035f95e0 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.c
++++ b/drivers/usb/typec/pd/sink_port_pe.c
+@@ -42,6 +42,15 @@ static inline void snkpe_update_state(struct sink_port_pe *sink,
+ 	mutex_unlock(&sink->snkpe_state_lock);
+ }
+ 
++static void snkpe_reset_params(struct sink_port_pe *sink)
++{
++	/* By default dual power role supported*/
++	sink->pp_is_dual_prole = 1;
++	/* By default dual data role supported*/
++	sink->pp_is_dual_drole = 1;
++	sink->pp_is_ext_pwrd = 0;
++}
++
+ static int snkpe_timeout_transition_check(struct sink_port_pe *sink)
+ {
+ 	int ret = 0;
+@@ -242,29 +251,41 @@ static int snkpe_handle_pr_swap(struct sink_port_pe *sink)
+ 	enum pwr_role prole;
+ 	int ret = 0;
+ 
++	snkpe_update_state(sink, PE_PRS_SNK_SRC_EVALUATE_PR_SWAP);
++	/* If port partner is externally powered, power role swap from
++	 * sink to source can be rejected.
++	 */
++	if (sink->pp_is_ext_pwrd || (!sink->pp_is_dual_prole)) {
++		pr_info("SNKPE:%s: Not processing PR_SWAP Req\n",
++				__func__);
++		goto pr_swap_reject;
++	}
+ 	prole = policy_get_power_role(&sink->p);
+ 	if (prole <= 0) {
+ 		pr_err("SINKPE: Error in getting power role\n");
+-		return -EINVAL;
++		goto pr_swap_reject;
+ 	}
+-	snkpe_update_state(sink, PE_PRS_SNK_SRC_EVALUATE_PR_SWAP);
+ 
+-	if (prole == POWER_ROLE_SINK) {
+-		/* As the request to transition to provider mode, It
+-		 * will be accepted only if VBAT >= 50% else reject.
+-		 * returns: 1 - accepted, 0 - rejected or error code.
+-		 */
+-		ret = policy_is_pr_swap_support(&sink->p, prole);
+-		if (ret > 0)
+-			return snkpe_send_pr_swap_accept(sink);
+-		else
+-			return snkpe_send_pr_swap_reject(sink);
+-	} else {
++	if (prole != POWER_ROLE_SINK) {
+ 		pr_warn("SNKPE: Current Power Role - %d\n", prole);
+-		ret = -ENOTSUPP;
++		goto pr_swap_reject;
++	}
++	/* As the request to transition to provider mode, It
++	 * will be accepted only if VBAT >= 50% else reject.
++	 * returns: 1 - accepted, 0 - rejected or error code.
++	 */
++	ret = policy_is_pr_swap_support(&sink->p, prole);
++	if (ret == 0) {
++		pr_warn("SNKPE: Batt cap < 50\n");
++		goto pr_swap_reject;
+ 	}
+ 
+-	return ret;
++	pr_debug("SNKPE:%s: Accepting pr_swap\n", __func__);
++	return snkpe_send_pr_swap_accept(sink);
++
++pr_swap_reject:
++	pr_debug("SNKPE:%s: Rejecting pr_swap\n", __func__);
++	return snkpe_send_pr_swap_reject(sink);
+ }
+ 
+ static inline int snkpe_do_prot_reset(struct sink_port_pe *sink)
+@@ -297,6 +318,7 @@ static int snkpe_start(struct sink_port_pe *sink)
+ 	}
+ 
+ 	/*---------- Start of Sink Port PE --------------*/
++	snkpe_reset_params(sink);
+ 	/* get the sink_cable_state, in case of boot with cable */
+ 	sink_cable_state = policy_get_cable_state(&sink->p,
+ 					CABLE_TYPE_CONSUMER);
+@@ -485,6 +507,11 @@ static int sink_port_policy_rcv_request(struct policy *p, enum pe_event evt)
+ 
+ 	switch (evt) {
+ 	case PE_EVT_SEND_PR_SWAP:
++		if (sink->pp_is_ext_pwrd || (!sink->pp_is_dual_prole)) {
++			pr_info("SNKPE:%s: Not processing PR_SWAP Req\n",
++					__func__);
++			break;
++		}
+ 		snkpe_update_state(sink, PE_PRS_SNK_SRC_SEND_PR_SWAP);
+ 		sink->pevt = evt;
+ 		policy_send_packet(&sink->p, NULL, 0,
+@@ -680,6 +707,29 @@ error:
+ 	return ret;
+ }
+ 
++/* This function will read the port partner capabilities and
++ * save it for further use.
++ */
++static void snkpe_read_src_caps(struct sink_port_pe *sink,
++					struct pd_packet *pkt)
++{
++	struct pd_fixed_supply_pdo *pdo =
++			(struct pd_fixed_supply_pdo *) &pkt->data_obj[0];
++
++	if (pdo->fixed_supply != SUPPLY_TYPE_FIXED) {
++		pr_debug("SNKPE:%s: source is not fixed supply\n",
++					__func__);
++		return;
++	}
++	sink->pp_is_dual_prole = pdo->dual_role_pwr;
++	sink->pp_is_dual_drole = pdo->data_role_swap;
++	sink->pp_is_ext_pwrd = pdo->ext_powered;
++
++	pr_debug("SNKPE:%s:dual_prole=%d, dual_drole=%d, ext_pwrd=%d",
++			__func__, sink->pp_is_dual_prole,
++			sink->pp_is_dual_drole,	sink->pp_is_ext_pwrd);
++}
++
+ static int snkpe_handle_select_capability_state(struct sink_port_pe *sink,
+ 							struct pd_packet *pkt)
+ {
+@@ -690,6 +740,8 @@ static int snkpe_handle_select_capability_state(struct sink_port_pe *sink,
+ 	/* move the next state PE_SNK_Select_Capability */
+ 	snkpe_update_state(sink, PE_SNK_SELECT_CAPABILITY);
+ 
++	snkpe_read_src_caps(sink, pkt);
++
+ 	evt = PE_EVT_SEND_REQUEST;
+ 	/* make request message and send to PE -> protocol */
+ 	ret = snkpe_get_msg(sink, pkt, evt, &data);
+diff --git a/drivers/usb/typec/pd/sink_port_pe.h b/drivers/usb/typec/pd/sink_port_pe.h
+index 37497b99c95e..e24f96a31197 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.h
++++ b/drivers/usb/typec/pd/sink_port_pe.h
+@@ -107,6 +107,11 @@ struct sink_port_pe {
+ 	struct work_struct timer_work;
+ 	bool is_sink_cable_connected;
+ 	u8 hard_reset_count;
++
++	/* Port partner caps */
++	unsigned pp_is_dual_prole:1;
++	unsigned pp_is_dual_drole:1;
++	unsigned pp_is_ext_pwrd:1;
+ };
+ 
+ static int snkpe_start(struct sink_port_pe *sink);
+diff --git a/drivers/usb/typec/pd/src_port_pe.c b/drivers/usb/typec/pd/src_port_pe.c
+index d8faf7d1ccf8..1e599ab50387 100644
+--- a/drivers/usb/typec/pd/src_port_pe.c
++++ b/drivers/usb/typec/pd/src_port_pe.c
+@@ -53,6 +53,10 @@ struct src_port_pe {
+ 	struct delayed_work start_comm;
+ 	struct work_struct msg_work;
+ 	int cmd_retry;
++	/* port partner caps */
++	unsigned pp_is_dual_drole:1;
++	unsigned pp_is_dual_prole:1;
++	unsigned pp_is_ext_pwrd:1;
+ };
+ 
+ /* Source policy engine states */
+@@ -90,6 +94,12 @@ static void src_pe_reset_policy_engine(struct src_port_pe *src_pe)
+ 	src_pe->state = SRC_PE_STATE_NONE;
+ 	src_pe->pcap.mv = 0;
+ 	src_pe->pcap.ma = 0;
++
++	/* By default dual data role is enabled*/
++	src_pe->pp_is_dual_drole = 1;
++	/* By default dual power role is enabled*/
++	src_pe->pp_is_dual_prole = 1;
++	src_pe->pp_is_ext_pwrd = 0;
+ }
+ 
+ static int src_pe_send_srccap_cmd(struct src_port_pe *src_pe)
+@@ -112,6 +122,8 @@ static int src_pe_send_srccap_cmd(struct src_port_pe *src_pe)
+ 	pdo.volt = VOLT_TO_SRC_CAP_DATA_OBJ(pcap.mv); /* In 50mV units */
+ 	pdo.peak_cur = 0; /* No peek current supported */
+ 	pdo.dual_role_pwr = 1; /* Dual pwr role supported */
++	pdo.data_role_swap = 1; /*Dual data role*/
++	pdo.usb_comm = 1; /* USB communication supported */
+ 
+ 	ret = policy_send_packet(&src_pe->p, &pdo, 4,
+ 				PD_DATA_MSG_SRC_CAP, PE_EVT_SEND_SRC_CAP);
+@@ -132,6 +144,13 @@ static inline int src_pe_send_psrdy_cmd(struct src_port_pe *src_pe)
+ 				PD_CTRL_MSG_PS_RDY, PE_EVT_SEND_PS_RDY);
+ }
+ 
++static inline int src_pe_send_get_snk_cap_cmd(struct src_port_pe *src_pe)
++{
++
++	return policy_send_packet(&src_pe->p, NULL, 0,
++			PD_CTRL_MSG_GET_SINK_CAP, PE_EVT_SEND_GET_SINK_CAP);
++}
++
+ static int src_pe_handle_snk_source_off(struct src_port_pe *src_pe)
+ {
+ 	mutex_lock(&src_pe->pe_lock);
+@@ -187,6 +206,8 @@ src_pe_handle_gcrc(struct src_port_pe *src_pe, struct pd_packet *pkt)
+ 		log_info("SRC_PE_STATE_PS_RDY_SENT -> SRC_PE_STATE_PD_CONFIGURED");
+ 		pe_notify_policy_status_changed(&src_pe->p,
+ 				POLICY_TYPE_SOURCE, src_pe->p.status);
++		/* Get sink caps */
++		src_pe_send_get_snk_cap_cmd(src_pe);
+ 		break;
+ 	case PE_PRS_SRC_SNK_ACCEPT_PR_SWAP:
+ 		log_dbg("SRC_SNK_ACCEPT_PR_SWAP -> SRC_SNK_TRANSITION_TO_OFF");
+@@ -273,6 +294,10 @@ static int src_pe_rcv_request(struct policy *srcp, enum pe_event evt)
+ 	log_dbg("%s evt %d\n", __func__, evt);
+ 	switch (evt) {
+ 	case PE_EVT_SEND_PR_SWAP:
++		if (!src_pe->pp_is_dual_prole) {
++			log_info("Port partner doesnt support pr_swap");
++			break;
++		}
+ 		mutex_lock(&src_pe->pe_lock);
+ 		src_pe->state = PE_PRS_SRC_SNK_SEND_PR_SWAP;
+ 		src_pe->p.status = POLICY_STATUS_RUNNING;
+@@ -288,6 +313,32 @@ static int src_pe_rcv_request(struct policy *srcp, enum pe_event evt)
+ 	return 0;
+ }
+ 
++static void src_pe_handle_snk_cap_rcv(struct src_port_pe *src_pe,
++				struct pd_packet *pkt)
++{
++	struct pd_sink_fixed_pdo *snk_cap;
++
++	snk_cap = (struct pd_sink_fixed_pdo *) &pkt->data_obj[0];
++
++	if (snk_cap->supply_type != SUPPLY_TYPE_FIXED) {
++		log_dbg("Port partner is not a fixed sypply");
++		return;
++	}
++	/* Save sink port caps */
++	mutex_lock(&src_pe->pe_lock);
++	src_pe->pp_is_dual_drole = snk_cap->data_role_swap;
++	src_pe->pp_is_dual_prole = snk_cap->dual_role_pwr;
++	src_pe->pp_is_ext_pwrd = snk_cap->ext_powered;
++	mutex_unlock(&src_pe->pe_lock);
++
++	log_dbg("is_dual_prole=%d, is_dual_drole=%d, is_ext_pwrd=%d",
++			snk_cap->dual_role_pwr, snk_cap->data_role_swap,
++			snk_cap->ext_powered);
++	/* Trigger power role swap if extenally powered */
++	if (snk_cap->ext_powered)
++		src_pe_rcv_request(&src_pe->p, PE_EVT_SEND_PR_SWAP);
++}
++
+ static int
+ src_pe_rcv_pkt(struct policy *srcp, struct pd_packet *pkt, enum pe_event evt)
+ {
+@@ -319,6 +370,10 @@ src_pe_rcv_pkt(struct policy *srcp, struct pd_packet *pkt, enum pe_event evt)
+ 		if (src_pe->state == PE_PRS_SRC_SNK_SOURCE_OFF)
+ 			complete(&src_pe->psso_complete);
+ 		break;
++	case PE_EVT_RCVD_SNK_CAP:
++		if (src_pe->state == SRC_PE_STATE_PD_CONFIGURED)
++			src_pe_handle_snk_cap_rcv(src_pe, pkt);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 		log_info("Not proccessing the event=%d\n", evt);
+@@ -462,6 +517,7 @@ static int src_pe_start_policy_engine(struct policy *p)
+ 	p->state = POLICY_STATE_ONLINE;
+ 	p->status = POLICY_STATUS_RUNNING;
+ 	policy_set_pd_state(p, true);
++	src_pe_reset_policy_engine(src_pe);
+ 	schedule_delayed_work(&src_pe->start_comm, 0);
+ 	mutex_unlock(&src_pe->pe_lock);
+ 	return 0;
+@@ -482,6 +538,9 @@ static int src_pe_stop_policy_engine(struct policy *p)
+ 	reinit_completion(&src_pe->psso_complete);
+ 	policy_set_pd_state(p, false);
+ 	src_pe->cmd_retry = 0;
++	src_pe->pp_is_dual_drole = 0;
++	src_pe->pp_is_dual_prole = 0;
++	src_pe->pp_is_ext_pwrd = 0;
+ 	mutex_unlock(&src_pe->pe_lock);
+ 	return 0;
+ }
+-- 
+1.9.1
+

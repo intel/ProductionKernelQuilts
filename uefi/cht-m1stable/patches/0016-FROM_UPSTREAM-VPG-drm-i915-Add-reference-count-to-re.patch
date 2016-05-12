@@ -1,0 +1,176 @@
+From 3677fcb693124524c86bf74339e7dc2b000cc641 Mon Sep 17 00:00:00 2001
+Message-Id: <3677fcb693124524c86bf74339e7dc2b000cc641.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:24 +0000
+Subject: [PATCH 16/63] FROM_UPSTREAM [VPG]: drm/i915: Add reference count to
+ request structure
+
+The plan is to use request structures everywhere that seqno values were
+previously used. This means saving pointers to structures in places that used to
+be simple integers. In turn, that means that the target structure now needs much
+more stringent lifetime tracking. That is, it must not be freed while some other
+random object still holds a pointer to it.
+
+To achieve this tracking, a reference count needs to be added. Whenever a
+pointer to the structure is saved away, the count must be incremented and the
+free must only occur when all references have been released.
+
+Change-Id: I3899beafadc705c2697159ce178ea4ef0ef14d65
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: abfe262ae76246434fc427db855d716e575d0c1f
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_drv.h         |   28 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gem.c         |   20 ++++++++++++++------
+ drivers/gpu/drm/i915/intel_lrc.c        |    4 +++-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    4 +++-
+ 4 files changed, 48 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index a9c3fea..073401b 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2076,6 +2076,8 @@ struct drm_i915_gem_object {
+  * an emission time with seqnos for tracking how far ahead of the GPU we are.
+  */
+ struct drm_i915_gem_request {
++	struct kref ref;
++
+ 	/** On Which ring this request was generated */
+ 	struct intel_engine_cs *ring;
+ 
+@@ -2105,6 +2107,32 @@ struct drm_i915_gem_request {
+ 	struct list_head client_list;
+ };
+ 
++void i915_gem_request_free(struct kref *req_ref);
++
++static inline void
++i915_gem_request_reference(struct drm_i915_gem_request *req)
++{
++	kref_get(&req->ref);
++}
++
++static inline void
++i915_gem_request_unreference(struct drm_i915_gem_request *req)
++{
++	kref_put(&req->ref, i915_gem_request_free);
++}
++
++static inline void i915_gem_request_assign(struct drm_i915_gem_request **pdst,
++					   struct drm_i915_gem_request *src)
++{
++	if (src)
++		i915_gem_request_reference(src);
++
++	if (*pdst)
++		i915_gem_request_unreference(*pdst);
++
++	*pdst = src;
++}
++
+ struct drm_i915_file_private {
+ 	struct drm_i915_private *dev_priv;
+ 	struct drm_file *file;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index e57d030..6d4d35e 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2623,21 +2623,30 @@ void i915_set_reset_status(struct drm_i915_private *dev_priv,
+ 
+ static void i915_gem_free_request(struct drm_i915_gem_request *request)
+ {
+-	struct intel_context *ctx = request->ctx;
+-
+ 	list_del(&request->list);
+ 	i915_gem_request_remove_from_client(request);
+ 
++	i915_gem_request_unreference(request);
++}
++
++void i915_gem_request_free(struct kref *req_ref)
++{
++	struct drm_i915_gem_request *req = container_of(req_ref,
++						 typeof(*req), ref);
++	struct intel_context *ctx = req->ctx;
++
+ 	if (ctx) {
+ 		if (i915.enable_execlists) {
+-			struct intel_engine_cs *ring = request->ring;
++			struct intel_engine_cs *ring = req->ring;
+ 
+ 			if (ctx != ring->default_context)
+ 				intel_lr_context_unpin(ring, ctx);
+ 		}
++
+ 		i915_gem_context_unreference(ctx);
+ 	}
+-	kfree(request);
++
++	kfree(req);
+ }
+ 
+ struct drm_i915_gem_request *
+@@ -2726,8 +2735,7 @@ static void i915_gem_reset_ring_cleanup(struct drm_i915_private *dev_priv,
+ 	}
+ 
+ 	/* These may not have been flush before the reset, do so now */
+-	kfree(ring->preallocated_lazy_request);
+-	ring->preallocated_lazy_request = NULL;
++	i915_gem_request_assign(&ring->preallocated_lazy_request, NULL);
+ 	ring->outstanding_lazy_seqno = 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 2bcb86b..db000c5 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1277,6 +1277,8 @@ static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
+ 		}
+ 	}
+ 
++	kref_init(&request->ref);
++
+ 	ret = i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
+ 	if (ret) {
+ 		intel_lr_context_unpin(ring, ctx);
+@@ -1736,7 +1738,7 @@ void intel_logical_ring_cleanup(struct intel_engine_cs *ring)
+ 	i915_sync_timeline_advance(ring);
+ 	i915_sync_timeline_destroy(ring);
+ 
+-	ring->preallocated_lazy_request = NULL;
++	i915_gem_request_assign(&ring->preallocated_lazy_request, NULL);
+ 	ring->outstanding_lazy_seqno = 0;
+ 
+ 	if (ring->cleanup)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index e4e5208..f02fd27 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2200,7 +2200,7 @@ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring)
+ 
+ 	intel_unpin_ringbuffer_obj(ringbuf);
+ 	intel_destroy_ringbuffer_obj(ringbuf);
+-	ring->preallocated_lazy_request = NULL;
++	i915_gem_request_assign(&ring->preallocated_lazy_request, NULL);
+ 	ring->outstanding_lazy_seqno = 0;
+ 
+ 	if (ring->cleanup)
+@@ -2392,6 +2392,8 @@ intel_ring_alloc_seqno(struct intel_engine_cs *ring)
+ 	if (request == NULL)
+ 		return -ENOMEM;
+ 
++	kref_init(&request->ref);
++
+ 	ret = i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
+ 	if (ret) {
+ 		kfree(request);
+-- 
+1.7.9.5
+

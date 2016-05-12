@@ -1,0 +1,436 @@
+From 94405ae251e4094f6dcbb393c1f79234718fc436 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Tue, 3 Feb 2015 20:46:33 +0530
+Subject: [PATCH] XPWR: Implemented acpi based fg config data loading.
+
+In an acpi based systems, the xpwr fg config data will be provided
+through BCFG acpi table. Drivers should read the fg data from acpi and
+load the hardware registers. This patch implements the feature.
+
+Change-Id: I45630dbee8e45098f06abbbdbf4cbe415b44afe8
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-948
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+---
+ drivers/mfd/intel_soc_pmic_dc.c       | 107 ++++++++++++++++++++++-------
+ drivers/power/dc_xpwr_battery.c       | 126 +++++++++++++++++++++++++++-------
+ include/linux/power/dc_xpwr_battery.h |  31 ++++++---
+ 3 files changed, 207 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/mfd/intel_soc_pmic_dc.c b/drivers/mfd/intel_soc_pmic_dc.c
+index b198a10..ae8ec53 100644
+--- a/drivers/mfd/intel_soc_pmic_dc.c
++++ b/drivers/mfd/intel_soc_pmic_dc.c
+@@ -350,7 +350,7 @@ static void *platform_get_batt_charge_profile(void)
+ 					ps_batt_chrg_prof.batt_prof;
+ 	if ((ret < 0 || ps_batt_chrg_prof.chrg_prof_type == CHRG_PROF_NONE)
+ 		&& pse_mod_prof)
+-			snprintf(pse_mod_prof->batt_id, (BATTID_LEN+1),
++			snprintf(pse_mod_prof->batt_id, (BATTID_STR_LEN + 1),
+ 				"%s", BATTID_UNKNOWN);
+ 
+ 	return &ps_batt_chrg_prof;
+@@ -417,7 +417,7 @@ static void dc_xpwr_chrg_pdata(void)
+ 	pdata.def_iterm = 300;
+ 	pdata.def_max_temp = 55;
+ 	pdata.def_min_temp = 0;
+-	
++
+ 	/* Deprecated: DC does not handle GPIO for VBUS */
+ 	pdata.otg_gpio = -1;
+ 
+@@ -434,6 +434,84 @@ static int fg_bat_curve[] = {
+     0x50, 0x53, 0x55, 0x57, 0x5a, 0x5d, 0x61, 0x64,
+ };
+ 
++#ifdef CONFIG_ACPI
++#define FGCONFIG_ACPI_TABLE_NAME	"BCFG"
++
++static int
++dc_xpwr_get_acpi_cdata(struct dollarcove_fg_pdata *pdata)
++{
++	struct dc_xpwr_acpi_fg_config *acpi_tbl = NULL;
++	char *name = FGCONFIG_ACPI_TABLE_NAME;
++	acpi_size tbl_size;
++	acpi_status status;
++
++	/* read the fg config table from acpi */
++	status = acpi_get_table_with_size(name , 0,
++			(struct acpi_table_header **)&acpi_tbl, &tbl_size);
++	if (ACPI_FAILURE(status)) {
++		pr_err("%s:%s table not found!!\n", __func__, name);
++		return status;
++	}
++	pr_info("%s: %s table found, size=%d\n",
++				__func__, name, (int)tbl_size);
++
++	/* validate the table size */
++	if (tbl_size <  sizeof(struct dc_xpwr_acpi_fg_config)) {
++		pr_err("%s:%s table incomplete!!\n", __func__, name);
++		pr_info("%s: table_size=%d, structure_size=%lu\n",
++			__func__, (int)tbl_size,
++			sizeof(struct dc_xpwr_acpi_fg_config));
++		return -ENXIO;
++	}
++
++
++	memcpy(&pdata->cdata, &acpi_tbl->cdata,
++			sizeof(struct dc_xpwr_acpi_fg_config));
++
++	return 0;
++}
++#endif /* CONFIG_ACPI */
++
++static void dc_xpwr_get_fg_config_data(struct dollarcove_fg_pdata *pdata)
++{
++	int scaled_capacity;
++	int i;
++
++#ifdef CONFIG_ACPI
++	if (!dc_xpwr_get_acpi_cdata(pdata)) {
++		pr_info("%s: Loading fg config from acpi table\n", __func__);
++		return;
++	}
++#endif /* CONFIG_ACPI */
++
++	pr_info("%s: Loading default fg config.\n", __func__);
++	/*
++	 * Calculate cap1 and cap0.  The value of a LSB is 1.456mAh.
++	 * Using 1.5 as math friendly and close enough.
++	 */
++
++	scaled_capacity = (pdata->design_cap >> 1) +
++				(pdata->design_cap >> 3) +
++				(pdata->design_cap >> 4);
++
++	/*
++	 * bit 7 of cap1 register is set to indicate battery maximum
++	 * capacity is valid
++	 */
++	pdata->cdata.cap0 = scaled_capacity & 0xFF;
++	pdata->cdata.cap1 = (scaled_capacity >> 8) | 0x80;
++
++	pdata->cdata.rdc1 = 0xc0;
++	pdata->cdata.rdc0 = 0x97;
++
++	/* Donot update the entire fg  data on every boot*/
++	pdata->cdata.fco = 0x00;
++	/* copy curve data */
++	for (i = 0; i < XPWR_BAT_CURVE_SIZE; i++)
++		pdata->cdata.bat_curve[i] = fg_bat_curve[i];
++	return;
++}
++
+ static void dc_xpwr_fg_pdata(void)
+ {
+ 	static struct dollarcove_fg_pdata pdata;
+@@ -442,7 +520,7 @@ static void dc_xpwr_fg_pdata(void)
+ 
+ 	if (ps_batt_chrg_prof.chrg_prof_type == CHRG_PROF_NONE
+ 		|| (!pse_mod_prof))
+-		snprintf(pdata.battid, (BATTID_LEN+1),
++		snprintf(pdata.battid, (BATTID_STR_LEN + 1),
+ 			"%s", BATTID_UNKNOWN);
+ 	else
+ 		memcpy(pdata.battid, pse_mod_prof->batt_id,
+@@ -464,27 +542,8 @@ static void dc_xpwr_fg_pdata(void)
+ 
+ 	pdata.min_temp = pse_mod_prof->temp_low_lim;
+ 
+-	/*
+-	 * Calculate cap1 and cap0.  The value of a LSB is 1.456mAh.
+-	 * Using 1.5 as math friendly and close enough.
+-	 */
+-
+-	scaled_capacity = (pdata.design_cap >> 1) +
+-				(pdata.design_cap >> 3) +
+-				(pdata.design_cap >> 4);
+-
+-	/*
+-	 * bit 7 of cap1 register is set to indicate battery maximum
+-	 * capacity is valid
+-	 */
+-	pdata.cap0 = scaled_capacity & 0xFF;
+-	pdata.cap1 = (scaled_capacity >> 8) | 0x80;
+-
+-	pdata.rdc1 = 0xc0;
+-	pdata.rdc0 = 0x97;
+-	/* copy curve data */
+-	for (i = 0; i < BAT_CURVE_SIZE; i++)
+-		pdata.bat_curve[i] = fg_bat_curve[i];
++	/* Load FG config data to pdata */
++	dc_xpwr_get_fg_config_data(&pdata);
+ 
+ 	intel_soc_pmic_set_pdata("dollar_cove_battery",
+ 				(void *)&pdata, sizeof(pdata), 0);
+diff --git a/drivers/power/dc_xpwr_battery.c b/drivers/power/dc_xpwr_battery.c
+index 48408e2..81e1546 100644
+--- a/drivers/power/dc_xpwr_battery.c
++++ b/drivers/power/dc_xpwr_battery.c
+@@ -159,6 +159,10 @@
+ #define DC_FG_TUNING_CNTL4		0xEC
+ #define DC_FG_TUNING_CNTL5		0xED
+ 
++/* Set 3.7V as minimum RDC voltage */
++#define CNTL4_RDC_MIN_VOLT_SET_MASK	(1 << 4)
++#define CNTL4_RDC_MIN_VOLT_RESET_MASK	(1 << 3)
++
+ /* each LSB is equal to 1.1mV */
+ #define ADC_TO_VBATT(a)			((a * 11) / 10)
+ 
+@@ -279,6 +283,26 @@ static int pmic_fg_reg_writeb(struct pmic_fg_info *info, int reg, u8 val)
+ 	return ret;
+ }
+ 
++static int pmic_fg_reg_setb(struct pmic_fg_info *info, int reg, u8 mask)
++{
++	int ret;
++
++	ret = intel_soc_pmic_setb(reg, mask);
++	if (ret < 0)
++		dev_err(&info->pdev->dev, "pmic reg set mask err:%d\n", ret);
++	return ret;
++}
++
++static int pmic_fg_reg_clearb(struct pmic_fg_info *info, int reg, u8 mask)
++{
++	int ret;
++
++	ret = intel_soc_pmic_clearb(reg, mask);
++	if (ret < 0)
++		dev_err(&info->pdev->dev, "pmic reg set mask err:%d\n", ret);
++	return ret;
++}
++
+ static void pmic_fg_dump_init_regs(struct pmic_fg_info *info)
+ {
+ 	int i;
+@@ -287,7 +311,7 @@ static void pmic_fg_dump_init_regs(struct pmic_fg_info *info)
+ 			DC_CHRG_CCCV_REG,
+ 			pmic_fg_reg_readb(info, DC_CHRG_CCCV_REG));
+ 
+-	for (i = 0; i < BAT_CURVE_SIZE; i++) {
++	for (i = 0; i < XPWR_BAT_CURVE_SIZE; i++) {
+ 		dev_info(&info->pdev->dev, "reg:%x, val:%x\n",
+ 			DC_FG_OCV_CURVE_REG + i,
+ 			pmic_fg_reg_readb(info, DC_FG_OCV_CURVE_REG + i));
+@@ -809,13 +833,37 @@ fg_prog_ocv_fail:
+ 
+ static int pmic_fg_program_design_cap(struct pmic_fg_info *info)
+ {
+-	int ret;
++	int ret = 0;
++	int cap0, cap1;
+ 
+-	ret = pmic_fg_reg_writeb(info, DC_FG_DES_CAP1_REG, info->pdata->cap1);
+-	if (ret < 0)
++	cap1 = pmic_fg_reg_readb(info, DC_FG_DES_CAP1_REG);
++	if (cap1 < 0) {
++		dev_warn(&info->pdev->dev, "CAP1 reg read err!!\n");
++		goto fg_prog_descap_fail;
++	}
++	cap0 = pmic_fg_reg_readb(info, DC_FG_DES_CAP0_REG);
++	if (cap0 < 0) {
++		dev_warn(&info->pdev->dev, "CAP0 reg read err!!\n");
+ 		goto fg_prog_descap_fail;
++	}
+ 
+-	ret = pmic_fg_reg_writeb(info, DC_FG_DES_CAP0_REG, info->pdata->cap0);
++	/* If CAP values are as expected, skip capacity initialization*/
++	if ((cap1 == info->pdata->cdata.cap1)
++		&& (cap0 == info->pdata->cdata.cap0)) {
++		return 0;
++	}
++
++	ret = pmic_fg_reg_writeb(info, DC_FG_DES_CAP1_REG,
++					info->pdata->cdata.cap1);
++	if (ret < 0) {
++		dev_warn(&info->pdev->dev, "CAP1 reg write err!!\n");
++		goto fg_prog_descap_fail;
++	}
++
++	ret = pmic_fg_reg_writeb(info, DC_FG_DES_CAP0_REG,
++					info->pdata->cdata.cap0);
++	if (ret < 0)
++		dev_warn(&info->pdev->dev, "CAP0 reg write err!!\n");
+ 
+ fg_prog_descap_fail:
+ 	return ret;
+@@ -825,9 +873,10 @@ static int pmic_fg_program_ocv_curve(struct pmic_fg_info *info)
+ {
+ 	int ret, i;
+ 
+-	for (i = 0; i < BAT_CURVE_SIZE; i++) {
++	for (i = 0; i < XPWR_BAT_CURVE_SIZE; i++) {
+ 		ret = pmic_fg_reg_writeb(info,
+-			DC_FG_OCV_CURVE_REG + i, info->pdata->bat_curve[i]);
++			DC_FG_OCV_CURVE_REG + i,
++			info->pdata->cdata.bat_curve[i]);
+ 		if (ret < 0)
+ 			goto fg_prog_ocv_fail;
+ 	}
+@@ -838,22 +887,43 @@ fg_prog_ocv_fail:
+ 
+ static int pmic_fg_program_rdc_vals(struct pmic_fg_info *info)
+ {
+-	int ret;
++	int ret = 0;
++	int rdc0, rdc1, cntl4;
++
++	rdc1 = pmic_fg_reg_readb(info, DC_FG_RDC1_REG);
++	if (rdc1 < 0) {
++		dev_warn(&info->pdev->dev, "RDC1 reg read err!!\n");
++		goto fg_prog_rdc_fail;
++	}
++	rdc0 = pmic_fg_reg_readb(info, DC_FG_RDC0_REG);
++	if (rdc0 < 0) {
++		dev_warn(&info->pdev->dev, "RDC0 reg read err!!\n");
++		goto fg_prog_rdc_fail;
++	}
++	/* If RDC values are as expected, skip RDC initialization*/
++	if ((rdc1 == info->pdata->cdata.rdc1)
++		&& (rdc0 == info->pdata->cdata.rdc0)) {
++		return 0;
++	}
+ 
+-	ret = pmic_fg_reg_writeb(info, DC_FG_RDC1_REG, info->pdata->rdc1);
++	ret = pmic_fg_reg_writeb(info, DC_FG_RDC1_REG, info->pdata->cdata.rdc1);
+ 	if (ret < 0)
+-		goto fg_prog_ocv_fail;
++		goto fg_prog_rdc_fail;
+ 
+-	ret = pmic_fg_reg_writeb(info, DC_FG_RDC0_REG, info->pdata->rdc0);
++	ret = pmic_fg_reg_writeb(info, DC_FG_RDC0_REG, info->pdata->cdata.rdc0);
+ 
+-fg_prog_ocv_fail:
++	cntl4 = pmic_fg_reg_clearb(info, DC_FG_TUNING_CNTL4,
++					CNTL4_RDC_MIN_VOLT_RESET_MASK);
++	ret = pmic_fg_reg_setb(info, DC_FG_TUNING_CNTL4,
++					CNTL4_RDC_MIN_VOLT_SET_MASK);
++
++fg_prog_rdc_fail:
+ 	return ret;
+ }
+ 
+ static void pmic_fg_init_config_regs(struct pmic_fg_info *info)
+ {
+-	int ret;
+-
++	int ret = 0;
+ 
+ 	/*
+ 	 * check if the config data is already
+@@ -862,9 +932,10 @@ static void pmic_fg_init_config_regs(struct pmic_fg_info *info)
+ 	ret = pmic_fg_reg_readb(info, DC_FG_CNTL_REG);
+ 	if (ret < 0) {
+ 		dev_warn(&info->pdev->dev, "FG CNTL reg read err!!\n");
+-	} else if ((ret & FG_CNTL_OCV_ADJ_EN) && (ret & FG_CNTL_CAP_ADJ_EN)) {
++	} else if ((ret & FG_CNTL_OCV_ADJ_EN) && (ret & FG_CNTL_CAP_ADJ_EN)
++			&& !info->pdata->cdata.fco) {
+ 		dev_info(&info->pdev->dev,
+-			 "FG data except the OCV curve is initialized\n");
++			 "Only OCV curve from FG data is initialized\n");
+ 		/*
+ 		 * ocv curve will be set to default values
+ 		 * at every boot, so it is needed to explicitly write
+@@ -876,25 +947,30 @@ static void pmic_fg_init_config_regs(struct pmic_fg_info *info)
+ 				"set ocv curve fail:%d\n", ret);
+ 		pmic_fg_dump_init_regs(info);
+ 		return;
+-	} else {
+-		dev_info(&info->pdev->dev, "FG data need to be initialized\n");
++
+ 	}
++	dev_info(&info->pdev->dev, "FG data need to be initialized\n");
+ 
+-	ret = pmic_fg_program_vbatt_full(info);
++	dev_info(&info->pdev->dev, "DisableFG during  initialization\n");
++	ret = pmic_fg_reg_writeb(info, DC_FG_CNTL_REG, 0x00);
+ 	if (ret < 0)
+-		dev_err(&info->pdev->dev, "set vbatt full fail:%d\n", ret);
++		dev_err(&info->pdev->dev, "gauge cntl set fail:%d\n", ret);
+ 
+-	ret = pmic_fg_program_design_cap(info);
++	ret = pmic_fg_program_ocv_curve(info);
+ 	if (ret < 0)
+-		dev_err(&info->pdev->dev, "set design cap fail:%d\n", ret);
++		dev_err(&info->pdev->dev, "set ocv curve fail:%d\n", ret);
+ 
+ 	ret = pmic_fg_program_rdc_vals(info);
+ 	if (ret < 0)
+ 		dev_err(&info->pdev->dev, "set rdc fail:%d\n", ret);
+ 
+-	ret = pmic_fg_program_ocv_curve(info);
++	ret = pmic_fg_program_design_cap(info);
+ 	if (ret < 0)
+-		dev_err(&info->pdev->dev, "set ocv curve fail:%d\n", ret);
++		dev_err(&info->pdev->dev, "set design cap fail:%d\n", ret);
++
++	ret = pmic_fg_program_vbatt_full(info);
++	if (ret < 0)
++		dev_err(&info->pdev->dev, "set vbatt full fail:%d\n", ret);
+ 
+ 	ret = pmic_fg_set_lowbatt_thresholds(info);
+ 	if (ret < 0)
+@@ -953,7 +1029,7 @@ static void pmic_fg_init_psy(struct pmic_fg_info *info)
+ static int pmic_fg_probe(struct platform_device *pdev)
+ {
+ 	struct pmic_fg_info *info;
+-	int ret;
++	int ret = 0;
+ 
+ 	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
+ 	if (!info) {
+diff --git a/include/linux/power/dc_xpwr_battery.h b/include/linux/power/dc_xpwr_battery.h
+index 1e1de66..f2e1959 100644
+--- a/include/linux/power/dc_xpwr_battery.h
++++ b/include/linux/power/dc_xpwr_battery.h
+@@ -27,11 +27,30 @@
+ #include <linux/power_supply.h>
+ #include <linux/power/battery_id.h>
+ 
+-#define BAT_CURVE_SIZE		32
+-#define BATTID_LEN		8
++#define XPWR_FG_DATA_SIZE	36
++#define XPWR_BAT_CURVE_SIZE	32
++#define ACPI_FG_CONF_NAME_LEN	8
++
++struct dc_xpwr_fg_config_data {
++	char fg_name[ACPI_FG_CONF_NAME_LEN];
++	char battid[BATTID_STR_LEN];
++	u16 size; /* config size */
++	u8 fco; /* FG config options */
++	u16 checksum; /* Primary data checksum */
++	u8 cap1;
++	u8 cap0;
++	u8 rdc1;
++	u8 rdc0;
++	u8 bat_curve[XPWR_BAT_CURVE_SIZE];
++} __packed;
++
++struct dc_xpwr_acpi_fg_config {
++	struct acpi_table_header acpi_header;
++	struct dc_xpwr_fg_config_data cdata;
++} __packed;
+ 
+ struct dollarcove_fg_pdata {
+-	char battid[BATTID_LEN + 1];
++	char battid[BATTID_STR_LEN + 1];
+ 
+ 	int design_cap;
+ 	int design_min_volt;
+@@ -39,11 +58,7 @@ struct dollarcove_fg_pdata {
+ 	int max_temp;
+ 	int min_temp;
+ 
+-	int cap1;
+-	int cap0;
+-	int rdc1;
+-	int rdc0;
+-	int bat_curve[BAT_CURVE_SIZE];
++	struct dc_xpwr_fg_config_data cdata;
+ };
+ 
+ #endif	/* __DOLLAR_COVE_BATTERY_H__ */
+-- 
+1.9.1
+

@@ -1,0 +1,224 @@
+From dfcc62d8c689fdbd68c0e323f5c03ece442ea1f0 Mon Sep 17 00:00:00 2001
+Message-Id: <dfcc62d8c689fdbd68c0e323f5c03ece442ea1f0.1398812351.git.mark.gross@intel.com>
+In-Reply-To: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+References: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+From: Jianxun Zhang <jianxun.zhang@intel.com>
+Date: Tue, 25 Jun 2013 17:24:04 -0700
+Subject: [PATCH 271/429] pstore: support extra dumper
+
+Provide new interfaces in pstore, so that other pieces in kernel
+can dump their data to the persistent storage when a panic or
+crash happens.
+
+A new module parameter is also added to limit the total amount
+of data from extra dumpers. It will not be reset until reboot.
+
+For: AXIA-3125
+
+Change-Id: I7dbf1e02200c9ab1432046901c28a2f9227e2d65
+Origin-Change-Id: I1b3edd2e38e9bcccc78be71921defb89b4d12272
+Signed-off-by: Jianxun Zhang <jianxun.zhang@intel.com>
+Signed-off-by: Joakim Nordell <joakim.nordell@intel.com>
+
+Conflicts:
+
+	include/linux/pstore.h
+
+Signed-off-by: Hans Holmberg <hans.holmberg@intel.com>
+---
+ fs/pstore/platform.c   |   91 +++++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/pstore.h |   33 +++++++++++++++++
+ 2 files changed, 124 insertions(+)
+
+--- linux.orig/fs/pstore/platform.c
++++ linux/fs/pstore/platform.c
+@@ -49,6 +49,10 @@ MODULE_PARM_DESC(update_ms, "millisecond
+ 		 "enabling this option is not safe, it may lead to further "
+ 		 "corruption on Oopses)");
+ 
++static ulong pstore_extra_size = 8000;
++module_param_named(extra_size, pstore_extra_size, ulong, 0600);
++MODULE_PARM_DESC(extra_size, "maximum of dumped extra data (beside kmsg)");
++
+ static int pstore_new_entry;
+ 
+ static void pstore_timefunc(unsigned long);
+@@ -57,11 +61,15 @@ static DEFINE_TIMER(pstore_timer, pstore
+ static void pstore_dowork(struct work_struct *);
+ static DECLARE_WORK(pstore_work, pstore_dowork);
+ 
++static LIST_HEAD(pstore_extra_dumper_list);
++
+ /*
+  * pstore_lock just protects "psinfo" during
+  * calls to pstore_register()
+  */
+ static DEFINE_SPINLOCK(pstore_lock);
++static DEFINE_SPINLOCK(pstore_extra_dumper_lock);
++static size_t pstore_extra_written;
+ struct pstore_info *psinfo;
+ 
+ static char *backend;
+@@ -278,6 +286,8 @@ static void pstore_dump(struct kmsg_dump
+ 	unsigned long	flags = 0;
+ 	int		is_locked = 0;
+ 	int		ret;
++	unsigned long	flags_extra;
++	struct pstore_extra_dumper *extra_dumper;
+ 
+ 	why = get_reason_str(reason);
+ 
+@@ -342,6 +352,48 @@ static void pstore_dump(struct kmsg_dump
+ 		total += total_len;
+ 		part++;
+ 	}
++
++	/* call each registered extra dumper after kmsg */
++	part = 1;
++
++	/* skip extra dumping if we cannot acquire the lock when a panic
++	 * happens. Otherwise we could be at a deadlock situation.
++	 */
++	if (spin_trylock_irqsave(&pstore_extra_dumper_lock, flags_extra)) {
++
++		list_for_each_entry(extra_dumper, &pstore_extra_dumper_list, list)
++		{
++			while (pstore_extra_written < pstore_extra_size) {
++				size_t read;
++				size_t len = min(psinfo->bufsize,
++						pstore_extra_size - pstore_extra_written);
++
++				ret = extra_dumper->get_data(psinfo->buf, len, &read,
++						extra_dumper->priv);
++
++				if (ret < 0 || !read)
++					break;
++
++				if (unlikely(read > len))
++					read = len;
++
++				ret = psinfo->write(PSTORE_TYPE_EXTRA, reason, &id, part,
++						oopscount, read, psinfo);
++
++				if (ret < 0)
++					goto extra_done;
++
++				pstore_extra_written += read;
++
++				part++;
++			}
++		}
++
++extra_done:
++
++		spin_unlock_irqrestore(&pstore_extra_dumper_lock, flags_extra);
++	}
++
+ 	if (pstore_cannot_block_path(reason)) {
+ 		if (is_locked)
+ 			spin_unlock_irqrestore(&psinfo->buf_lock, flags);
+@@ -464,6 +516,45 @@ int pstore_register(struct pstore_info *
+ EXPORT_SYMBOL_GPL(pstore_register);
+ 
+ /*
++ * other pieces in kernel can register their extra dumper here
++ * if they want to dump their data into persistent storage when
++ * a crash happens but don't want to dump the data via kmsg.
++ */
++int pstore_register_extra_dumper(struct pstore_extra_dumper *extra_dumper)
++{
++	unsigned long flags;
++	if (!extra_dumper || (!extra_dumper->get_data))
++		return -EINVAL;
++
++	spin_lock_irqsave(&pstore_extra_dumper_lock, flags);
++	list_add_tail(&extra_dumper->list, &pstore_extra_dumper_list);
++	spin_unlock_irqrestore(&pstore_extra_dumper_lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(pstore_register_extra_dumper);
++
++/*
++ * unregister an extra dumper
++ */
++int pstore_unregister_extra_dumper(struct pstore_extra_dumper *extra_dumper)
++{
++	unsigned long flags;
++	struct pstore_extra_dumper *dumper;
++	struct pstore_extra_dumper *tmp;
++
++	spin_lock_irqsave(&pstore_extra_dumper_lock, flags);
++	list_for_each_entry_safe(dumper, tmp, &pstore_extra_dumper_list, list)
++		if (dumper == extra_dumper)
++			list_del(&dumper->list);
++
++	spin_unlock_irqrestore(&pstore_extra_dumper_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(pstore_unregister_extra_dumper);
++
++
++/*
+  * Read all the records from the persistent store. Create
+  * files in our filesystem.  Don't warn about -EEXIST errors
+  * when we are re-scanning the backing store looking to add new
+--- linux.orig/include/linux/pstore.h
++++ linux/include/linux/pstore.h
+@@ -40,6 +40,8 @@ enum pstore_type_id {
+ 	PSTORE_TYPE_PPC_OF	= 5,
+ 	PSTORE_TYPE_PPC_COMMON	= 6,
+ 	PSTORE_TYPE_PMSG	= 7,
++
++	PSTORE_TYPE_EXTRA	= 8,
+ 	PSTORE_TYPE_UNKNOWN	= 255
+ };
+ 
+@@ -73,9 +75,32 @@ struct pstore_info {
+ };
+ 
+ #define	PSTORE_FLAGS_FRAGILE	1
++struct pstore_extra_dumper {
++	struct list_head list;	/* pstore's private list */
++	const char	*name;
++	/*
++	 * get_data - called by pstore to ask data to be written into
++	 * persistent storage when a crash happens.
++	 * @pstore_buf:	buffer provided by pstore to retrieve data.
++	 * @len:		the length of pstore_buf.
++	 * @read:		actual bytes read to pstore buffer
++	 * @priv:		client's private data
++	 * @return:		0 for success, or <0 with error no
++	 */
++	int		(*get_data)(char *pstore_buf, size_t len,
++			size_t *read, void *priv);
++	void	*priv;	/* clients's private data */
++};
+ 
+ #ifdef CONFIG_PSTORE
+ extern int pstore_register(struct pstore_info *);
++
++extern
++int pstore_register_extra_dumper(struct pstore_extra_dumper *extra_dumper);
++
++extern
++int pstore_unregister_extra_dumper(struct pstore_extra_dumper *extra_dumper);
++
+ extern bool pstore_cannot_block_path(enum kmsg_dump_reason reason);
+ #else
+ static inline int
+@@ -88,6 +113,14 @@ pstore_cannot_block_path(enum kmsg_dump_
+ {
+ 	return false;
+ }
++static pstore_register_extra_dumper(struct pstore_extra_dumper *extra_dumper)
++{
++	return 0;
++}
++static pstore_unregister_extra_dumper(struct pstore_extra_dumper *extra_dumper)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif /*_LINUX_PSTORE_H*/

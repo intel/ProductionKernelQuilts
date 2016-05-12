@@ -1,0 +1,82 @@
+From 442b667007cf9eca9e422aab17d48da10cc24fac Mon Sep 17 00:00:00 2001
+Message-Id: <442b667007cf9eca9e422aab17d48da10cc24fac.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 24 Jul 2014 17:04:41 +0100
+Subject: [PATCH 38/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Help out the ctx
+ switch interrupt handler
+
+If we receive a storm of requests for the same context (see gem_storedw_loop_*)
+we might end up iterating over too many elements in interrupt time, looking for
+contexts to squash together. Instead, share the burden by giving more
+intelligence to the queue function. At most, the interrupt will iterate over
+three elements.
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+[danvet: Checkpatch.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit f1ad5a1fd4127b3a5e21b8f5ef7f1921a5d3063e)
+
+Change-Id: I7cc45de039c2dbff361de4f98c48036b502039b7
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: f1ad5a1fd4127b3a5e21b8f5ef7f1921a5d3063e
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/intel_lrc.c |   26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 7eba471..89f04b4 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -390,10 +390,10 @@ static int execlists_context_queue(struct intel_engine_cs *ring,
+ 				   struct intel_context *to,
+ 				   u32 tail)
+ {
+-	struct intel_ctx_submit_request *req = NULL;
++	struct intel_ctx_submit_request *req = NULL, *cursor;
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	unsigned long flags;
+-	bool was_empty;
++	int num_elements = 0;
+ 
+ 	req = kzalloc(sizeof(*req), GFP_KERNEL);
+ 	if (req == NULL)
+@@ -408,9 +408,27 @@ static int execlists_context_queue(struct intel_engine_cs *ring,
+ 
+ 	spin_lock_irqsave(&ring->execlist_lock, flags);
+ 
+-	was_empty = list_empty(&ring->execlist_queue);
++	list_for_each_entry(cursor, &ring->execlist_queue, execlist_link)
++		if (++num_elements > 2)
++			break;
++
++	if (num_elements > 2) {
++		struct intel_ctx_submit_request *tail_req;
++
++		tail_req = list_last_entry(&ring->execlist_queue,
++					   struct intel_ctx_submit_request,
++					   execlist_link);
++
++		if (to == tail_req->ctx) {
++			WARN(tail_req->elsp_submitted != 0,
++			     "More than 2 already-submitted reqs queued\n");
++			list_del(&tail_req->execlist_link);
++			queue_work(dev_priv->wq, &tail_req->work);
++		}
++	}
++
+ 	list_add_tail(&req->execlist_link, &ring->execlist_queue);
+-	if (was_empty)
++	if (num_elements == 0)
+ 		execlists_context_unqueue(ring);
+ 
+ 	spin_unlock_irqrestore(&ring->execlist_lock, flags);
+-- 
+1.7.9.5
+

@@ -1,0 +1,466 @@
+From 48152f0cb9bca0b184b8c73476b9aad7804620fd Mon Sep 17 00:00:00 2001
+Message-Id: <48152f0cb9bca0b184b8c73476b9aad7804620fd.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: Shashank Sharma <shashank.sharma@intel.com>
+Date: Wed, 28 Jan 2015 14:34:54 +0530
+Subject: [PATCH 28/95] MUST_REBASE [VPG]: adf/intel/vlv: Pipeline disable and
+ modeset
+
+This patch adds following changes:
+1. Disable pipeline sequence for CHV.
+2. Pipe programming functions.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5478
+Change-Id: Ib0a5e3e62f0ad76db2c4cd826377f91e1e2bcc07
+Signed-off-by: Shashank Sharma <shashank.sharma@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/vlv_pipe.c        |   75 ++++++--
+ drivers/video/adf/intel/core/vlv/vlv_pipeline.c    |  185 +++++++++++++++++---
+ .../video/adf/intel/include/core/vlv/vlv_pipe.h    |    3 +-
+ 3 files changed, 222 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipe.c b/drivers/video/adf/intel/core/vlv/vlv_pipe.c
+index 7845477..1374fd2 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipe.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipe.c
+@@ -25,7 +25,7 @@ bool vlv_pipe_vblank_on(struct vlv_pipe *pipe)
+ 			__func__, pipe->offset);
+ 	} else {
+ 		REG_WRITE(pipe->status_offset,
+-			 (val | PIPE_VBLANK_INTERRUPT_ENABLE));
++			(val | PIPE_VBLANK_INTERRUPT_ENABLE));
+ 		REG_POSTING_READ(pipe->status_offset);
+ 	}
+ 
+@@ -62,8 +62,8 @@ bool vlv_pipe_wait_for_vblank(struct vlv_pipe *pipe)
+ 	return ret;
+ }
+ 
+-static unsigned int usecs_to_scanlines(struct drm_mode_modeinfo *mode,
+-				unsigned int usecs)
++static u32 usecs_to_scanlines(struct drm_mode_modeinfo *mode,
++				u32 usecs)
+ {
+ 	/* paranoia */
+ 	if (!mode->htotal)
+@@ -229,7 +229,7 @@ u32 vlv_pipe_disable(struct vlv_pipe *pipe)
+ 	/* Wait for the Pipe State to go off */
+ 	if (wait_for(!(REG_READ(pipe->offset) & I965_PIPECONF_ACTIVE), 100)) {
+ 		pr_err("ADF: %s: pipe_off wait timed out\n", __func__);
+-		err = -EINVAL; /* FIXME: replace with timeout error :) */
++		err = -ETIMEDOUT;
+ 	}
+ 
+ 	return err;
+@@ -239,7 +239,7 @@ bool vlv_pipe_wait_for_pll_lock(struct vlv_pipe *pipe)
+ {
+ 	u32 err = 0;
+ 	if (wait_for(vlv_cck_read(CCK_REG_DSI_PLL_CONTROL) &
+-		     DSI_PLL_LOCK, 20)) {
++			DSI_PLL_LOCK, 20)) {
+ 		pr_err("DSI PLL lock failed\n");
+ 		err = -EINVAL; /* FIXME: assign correct error */
+ 	}
+@@ -248,14 +248,15 @@ bool vlv_pipe_wait_for_pll_lock(struct vlv_pipe *pipe)
+ }
+ 
+ u32 vlv_pipe_program_timings(struct vlv_pipe *pipe,
+-		struct drm_mode_modeinfo *mode)
++		struct drm_mode_modeinfo *mode,
++		enum intel_pipe_type type, u8 bpp)
+ {
+-	int vblank_start;
+-	int vblank_end;
+-	int hblank_start;
+-	int hblank_end;
++	u32 vblank_start;
++	u32 vblank_end;
++	u32 hblank_start;
++	u32 hblank_end;
+ 	u32 pipeconf = 0;
+-	int i = 0;
++	u32 i = 0;
+ 
+ 	vblank_start = min(mode->vsync_start, mode->vdisplay);
+ 	vblank_end = max(mode->vsync_end, mode->vtotal);
+@@ -287,18 +288,46 @@ u32 vlv_pipe_program_timings(struct vlv_pipe *pipe,
+ 		((mode->vsync_end - 1) << 16));
+ 
+ 	/*
++	 * FIXME: DRM has special case here check if it is required
+ 	 * pipesrc controls the size that is scaled from, which should
+ 	 * always be the user's requested size.
+ 	 */
+ 	REG_WRITE(pipe->src_size_offset,
+-		((mode->hdisplay - 1) << 16) | (mode->vdisplay - 1));
++			((mode->hdisplay - 1) << 16) | (mode->vdisplay - 1));
++
++	/*
++	 * FIXME: check if dithering needs checing here or later
++	 * if (intel_crtc->config.dither && intel_crtc->config.pipe_bpp != 30)
++	 *      pipeconf |= PIPECONF_DITHER_EN |
++	 *              PIPECONF_DITHER_TYPE_SP;
++	 * pipeconf |= PIPECONF_COLOR_RANGE_SELECT;
++	 */
++
++	switch (bpp) {
++	case 18:
++		pipeconf |= PIPECONF_6BPC;
++		break;
++	case 24:
++		pipeconf |= PIPECONF_8BPC;
++		break;
++	case 30:
++		pipeconf |= PIPECONF_10BPC;
++		break;
++	default:
++		/* Case prevented by intel_choose_pipe_bpp_dither. */
++		pr_err("%s: invalid bpp passed\n", __func__);
++	}
++
++	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
++		pipeconf |= PIPECONF_INTERLACE_W_SYNC_SHIFT;
++	else
++		pipeconf |= PIPECONF_PROGRESSIVE;
+ 
+ 	/*
+-	 * pipesrc and dspsize control the size that is scaled from,
+-	 * which should always be the user's requested size.
++	 * FIXME: enable when color ranges are supported
++	 * pipeconf |= PIPECONF_COLOR_RANGE_SELECT;
+ 	 */
+ 
+-	pipeconf |= PIPECONF_PROGRESSIVE;
+ 	REG_WRITE(pipe->offset, pipeconf);
+ 	REG_POSTING_READ(pipe->offset);
+ 
+@@ -330,11 +359,23 @@ bool vlv_pipe_init(struct vlv_pipe *pipe, enum pipe pipeid)
+ 	pipe->vblank_offset = VBLANK(pipeid);
+ 	pipe->vsync_offset = VSYNC(pipeid);
+ 	pipe->gamma_offset = PALETTE(pipeid);
+-
+ 	pipe->src_size_offset = PIPESRC(pipeid);
+-
+ 	pipe->pipe_id = pipeid;
+ 
++#ifdef INTEL_ADF_DUMP_INIT_REGS
++	pr_info("ADF: Pipe regs are:\n");
++	pr_info("=====================================\n");
++	pr_info("conf=0x%x status=0x%x scan_line=0x%x frame_count=0x%x\n",
++		pipe->offset, pipe->status_offset,
++		pipe->scan_line_offset, pipe->frame_count_offset);
++	pr_info("htotal=0x%x hblank=0x%x hsync=0x%x\n",
++		pipe->htotal_offset, pipe->hblank_offset, pipe->hsync_offset);
++	pr_info("vtotal=0x%x vblank=0x%x vsync=0x%x\n",
++		pipe->vtotal_offset, pipe->vblank_offset, pipe->vsync_offset);
++	pr_info("gamma=0x%x src_sz=0x%x id=%d\n",
++		pipe->gamma_offset, pipe->src_size_offset, pipe->pipe_id);
++	pr_info("=====================================\n");
++#endif
+ 	return true;
+ }
+ 
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+index d947668..f0876ab 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+@@ -14,16 +14,18 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/delay.h>
++#include <drm/drmP.h>
++#include <drm/i915_drm.h>
+ 
+-#include <core/vlv/vlv_dc_config.h>
+-#include <core/common/dsi/dsi_pipe.h>
+-#include <core/intel_dc_config.h>
+ #include <intel_adf.h>
++#include <core/intel_dc_config.h>
++#include <core/vlv/vlv_dc_config.h>
+ #include <core/vlv/vlv_dc_regs.h>
+ #include <core/common/dsi/dsi_pipe.h>
++#include <core/common/hdmi/gen_hdmi_pipe.h>
+ #include <core/vlv/vlv_pm.h>
+-#include <drm/drmP.h>
+-#include <drm/i915_drm.h>
++#include <core/vlv/vlv_pll.h>
++#include <core/vlv/dpio.h>
+ 
+ enum port vlv_get_connected_port(struct intel_pipe *intel_pipe)
+ {
+@@ -124,6 +126,7 @@ out:
+ u32 vlv_port_enable(struct intel_pipeline *pipeline,
+ 		struct drm_mode_modeinfo *mode)
+ {
++	u32 ret = 0;
+ 	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
+ 	struct vlv_dsi_port *dsi_port = &disp->port.dsi_port;
+ 	struct dsi_config *config = pipeline->params.dsi.dsi_config;
+@@ -131,10 +134,24 @@ u32 vlv_port_enable(struct intel_pipeline *pipeline,
+ 
+ 	if (disp->type == INTEL_PIPE_DSI) {
+ 		/* DSI PORT */
+-		vlv_dsi_port_enable(dsi_port, intel_dsi->port_bits);
++		ret = vlv_dsi_port_enable(dsi_port, intel_dsi->port_bits);
++		if (ret)
++			pr_err("ADF: %s Enable DSI port failed\n", __func__);
+ 		/* enable will be done in next call for dsi */
++	} else if (disp->type == INTEL_PIPE_HDMI) {
++		/* HDMI pre port enable */
++		chv_dpio_pre_port_enable(pipeline);
++		ret = vlv_hdmi_port_enable(&disp->port.hdmi_port);
++		if (ret)
++			pr_err("ADF: HDMI: %s Enable port failed\n", __func__);
++
++		ret = vlv_pll_wait_for_port_ready(
++					disp->port.hdmi_port.port_id);
++		if (ret)
++			pr_info("ADF: HDMI: %s Port ready failed\n", __func__);
+ 	}
+-	return 0;
++
++	return ret;
+ }
+ 
+ /*
+@@ -153,26 +170,69 @@ u32 vlv_pipeline_on(struct intel_pipeline *pipeline,
+ 	struct vlv_pri_plane *pplane = &disp->pplane;
+ 	struct vlv_pipe *pipe = &disp->pipe;
+ 	struct vlv_plane_params plane_params;
++	struct vlv_pll *pll = &disp->pll;
++	struct intel_clock clock;
+ 	u32 err = 0;
++	u8 bpp = 0;
++
++	if (!mode) {
++		pr_err("ADF: %s: mode=NULL\n", __func__);
++		return -EINVAL;
++	}
++
++	pr_info("ADF: %s: mode=%s\n", __func__, mode->name);
+ 
+ 	/* pll enable */
+-	/* need port, mode for pll enable */
++	if (disp->type != INTEL_PIPE_DSI) {
++		err = vlv_pll_program_timings(pll, mode, &clock);
++		if (err)
++			pr_err("ADF: %s: clock calculation failed\n", __func__);
+ 
+-	/* pf enable */
++		chv_dpio_update_clock(pipeline, &clock);
++		chv_dpio_update_channel(pipeline);
++
++		err = vlv_pll_enable(pll, mode);
++		if (err) {
++			pr_err("ADF: %s: clock calculation failed\n", __func__);
++			goto out_on;
++		}
++	}
+ 
+ 	/* port enable */
+-	vlv_port_enable(pipeline, mode);
+-	/* wait for dpio phystatus ready */
++	err = vlv_port_enable(pipeline, mode);
++	if (err)
++		pr_err("ADF: %s: port enable failed\n", __func__);
+ 
+-	vlv_pipe_program_timings(pipe, mode);
++	/* Program pipe timings */
++	switch (disp->type) {
++	case INTEL_PIPE_DSI:
++		bpp = disp->gen.dsi.config.bpp;
++		break;
++
++	case INTEL_PIPE_HDMI:
++		bpp = disp->base.params.hdmi.bpp;
++		break;
++
++	case INTEL_PIPE_DP:
++	case INTEL_PIPE_EDP:
++		break;
++	}
++
++	err = vlv_pipe_program_timings(pipe, mode, disp->type, bpp);
++	if (err)
++		pr_err("ADF: %s: program pipe failed\n", __func__);
+ 
+ 	/* pipe enable */
+-	vlv_pipe_enable(pipe, mode);
++	err = vlv_pipe_enable(pipe, mode);
++	if (err)
++		pr_err("ADF: %s: pipe enable failed\n", __func__);
+ 
+ 	/* FIXME: create func to update plane registers */
+-	vlv_pri_update_params(pplane, &plane_params);
++	err = vlv_pri_update_params(pplane, &plane_params);
++	if (err)
++		pr_err("ADF: %s: update primary failed\n", __func__);
+ 
+-	vlv_pipe_vblank_on(pipe);
++	err = vlv_pipe_vblank_on(pipe);
+ 	if (err != true)
+ 		pr_err("ADF: %s: enable vblank failed\n", __func__);
+ 	else
+@@ -190,6 +250,7 @@ u32 vlv_pipeline_on(struct intel_pipeline *pipeline,
+ 	/* Program the watermarks */
+ 	vlv_program_pm(pipeline);
+ 
++out_on:
+ 	return err;
+ }
+ 
+@@ -243,10 +304,11 @@ u32 vlv_post_pipeline_off(struct intel_pipeline *pipeline)
+ 	return err;
+ }
+ 
+-u32 vlv_port_disable(struct intel_pipeline *pipeline)
++static inline u32 vlv_port_disable(struct intel_pipeline *pipeline)
+ {
+ 	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
+ 	struct vlv_dsi_port *dsi_port = NULL;
++	struct vlv_hdmi_port *hdmi_port = NULL;
+ 	u32 err = 0;
+ 
+ 	switch (disp->type) {
+@@ -259,6 +321,10 @@ u32 vlv_port_disable(struct intel_pipeline *pipeline)
+ 		 * vlv_post_pipeline_off
+ 		 */
+ 		break;
++	case INTEL_PIPE_HDMI:
++		hdmi_port = &disp->port.hdmi_port;
++		err = vlv_hdmi_port_disable(hdmi_port);
++		break;
+ 	case INTEL_PIPE_EDP:
+ 	case INTEL_PIPE_DP:
+ 	default:
+@@ -293,28 +359,101 @@ u32 vlv_pipeline_off(struct intel_pipeline *pipeline)
+ 
+ 	pplane->base.ops->disable(&pplane->base);
+ 
+-	vlv_pipe_vblank_off(pipe);
++	err = vlv_pipe_vblank_off(pipe);
++	if (err != true) {
++		pr_err("ADF: %s: vblank disable failed\n", __func__);
++		goto out;
++	}
++
++	/* port disable */
++	err = vlv_port_disable(pipeline);
++	if (err != 0) {
++		pr_err("ADF: %s: port disable failed\n", __func__);
++		goto out;
++	}
+ 
+-	/* pipe */
+ 	err = vlv_pipe_disable(pipe);
+-	if (err != 0)
++	if (err != 0) {
++		pr_err("ADF: %s: pipe disable failed\n", __func__);
++		goto out;
++	}
++	if (disp->type == INTEL_PIPE_DSI)
+ 		goto out;
+ 
++	/* pll */
++	err = vlv_pll_disable(pll);
++	if (err != 0) {
++		pr_err("ADF: %s: pll disable failed\n", __func__);
++		goto out;
++	}
++
++	chv_dpio_post_pll_disable(pipeline);
++	if (disp->type == INTEL_PIPE_HDMI)
++		chv_dpio_lane_reset(pipeline);
++
++	/* FIXME: disable water mark/ddl etc */
++
++out:
++	return err;
++}
++
++u32 chv_pipeline_off(struct intel_pipeline *pipeline)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_pipe *pipe = NULL;
++	struct vlv_pri_plane *pplane = NULL;
++	struct vlv_sp_plane *splane = NULL;
++	struct vlv_pll *pll = NULL;
++	u32 i = 0;
++	u32 err = 0;
++
++	if (!disp)
++		return -EINVAL;
++
++	pipe = &disp->pipe;
++	pplane = &disp->pplane;
++
++	/* Disable DPST */
++	/* FIXME: vlv_dpst_pipeline_off(); */
++
++	for (i = 0; i < 2; i++) {
++		splane = &disp->splane[0];
++		splane->base.ops->disable(&splane->base);
++	}
++	pplane->base.ops->disable(&pplane->base);
++
++	/* Also check for pending flip and the vblank off  */
++	vlv_pipe_vblank_off(pipe);
++
+ 	/* port disable */
+ 	err = vlv_port_disable(pipeline);
+-	if (err != 0)
+-		goto out;
++	if (err)
++		pr_err("ADF: %s: port disable failed\n", __func__);
++
++	/* pipe disable */
++	err = vlv_pipe_disable(pipe);
++	if (err)
++		pr_err("ADF: %s: pipe disable failed\n", __func__);
+ 
+ 	if (disp->type == INTEL_PIPE_DSI)
+ 		goto out;
+ 
+ 	/* pll */
++	pll = &disp->pll;
+ 	err = vlv_pll_disable(pll);
+-	if (err != 0)
++	if (err) {
++		pr_err("ADF: %s: pll disable failed\n", __func__);
+ 		goto out;
++	}
++
++	chv_dpio_post_pll_disable(pipeline);
++	if (disp->type == INTEL_PIPE_HDMI)
++		chv_dpio_lane_reset(pipeline);
++
+ 
+-	/* TODO: watermark */
++	/* TODO: Disable watermark */
+ out:
++	pr_debug("%s: exit status %x\n", __func__, err);
+ 	return err;
+ }
+ 
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h b/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h
+index 63be89e..1c532d1 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h
+@@ -40,7 +40,8 @@ bool vlv_pipe_wait_for_vblank(struct vlv_pipe *pipe);
+ bool vlv_pipe_wait_for_pll_lock(struct vlv_pipe *pipe);
+ bool vlv_pipe_wait_for_pll_lock(struct vlv_pipe *pipe);
+ u32 vlv_pipe_program_timings(struct vlv_pipe *pipe,
+-		struct drm_mode_modeinfo *mode);
++		struct drm_mode_modeinfo *mode,
++		enum intel_pipe_type type, u8 bpp);
+ u32 vlv_pipe_enable(struct vlv_pipe *pipe,
+ 		struct drm_mode_modeinfo *mode);
+ u32 vlv_pipe_disable(struct vlv_pipe *pipe);
+-- 
+1.7.9.5
+

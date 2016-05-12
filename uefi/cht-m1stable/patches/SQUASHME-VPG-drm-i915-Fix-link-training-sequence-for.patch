@@ -1,0 +1,127 @@
+From 0914ec81137fd9a1747f6f64a795e7e3dc26a8b5 Mon Sep 17 00:00:00 2001
+From: "Thulasimani,Sivakumar" <sivakumar.thulasimani@intel.com>
+Date: Wed, 28 Oct 2015 12:10:47 +0530
+Subject: [PATCH 21/28] SQUASHME! [VPG]: drm/i915: Fix link training sequence
+ for Upfront
+
+The proper sequence as per spec is to try all link rates at
+highest lane count and then retry the same steps with
+lower lane count if available till link training succeeds.
+This can be repeated till lowest lane count and lowest link rate
+are reached. This patch fixes this sequence used during upfront
+link training.
+
+This patch should be merged to the following patch
+SQUASHME! - This patch should be squashed into the following existing patch:
+Author:    Durgadoss R <durgadoss.r@intel.com>
+Date:      Fri, 22 May 2015 14:30:07 +0530
+Change-Id: I2ae866b32a0998abcf32826efa2504e203dc8ffa
+Subject:   FOR_UPSTREAM [VPG]: drm/i915: Enable Upfront link training
+           for type-C DP support
+
+Change-Id: I4ff705c567207c12c208040f316df50e352dd0ea
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9749
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Reviewed-on: https://android.intel.com:443/439694
+---
+ drivers/gpu/drm/i915/intel_display.c | 22 ++++++++++++----------
+ drivers/gpu/drm/i915/intel_dp.c      | 17 +----------------
+ drivers/gpu/drm/i915/intel_drv.h     |  1 +
+ 3 files changed, 14 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index fa96d50..444e071 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -15257,14 +15257,10 @@ start_link_train:
+ 	tmp_link_bw = intel_dp->link_bw;
+ 
+ 	/* Initialize with Max Link rate & lane count supported by panel */
+-	intel_dp->link_bw =  intel_dp->dpcd[DP_MAX_LINK_RATE];
++	intel_dp->link_bw =  intel_dp_max_link_bw(intel_dp);
+ 	intel_dp->lane_count = intel_dp->dpcd[DP_MAX_LANE_COUNT] &
+ 					DP_MAX_LANE_COUNT_MASK;
+ 
+-	/* CHV does not support HBR2 */
+-	if (intel_dp->link_bw == DP_LINK_BW_5_4)
+-		intel_dp->link_bw = DP_LINK_BW_2_7;
+-
+ 	do {
+ 		/* Find port clock from link_bw */
+ 		crtc->config.port_clock =
+@@ -15308,14 +15304,20 @@ start_link_train:
+ 		intel_display_power_put(dev_priv, power_domain);
+ 		intel_display_power_get(dev_priv, power_domain);
+ 
+-		/* Go down to the next level and retry link training */
+-		if (intel_dp->lane_count == 4) {
++		/*
++		 * Per Spec, retry all link rates at current lane count
++		 * if link training failed for all rates then reduce the
++		 * lane count and start from max link rate again till
++		 * we reach lowest link rate and least lane count.
++		 */
++		if (intel_dp->link_bw == DP_LINK_BW_2_7)
++			intel_dp->link_bw = DP_LINK_BW_1_62;
++		else if (intel_dp->lane_count == 4) {
+ 			intel_dp->lane_count = 2;
++			intel_dp->link_bw =  intel_dp_max_link_bw(intel_dp);
+ 		} else if (intel_dp->lane_count == 2) {
+ 			intel_dp->lane_count = 1;
+-		} else if (intel_dp->link_bw == DP_LINK_BW_2_7) {
+-			intel_dp->link_bw = DP_LINK_BW_1_62;
+-			intel_dp->lane_count = 4;
++			intel_dp->link_bw =  intel_dp_max_link_bw(intel_dp);
+ 		} else {
+ 			/* Tried all combinations, so exit */
+ 			break;
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 6d3573c..8611acf 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -144,8 +144,7 @@ static struct edid *
+ intel_dp_get_edid(struct drm_connector *connector, struct i2c_adapter *adapter);
+ static int intel_dp_write_test_reply(struct intel_dp *intel_dp, uint8_t reply);
+ 
+-static int
+-intel_dp_max_link_bw(struct intel_dp *intel_dp)
++int intel_dp_max_link_bw(struct intel_dp *intel_dp)
+ {
+ 	int max_link_bw = intel_dp->dpcd[DP_MAX_LINK_RATE];
+ 	struct drm_device *dev = intel_dp->attached_connector->base.dev;
+@@ -4827,20 +4826,6 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 	if (intel_encoder->type != INTEL_OUTPUT_EDP)
+ 		intel_encoder->type = INTEL_OUTPUT_DISPLAYPORT;
+ 
+-	if (IS_CHERRYVIEW(dev) &&
+-			intel_encoder->type == INTEL_OUTPUT_DISPLAYPORT) {
+-		/* TODO: Need to test connected boot scenario once platform
+-		 * patches are ready. This path is tested on reworked-RVP only.
+-		 */
+-		if (intel_encoder->connectors_active &&
+-						crtc && crtc->enabled) {
+-			DRM_DEBUG_KMS("Disabling crtc %c for upfront link training\n",
+-					pipe_name(intel_crtc->pipe));
+-			intel_crtc_control(crtc, false);
+-		}
+-		chv_upfront_link_train(dev, intel_dp, intel_crtc);
+-	}
+-
+ 	status = connector_status_connected;
+ 
+ 	/* Try to read the source of the interrupt */
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 54caf94..9335ce8 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1017,6 +1017,7 @@ bool intel_dp_hpd_pulse(struct intel_digital_port *intel_dig_port,
+ 			bool long_hpd);
+ uint8_t intel_dp_calc_multiplier(struct intel_encoder *encoder,
+ 			u32 pixel_clock);
++int intel_dp_max_link_bw(struct intel_dp *intel_dp);
+ 
+ void intel_edp_backlight_on(struct intel_dp *intel_dp);
+ void intel_edp_backlight_off(struct intel_dp *intel_dp);
+-- 
+1.9.1
+

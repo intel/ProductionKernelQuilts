@@ -1,0 +1,939 @@
+From b9233c3e8dcd6dd9d2602a1e60260c23efbcdcad Mon Sep 17 00:00:00 2001
+Message-Id: <b9233c3e8dcd6dd9d2602a1e60260c23efbcdcad.1398812351.git.mark.gross@intel.com>
+In-Reply-To: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+References: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+From: Liam Girdwood <liam.r.girdwood@linux.intel.com>
+Date: Tue, 7 Jan 2014 15:05:30 +0000
+Subject: [PATCH 211/429] ASoC: Intel: Add Intel SST audio DSP low level shim
+ driver.
+
+Add support for Intel Smart Sound Technology (SST) audio DSPs.
+This driver provides the low level IO, reset, boot and IRQ management
+for Intel audio DSPs. These files make up  the low level part of the SST
+audio driver stack and will be used by many Intel SST cores like
+Haswell, Broadwell and Baytrail.
+
+SST DSPs expose a memory mapped region (shim) for config and control.
+The shim layout is mostly shared without much modification across cores
+and this driver provides a uniform API to access the shim and to enable
+basic shim functions. It also provides functionality to abstract some shim
+functions for cores with different shim features.
+
+Signed-off-by: Liam Girdwood <liam.r.girdwood@linux.intel.com>
+---
+ sound/soc/intel/sst-dsp-priv.h | 291 ++++++++++++++++++++++++++++++++
+ sound/soc/intel/sst-dsp.c      | 370 +++++++++++++++++++++++++++++++++++++++++
+ sound/soc/intel/sst-dsp.h      | 226 +++++++++++++++++++++++++
+ 3 files changed, 887 insertions(+)
+ create mode 100644 sound/soc/intel/sst-dsp-priv.h
+ create mode 100644 sound/soc/intel/sst-dsp.c
+ create mode 100644 sound/soc/intel/sst-dsp.h
+
+diff --git a/sound/soc/intel/sst-dsp-priv.h b/sound/soc/intel/sst-dsp-priv.h
+new file mode 100644
+index 0000000..c4db4c7
+--- /dev/null
++++ b/sound/soc/intel/sst-dsp-priv.h
+@@ -0,0 +1,291 @@
++/*
++ * Intel Smart Sound Technology
++ *
++ * Copyright (C) 2013, Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __SOUND_SOC_SST_DSP_PRIV_H
++#define __SOUND_SOC_SST_DSP_PRIV_H
++
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/interrupt.h>
++#include <linux/firmware.h>
++
++struct sst_mem_block;
++struct sst_module;
++struct sst_fw;
++
++/*
++ * DSP Operations exported by platform Audio DSP driver.
++ */
++struct sst_ops {
++	/* DSP core boot / reset */
++	void (*boot)(struct sst_dsp *);
++	void (*reset)(struct sst_dsp *);
++
++	/* Shim IO */
++	void (*write)(void __iomem *addr, u32 offset, u32 value);
++	u32 (*read)(void __iomem *addr, u32 offset);
++	void (*write64)(void __iomem *addr, u32 offset, u64 value);
++	u64 (*read64)(void __iomem *addr, u32 offset);
++
++	/* DSP I/DRAM IO */
++	void (*ram_read)(struct sst_dsp *sst, void *dest, void *src, size_t bytes);
++	void (*ram_write)(struct sst_dsp *sst, void *dest, void *src, size_t bytes);
++
++	void (*dump)(struct sst_dsp *);
++
++	/* IRQ handlers */
++	irqreturn_t (*irq_handler)(int irq, void *context);
++
++	/* SST init and free */
++	int (*init)(struct sst_dsp *sst, struct sst_pdata *pdata);
++	void (*free)(struct sst_dsp *sst);
++
++	/* FW module parser/loader */
++	int (*parse_fw)(struct sst_fw *sst_fw);
++};
++
++/*
++ * Audio DSP memory offsets and addresses.
++ */
++struct sst_addr {
++	u32 lpe_base;
++	u32 shim_offset;
++	u32 iram_offset;
++	void __iomem *lpe;
++	void __iomem *shim;
++	void __iomem *pci_cfg;
++	void __iomem *fw_ext;
++};
++
++/*
++ * Audio DSP Mailbox configuration.
++ */
++struct sst_mailbox {
++	void __iomem *in_base;
++	void __iomem *out_base;
++	size_t in_size;
++	size_t out_size;
++};
++
++/*
++ * Audio DSP Firmware data types.
++ */
++enum sst_data_type {
++	SST_DATA_M	= 0, /* module block data */
++	SST_DATA_P	= 1, /* peristant data (text, data) */
++	SST_DATA_S	= 2, /* scratch data (usually buffers) */
++};
++
++/*
++ * Audio DSP memory block types.
++ */
++enum sst_mem_type {
++	SST_MEM_IRAM = 0,
++	SST_MEM_DRAM = 1,
++	SST_MEM_ANY  = 2,
++	SST_MEM_CACHE= 3,
++};
++
++/*
++ * Audio DSP Generic Firmware File.
++ *
++ * SST Firmware files can consist of 1..N modules. This generic structure is
++ * used to manage each firmware file and it's modules regardless of SST firmware
++ * type. A SST driver may load multiple FW files.
++ */
++struct sst_fw {
++	struct sst_dsp *dsp;
++
++	/* base addresses of FW file data */
++	dma_addr_t dmable_fw_paddr;	/* physical address of fw data */
++	void *dma_buf;			/* virtual address of fw data */
++	u32 size;			/* size of fw data */
++
++	/* lists */
++	struct list_head list;		/* DSP list of FW */
++	struct list_head module_list;	/* FW list of modules */
++
++	void *private;			/* core doesn't touch this */
++};
++
++/*
++ * Audio DSP Generic Module data.
++ *
++ * This is used to dsecribe any sections of persistent (text and data) and
++ * scratch (buffers) of module data in ADSP memory space.
++ */
++struct sst_module_data {
++
++	enum sst_mem_type type;		/* destination memory type */
++	enum sst_data_type data_type;	/* type of module data */
++
++	u32 size;		/* size in bytes */
++	u32 offset;		/* offset in FW file */
++	u32 data_offset;	/* offset in ADSP memory space */
++	void *data;		/* module data */
++};
++
++/*
++ * Audio DSP Generic Module Template.
++ *
++ * Used to define and register a new FW module. This data is extracted from
++ * FW module header information.
++ */
++struct sst_module_template {
++	u32 id;
++	u32 entry;			/* entry point */
++	struct sst_module_data s;	/* scratch data */
++	struct sst_module_data p;	/* peristant data */
++};
++
++/*
++ * Audio DSP Generic Module.
++ *
++ * Each Firmware file can consist of 1..N modules. A module can span multiple
++ * ADSP memory blocks. The simplest FW will be a file with 1 module.
++ */
++struct sst_module {
++	struct sst_dsp *dsp;
++	struct sst_fw *sst_fw;		/* parent FW we belong too */
++
++	/* module configuration */
++	u32 id;
++	u32 entry;			/* module entry point */
++	u32 offset;			/* module offset in firmware file */
++	u32 size;			/* module size */
++	struct sst_module_data s;	/* scratch data */
++	struct sst_module_data p;	/* peristant data */
++
++	/* runtime */
++	u32 usage_count;		/* can be unloaded if count == 0 */
++	void *private;			/* core doesn't touch this */
++
++	/* lists */
++	struct list_head block_list;	/* Module list of blocks in use */
++	struct list_head list;		/* DSP list of modules */
++	struct list_head list_fw;	/* FW list of modules */
++};
++
++/*
++ * SST Memory Block operations.
++ */
++struct sst_block_ops {
++	int (*enable)(struct sst_mem_block *block);
++	int (*disable)(struct sst_mem_block *block);
++};
++
++/*
++ * SST Generic Memory Block.
++ *
++ * SST ADP  memory has multiple IRAM and DRAM blocks. Some ADSP blocks can be
++ * power gated.
++ */
++struct sst_mem_block {
++	struct sst_dsp *dsp;
++	struct sst_module *module;	/* module that uses this block */
++
++	/* block config */
++	u32 offset;			/* offset from base */
++	u32 size;			/* block size */
++	u32 index;			/* block index 0..N */
++	enum sst_mem_type type;		/* block memory type IRAM/DRAM */
++	struct sst_block_ops *ops;	/* block operations, if any */
++
++	/* block status */
++	enum sst_data_type data_type;	/* data type held in this block */
++	u32 bytes_used;			/* bytes in use by modules */
++	void *private;			/* generic core does not touch this */
++	int users;			/* number of modules using this block */
++
++	/* block lists */
++	struct list_head module_list;	/* Module list of blocks */
++	struct list_head list;		/* Map list of free/used blocks */
++};
++
++/*
++ * Generic SST Shim Interface.
++ */
++struct sst_dsp {
++
++	/* runtime */
++	struct sst_dsp_device *sst_dev;
++	spinlock_t spinlock;	/* IPC locking */
++	struct mutex mutex;	/* DSP FW lock */
++	struct device *dev;
++	void *thread_context;
++	int irq;
++	u32 id;
++
++	/* list of free and used ADSP memory blocks */
++	struct list_head used_block_list;
++	struct list_head free_block_list;
++
++	/* operations */
++	struct sst_ops *ops;
++
++	/* debug FS */
++	struct dentry *debugfs_root;
++
++	/* base addresses */
++	struct sst_addr addr;
++
++	/* mailbox */
++	struct sst_mailbox mailbox;
++
++	/* SST FW files loaded and their modules */
++	struct list_head module_list;
++	struct list_head fw_list;
++
++	/* platform data */
++	struct sst_pdata *pdata;
++
++	/* DMA FW loading */
++	struct sst_dma *dma;
++	bool fw_use_dma;
++};
++
++/* Create/Free FW files - can contain multiple modules */
++struct sst_fw *sst_fw_new(struct sst_dsp *dsp,
++	const struct firmware *fw, void *private);
++void sst_fw_free(struct sst_fw *sst_fw);
++void sst_fw_free_all(struct sst_dsp *dsp);
++
++/* Create/Free firmware modules */
++struct sst_module *sst_module_new(struct sst_fw *sst_fw,
++	struct sst_module_template *template, void *private);
++void sst_module_free(struct sst_module *sst_module);
++int sst_module_insert(struct sst_module *sst_module);
++int sst_module_remove(struct sst_module *sst_module);
++int sst_module_insert_fixed_block(struct sst_module *module,
++	struct sst_module_data *data);
++struct sst_module *sst_module_get_from_id(struct sst_dsp *dsp, u32 id);
++
++/* allocate/free pesistent/scratch memory regions managed by drv */
++struct sst_module *sst_mem_block_alloc_scratch(struct sst_dsp *dsp);
++void sst_mem_block_free_scratch(struct sst_dsp *dsp,
++	struct sst_module *scratch);
++
++/* Register the DSPs memory blocks - would be nice to read from ACPI */
++struct sst_mem_block *sst_mem_block_register(struct sst_dsp *dsp, u32 offset,
++	u32 size, enum sst_mem_type type, struct sst_block_ops *ops, u32 index,
++	void *private);
++void sst_mem_block_unregister_all(struct sst_dsp *dsp);
++
++/* DMA */
++int sst_dma_new(struct sst_dsp *sst);
++void sst_dma_free(struct sst_dma *dma);
++
++#endif
+diff --git a/sound/soc/intel/sst-dsp.c b/sound/soc/intel/sst-dsp.c
+new file mode 100644
+index 0000000..beef2ef
+--- /dev/null
++++ b/sound/soc/intel/sst-dsp.c
+@@ -0,0 +1,370 @@
++/*
++ * Intel Smart Sound Technology (SST) DSP Core Driver
++ *
++ * Copyright (C) 2013, Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/slab.h>
++#include <linux/export.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++
++#include "sst-dsp.h"
++#include "sst-dsp-priv.h"
++
++#define CREATE_TRACE_POINTS
++#include <trace/events/sst.h>
++
++/* Public API */
++void sst_dsp_shim_write(struct sst_dsp *sst, u32 offset, u32 value)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&sst->spinlock, flags);
++	sst->ops->write(sst->addr.shim, offset, value);
++	spin_unlock_irqrestore(&sst->spinlock, flags);
++}
++EXPORT_SYMBOL(sst_dsp_shim_write);
++
++u32 sst_dsp_shim_read(struct sst_dsp *sst, u32 offset)
++{
++	unsigned long flags;
++	u32 val;
++
++	spin_lock_irqsave(&sst->spinlock, flags);
++	val = sst->ops->read(sst->addr.shim, offset);
++	spin_unlock_irqrestore(&sst->spinlock, flags);
++
++	return val;
++}
++EXPORT_SYMBOL(sst_dsp_shim_read);
++
++void sst_dsp_shim_write64(struct sst_dsp *sst, u32 offset, u64 value)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&sst->spinlock, flags);
++	sst->ops->write64(sst->addr.shim, offset, value);
++	spin_unlock_irqrestore(&sst->spinlock, flags);
++}
++EXPORT_SYMBOL(sst_dsp_shim_write64);
++
++u64 sst_dsp_shim_read64(struct sst_dsp *sst, u32 offset)
++{
++	unsigned long flags;
++	u64 val;
++
++	spin_lock_irqsave(&sst->spinlock, flags);
++	val = sst->ops->read64(sst->addr.shim, offset);
++	spin_unlock_irqrestore(&sst->spinlock, flags);
++
++	return val;
++}
++EXPORT_SYMBOL(sst_dsp_shim_read64);
++
++void sst_dsp_shim_write_unlocked(struct sst_dsp *sst, u32 offset, u32 value)
++{
++	sst->ops->write(sst->addr.shim, offset, value);
++}
++EXPORT_SYMBOL(sst_dsp_shim_write_unlocked);
++
++u32 sst_dsp_shim_read_unlocked(struct sst_dsp *sst, u32 offset)
++{
++	return sst->ops->read(sst->addr.shim, offset);
++}
++EXPORT_SYMBOL(sst_dsp_shim_read_unlocked);
++
++void sst_dsp_shim_write64_unlocked(struct sst_dsp *sst, u32 offset, u64 value)
++{
++	sst->ops->write64(sst->addr.shim, offset, value);
++}
++EXPORT_SYMBOL(sst_dsp_shim_write64_unlocked);
++
++u64 sst_dsp_shim_read64_unlocked(struct sst_dsp *sst, u32 offset)
++{
++	return sst->ops->read64(sst->addr.shim, offset);
++}
++EXPORT_SYMBOL(sst_dsp_shim_read64_unlocked);
++
++int sst_dsp_shim_update_bits(struct sst_dsp *sst, u32 offset,
++				u32 mask, u32 value)
++{
++	unsigned long flags;
++	bool change;
++	u32 old, new;
++
++	spin_lock_irqsave(&sst->spinlock, flags);
++	old = sst_dsp_shim_read_unlocked(sst, offset);
++
++	new = (old & (~mask)) | (value & mask);
++
++	change = (old != new);
++	if (change)
++		sst_dsp_shim_write_unlocked(sst, offset, new);
++
++	spin_unlock_irqrestore(&sst->spinlock, flags);
++	return change;
++}
++EXPORT_SYMBOL(sst_dsp_shim_update_bits);
++
++int sst_dsp_shim_update_bits64(struct sst_dsp *sst, u32 offset,
++				u64 mask, u64 value)
++{
++	unsigned long flags;
++	bool change;
++	u64 old, new;
++
++	spin_lock_irqsave(&sst->spinlock, flags);
++	old = sst_dsp_shim_read64_unlocked(sst, offset);
++
++	new = (old & (~mask)) | (value & mask);
++
++	change = (old != new);
++	if (change)
++		sst_dsp_shim_write64_unlocked(sst, offset, new);
++
++	spin_unlock_irqrestore(&sst->spinlock, flags);
++	return change;
++}
++EXPORT_SYMBOL(sst_dsp_shim_update_bits64);
++
++int sst_dsp_shim_update_bits_unlocked(struct sst_dsp *sst, u32 offset,
++				u32 mask, u32 value)
++{
++	bool change;
++	unsigned int old, new;
++	u32 ret;
++
++	ret = sst_dsp_shim_read_unlocked(sst, offset);
++
++	old = ret;
++	new = (old & (~mask)) | (value & mask);
++
++	change = (old != new);
++	if (change)
++		sst_dsp_shim_write_unlocked(sst, offset, new);
++
++	return change;
++}
++EXPORT_SYMBOL(sst_dsp_shim_update_bits_unlocked);
++
++int sst_dsp_shim_update_bits64_unlocked(struct sst_dsp *sst, u32 offset,
++				u64 mask, u64 value)
++{
++	bool change;
++	u64 old, new;
++
++	old = sst_dsp_shim_read64_unlocked(sst, offset);
++
++	new = (old & (~mask)) | (value & mask);
++
++	change = (old != new);
++	if (change)
++		sst_dsp_shim_write64_unlocked(sst, offset, new);
++
++	return change;
++}
++EXPORT_SYMBOL(sst_dsp_shim_update_bits64_unlocked);
++
++void sst_dsp_dump(struct sst_dsp *sst)
++{
++	sst->ops->dump(sst);
++}
++EXPORT_SYMBOL(sst_dsp_dump);
++
++void sst_dsp_reset(struct sst_dsp *sst)
++{
++	sst->ops->reset(sst);
++}
++EXPORT_SYMBOL(sst_dsp_reset);
++
++int sst_dsp_boot(struct sst_dsp *sst)
++{
++	sst->ops->boot(sst);
++	return 0;
++}
++EXPORT_SYMBOL(sst_dsp_boot);
++
++void sst_dsp_ipc_msg_tx(struct sst_dsp *dsp, u32 msg)
++{
++	sst_dsp_shim_write_unlocked(dsp, SST_IPCX, msg | SST_IPCX_BUSY);
++	trace_sst_ipc_msg_tx(msg);
++}
++EXPORT_SYMBOL_GPL(sst_dsp_ipc_msg_tx);
++
++u32 sst_dsp_ipc_msg_rx(struct sst_dsp *dsp)
++{
++	u32 msg;
++
++	msg = sst_dsp_shim_read_unlocked(dsp, SST_IPCX);
++	trace_sst_ipc_msg_rx(msg);
++
++	return msg;
++}
++EXPORT_SYMBOL_GPL(sst_dsp_ipc_msg_rx);
++
++void sst_dsp_write(struct sst_dsp *sst, void *src, u32 dest_offset,
++	size_t bytes)
++{
++	sst->ops->ram_write(sst, sst->addr.lpe + dest_offset, src, bytes);
++}
++EXPORT_SYMBOL(sst_dsp_write);
++
++void sst_dsp_read(struct sst_dsp *sst, void *dest, u32 src_offset,
++	size_t bytes)
++{
++	sst->ops->ram_read(sst, dest, sst->addr.lpe + src_offset, bytes);
++}
++EXPORT_SYMBOL(sst_dsp_read);
++
++int sst_dsp_mailbox_init(struct sst_dsp *sst, u32 inbox_offset, size_t inbox_size,
++	u32 outbox_offset, size_t outbox_size)
++{
++	sst->mailbox.in_base = sst->addr.lpe + inbox_offset;
++	sst->mailbox.out_base = sst->addr.lpe + outbox_offset;
++	sst->mailbox.in_size = inbox_size;
++	sst->mailbox.out_size = outbox_size;
++	return 0;
++}
++EXPORT_SYMBOL(sst_dsp_mailbox_init);
++
++void sst_dsp_outbox_write(struct sst_dsp *sst, void *message, size_t bytes)
++{
++	int i;
++
++	trace_sst_ipc_outbox_write(bytes);
++
++	memcpy_toio(sst->mailbox.out_base, message, bytes);
++
++	for (i = 0; i < bytes; i += 4)
++		trace_sst_ipc_outbox_wdata(i, *(uint32_t *)(message + i));
++}
++EXPORT_SYMBOL(sst_dsp_outbox_write);
++
++void sst_dsp_outbox_read(struct sst_dsp *sst, void *message, size_t bytes)
++{
++	int i;
++
++	trace_sst_ipc_outbox_read(bytes);
++
++	memcpy_fromio(message, sst->mailbox.out_base, bytes);
++
++	for (i = 0; i < bytes; i += 4)
++		trace_sst_ipc_outbox_rdata(i, *(uint32_t *)(message + i));
++}
++EXPORT_SYMBOL(sst_dsp_outbox_read);
++
++void sst_dsp_inbox_write(struct sst_dsp *sst, void *message, size_t bytes)
++{
++	int i;
++
++	trace_sst_ipc_inbox_write(bytes);
++
++	memcpy_toio(sst->mailbox.in_base, message, bytes);
++
++	for (i = 0; i < bytes; i += 4)
++		trace_sst_ipc_inbox_wdata(i, *(uint32_t *)(message + i));
++}
++EXPORT_SYMBOL(sst_dsp_inbox_write);
++
++void sst_dsp_inbox_read(struct sst_dsp *sst, void *message, size_t bytes)
++{
++	int i;
++
++	trace_sst_ipc_inbox_read(bytes);
++
++	memcpy_fromio(message, sst->mailbox.in_base, bytes);
++
++	for (i = 0; i < bytes; i += 4)
++		trace_sst_ipc_inbox_rdata(i, *(uint32_t *)(message + i));
++}
++EXPORT_SYMBOL(sst_dsp_inbox_read);
++
++void *sst_dsp_get_thread_context(struct sst_dsp *sst)
++{
++	return sst->thread_context;
++}
++EXPORT_SYMBOL(sst_dsp_get_thread_context);
++
++struct sst_dsp *sst_dsp_new(struct device *dev,
++	struct sst_dsp_device *sst_dev, struct sst_pdata *pdata)
++{
++	struct sst_dsp *sst;
++	int err;
++
++	dev_dbg(dev, "initialising audio DSP id 0x%x\n", pdata->id);
++
++	sst = devm_kzalloc(dev, sizeof(*sst), GFP_KERNEL);
++	if (sst == NULL)
++		return NULL;
++
++	spin_lock_init(&sst->spinlock);
++	mutex_init(&sst->mutex);
++	sst->dev = dev;
++	sst->thread_context = sst_dev->thread_context;
++	sst->sst_dev = sst_dev;
++	sst->id = pdata->id;
++	sst->irq = pdata->irq;
++	sst->ops = sst_dev->ops;
++	sst->pdata = pdata;
++	INIT_LIST_HEAD(&sst->used_block_list);
++	INIT_LIST_HEAD(&sst->free_block_list);
++	INIT_LIST_HEAD(&sst->module_list);
++	INIT_LIST_HEAD(&sst->fw_list);
++
++	/* Initialise SST Audio DSP */
++	if (sst->ops->init) {
++		err = sst->ops->init(sst, pdata);
++		if (err < 0)
++			return NULL;
++	}
++
++	/* Register the ISR */
++	err = request_threaded_irq(sst->irq, sst->ops->irq_handler,
++		sst_dev->thread, IRQF_SHARED, "AudioDSP", sst);
++	if (err)
++		goto irq_err;
++
++	/* Register the FW loader DMA controller if we have one */
++	if (pdata->dma_engine)
++		err = sst_dma_new(sst);
++	if (err)
++		goto dma_err;
++
++	return sst;
++
++dma_err:
++	free_irq(sst->irq, sst);
++irq_err:
++	if (sst->ops->free)
++		sst->ops->free(sst);
++
++	return NULL;
++}
++EXPORT_SYMBOL(sst_dsp_new);
++
++void sst_dsp_free(struct sst_dsp *sst)
++{
++	if (sst->pdata->dma_engine)
++		sst_dma_free(sst->dma);
++	free_irq(sst->irq, sst);
++	if (sst->ops->free)
++		sst->ops->free(sst);
++}
++EXPORT_SYMBOL(sst_dsp_free);
++
++/* Module information */
++MODULE_AUTHOR("Liam Girdwood");
++MODULE_DESCRIPTION("Intel SST Core");
++MODULE_LICENSE("GPL v2");
+diff --git a/sound/soc/intel/sst-dsp.h b/sound/soc/intel/sst-dsp.h
+new file mode 100644
+index 0000000..8ea3cbe
+--- /dev/null
++++ b/sound/soc/intel/sst-dsp.h
+@@ -0,0 +1,226 @@
++/*
++ * Intel Smart Sound Technology (SST) Core
++ *
++ * Copyright (C) 2013, Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __SOUND_SOC_SST_DSP_H
++#define __SOUND_SOC_SST_DSP_H
++
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/interrupt.h>
++
++/* SST Device IDs  */
++#define SST_DEV_ID_LYNX_POINT		0x33C8
++#define SST_DEV_ID_WILDCAT_POINT	0x3438
++
++/* Supported SST DMA Devices */
++#define SST_DMA_TYPE_DW		1
++#define SST_DMA_TYPE_MID	2
++
++/* SST Shim register map
++ * The register naming can differ between products. Some products also
++ * contain extra functionality.
++ */
++#define SST_CSR			0x00
++#define SST_PISR		0x08
++#define SST_PIMR		0x10
++#define SST_ISRX		0x18
++#define SST_ISRD		0x20
++#define SST_IMRX		0x28
++#define SST_IMRD		0x30
++#define SST_IPCX		0x38 /* IPC IA -> SST */
++#define SST_IPCD		0x40 /* IPC SST -> IA */
++#define SST_ISRSC		0x48
++#define SST_ISRLPESC		0x50
++#define SST_IMRSC		0x58
++#define SST_IMRLPESC		0x60
++#define SST_IPCSC		0x68
++#define SST_IPCLPESC		0x70
++#define SST_CLKCTL		0x78
++#define SST_CSR2		0x80
++#define SST_LTRC		0xE0
++#define SST_HDMC		0xE8
++#define SST_DBGO		0xF0
++
++#define SST_SHIM_SIZE		0x100
++#define SST_PWMCTRL             0x1000
++
++/* SST Shim Register bits
++ * The register bit naming can differ between products. Some products also
++ * contain extra functionality.
++ */
++
++/* CSR / CS */
++#define SST_CSR_RST		(0x1 << 1)
++#define SST_CSR_SBCS0		(0x1 << 2)
++#define SST_CSR_SBCS1		(0x1 << 3)
++#define SST_CSR_DCS(x)		(x << 4)
++#define SST_CSR_DCS_MASK	(0x7 << 4)
++#define SST_CSR_STALL		(0x1 << 10)
++#define SST_CSR_S0IOCS		(0x1 << 21)
++#define SST_CSR_S1IOCS		(0x1 << 23)
++#define SST_CSR_LPCS		(0x1 << 31)
++
++/*  ISRX / ISC */
++#define SST_ISRX_BUSY		(0x1 << 1)
++#define SST_ISRX_DONE		(0x1 << 0)
++
++/*  ISRD / ISD */
++#define SST_ISRD_BUSY		(0x1 << 1)
++#define SST_ISRD_DONE		(0x1 << 0)
++
++/* IMRX / IMC */
++#define SST_IMRX_BUSY		(0x1 << 1)
++#define SST_IMRX_DONE		(0x1 << 0)
++
++/*  IPCX / IPCC */
++#define	SST_IPCX_DONE		(0x1 << 30)
++#define	SST_IPCX_BUSY		(0x1 << 31)
++
++/*  IPCD */
++#define	SST_IPCD_DONE		(0x1 << 30)
++#define	SST_IPCD_BUSY		(0x1 << 31)
++
++/* CLKCTL */
++#define SST_CLKCTL_SMOS(x)	(x << 24)
++#define SST_CLKCTL_MASK		(3 << 24)
++#define SST_CLKCTL_DCPLCG	(1 << 18)
++#define SST_CLKCTL_SCOE1	(1 << 17)
++#define SST_CLKCTL_SCOE0	(1 << 16)
++
++/* CSR2 / CS2 */
++#define SST_CSR2_SDFD_SSP0	(1 << 1)
++#define SST_CSR2_SDFD_SSP1	(1 << 2)
++
++/* LTRC */
++#define SST_LTRC_VAL(x)		(x << 0)
++
++/* HDMC */
++#define SST_HDMC_HDDA0(x)	(x << 0)
++#define SST_HDMC_HDDA1(x)	(x << 7)
++
++
++/* SST Vendor Defined Registers and bits */
++#define SST_VDRTCTL0		0xa0
++#define SST_VDRTCTL1		0xa4
++#define SST_VDRTCTL2		0xa8
++#define SST_VDRTCTL3		0xaC
++
++/* VDRTCTL0 */
++#define SST_VDRTCL0_DSRAMPGE_SHIFT	16
++#define SST_VDRTCL0_DSRAMPGE_MASK	(0xffff << SST_VDRTCL0_DSRAMPGE_SHIFT)
++#define SST_VDRTCL0_ISRAMPGE_SHIFT	6
++#define SST_VDRTCL0_ISRAMPGE_MASK	(0x3ff << SST_VDRTCL0_ISRAMPGE_SHIFT)
++
++struct sst_dsp;
++
++/*
++ * SST Device.
++ *
++ * This structure is populated by the SST core driver.
++ */
++struct sst_dsp_device {
++	/* Mandatory fields */
++	struct sst_ops *ops;
++	irqreturn_t (*thread)(int irq, void *context);
++	void *thread_context;
++};
++
++/*
++ * SST Platform Data.
++ */
++struct sst_pdata {
++	/* ACPI data */
++	u32 lpe_base;
++	u32 lpe_size;
++	u32 pcicfg_base;
++	u32 pcicfg_size;
++	int irq;
++
++	/* Firmware */
++	const char *fw_filename;
++	u32 fw_base;
++	u32 fw_size;
++
++	/* DMA */
++	u32 dma_base;
++	u32 dma_size;
++	int dma_engine;
++
++	/* DSP */
++	u32 id;
++	void *dsp;
++};
++
++/* Initialization */
++struct sst_dsp *sst_dsp_new(struct device *dev,
++	struct sst_dsp_device *sst_dev, struct sst_pdata *pdata);
++void sst_dsp_free(struct sst_dsp *sst);
++
++/* SHIM Read / Write */
++void sst_dsp_shim_write(struct sst_dsp *sst, u32 offset, u32 value);
++u32 sst_dsp_shim_read(struct sst_dsp *sst, u32 offset);
++int sst_dsp_shim_update_bits(struct sst_dsp *sst, u32 offset,
++				u32 mask, u32 value);
++void sst_dsp_shim_write64(struct sst_dsp *sst, u32 offset, u64 value);
++u64 sst_dsp_shim_read64(struct sst_dsp *sst, u32 offset);
++int sst_dsp_shim_update_bits64(struct sst_dsp *sst, u32 offset,
++				u64 mask, u64 value);
++
++/* SHIM Read / Write Unlocked for callers already holding sst lock */
++void sst_dsp_shim_write_unlocked(struct sst_dsp *sst, u32 offset, u32 value);
++u32 sst_dsp_shim_read_unlocked(struct sst_dsp *sst, u32 offset);
++int sst_dsp_shim_update_bits_unlocked(struct sst_dsp *sst, u32 offset,
++				u32 mask, u32 value);
++void sst_dsp_shim_write64_unlocked(struct sst_dsp *sst, u32 offset, u64 value);
++u64 sst_dsp_shim_read64_unlocked(struct sst_dsp *sst, u32 offset);
++int sst_dsp_shim_update_bits64_unlocked(struct sst_dsp *sst, u32 offset,
++					u64 mask, u64 value);
++
++/* Size optimised DRAM/IRAM memcpy */
++void sst_dsp_write(struct sst_dsp *sst, void *src, u32 dest_offset,
++	size_t bytes);
++void sst_dsp_bzero(struct sst_dsp *sst, u32 src_offset, size_t bytes);
++void sst_dsp_read(struct sst_dsp *sst, void *dest, u32 src_offset,
++	size_t bytes);
++
++/* DSP reset & boot */
++void sst_dsp_reset(struct sst_dsp *sst);
++int sst_dsp_boot(struct sst_dsp *sst);
++
++/* Msg IO */
++void sst_dsp_ipc_msg_tx(struct sst_dsp *dsp, u32 msg);
++u32 sst_dsp_ipc_msg_rx(struct sst_dsp *dsp);
++void *sst_dsp_get_thread_context(struct sst_dsp *sst);
++
++/* Mailbox management */
++int sst_dsp_mailbox_init(struct sst_dsp *dsp, u32 inbox_offset,
++	size_t inbox_size, u32 outbox_offset, size_t outbox_size);
++void sst_dsp_inbox_write(struct sst_dsp *dsp, void *message, size_t bytes);
++void sst_dsp_inbox_read(struct sst_dsp *dsp, void *message, size_t bytes);
++void sst_dsp_outbox_write(struct sst_dsp *dsp, void *message, size_t bytes);
++void sst_dsp_outbox_read(struct sst_dsp *dsp, void *message, size_t bytes);
++void sst_dsp_mailbox_dump(struct sst_dsp *dsp, size_t bytes);
++
++/* DMA FW maangement */
++int sst_dsp_dma_copy(struct sst_dsp *sst, dma_addr_t src_addr,
++	dma_addr_t dstn_addr, size_t size);
++int sst_dsp_dma_get_channel(struct sst_dsp *dsp, int chan_id);
++void sst_dsp_dma_put_channel(struct sst_dsp *dsp);
++
++/* Debug */
++void sst_dsp_dump(struct sst_dsp *sst);
++
++#endif
+-- 
+1.8.3.2
+

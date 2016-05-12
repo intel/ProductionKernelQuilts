@@ -1,0 +1,79 @@
+From a555489ba5ea9bfdbb5bf8c168e8686517663a6b Mon Sep 17 00:00:00 2001
+From: Brad Volkin <bradley.d.volkin@intel.com>
+Date: Mon, 22 Sep 2014 08:25:21 -0700
+Subject: [PATCH 2/4] FROM_UPSTREAM [VPG]: drm/i915: Don't leak command parser
+ tables on suspend/resume
+
+Ring init and cleanup are not balanced because we re-init the rings on
+resume without having cleaned them up on suspend. This leads to the
+driver leaking the parser's hash tables with a kmemleak signature such
+as this:
+
+unreferenced object 0xffff880405960980 (size 32):
+  comm "systemd-udevd", pid 516, jiffies 4294896961 (age 10202.044s)
+  hex dump (first 32 bytes):
+    d0 85 46 c0 ff ff ff ff 00 00 00 00 00 00 00 00  ..F.............
+    98 60 28 04 04 88 ff ff 00 00 00 00 00 00 00 00  .`(.............
+  backtrace:
+    [<ffffffff81816f9e>] kmemleak_alloc+0x4e/0xb0
+    [<ffffffff811fa678>] kmem_cache_alloc_trace+0x168/0x2f0
+    [<ffffffffc03e20a5>] i915_cmd_parser_init_ring+0x2a5/0x3e0 [i915]
+    [<ffffffffc04088a2>] intel_init_ring_buffer+0x202/0x470 [i915]
+    [<ffffffffc040c998>] intel_init_vebox_ring_buffer+0x1e8/0x2b0 [i915]
+    [<ffffffffc03eff59>] i915_gem_init_hw+0x2f9/0x3a0 [i915]
+    [<ffffffffc03f0057>] i915_gem_init+0x57/0x1d0 [i915]
+    [<ffffffffc045e26a>] i915_driver_load+0xc0a/0x10e0 [i915]
+    [<ffffffffc02e0d5d>] drm_dev_register+0xad/0x100 [drm]
+    [<ffffffffc02e3b9f>] drm_get_pci_dev+0x8f/0x200 [drm]
+    [<ffffffffc03c934b>] i915_pci_probe+0x3b/0x60 [i915]
+    [<ffffffff81436725>] local_pci_probe+0x45/0xa0
+    [<ffffffff81437a69>] pci_device_probe+0xd9/0x130
+    [<ffffffff81524f4d>] driver_probe_device+0x12d/0x3e0
+    [<ffffffff815252d3>] __driver_attach+0x93/0xa0
+    [<ffffffff81522e1b>] bus_for_each_dev+0x6b/0xb0
+
+This patch extends the current convention of checking whether a
+resource is already allocated before allocating it during ring init.
+Longer term it might make sense to only init the rings once.
+
+For: GMINL-4109
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 22cb99af39b5d4aae075a5bc9da615ba245227cd
+Upstream-as-of-tag: none
+Change-Id: Ic092887856f3061122ab93a8b639f318ed5ce2e0
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=83794
+Tested-by: Kari Suvanto <kari.tj.suvanto@gmail.com>
+Signed-off-by: Brad Volkin <bradley.d.volkin@intel.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: stable@vger.kernel.org
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+---
+ drivers/gpu/drm/i915/i915_cmd_parser.c |   12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_cmd_parser.c b/drivers/gpu/drm/i915/i915_cmd_parser.c
+index 8f0f01b..97ea203 100644
+--- a/drivers/gpu/drm/i915/i915_cmd_parser.c
++++ b/drivers/gpu/drm/i915/i915_cmd_parser.c
+@@ -864,11 +864,13 @@ int i915_cmd_parser_init_ring(struct intel_engine_cs *ring)
+ 	BUG_ON(!validate_cmds_sorted(ring, cmd_tables, cmd_table_count));
+ 	BUG_ON(!validate_regs_sorted(ring));
+ 
+-	ret = init_hash_table(ring, cmd_tables, cmd_table_count);
+-	if (ret) {
+-		DRM_ERROR("CMD: cmd_parser_init failed!\n");
+-		fini_hash_table(ring);
+-		return ret;
++	if (hash_empty(ring->cmd_hash)) {
++		ret = init_hash_table(ring, cmd_tables, cmd_table_count);
++		if (ret) {
++			DRM_ERROR("CMD: cmd_parser_init failed!\n");
++			fini_hash_table(ring);
++			return ret;
++		}
+ 	}
+ 
+ 	ring->needs_cmd_parser = true;
+-- 
+1.7.9.5
+

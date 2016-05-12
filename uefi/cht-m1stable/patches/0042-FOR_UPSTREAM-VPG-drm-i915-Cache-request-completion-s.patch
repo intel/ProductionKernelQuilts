@@ -1,0 +1,160 @@
+From 579b400a6135f9f6f406328efee4553454b1b24c Mon Sep 17 00:00:00 2001
+Message-Id: <579b400a6135f9f6f406328efee4553454b1b24c.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 7 Oct 2014 11:42:20 +0100
+Subject: [PATCH 42/63] FOR_UPSTREAM [VPG]: drm/i915: Cache request completion
+ status
+
+Continuing the removal of seqno based operations - updated the request
+completion query to not simply chain on to i915_seqno_passed(). Instead, it now
+returns a pre-cached completion flag in the fast case. In the slow case it reads
+the hardware seqno and, only if it has moved on since the last scan, looks
+through the outstanding request list to see which requests can be marked as
+completed.
+
+Later in the patch series, this will be optimised further by only doing the
+completion scan when an interrupt is raised to say that a request has actually
+completed on the hardware. Thus the call to test the completion status of an
+arbitrary request simply becomes 'return req->completed'.
+
+Change-Id: I68cfae4eb22db0ac25482fa6692ff1f6b2999b27
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |   32 +++++++++++++++----------------
+ drivers/gpu/drm/i915/i915_gem.c         |   24 +++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    1 +
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    3 +++
+ 4 files changed, 43 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index d397594..c03e1fe 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2078,6 +2078,9 @@ struct drm_i915_gem_object {
+ struct drm_i915_gem_request {
+ 	struct kref ref;
+ 
++	/** Is this request known to be complete? */
++	bool complete;
++
+ 	/** On Which ring this request was generated */
+ 	struct intel_engine_cs *ring;
+ 
+@@ -2114,6 +2117,8 @@ struct drm_i915_gem_request {
+ };
+ 
+ void i915_gem_request_free(struct kref *req_ref);
++void i915_gem_complete_requests_ring(struct intel_engine_cs *ring,
++				     bool lazy_coherency);
+ 
+ static inline uint32_t
+ i915_gem_request_get_seqno(struct drm_i915_gem_request *req)
+@@ -2154,11 +2159,16 @@ static inline void i915_gem_request_assign(struct drm_i915_gem_request **pdst,
+ 	*pdst = src;
+ }
+ 
+-/*
+- * XXX: i915_gem_request_completed should be here but currently needs the
+- * definition of i915_seqno_passed() which is below. It will be moved in
+- * a later patch when the call to i915_seqno_passed() is obsoleted...
+- */
++static inline bool i915_gem_request_completed(struct drm_i915_gem_request *req,
++					      bool lazy_coherency)
++{
++	if (req->complete)
++		return true;
++
++	i915_gem_complete_requests_ring(req->ring, lazy_coherency);
++
++	return req->complete;
++}
+ 
+ struct drm_i915_file_private {
+ 	struct drm_i915_private *dev_priv;
+@@ -2601,18 +2611,6 @@ i915_seqno_passed(uint32_t seq1, uint32_t seq2)
+ 	return (int32_t)(seq1 - seq2) >= 0;
+ }
+ 
+-static inline bool i915_gem_request_completed(struct drm_i915_gem_request *req,
+-					      bool lazy_coherency)
+-{
+-	u32 seqno;
+-
+-	BUG_ON(req == NULL);
+-
+-	seqno = req->ring->get_seqno(req->ring, lazy_coherency);
+-
+-	return i915_seqno_passed(seqno, req->seqno);
+-}
+-
+ int __must_check i915_gem_get_seqno(struct drm_device *dev, u32 *seqno);
+ int __must_check i915_gem_set_seqno(struct drm_device *dev, u32 seqno);
+ int __must_check i915_gem_object_get_fence(struct drm_i915_gem_object *obj);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 996ec2f..481a579 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2792,6 +2792,30 @@ void i915_gem_request_unreference_irq(struct drm_i915_gem_request *req)
+ 	spin_unlock_irqrestore(&ring->reqlist_lock, flags);
+ }
+ 
++void i915_gem_complete_requests_ring(struct intel_engine_cs *ring,
++				     bool lazy_coherency)
++{
++	struct drm_i915_gem_request *req;
++	u32 seqno;
++
++	seqno = ring->get_seqno(ring, lazy_coherency);
++	if (!seqno)
++		return;
++
++	if (seqno == ring->last_read_seqno)
++		return;
++
++	list_for_each_entry(req, &ring->request_list, list) {
++		if (req->complete)
++			continue;
++
++		if (i915_seqno_passed(seqno, req->seqno))
++			req->complete = true;
++	}
++
++	ring->last_read_seqno = seqno;
++}
++
+ /**
+  * This function clears the request list as sequence numbers are passed.
+  */
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 3434c32..83825a1 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2488,6 +2488,7 @@ void intel_ring_init_seqno(struct intel_engine_cs *ring, u32 seqno)
+ 			I915_WRITE(RING_SYNC_2(ring->mmio_base), 0);
+ 	}
+ 
++	ring->last_read_seqno = 0;
+ 	ring->set_seqno(ring, seqno);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 51ed751..dff6a2d 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -282,6 +282,9 @@ struct intel_engine_cs {
+ 	bool gpu_caches_dirty;
+ 	bool fbc_dirty;
+ 
++	/* For optimising request completion events */
++	u32 last_read_seqno;
++
+ 	wait_queue_head_t irq_queue;
+ 
+ 	struct intel_context *default_context;
+-- 
+1.7.9.5
+

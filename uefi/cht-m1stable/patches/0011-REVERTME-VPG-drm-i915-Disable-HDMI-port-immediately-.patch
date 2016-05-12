@@ -1,0 +1,162 @@
+From b80c1f8afe1643dfc2b8fe5e90793f3af146f975 Mon Sep 17 00:00:00 2001
+Message-Id: <b80c1f8afe1643dfc2b8fe5e90793f3af146f975.1427265330.git.chang-joon.lee@intel.com>
+In-Reply-To: <b4c66aa6a04d2be0fca9fa4448c7188a581a57a5.1427265330.git.chang-joon.lee@intel.com>
+References: <b4c66aa6a04d2be0fca9fa4448c7188a581a57a5.1427265330.git.chang-joon.lee@intel.com>
+From: Akashdeep Sharma <akashdeep.sharma@intel.com>
+Date: Wed, 18 Mar 2015 04:47:10 +0530
+Subject: [PATCH 11/22] REVERTME [VPG]: drm/i915: Disable HDMI port
+ immediately on unplug
+
+HDCP daemon expects HDMI port to be disabled as soon as the
+driver detects hot unplug, and send the event to userspace. As
+userspace sends DPMS off, after some delay, driver should disable
+the port as soon as hot-unplug is detected, and then disable the
+complete display on corresponding DPMS OFF call.
+
+This patch adds following changes for the same:
+1. Add a bool variable in intel_hdmi to indicate quick port disable.
+2. Disable port, as soon as HDMI unplugged.
+3. Suppress warnings due to HW/SW tracking for this case, only for HDMI.
+
+REVERTME: This is a temporary fix for HDCP compliance. Working on
+a cleaner approach.
+
+Issue: GMINL-7136
+Change-Id: If6e42763e18f445e7944c4321e311602c7b2c722
+Signed-off-by: Akashdeep Sharma <akashdeep.sharma@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ drivers/gpu/drm/i915/i915_irq.c      |   29 ++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_display.c |   16 ++++++++++++++++
+ drivers/gpu/drm/i915/intel_drv.h     |    9 +++++++++
+ drivers/gpu/drm/i915/intel_hdmi.c    |    2 ++
+ 4 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index edb3013..c73d9a9 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1135,6 +1135,22 @@ static bool intel_hpd_irq_event(struct drm_device *dev,
+ 	return true;
+ }
+ 
++static void intel_hdmi_disable_port(struct drm_device *dev,
++				struct drm_connector *connector)
++{
++	u32 temp;
++	struct intel_connector *intel_connector = to_intel_connector(connector);
++	struct intel_encoder *intel_encoder = intel_connector->encoder;
++	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(&intel_encoder->base);
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	temp = I915_READ(intel_hdmi->hdmi_reg);
++	temp &= ~(SDVO_ENABLE | SDVO_AUDIO_ENABLE);
++	I915_WRITE(intel_hdmi->hdmi_reg, temp);
++	POSTING_READ(intel_hdmi->hdmi_reg);
++	intel_hdmi->skip_port_check = true;
++}
++
+ /*
+  * Handle hotplug events outside the interrupt handler proper.
+  */
+@@ -1201,8 +1217,19 @@ static void i915_hotplug_work_func(struct work_struct *work)
+ 		if (hpd_event_bits & (1 << intel_encoder->hpd_pin)) {
+ 			if (intel_encoder->hot_plug)
+ 				intel_encoder->hot_plug(intel_encoder);
+-			if (intel_hpd_irq_event(dev, connector))
++			if (intel_hpd_irq_event(dev, connector)) {
++				if (connector->status ==
++				    connector_status_disconnected &&
++				    intel_encoder->type == INTEL_OUTPUT_HDMI) {
++					/*
++					 * Disable HDMI port immediately
++					 * for HDCP
++					 */
++					intel_hdmi_disable_port(dev, connector);
++				}
++
+ 				changed = true;
++			}
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 10fc391..6a34a37 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -11902,9 +11902,16 @@ static void
+ check_connector_state(struct drm_device *dev)
+ {
+ 	struct intel_connector *connector;
++	struct intel_hdmi *intel_hdmi;
+ 
+ 	list_for_each_entry(connector, &dev->mode_config.connector_list,
+ 			    base.head) {
++		if (connector->encoder->type == INTEL_OUTPUT_HDMI) {
++			intel_hdmi =
++				enc_to_intel_hdmi(&connector->encoder->base);
++			if (intel_hdmi->skip_port_check)
++				continue;
++		}
+ 		/* This also checks the encoder/connector hw state with the
+ 		 * ->get_hw_state callbacks. */
+ 		intel_connector_check_state(connector);
+@@ -11919,6 +11926,7 @@ check_encoder_state(struct drm_device *dev)
+ {
+ 	struct intel_encoder *encoder;
+ 	struct intel_connector *connector;
++	struct intel_hdmi *intel_hdmi;
+ 
+ 	list_for_each_entry(encoder, &dev->mode_config.encoder_list,
+ 			    base.head) {
+@@ -11926,6 +11934,14 @@ check_encoder_state(struct drm_device *dev)
+ 		bool active = false;
+ 		enum pipe pipe, tracked_pipe;
+ 
++		if (encoder->type == INTEL_OUTPUT_HDMI) {
++			intel_hdmi = enc_to_intel_hdmi(&encoder->base);
++			if (intel_hdmi->skip_port_check) {
++				intel_hdmi->skip_port_check = false;
++				continue;
++			}
++		}
++
+ 		DRM_DEBUG_KMS("[ENCODER:%d:%s]\n",
+ 			      encoder->base.base.id,
+ 			      encoder->base.name);
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 184d1b8..d07b627 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -623,6 +623,15 @@ struct intel_hdmi {
+ 	bool rgb_quant_range_selectable;
+ 	struct edid *edid;
+ 	u32 edid_mode_count;
++
++	/*
++	 * For HDCP compliance, we disable port immediately after detecting
++	 * hdmi hot unplug event. This bool is set to supress hw/ sw tracking
++	 * warnings for HDMI as we disable port immediately after hot un plug
++	 * whereas the planes/pipe will get disabled as per existing flow.
++	 */
++	bool skip_port_check;
++
+ 	void (*write_infoframe)(struct drm_encoder *encoder,
+ 				enum hdmi_infoframe_type type,
+ 				const void *frame, ssize_t len);
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index 34d6a45..f7b0487 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1979,6 +1979,8 @@ void intel_hdmi_init_connector(struct intel_digital_port *intel_dig_port,
+ 
+ 	/* Update the first status */
+ 	connector->status = intel_hdmi_detect(connector, false);
++
++	intel_hdmi->skip_port_check = false;
+ }
+ 
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+-- 
+1.7.9.5
+

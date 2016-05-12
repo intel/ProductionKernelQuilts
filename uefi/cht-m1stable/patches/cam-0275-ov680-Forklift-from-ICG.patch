@@ -1,0 +1,281 @@
+From 9af1dc59b26f98e0e1f5e6af274911add21ab928 Mon Sep 17 00:00:00 2001
+From: Per Persson <per.persson@intel.com>
+Date: Mon, 2 Mar 2015 11:19:16 +0100
+Subject: [PATCH 275/275] ov680: Forklift from ICG
+
+Change-Id: I8c824d167f240c8b342ef451429503095c6510f6
+Signed-off-by: Per Persson <per.persson@intel.com>
+---
+ .../camera/drivers/media/i2c/ov680.c               |  42 +++----
+ .../camera/drivers/media/i2c/ov680.h               | 122 +++++++++++++++++++--
+ 2 files changed, 136 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov680.c b/drivers/external_drivers/camera/drivers/media/i2c/ov680.c
+index bdd4300..b628ee7 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov680.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov680.c
+@@ -18,6 +18,10 @@
+ 
+ #define to_ov680_device(sub_dev) container_of(sub_dev, struct ov680_device, sd)
+ 
++static int factory_mode;
++module_param(factory_mode, int, 0644);
++MODULE_PARM_DESC(factory_mode, "Factory mode (0-1)");
++
+ static int ov680_i2c_read_reg(struct v4l2_subdev *sd,
+ 			      u16 reg, u8 *val)
+ {
+@@ -137,8 +141,8 @@ static int __ov680_flush_reg_array(struct i2c_client *client,
+ }
+ 
+ static int __ov680_buf_reg_array(struct i2c_client *client,
+-				   struct ov680_write_ctrl *ctrl,
+-				   const struct ov680_reg *next)
++				 struct ov680_write_ctrl *ctrl,
++				 const struct ov680_reg *next)
+ {
+ 	int size;
+ 	u16 *data16;
+@@ -292,13 +296,14 @@ static int ov680_check_sensor_avail(struct v4l2_subdev *sd)
+ 		ret = ov680_read_sensor(sd, sid[i], 0x0001, &data[1]);
+ 		if (ret || data[0] != OV680_SENSOR_REG0_VAL ||
+ 		    data[1] != OV680_SENSOR_REG1_VAL) {
+-			dev_err(&client->dev, "Subdev OV680 sensor %d with"\
+-				" id:0x%x detection failure.\n", i, sid[i]);
++			dev_err(&client->dev,
++				"Subdev OV680 sensor %d with id:0x%x detection failure.\n",
++				i, sid[i]);
+ 			sensor_fail = true;
+ 		} else {
+ 			dev_info(&client->dev,
+-				 "Subdev OV680 sensor %d with id:0x%x"\
+-				 " detection Successful.\n", i, sid[i]);
++				 "Subdev OV680 sensor %d with id:0x%x detection Successful.\n",
++				 i, sid[i]);
+ 		}
+ 	}
+ 
+@@ -384,7 +389,6 @@ static int ov680_write_firmware(struct v4l2_subdev *sd)
+ static int ov680_load_firmware(struct v4l2_subdev *sd)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+-	struct ov680_device *dev = to_ov680_device(sd);
+ 	int ret;
+ 	u8 read_value;
+ 	unsigned int read_timeout = 500;
+@@ -443,15 +447,6 @@ static int ov680_load_firmware(struct v4l2_subdev *sd)
+ 		return -EBUSY;
+ 	}
+ 
+-	if (dev->probed) {
+-		/* turn embedded line on */
+-		ret = ov680_write_reg_array(sd, ov680_720p_2s_embedded_line);
+-		if (ret) {
+-			dev_err(&client->dev, "%s - turn embedded on failed\n",
+-					__func__);
+-			return ret;
+-		}
+-	}
+ 	dev_info(&client->dev, "firmware load successfully.\n");
+ 	return ret;
+ }
+@@ -850,7 +845,7 @@ static int ov680_try_mbus_fmt(struct v4l2_subdev *sd,
+ }
+ 
+ static int ov680_get_mbus_fmt(struct v4l2_subdev *sd,
+-				struct v4l2_mbus_framefmt *fmt)
++			      struct v4l2_mbus_framefmt *fmt)
+ {
+ 	struct ov680_device *dev = to_ov680_device(sd);
+ 
+@@ -1068,7 +1063,13 @@ static int ov680_s_stream(struct v4l2_subdev *sd, int enable)
+ 	mutex_lock(&dev->input_lock);
+ 	if (dev->power_on && enable) {
+ 		/* start streaming */
+-		ret = ov680_write_reg_array(sd, ov680_720p_2s_embedded_stream_on);
++		if (factory_mode) {
++			ret = ov680_write_reg_array(sd,
++				ov680_720p_2s_embedded_factory_stream_on);
++		} else {
++			ret = ov680_write_reg_array(sd,
++				ov680_720p_2s_embedded_stream_on);
++		}
+ 		if (ret) {
+ 			dev_err(&client->dev,
+ 				"%s - stream on failed\n", __func__);
+@@ -1077,9 +1078,8 @@ static int ov680_s_stream(struct v4l2_subdev *sd, int enable)
+ 			dev->sys_activated = 1;
+ 		}
+ 	} else { /* stream off */
+-
+-		ret = ov680_i2c_write_reg(sd, REG_SC_03,
+-					  REG_SC_03_GLOBAL_DISABLED);
++		ret = ov680_write_reg_array(sd,
++					    ov680_720p_2s_embedded_stream_off);
+ 		if (ret)
+ 			dev_err(&client->dev,
+ 				"%s - stream off failed\n", __func__);
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov680.h b/drivers/external_drivers/camera/drivers/media/i2c/ov680.h
+index 0885ee6..7d79de7 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov680.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov680.h
+@@ -188,8 +188,6 @@
+ #define OV680_CONFIG_ISP_LENC_ON 0x02
+ #define OV680_CONFIG_ISP_LENS_OFF 0x03
+ 
+-/* Todo:  to define more ov680 register names */
+-
+ #define OV680_FIRMWARE_SIZE (33020) /* size =0xb610 - 0x8000 */
+ #define OV680_MAX_RATIO_MISMATCH 10 /* Unit in percentage */
+ 
+@@ -371,6 +369,7 @@ static struct ov680_reg const ov680_dw_fw_change_back_pll[] = {
+ };
+ 
+ static struct ov680_reg const ov680_720p_2s_embedded_stream_on[] = {
++	{OV680_8BIT, 0x6003, 0x10},
+ 
+ 	{OV680_8BIT, 0x6B18, 0x85},
+ 	{OV680_8BIT, 0x6B19, 0x90},
+@@ -379,8 +378,120 @@ static struct ov680_reg const ov680_720p_2s_embedded_stream_on[] = {
+ 	{OV680_8BIT, 0x6B1C, 0x01},
+ 	{OV680_8BIT, 0x6B17, 0xF0},
+ 
+-	{OV680_TOK_DELAY, 0x0, 0x64}, /* sleep 100ms */
+-	{OV680_8BIT, 0x6011, 0xFF}, /* AEC on */
++	{OV680_8BIT, 0x6011, 0xFF},  /* AEC on */
++
++	{OV680_TOK_TERM, 0, 0}
++};
++
++static struct ov680_reg const ov680_720p_2s_embedded_factory_stream_on[] = {
++/* BEGIN ov680 factory mode */
++	{OV680_8BIT, 0x6003, 0x11},
++	{OV680_8BIT, 0x6011, 0xCF}, /* AEC off */
++
++	/* 0x0202=0x03 default exposure 33ms */
++	{OV680_8BIT, 0x6B18, 0x85},
++	{OV680_8BIT, 0x6B19, 0x90},
++	{OV680_8BIT, 0x6B1A, 0x02},
++	{OV680_8BIT, 0x6B1B, 0x02},
++	{OV680_8BIT, 0x6B1C, 0x03},
++	{OV680_8BIT, 0x6B17, 0xF0},
++
++	/* 0x0203=0x20 default exposure 33ms */
++	{OV680_8BIT, 0x6B18, 0x85},
++	{OV680_8BIT, 0x6B19, 0x90},
++	{OV680_8BIT, 0x6B1A, 0x02},
++	{OV680_8BIT, 0x6B1B, 0x03},
++	{OV680_8BIT, 0x6B1C, 0x20},
++	{OV680_8BIT, 0x6B17, 0xF0},
++
++	/* 0x0204=00 Sensor 0 Gain=0 */
++	{OV680_8BIT, 0x6B18, 0x85},
++	{OV680_8BIT, 0x6B19, 0x90},
++	{OV680_8BIT, 0x6B1A, 0x02},
++	{OV680_8BIT, 0x6B1B, 0x04},
++	{OV680_8BIT, 0x6B1C, 0x00},
++	{OV680_8BIT, 0x6B17, 0xF0},
++
++	/* 0x0205=00 Sensor 1 Gain=0 */
++	{OV680_8BIT, 0x6B18, 0x85},
++	{OV680_8BIT, 0x6B19, 0x90},
++	{OV680_8BIT, 0x6B1A, 0x02},
++	{OV680_8BIT, 0x6B1B, 0x05},
++	{OV680_8BIT, 0x6B1C, 0x00},
++	{OV680_8BIT, 0x6B17, 0xF0},
++
++	/* Sensor 0 Disable sharpening */
++	{OV680_8BIT, 0x7408, 0x00},
++	{OV680_8BIT, 0x7409, 0x00},
++	{OV680_8BIT, 0x740A, 0x00},
++	{OV680_8BIT, 0x740B, 0x00},
++	{OV680_8BIT, 0x740C, 0x08},
++
++	/* Sensor 0 Disable AGC and set gain to 0 */
++	{OV680_8BIT, 0x6E01, 0x03},
++	{OV680_8BIT, 0x6E02, 0x20},
++	{OV680_8BIT, 0x6E03, 0x03},
++	{OV680_8BIT, 0x6E04, 0x00},
++	{OV680_8BIT, 0x6E05, 0x00},
++
++	/* Sensor 1 Disable sharpening */
++	{OV680_8BIT, 0x7B08, 0x00},
++	{OV680_8BIT, 0x7B09, 0x00},
++	{OV680_8BIT, 0x7B0A, 0x00},
++	{OV680_8BIT, 0x7B0B, 0x00},
++	{OV680_8BIT, 0x7B0C, 0x08},
++
++	/* Sensor 1 Disable AGC and set gain to 0 */
++	{OV680_8BIT, 0x6E81, 0x03},
++	{OV680_8BIT, 0x6E82, 0x20},
++	{OV680_8BIT, 0x6E83, 0x03},
++	{OV680_8BIT, 0x6E84, 0x00},
++	{OV680_8BIT, 0x6E85, 0x00},
++/* END ov680 factory mode */
++
++	/*
++	 * Embedded stream on commands,
++	 * do not enable AEC
++	 */
++	{OV680_8BIT, 0x6003, 0x10},
++
++	{OV680_8BIT, 0x6B18, 0x85},
++	{OV680_8BIT, 0x6B19, 0x90},
++	{OV680_8BIT, 0x6B1A, 0x01},
++	{OV680_8BIT, 0x6B1B, 0x00},
++	{OV680_8BIT, 0x6B1C, 0x01},
++	{OV680_8BIT, 0x6B17, 0xF0},
++
++	{OV680_TOK_TERM, 0, 0}
++};
++
++static struct ov680_reg const ov680_720p_2s_embedded_stream_off[] = {
++	{OV680_8BIT, 0x6003, 0x11},
++	{OV680_8BIT, 0x6011, 0xcf}, /* AEC off */
++
++	/* set min exposure start */
++	{OV680_8BIT, 0x6B18, 0x85},
++	{OV680_8BIT, 0x6B19, 0x90},
++	{OV680_8BIT, 0x6B1A, 0x02},
++	{OV680_8BIT, 0x6B1B, 0x02},
++	{OV680_8BIT, 0x6B1C, 0x00},
++	{OV680_8BIT, 0x6B17, 0xF0},
++
++	{OV680_8BIT, 0x6B18, 0x85},
++	{OV680_8BIT, 0x6B19, 0x90},
++	{OV680_8BIT, 0x6B1A, 0x02},
++	{OV680_8BIT, 0x6B1B, 0x03},
++	{OV680_8BIT, 0x6B1C, 0x10},
++	{OV680_8BIT, 0x6B17, 0xF0},
++	/* set min exposure end */
++
++	/* sleep sensor */
++	{OV680_8BIT, 0x6B18, 0x85},
++	{OV680_8BIT, 0x6B19, 0x90},
++	{OV680_8BIT, 0x6B1A, 0x01},
++	{OV680_8BIT, 0x6B1B, 0x00},
++	{OV680_8BIT, 0x6B1C, 0x00},
++	{OV680_8BIT, 0x6B17, 0xF0},
+ 
+ 	{OV680_TOK_TERM, 0, 0}
+ };
+@@ -397,16 +508,13 @@ static struct ov680_reg const ov680_720p_2s_embedded_line[] = {
+ 	{OV680_8BIT, 0x6914, 0x52},
+ 	{OV680_8BIT, 0x6096, 0x11},
+ 
+-
+ 	{OV680_8BIT, 0x6b01, 0x24},
+ 	{OV680_8BIT, 0x6b02, 0xc0},
+ 	{OV680_8BIT, 0x6003, 0x10},
+ 
+-
+ 	{OV680_TOK_DELAY, 0x0, 0x64}, /* sleep 100ms */
+ 	{OV680_TOK_DELAY, 0x0, 0x64}, /* sleep 100ms */
+ 
+-
+ 	{OV680_8BIT, 0x600a, 0x00},
+ 	{OV680_TOK_TERM, 0, 0}
+ };
+-- 
+1.9.1
+

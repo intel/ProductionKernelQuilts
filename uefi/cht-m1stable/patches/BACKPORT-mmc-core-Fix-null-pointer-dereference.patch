@@ -1,0 +1,66 @@
+From d0e235a9f8236afe035ceee5b3c272776498b75b Mon Sep 17 00:00:00 2001
+From: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Date: Wed, 13 May 2015 18:09:44 +0800
+Subject: [PATCH] BACKPORT: mmc: core: Fix null pointer dereference
+
+Fix a race condition that can lead to null pointer dereference
+while the MMC transfers are going on.
+1) mmc_request_done() -> mmc_wait_for_data_done ->
+step1: update is_done_rcv
+step2: wake_up sleeping thread (mmcqd) waiting for is_done_rcv
+
+2) mmcqd -> mmc_wait_for_data_req_done
+step4: wait for is_done_rcv or is_new_req
+step5: is_new_req set from block layer context and mmcqd is woken up
+step6: let's say step1 is done, so complete the current request
+step7: fetch new request and issue to host layer
+step8: fetch one more request and wait for previous request to complete
+
+In the above execution contexts, if step4-step8 happens between step1 and
+step2 a null pointer dereference is observed.
+
+Change-Id: I4904f3b08f4af2893b8dfbeedf6ad1fe05e567a3
+Signed-off-by: Sujit Reddy Thumma <sthumma@codeaurora.org>
+Signed-off-by: Yi Sun <yi.y.sun@intel.com>
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+---
+ drivers/mmc/core/core.c |    7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+Index: b/drivers/mmc/core/core.c
+===================================================================
+--- a/drivers/mmc/core/core.c	2015-10-02 10:03:15.328885184 -0700
++++ b/drivers/mmc/core/core.c	2015-10-02 10:08:35.687721696 -0700
+@@ -404,10 +404,13 @@
+  */
+ static void mmc_wait_data_done(struct mmc_request *mrq)
+ {
++	unsigned long flags;
+ 	struct mmc_context_info *context_info = &mrq->host->context_info;
+ 
++	spin_lock_irqsave(&context_info->lock, flags);
+ 	context_info->is_done_rcv = true;
+ 	wake_up_interruptible(&context_info->wait);
++	spin_unlock_irqrestore(&context_info->lock, flags);
+ }
+ 
+ static void mmc_wait_done(struct mmc_request *mrq)
+@@ -470,6 +473,7 @@
+ 	struct mmc_context_info *context_info = &host->context_info;
+ 	int err;
+ 	unsigned long flags;
++	bool is_done_rcv = false;
+ 
+ 	while (1) {
+ 		wait_event_interruptible(context_info->wait,
+@@ -477,8 +481,9 @@
+ 				 context_info->is_new_req));
+ 		spin_lock_irqsave(&context_info->lock, flags);
+ 		context_info->is_waiting_last_req = false;
++		is_done_rcv = context_info->is_done_rcv;
+ 		spin_unlock_irqrestore(&context_info->lock, flags);
+-		if (context_info->is_done_rcv) {
++		if (is_done_rcv) {
+ 			context_info->is_done_rcv = false;
+ 			context_info->is_new_req = false;
+ 			cmd = mrq->cmd;

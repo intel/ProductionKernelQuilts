@@ -1,0 +1,111 @@
+From fcc46c25a30b81dd37a795eaf6f11fb8602c2d92 Mon Sep 17 00:00:00 2001
+From: Mustapha Ben Zoubeir <mustaphax.ben.zoubeir@intel.com>
+Date: Tue, 19 Aug 2014 11:54:49 +0200
+Subject: [PATCH 6/8] n_gsm: avoid race between gsm_dlci_release and tty
+ operations
+
+gsm_dlci_release() is likely to called in parallel with n_gsm tty
+operations, then tty operation might refer to wild pointer which points
+to the released ldisc, therefore it hits panic. Following are some of
+panic examples:
+
+gsm_dlci_release() race with gsmtty_open():
+1) tty_open(gsmttyi) -> gsmtty_install(gsmttyi), dlci[i] is allocated;
+2) tty_release(ttyACM0) -> gsm_dlci_release(dlci[i]), dlci[i] is released but
+tty operations could still get the pointer to dlci[i] by tty->driver_data;
+3) continue step 1), tty_open(gsmttyi) -> gsmtty_open(gsmttyi), it uses wild
+pointer to dlci[i], then panic happen.
+
+gsm_dlci_release() race with gsmtty_install();
+1) tty_open(gsmtty7) -> gsmtty_install(gsmtty7), it checks dlci[0] is set, so
+it'll continue with normal opening process;
+2) tty_release(ttyACM0) -> gsm_dlci_release(dlci[0]), dlci[0] is released;
+3) continue step 1), tty_open(gsmtty7) -> gsmtty_attach_dlci(dlci[7]), it will
+refer to dlci[0] and panic.
+
+This patch is to avoid such sort of race by:
+1) use a gsm mutex lock to prevent gsm_dlci_release() running in parallel with
+gsmtty_install();
+2) Increase ldisc ref count in gsmtty_install() instead of gsmtty_attach_dlci(),
+purpose is to avoid ldisc being released by gsm_dlci_release() in the time
+slot between gsmtty_install() and gsmtty_open();
+3) Decrease ldisc ref count in gsmtty_remove() instead of gsmtty_detach_dlci(),
+this is the opposite process for 2);
+
+Change-Id: Ia4573b58034ee5d337b5b513221bc16c6930a9ae
+Orig-Change-Id: Idd2dbfe5f00eeb152311bf3e18b11a2cfafea8a5
+Signed-off-by: chao.bi <chao.bi@intel.com>
+---
+ drivers/tty/n_gsm.c  |   13 +++----------
+ drivers/tty/tty_io.c |    6 ++++--
+ 2 files changed, 7 insertions(+), 12 deletions(-)
+
+--- linux.orig/drivers/tty/n_gsm.c
++++ linux/drivers/tty/n_gsm.c
+@@ -2125,9 +2125,11 @@ void gsm_cleanup_mux(struct gsm_mux *gsm
+ 	if (!gsm->tty_dead)
+ 		gsm_closeall_dlci(gsm);
+ 
++	mutex_lock(&gsm->mutex);
+ 	for (i = NUM_DLCI-1; i >= 0; i--)
+ 		if (gsm->dlci[i])
+ 			gsm_dlci_release(gsm->dlci[i]);
++	mutex_unlock(&gsm->mutex);
+ 
+ 	spin_lock_irqsave(&gsm->tx_lock, flags);
+ 	/* Now wipe the queues */
+@@ -3100,15 +3102,11 @@ static void gsmtty_attach_dlci(struct tt
+ 	spin_lock(&dlci->gsmtty_lock);
+ 	dlci->gsmtty_count++;
+ 	spin_unlock(&dlci->gsmtty_lock);
+-	dlci_get(dlci);
+-	dlci_get(dlci->gsm->dlci[0]);
+-	mux_get(dlci->gsm);
+ }
+ 
+ static void gsmtty_detach_dlci(struct tty_struct *tty)
+ {
+ 	struct gsm_dlci *dlci = tty->driver_data;
+-	struct gsm_mux *gsm;
+ 	int has_open;
+ 
+ 	if (!dlci) {
+@@ -3119,13 +3117,7 @@ static void gsmtty_detach_dlci(struct tt
+ 	has_open = --dlci->gsmtty_count;
+ 	if (!has_open)
+ 		tty_port_tty_set(&dlci->port, NULL);
+-
+ 	spin_unlock(&dlci->gsmtty_lock);
+-
+-	gsm = dlci->gsm;
+-	dlci_put(dlci);
+-	dlci_put(gsm->dlci[0]);
+-	mux_put(gsm);
+ }
+ 
+ static int gsmtty_install(struct tty_driver *driver, struct tty_struct *tty)
+@@ -3471,6 +3463,7 @@ static void gsmtty_cleanup(struct tty_st
+ 	dlci_put(gsm->dlci[0]);
+ 	mux_put(gsm);
+ 	tty->driver_data = NULL;
++	tty->port = NULL;
+ }
+ 
+ /* Virtual ttys for the demux */
+--- linux.orig/drivers/tty/tty_io.c
++++ linux/drivers/tty/tty_io.c
+@@ -1622,10 +1622,12 @@ static void release_tty(struct tty_struc
+ 		tty->ops->shutdown(tty);
+ 	tty_free_termios(tty);
+ 	tty_driver_remove_tty(tty->driver, tty);
+-	tty->port->itty = NULL;
++	if (tty->port)
++		tty->port->itty = NULL;
+ 	if (tty->link)
+ 		tty->link->port->itty = NULL;
+-	cancel_work_sync(&tty->port->buf.work);
++	if (tty->port)
++		cancel_work_sync(&tty->port->buf.work);
+ 
+ 	if (tty->link)
+ 		tty_kref_put(tty->link);

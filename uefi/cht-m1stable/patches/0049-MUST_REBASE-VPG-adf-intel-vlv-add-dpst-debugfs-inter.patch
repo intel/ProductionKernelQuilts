@@ -1,0 +1,304 @@
+From 6a135cffa60e5df2a9b53a26b14943369bbb4bcc Mon Sep 17 00:00:00 2001
+Message-Id: <6a135cffa60e5df2a9b53a26b14943369bbb4bcc.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Sun, 5 Oct 2014 13:33:21 +0530
+Subject: [PATCH 49/75] MUST_REBASE [VPG]: adf/intel/vlv: add dpst debugfs
+ interface to validate the feature
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I97361882dcc6b3576f058b8784c09b1456d4d815
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/Makefile          |    3 +-
+ drivers/video/adf/intel/core/vlv/vlv_dc_config.c   |    7 +
+ drivers/video/adf/intel/core/vlv/vlv_debugfs.c     |  196 ++++++++++++++++++++
+ .../adf/intel/include/core/vlv/vlv_dc_config.h     |    7 +
+ .../video/adf/intel/include/core/vlv/vlv_dpst.h    |    5 +-
+ 5 files changed, 215 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/vlv/vlv_debugfs.c
+
+diff --git a/drivers/video/adf/intel/core/vlv/Makefile b/drivers/video/adf/intel/core/vlv/Makefile
+index 89d973e..72938f8 100644
+--- a/drivers/video/adf/intel/core/vlv/Makefile
++++ b/drivers/video/adf/intel/core/vlv/Makefile
+@@ -6,4 +6,5 @@ obj-y := vlv_dc_config.o \
+ 	vlv_pri_plane.o \
+ 	vlv_sp_plane.o \
+ 	vlv_mode_set.o \
+-	vlv_dpst.o
++	vlv_dpst.o \
++	vlv_debugfs.o
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+index c827578..7da0d58 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+@@ -66,6 +66,9 @@ void vlv_dc_config_destroy(struct intel_dc_config *config)
+ 		vlv_sp_plane_destroy(splane);
+ 	}
+ 
++#ifdef CONFIG_DEBUG_FS
++	vlv_debugfs_teardown(vlv_config);
++#endif
+ 	intel_dc_config_destroy(config);
+ 	vlv_dpst_teardown();
+ 	kfree(config);
+@@ -183,6 +186,10 @@ struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
+ 	vlv_initialize_disp(config, PIPE_A, INTEL_PIPE_DSI);
+ 
+ 	vlv_dpst_init(&config->base);
++
++#ifdef CONFIG_DEBUG_FS
++	vlv_debugfs_init(config);
++#endif
+ 	return &config->base;
+ err:
+ 	vlv_dc_config_destroy(&config->base);
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_debugfs.c b/drivers/video/adf/intel/core/vlv/vlv_debugfs.c
+new file mode 100644
+index 0000000..30c9d2a
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/vlv_debugfs.c
+@@ -0,0 +1,196 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ *
++ * Authors:	Deepak S <deepak.s@linux.intel.com>
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/io.h>
++#include <linux/uaccess.h>
++
++#include "intel_adf.h"
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_dpst.h>
++
++static ssize_t
++intel_dpst_disable_get(struct file *file, char __user *ubuf, size_t max,
++		   loff_t *ppos)
++{
++	struct vlv_dc_config *vlv_config = file->private_data;
++	char buf[] = "dpst read is not defined";
++	u32 len;
++
++	len = snprintf(buf, sizeof(buf),
++			"%d\n",  vlv_config->dpst.kernel_disable);
++
++	if (len > sizeof(buf))
++		len = sizeof(buf);
++	return simple_read_from_buffer(ubuf, max, ppos, buf, len);
++}
++
++
++static ssize_t
++intel_dpst_disable_set(struct file *file, const char __user *ubuf, size_t cnt,
++		    loff_t *ppos)
++{
++	struct vlv_dc_config *config = file->private_data;
++	char buf[20];
++	int ret;
++	u32 val;
++
++	if (cnt > 0) {
++		if (cnt > sizeof(buf) - 1)
++			return -EINVAL;
++
++		if (copy_from_user(buf, ubuf, cnt))
++			return -EFAULT;
++
++		buf[cnt] = 0;
++
++		ret = kstrtoul(buf, 0,
++				(unsigned long *)&val);
++		if (ret)
++			return -EINVAL;
++
++		pr_err("Setting DPST disable %s\n",
++			 val ? "true" : "false");
++
++		vlv_dpst_set_kernel_disable(config, val);
++
++	}
++
++	return cnt;
++}
++
++static const struct file_operations intel_dpst_disable_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = intel_dpst_disable_get,
++	.write = intel_dpst_disable_set,
++	.llseek = default_llseek,
++};
++
++static ssize_t
++intel_dpst_status_get(struct file *file, char __user *ubuf, size_t max,
++		   loff_t *ppos)
++{
++	struct vlv_dc_config *config = file->private_data;
++	char buf[800];
++	u32 len = 0;
++	int i;
++	const int columns = 4;
++	u32 blm_hist_ctl, blm_hist_guard;
++
++	blm_hist_ctl = REG_READ(config->dpst.reg.blm_hist_ctl);
++	blm_hist_guard = REG_READ(config->dpst.reg.blm_hist_guard);
++
++	len = scnprintf(buf, sizeof(buf),
++			"histogram logic: %s\n",
++			blm_hist_ctl & IE_HISTOGRAM_ENABLE ?
++			"enabled" : "disabled");
++
++	len += scnprintf(&buf[len], (sizeof(buf) - len),
++			"histogram interrupts: %s\n",
++			blm_hist_guard & HISTOGRAM_INTERRUPT_ENABLE ?
++			"enabled" : "disabled");
++
++	len += scnprintf(&buf[len], (sizeof(buf) - len),
++			"backlight adjustment: %u%%\n",
++			config->dpst.blc_adjustment * 100 / DPST_MAX_FACTOR);
++
++	len += scnprintf(&buf[len], (sizeof(buf) - len),
++			"IE modification table: %s\n",
++			blm_hist_ctl & IE_MOD_TABLE_ENABLE ?
++			"enabled" : "disabled");
++
++	blm_hist_ctl |= BIN_REG_FUNCTION_SELECT_IE;
++	blm_hist_ctl &= ~BIN_REGISTER_INDEX_MASK;
++	REG_WRITE(BLM_HIST_CTL, blm_hist_ctl);
++
++	len += scnprintf(&buf[len], (sizeof(buf) - len),
++			 "IE modification table values...");
++	for (i = 0; i < DPST_DIET_ENTRY_COUNT; i++) {
++		if (i % columns == 0)
++			len += scnprintf(&buf[len], (sizeof(buf) - len),
++				"\nbins %02d-%02d:", i, i + columns - 1);
++		len += scnprintf(&buf[len], (sizeof(buf) - len),
++			"%10x", REG_READ(config->dpst.reg.blm_hist_bin));
++	}
++	len += scnprintf(&buf[len], (sizeof(buf) - len), "\n");
++
++
++	return simple_read_from_buffer(ubuf, max, ppos, buf, len);
++}
++
++
++static ssize_t
++intel_dpst_status_set(struct file *file, const char __user *ubuf, size_t cnt,
++		    loff_t *ppos)
++{
++	return cnt;
++}
++
++static const struct file_operations intel_dpst_status_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = intel_dpst_status_get,
++	.write = intel_dpst_status_set,
++	.llseek = default_llseek,
++};
++
++int vlv_debugfs_init(struct vlv_dc_config *vlv_config)
++{
++	struct dentry		*root;
++	struct dentry		*file;
++	int			ret;
++
++	root = debugfs_create_dir("intel_adf", NULL);
++	if (!root) {
++		ret = -ENOMEM;
++		goto err0;
++	}
++
++	file = debugfs_create_file("intel_dpst_status", S_IRUGO, root,
++			vlv_config, &intel_dpst_status_fops);
++	if (!file) {
++		ret = -ENOMEM;
++		goto err1;
++	}
++
++	file = debugfs_create_file("intel_dpst_disable", S_IRUGO, root,
++			vlv_config, &intel_dpst_disable_fops);
++	if (!file) {
++		ret = -ENOMEM;
++		goto err1;
++	}
++
++	vlv_config->debugfs_root = root;
++
++	return 0;
++
++err1:
++	debugfs_remove_recursive(root);
++
++err0:
++	return ret;
++}
++
++void vlv_debugfs_teardown(struct vlv_dc_config *config)
++{
++	debugfs_remove_recursive(config->debugfs_root);
++}
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+index 63daf81..083ed0c 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+@@ -101,6 +101,9 @@ static inline void vlv_cck_write(u32 reg, u32 val)
+ struct vlv_dc_config {
+ 	struct intel_dc_config base;
+ 	struct vlv_dpst dpst;
++#ifdef CONFIG_DEBUG_FS
++	struct dentry	*debugfs_root;
++#endif
+ 	struct vlv_disp {
+ 		struct vlv_pri_plane pplane;
+ 		struct vlv_sp_plane splane[2];
+@@ -126,4 +129,8 @@ extern int pipe_mode_set(struct intel_pipe *pipe,
+ 			 struct drm_mode_modeinfo *mode);
+ extern int vlv_display_on(struct intel_pipe *pipe);
+ extern int vlv_display_off(struct intel_pipe *pipe);
++
++/* vlv_debugfs */
++extern int vlv_debugfs_init(struct vlv_dc_config *vlv_config);
++extern void vlv_debugfs_teardown(struct vlv_dc_config *vlv_config);
+ #endif
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dpst.h b/drivers/video/adf/intel/include/core/vlv/vlv_dpst.h
+index c6a2c96..e2931ec 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dpst.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dpst.h
+@@ -93,6 +93,7 @@ void vlv_dpst_irq_handler(struct intel_pipe *pipe);
+ void vlv_dpst_display_on(void);
+ void vlv_dpst_display_off(void);
+ void vlv_dpst_set_brightness(struct intel_pipe *pipe, u32 brightness_val);
+-#endif
+-
+ 
++int vlv_dpst_set_kernel_disable(struct vlv_dc_config *vlv_config,
++				bool disable);
++#endif
+-- 
+1.7.9.5
+

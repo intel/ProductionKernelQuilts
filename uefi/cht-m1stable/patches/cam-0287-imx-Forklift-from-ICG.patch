@@ -1,0 +1,2222 @@
+From ca768d1a076e20f92f0cce2cb735ffa46615f5a4 Mon Sep 17 00:00:00 2001
+From: Per Persson <per.persson@intel.com>
+Date: Thu, 19 Mar 2015 08:05:54 +0100
+Subject: [PATCH 1/3] imx:Forklift from ICG
+
+Change-Id: I75ce92a31c788dabc5541d2d483df6c093de3199
+Signed-off-by: Per Persson <per.persson@intel.com>
+---
+ .../camera/drivers/media/i2c/imx/dw9714.c          |  15 +
+ .../camera/drivers/media/i2c/imx/dw9714.h          |   1 +
+ .../camera/drivers/media/i2c/imx/dw9718.c          |  92 +-
+ .../camera/drivers/media/i2c/imx/dw9718.h          |   5 +
+ .../camera/drivers/media/i2c/imx/imx.c             |  26 +-
+ .../camera/drivers/media/i2c/imx/imx.h             |  20 +-
+ .../camera/drivers/media/i2c/imx/imx132.h          | 174 ----
+ .../camera/drivers/media/i2c/imx/imx134.h          | 393 +++++++-
+ .../camera/drivers/media/i2c/imx/imx135.h          | 996 +++++++++++++++++++--
+ 9 files changed, 1433 insertions(+), 289 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9714.c b/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9714.c
+index d7282df..d7fe6ca 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9714.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9714.c
+@@ -148,6 +148,21 @@ int dw9714_t_focus_abs(struct v4l2_subdev *sd, s32 value)
+ 	return ret;
+ }
+ 
++int dw9714_t_focus_abs_init(struct v4l2_subdev *sd)
++{
++	int ret;
++
++	ret = dw9714_t_focus_vcm(sd, DW9714_DEFAULT_FOCUS_POS);
++	if (ret == 0) {
++		dw9714_dev.number_of_steps =
++			DW9714_DEFAULT_FOCUS_POS - dw9714_dev.focus;
++		dw9714_dev.focus = DW9714_DEFAULT_FOCUS_POS;
++		getnstimeofday(&(dw9714_dev.timestamp_t_focus_abs));
++	}
++
++	return ret;
++}
++
+ int dw9714_t_focus_rel(struct v4l2_subdev *sd, s32 value)
+ {
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9714.h b/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9714.h
+index 972eed1..50f988c 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9714.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9714.h
+@@ -40,6 +40,7 @@ struct dw9714_device {
+ 
+ #define DW9714_INVALID_CONFIG	0xffffffff
+ #define DW9714_MAX_FOCUS_POS	1023
++#define DW9714_DEFAULT_FOCUS_POS	290
+ 
+ 
+ /* MCLK[1:0] = 01 T_SRC[4:0] = 00001 S[3:0] = 0111 */
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9718.c b/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9718.c
+index 8020bb3..e20b65e 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9718.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9718.c
+@@ -79,27 +79,53 @@ static int dw9718_i2c_wr16(struct i2c_client *client, u8 reg, u16 val)
+ 	return 0;
+ }
+ 
++int dw9718_t_focus_abs(struct v4l2_subdev *sd, s32 value)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(sd);
++	int ret;
++
++	value = clamp(value, 0, DW9718_MAX_FOCUS_POS);
++	ret = dw9718_i2c_wr16(client, DW9718_DATA_M, value);
++	pr_info("%s: value = %d\n", __func__, value);
++	if (ret < 0)
++		return ret;
++
++	getnstimeofday(&dw9718_dev.focus_time);
++	dw9718_dev.focus = value;
++
++	return 0;
++}
++
+ int dw9718_vcm_power_up(struct v4l2_subdev *sd)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+ 	int ret;
+ 	u8 value;
++	int i;
++	int step = DW9718_CLICK_REDUCTION_STEP;
+ 
+ 	/* Enable power */
+ 	ret = dw9718_dev.platform_data->power_ctrl(sd, 1);
+ 	if (ret)
+ 		return ret;
+-	/* Wait for VBAT to stabilize */
+-	udelay(100);
++	/* Wait t_OPR for VBAT to stabilize */
++	usleep_range(100, 110);
+ 
+ 	/* Detect device */
+ 	ret = dw9718_i2c_rd8(client, DW9718_SACT, &value);
+ 	if (ret < 0)
+ 		goto fail_powerdown;
+-	if (value != DW9718_SACT_DEFAULT_VAL) {
+-		dev_err(&client->dev, "%s error, incorrect ID\n", __func__);
+-		return -ENXIO;
+-	}
++
++	/*
++	 * WORKAROUND: for module P8V12F-203 which are used on
++	 * Cherrytrail Refresh Davis Reef AoB, register SACT is not
++	 * returning default value as spec. But VCM works as expected and
++	 * root cause is still under discussion with vendor.
++	 * workaround here to avoid aborting the power up sequence and just
++	 * give a warning about this error.
++	 */
++	if (value != DW9718_SACT_DEFAULT_VAL)
++		dev_warn(&client->dev, "%s error, incorrect ID\n", __func__);
+ 
+ 	/* Initialize according to recommended settings */
+ 	ret = dw9718_i2c_wr8(client, DW9718_CONTROL,
+@@ -115,7 +141,25 @@ int dw9718_vcm_power_up(struct v4l2_subdev *sd)
+ 	if (ret < 0)
+ 		goto fail_powerdown;
+ 
+-	dw9718_dev.focus = DW9718_MAX_FOCUS_POS;
++	/* Wait t_MODE after changing from switching to linear mode */
++	usleep_range(85, 95);
++
++	/* Minimize the click sounds from the lens during power up */
++	i = DW9718_LENS_MOVE_POSITION;
++	while (i <= dw9718_dev.focus) {
++		ret = dw9718_i2c_wr16(client, DW9718_DATA_M, i);
++		if (ret) {
++			dev_err(&client->dev, "%s: write failed\n", __func__);
++			break;
++		}
++		msleep(DW9718_CLICK_REDUCTION_SLEEP);
++		i += step;
++	}
++
++	ret = dw9718_t_focus_abs(sd, dw9718_dev.focus);
++	if (ret)
++		return ret;
++
+ 	dw9718_dev.initialized = true;
+ 
+ 	return 0;
+@@ -128,6 +172,23 @@ fail_powerdown:
+ 
+ int dw9718_vcm_power_down(struct v4l2_subdev *sd)
+ {
++	struct i2c_client *client = v4l2_get_subdevdata(sd);
++	int ret;
++	int i;
++	int step = DW9718_CLICK_REDUCTION_STEP;
++
++	/* Minimize the click sounds from the lens during power down */
++	i = min(dw9718_dev.focus, DW9718_DEFAULT_FOCUS_POSITION) - step;
++	while (i >= DW9718_LENS_MOVE_POSITION) {
++		ret = dw9718_i2c_wr16(client, DW9718_DATA_M, i);
++		if (ret) {
++			dev_err(&client->dev, "%s: write failed\n", __func__);
++			break;
++		}
++		msleep(DW9718_CLICK_REDUCTION_SLEEP);
++		i -= step;
++	}
++
+ 	return dw9718_dev.platform_data->power_ctrl(sd, 0);
+ }
+ 
+@@ -158,22 +219,6 @@ int dw9718_t_focus_vcm(struct v4l2_subdev *sd, u16 val)
+ 	return -EINVAL;
+ }
+ 
+-int dw9718_t_focus_abs(struct v4l2_subdev *sd, s32 value)
+-{
+-	struct i2c_client *client = v4l2_get_subdevdata(sd);
+-	int ret;
+-
+-	value = clamp(value, 0, DW9718_MAX_FOCUS_POS);
+-	ret = dw9718_i2c_wr16(client, DW9718_DATA_M, value);
+-	if (ret < 0)
+-		return ret;
+-
+-	getnstimeofday(&dw9718_dev.focus_time);
+-	dw9718_dev.focus = value;
+-
+-	return 0;
+-}
+-
+ int dw9718_t_focus_rel(struct v4l2_subdev *sd, s32 value)
+ {
+ 	return dw9718_t_focus_abs(sd, dw9718_dev.focus + value);
+@@ -197,5 +242,6 @@ int dw9718_t_vcm_timing(struct v4l2_subdev *sd, s32 value)
+ int dw9718_vcm_init(struct v4l2_subdev *sd)
+ {
+ 	dw9718_dev.platform_data = camera_get_af_platform_data();
++	dw9718_dev.focus = DW9718_DEFAULT_FOCUS_POSITION;
+ 	return (NULL == dw9718_dev.platform_data) ? -ENODEV : 0;
+ }
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9718.h b/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9718.h
+index ae1a0f0..b878df5c 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9718.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/dw9718.h
+@@ -58,4 +58,9 @@ struct dw9718_device {
+ #define DW9718_SACT_PERIOD_8_8MS	0x19
+ #define DW9718_SACT_DEFAULT_VAL		0x60
+ 
++#define DW9718_CLICK_REDUCTION_STEP	 30 /* in vcm units */
++#define DW9718_CLICK_REDUCTION_SLEEP	 20 /* in milliseconds */
++#define DW9718_LENS_MOVE_POSITION	120 /* in vcm units */
++#define DW9718_DEFAULT_FOCUS_POSITION	300 /* in vcm units */
++
+ #endif /* __DW9718_H__ */
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+index 91fb994..37d743a 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+@@ -1512,11 +1512,16 @@ static const struct v4l2_ctrl_config imx_controls[] = {
+  * Returns the value of gap or -1 if fail.
+  */
+ #define LARGEST_ALLOWED_RATIO_MISMATCH 600
+-static int distance(struct imx_resolution const *res, u32 w, u32 h)
++static int distance(struct imx_resolution const *res, u32 w, u32 h,
++		bool keep_ratio)
+ {
+ 	unsigned int w_ratio;
+ 	unsigned int h_ratio;
+ 	int match;
++	unsigned int allowed_ratio_mismatch = LARGEST_ALLOWED_RATIO_MISMATCH;
++
++	if (!keep_ratio)
++		allowed_ratio_mismatch = ~0;
+ 
+ 	if (w == 0)
+ 		return -1;
+@@ -1529,7 +1534,7 @@ static int distance(struct imx_resolution const *res, u32 w, u32 h)
+ 	match   = abs(((w_ratio << 13) / h_ratio) - ((int)8192));
+ 
+ 	if ((w_ratio < (int)8192) || (h_ratio < (int)8192)  ||
+-		(match > LARGEST_ALLOWED_RATIO_MISMATCH))
++		(match > allowed_ratio_mismatch))
+ 		return -1;
+ 
+ 	return w_ratio + h_ratio;
+@@ -1546,10 +1551,11 @@ static int nearest_resolution_index(struct v4l2_subdev *sd, int w, int h)
+ 	int min_dist = INT_MAX;
+ 	const struct imx_resolution *tmp_res = NULL;
+ 	struct imx_device *dev = to_imx_sensor(sd);
+-
++	bool again = 1;
++retry:
+ 	for (i = 0; i < dev->entries_curr_table; i++) {
+ 		tmp_res = &dev->curr_res_table[i];
+-		dist = distance(tmp_res, w, h);
++		dist = distance(tmp_res, w, h, again);
+ 		if (dist == -1)
+ 			continue;
+ 		if (dist < min_dist) {
+@@ -1566,6 +1572,14 @@ static int nearest_resolution_index(struct v4l2_subdev *sd, int w, int h)
+ 		}
+ 	}
+ 
++	/*
++	 * FIXME!
++	 * only IMX135 for Saltbay use this algorithm
++	 */
++	if (idx == -1 && again == true && dev->new_res_sel_method) {
++		again = false;
++		goto retry;
++	}
+ 	return idx;
+ }
+ 
+@@ -1882,6 +1896,8 @@ static int imx_s_stream(struct v4l2_subdev *sd, int enable)
+ 			return ret;
+ 		}
+ 		dev->streaming = 1;
++		if (dev->vcm_driver && dev->vcm_driver->t_focus_abs_init)
++			dev->vcm_driver->t_focus_abs_init(sd);
+ 	} else {
+ 		ret = imx_write_reg_array(client, imx_soft_standby);
+ 		if (ret != 0) {
+@@ -1995,6 +2011,8 @@ static int __update_imx_device_settings(struct imx_device *dev, u16 sensor_id)
+ 			dev->mode_tables = &imx_sets[IMX135_SALTBAY];
+ 			dev->vcm_driver = &imx_vcms[IMX135_SALTBAY];
+ 			dev->otp_driver = &imx_otps[IMX135_SALTBAY];
++			/* FIXME! */
++			dev->new_res_sel_method = true;
+ 		}
+ 		break;
+ 	case IMX134_ID:
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.h b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.h
+index 43ea32a..fb78175 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.h
+@@ -209,6 +209,7 @@ struct imx_vcm {
+ 	int (*init)(struct v4l2_subdev *sd);
+ 	int (*t_focus_vcm)(struct v4l2_subdev *sd, u16 val);
+ 	int (*t_focus_abs)(struct v4l2_subdev *sd, s32 value);
++	int (*t_focus_abs_init)(struct v4l2_subdev *sd);
+ 	int (*t_focus_rel)(struct v4l2_subdev *sd, s32 value);
+ 	int (*q_focus_status)(struct v4l2_subdev *sd, s32 *value);
+ 	int (*q_focus_abs)(struct v4l2_subdev *sd, s32 *value);
+@@ -296,11 +297,11 @@ struct imx_settings imx_sets[] = {
+ 	},
+ 	[IMX135_VICTORIABAY] = {
+ 		.init_settings = imx135_init_settings,
+-		.res_preview = imx135_res_preview,
+-		.res_still = imx135_res_still,
++		.res_preview = imx135_res_preview_mofd,
++		.res_still = imx135_res_still_mofd,
+ 		.res_video = imx135_res_video,
+-		.n_res_preview = ARRAY_SIZE(imx135_res_preview),
+-		.n_res_still = ARRAY_SIZE(imx135_res_still),
++		.n_res_preview = ARRAY_SIZE(imx135_res_preview_mofd),
++		.n_res_still = ARRAY_SIZE(imx135_res_still_mofd),
+ 		.n_res_video = ARRAY_SIZE(imx135_res_video),
+ 	},
+ 	[IMX132_SALTBAY] = {
+@@ -471,6 +472,9 @@ struct imx_device {
+ 	struct v4l2_ctrl *tp_gr;
+ 	struct v4l2_ctrl *tp_gb;
+ 	struct v4l2_ctrl *tp_b;
++
++	/* FIXME! */
++	bool new_res_sel_method;
+ };
+ 
+ #define to_imx_sensor(x) container_of(x, struct imx_device, sd)
+@@ -544,6 +548,7 @@ extern int dw9714_vcm_init(struct v4l2_subdev *sd);
+ 
+ extern int dw9714_t_focus_vcm(struct v4l2_subdev *sd, u16 val);
+ extern int dw9714_t_focus_abs(struct v4l2_subdev *sd, s32 value);
++extern int dw9714_t_focus_abs_init(struct v4l2_subdev *sd);
+ extern int dw9714_t_focus_rel(struct v4l2_subdev *sd, s32 value);
+ extern int dw9714_q_focus_status(struct v4l2_subdev *sd, s32 *value);
+ extern int dw9714_q_focus_abs(struct v4l2_subdev *sd, s32 *value);
+@@ -584,6 +589,7 @@ struct imx_vcm imx_vcms[] = {
+ 		.init = drv201_vcm_init,
+ 		.t_focus_vcm = drv201_t_focus_vcm,
+ 		.t_focus_abs = drv201_t_focus_abs,
++		.t_focus_abs_init = NULL,
+ 		.t_focus_rel = drv201_t_focus_rel,
+ 		.q_focus_status = drv201_q_focus_status,
+ 		.q_focus_abs = drv201_q_focus_abs,
+@@ -596,6 +602,7 @@ struct imx_vcm imx_vcms[] = {
+ 		.init = dw9714_vcm_init,
+ 		.t_focus_vcm = dw9714_t_focus_vcm,
+ 		.t_focus_abs = dw9714_t_focus_abs,
++		.t_focus_abs_init = NULL,
+ 		.t_focus_rel = dw9714_t_focus_rel,
+ 		.q_focus_status = dw9714_q_focus_status,
+ 		.q_focus_abs = dw9714_q_focus_abs,
+@@ -608,6 +615,7 @@ struct imx_vcm imx_vcms[] = {
+ 		.init = ad5816g_vcm_init,
+ 		.t_focus_vcm = ad5816g_t_focus_vcm,
+ 		.t_focus_abs = ad5816g_t_focus_abs,
++		.t_focus_abs_init = NULL,
+ 		.t_focus_rel = ad5816g_t_focus_rel,
+ 		.q_focus_status = ad5816g_q_focus_status,
+ 		.q_focus_abs = ad5816g_q_focus_abs,
+@@ -620,6 +628,7 @@ struct imx_vcm imx_vcms[] = {
+ 		.init = dw9719_vcm_init,
+ 		.t_focus_vcm = dw9719_t_focus_vcm,
+ 		.t_focus_abs = dw9719_t_focus_abs,
++		.t_focus_abs_init = NULL,
+ 		.t_focus_rel = dw9719_t_focus_rel,
+ 		.q_focus_status = dw9719_q_focus_status,
+ 		.q_focus_abs = dw9719_q_focus_abs,
+@@ -632,6 +641,7 @@ struct imx_vcm imx_vcms[] = {
+ 		.init = dw9714_vcm_init,
+ 		.t_focus_vcm = dw9714_t_focus_vcm,
+ 		.t_focus_abs = dw9714_t_focus_abs,
++		.t_focus_abs_init = dw9714_t_focus_abs_init,
+ 		.t_focus_rel = dw9714_t_focus_rel,
+ 		.q_focus_status = dw9714_q_focus_status,
+ 		.q_focus_abs = dw9714_q_focus_abs,
+@@ -644,6 +654,7 @@ struct imx_vcm imx_vcms[] = {
+ 		.init = dw9718_vcm_init,
+ 		.t_focus_vcm = dw9718_t_focus_vcm,
+ 		.t_focus_abs = dw9718_t_focus_abs,
++		.t_focus_abs_init = NULL,
+ 		.t_focus_rel = dw9718_t_focus_rel,
+ 		.q_focus_status = dw9718_q_focus_status,
+ 		.q_focus_abs = dw9718_q_focus_abs,
+@@ -653,6 +664,7 @@ struct imx_vcm imx_vcms[] = {
+ 	[IMX_ID_DEFAULT] = {
+ 		.power_up = vcm_power_up,
+ 		.power_down = vcm_power_down,
++		.t_focus_abs_init = NULL,
+ 	},
+ };
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx132.h b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx132.h
+index 0f862ca..98f047b8 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx132.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx132.h
+@@ -409,100 +409,6 @@ static struct imx_reg imx132_1336x1096_30fps[] = {
+ 	{IMX_TOK_TERM, 0, 0},
+ };
+ 
+-static struct imx_reg imx132_1200p_30fps[] = {
+-	GROUPED_PARAMETER_HOLD_ENABLE,
+-	/* Global Settings */
+-	{IMX_8BIT, 0x3087, 0x53},
+-	{IMX_8BIT, 0x308B, 0x5A},
+-	{IMX_8BIT, 0x3094, 0x11},
+-	{IMX_8BIT, 0x309D, 0xA4},
+-	{IMX_8BIT, 0x30AA, 0x01},
+-	{IMX_8BIT, 0x30C6, 0x00},
+-	{IMX_8BIT, 0x30C7, 0x00},
+-	{IMX_8BIT, 0x3118, 0x2F},
+-	{IMX_8BIT, 0x312A, 0x00},
+-	{IMX_8BIT, 0x312B, 0x0B},
+-	{IMX_8BIT, 0x312C, 0x0B},
+-	{IMX_8BIT, 0x312D, 0x13},
+-	/* PLL setting */
+-	{IMX_8BIT, 0x0305, 0x02},
+-	{IMX_8BIT, 0x0307, 0x54},
+-	{IMX_8BIT, 0x30A4, 0x02},
+-	{IMX_8BIT, 0x303C, 0x3C},
+-	/* Mode setting */
+-	{IMX_8BIT, 0x0344, 0x00},
+-	{IMX_8BIT, 0x0345, 0x14},
+-	{IMX_8BIT, 0x0346, 0x00},
+-	{IMX_8BIT, 0x0347, 0x00},
+-	{IMX_8BIT, 0x0348, 0x07},
+-	{IMX_8BIT, 0x0349, 0xA3},
+-	{IMX_8BIT, 0x034A, 0x04},
+-	{IMX_8BIT, 0x034B, 0xAF},
+-	{IMX_8BIT, 0x034C, 0x07},
+-	{IMX_8BIT, 0x034D, 0x90},
+-	{IMX_8BIT, 0x034E, 0x04},
+-	{IMX_8BIT, 0x034F, 0xB0},
+-	{IMX_8BIT, 0x0381, 0x01},
+-	{IMX_8BIT, 0x0383, 0x01},
+-	{IMX_8BIT, 0x0385, 0x01},
+-	{IMX_8BIT, 0x0387, 0x01},
+-	{IMX_8BIT, 0x303D, 0x10},
+-	{IMX_8BIT, 0x303E, 0x5A},
+-	{IMX_8BIT, 0x3040, 0x00},
+-	{IMX_8BIT, 0x3041, 0x00},
+-	{IMX_8BIT, 0x3048, 0x00},
+-	{IMX_8BIT, 0x304C, 0x2F},
+-	{IMX_8BIT, 0x304D, 0x02},
+-	{IMX_8BIT, 0x3064, 0x92},
+-	{IMX_8BIT, 0x306A, 0x10},
+-	{IMX_8BIT, 0x309B, 0x00},
+-	{IMX_8BIT, 0x309E, 0x41},
+-	{IMX_8BIT, 0x30A0, 0x10},
+-	{IMX_8BIT, 0x30A1, 0x0B},
+-	{IMX_8BIT, 0x30B2, 0x00},
+-	{IMX_8BIT, 0x30D5, 0x00},
+-	{IMX_8BIT, 0x30D6, 0x00},
+-	{IMX_8BIT, 0x30D7, 0x00},
+-	{IMX_8BIT, 0x30D8, 0x00},
+-	{IMX_8BIT, 0x30D9, 0x00},
+-	{IMX_8BIT, 0x30DA, 0x00},
+-	{IMX_8BIT, 0x30DB, 0x00},
+-	{IMX_8BIT, 0x30DC, 0x00},
+-	{IMX_8BIT, 0x30DD, 0x00},
+-	{IMX_8BIT, 0x30DE, 0x00},
+-	{IMX_8BIT, 0x3102, 0x0C},
+-	{IMX_8BIT, 0x3103, 0x33},
+-	{IMX_8BIT, 0x3104, 0x18},
+-	{IMX_8BIT, 0x3105, 0x00},
+-	{IMX_8BIT, 0x3106, 0x65},
+-	{IMX_8BIT, 0x3107, 0x00},
+-	{IMX_8BIT, 0x3108, 0x06},
+-	{IMX_8BIT, 0x3109, 0x04},
+-	{IMX_8BIT, 0x310A, 0x04},
+-	{IMX_8BIT, 0x315C, 0x3D},
+-	{IMX_8BIT, 0x315D, 0x3C},
+-	{IMX_8BIT, 0x316E, 0x3E},
+-	{IMX_8BIT, 0x316F, 0x3D},
+-	/* Global timing */
+-	{IMX_8BIT, 0x3304, 0x07}, /* RGTLPX[5:0] TLPX */
+-	{IMX_8BIT, 0x3305, 0x06}, /* RGTCLKPREPARE[3:0] TCLK-PREPARE */
+-	{IMX_8BIT, 0x3306, 0x19}, /* RGTCLKZERO[5:0] TCLK-ZERO */
+-	{IMX_8BIT, 0x3307, 0x03}, /* RGTCLKPRE[5:0] TCLK-PRE */
+-	{IMX_8BIT, 0x3308, 0x0F}, /* RGTCLKPOST[5:0] TCLK-POST */
+-	{IMX_8BIT, 0x3309, 0x07}, /* RGTCLKTRAIL[3:0] TCLK-TRAIL */
+-	{IMX_8BIT, 0x330A, 0x0C}, /* RGTHSEXIT[5:0] THS-EXIT */
+-	{IMX_8BIT, 0x330B, 0x06}, /* RGTHSPREPARE[3:0] THS-PREPARE */
+-	{IMX_8BIT, 0x330C, 0x0B}, /* RGTHSZERO[5:0] THS-ZERO */
+-	{IMX_8BIT, 0x330D, 0x07}, /* RGTHSTRAIL[3:0] THS-TRAIL */
+-	{IMX_8BIT, 0x330E, 0x03},
+-	{IMX_8BIT, 0x3318, 0x62},
+-	{IMX_8BIT, 0x3322, 0x09},
+-	{IMX_8BIT, 0x3342, 0x00},
+-	{IMX_8BIT, 0x3348, 0xE0},
+-
+-	{IMX_TOK_TERM, 0, 0},
+-};
+-
+ /********************** settings for imx - reference *********************/
+ static struct imx_reg const imx132_init_settings[] = {
+ 	/* sw reset */
+@@ -549,46 +455,6 @@ struct imx_resolution imx132_res_preview[] = {
+ 		.skip_frames = 2,
+ 		.mipi_freq = 384000,
+ 	},
+-	{
+-		.desc = "imx132_1200p_30fps",
+-		.regs = imx132_1200p_30fps,
+-		.width = 1936,
+-		.height = 1200,
+-		.fps_options = {
+-			{
+-				.fps = 30,
+-				.pixels_per_line = 0x0966,
+-				.lines_per_frame = 0x04B8,
+-			},
+-			{
+-			}
+-		},
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
+-		.used = 0,
+-		.skip_frames = 2,
+-		.mipi_freq = 403200,
+-	},
+-	{
+-		.desc = "imx132_1456x1096_30fps",
+-		.regs = imx132_1456x1096_30fps,
+-		.width = 1456,
+-		.height = 1096,
+-		.fps_options = {
+-			{
+-				.fps = 30,
+-				.pixels_per_line = 0x08F2,
+-				.lines_per_frame = 0x045C,
+-			},
+-			{
+-			}
+-		},
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
+-		.used = 0,
+-		.skip_frames = 2,
+-		.mipi_freq = 384000,
+-	},
+ };
+ 
+ struct imx_resolution imx132_res_still[] = {
+@@ -612,46 +478,6 @@ struct imx_resolution imx132_res_still[] = {
+ 		.skip_frames = 2,
+ 		.mipi_freq = 384000,
+ 	},
+-	{
+-		.desc = "imx132_1200p_30fps",
+-		.regs = imx132_1200p_30fps,
+-		.width = 1936,
+-		.height = 1200,
+-		.fps_options = {
+-			{
+-				.fps = 30,
+-				.pixels_per_line = 0x0966,
+-				.lines_per_frame = 0x04B8,
+-			},
+-			{
+-			}
+-		},
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
+-		.used = 0,
+-		.skip_frames = 2,
+-		.mipi_freq = 403200,
+-	},
+-	{
+-		.desc = "imx132_1456x1096_30fps",
+-		.regs = imx132_1456x1096_30fps,
+-		.width = 1456,
+-		.height = 1096,
+-		.fps_options = {
+-			{
+-				.fps = 30,
+-				.pixels_per_line = 0x08F2,
+-				.lines_per_frame = 0x045C,
+-			},
+-			{
+-			}
+-		},
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
+-		.used = 0,
+-		.skip_frames = 2,
+-		.mipi_freq = 384000,
+-	},
+ };
+ 
+ struct imx_resolution imx132_res_video[] = {
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx134.h b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx134.h
+index f7f94b8..cf35197 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx134.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx134.h
+@@ -218,11 +218,14 @@ static struct imx_reg const imx134_1640_1232_30fps[] = {
+ 	{ IMX_8BIT, 0x0355, 0x68 },
+ 	{ IMX_8BIT, 0x0356, 0x04 },
+ 	{ IMX_8BIT, 0x0357, 0xD0 },
++
+ 	{ IMX_8BIT, 0x301D, 0x30 },
++
+ 	{ IMX_8BIT, 0x3310, 0x06 },
+ 	{ IMX_8BIT, 0x3311, 0x68 },
+ 	{ IMX_8BIT, 0x3312, 0x04 },
+ 	{ IMX_8BIT, 0x3313, 0xD0 },
++
+ 	{ IMX_8BIT, 0x331C, 0x04 },
+ 	{ IMX_8BIT, 0x331D, 0x06 },
+ 	{ IMX_8BIT, 0x4084, 0x00 },
+@@ -379,6 +382,119 @@ static struct imx_reg const imx134_820_616_30fps[] = {
+ 	{ IMX_TOK_TERM, 0, 0 }
+ };
+ 
++/* 4 lane, 1/4 binning 30fps 820x552 */
++static struct imx_reg const imx134_820_552_30fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	/* mode set clear */
++	{ IMX_8BIT, 0x3A43, 0x01 },
++	/* Clock Setting */
++	{ IMX_8BIT, 0x011E, 0x13 },
++	{ IMX_8BIT, 0x011F, 0x33 },
++	{ IMX_8BIT, 0x0301, 0x05 },
++	{ IMX_8BIT, 0x0303, 0x01 },
++	{ IMX_8BIT, 0x0305, 0x0C },
++	{ IMX_8BIT, 0x0309, 0x05 },
++	{ IMX_8BIT, 0x030B, 0x01 },
++	{ IMX_8BIT, 0x030C, 0x01 },
++	{ IMX_8BIT, 0x030D, 0xA9 },
++	{ IMX_8BIT, 0x030E, 0x01 },
++	{ IMX_8BIT, 0x3A06, 0x11 },
++
++	/* Mode setting */
++	{ IMX_8BIT, 0x0108, 0x03 },
++	{ IMX_8BIT, 0x0112, 0x0A },
++	{ IMX_8BIT, 0x0113, 0x0A },
++	{ IMX_8BIT, 0x0381, 0x01 },
++	{ IMX_8BIT, 0x0383, 0x01 },
++	{ IMX_8BIT, 0x0385, 0x01 },
++	{ IMX_8BIT, 0x0387, 0x01 },
++	{ IMX_8BIT, 0x0390, 0x01 },	/* binning */
++	{ IMX_8BIT, 0x0391, 0x44 },	/* 4x4 binning */
++	{ IMX_8BIT, 0x0392, 0x00 },
++	{ IMX_8BIT, 0x0401, 0x00 },	/* no resize */
++	{ IMX_8BIT, 0x0404, 0x00 },
++	{ IMX_8BIT, 0x0405, 0x10 },
++	{ IMX_8BIT, 0x4082, 0x01 },
++	{ IMX_8BIT, 0x4083, 0x01 },
++	{ IMX_8BIT, 0x7006, 0x04 },
++
++	/* Optionnal Function setting */
++	{ IMX_8BIT, 0x0700, 0x00 },
++	{ IMX_8BIT, 0x3A63, 0x00 },
++	{ IMX_8BIT, 0x4100, 0xF8 },
++	{ IMX_8BIT, 0x4203, 0xFF },
++	{ IMX_8BIT, 0x4344, 0x00 },
++	{ IMX_8BIT, 0x441C, 0x01 },
++
++	/* Size setting */
++	{ IMX_8BIT, 0x0344, 0x00 },      /* x_addr_start[15:8]:0 */
++	{ IMX_8BIT, 0x0345, 0x00 },      /* x_addr_start[7:0] */
++	{ IMX_8BIT, 0x0346, 0x00 },      /* y_addr_start[15:8]:128 */
++	{ IMX_8BIT, 0x0347, 0x80 },      /* y_addr_start[7:0] */
++	{ IMX_8BIT, 0x0348, 0x0C },      /* x_addr_end[15:8]:3280-1 */
++	{ IMX_8BIT, 0x0349, 0xCF },      /* x_addr_end[7:0] */
++	{ IMX_8BIT, 0x034A, 0x09 },      /* y_addr_end[15:8]:2208+128-1 */
++	{ IMX_8BIT, 0x034B, 0x1F },      /* y_addr_end[7:0] */
++	{ IMX_8BIT, 0x034C, 0x03 },      /* x_output_size[15:8]: */
++	{ IMX_8BIT, 0x034D, 0x34 },      /* x_output_size[7:0] */
++	{ IMX_8BIT, 0x034E, 0x02 },      /* y_output_size[15:8]:616 */
++	{ IMX_8BIT, 0x034F, 0x28 },      /* y_output_size[7:0] */
++	{ IMX_8BIT, 0x0350, 0x00 },
++	{ IMX_8BIT, 0x0351, 0x00 },
++	{ IMX_8BIT, 0x0352, 0x00 },
++	{ IMX_8BIT, 0x0353, 0x00 },
++	{ IMX_8BIT, 0x0354, 0x03 },
++	{ IMX_8BIT, 0x0355, 0x34 },
++	{ IMX_8BIT, 0x0356, 0x02 },
++	{ IMX_8BIT, 0x0357, 0x28 },
++	{ IMX_8BIT, 0x301D, 0x30 },
++	{ IMX_8BIT, 0x3310, 0x03 },
++	{ IMX_8BIT, 0x3311, 0x34 },
++	{ IMX_8BIT, 0x3312, 0x02 },
++	{ IMX_8BIT, 0x3313, 0x28 },
++	{ IMX_8BIT, 0x331C, 0x02 },
++	{ IMX_8BIT, 0x331D, 0xD0 },
++	{ IMX_8BIT, 0x4084, 0x00 },
++	{ IMX_8BIT, 0x4085, 0x00 },
++	{ IMX_8BIT, 0x4086, 0x00 },
++	{ IMX_8BIT, 0x4087, 0x00 },
++	{ IMX_8BIT, 0x4400, 0x00 },
++
++	/* Global Timing Setting */
++	{ IMX_8BIT, 0x0830, 0x77 },
++	{ IMX_8BIT, 0x0831, 0x2F },
++	{ IMX_8BIT, 0x0832, 0x4F },
++	{ IMX_8BIT, 0x0833, 0x37 },
++	{ IMX_8BIT, 0x0834, 0x2F },
++	{ IMX_8BIT, 0x0835, 0x37 },
++	{ IMX_8BIT, 0x0836, 0xAF },
++	{ IMX_8BIT, 0x0837, 0x37 },
++	{ IMX_8BIT, 0x0839, 0x1F },
++	{ IMX_8BIT, 0x083A, 0x17 },
++	{ IMX_8BIT, 0x083B, 0x02 },
++
++	/* Integration Time Setting */
++	{ IMX_8BIT, 0x0202, 0x09 },
++	{ IMX_8BIT, 0x0203, 0xD2 },
++
++	/* HDR Setting */
++	{ IMX_8BIT, 0x0230, 0x00 },
++	{ IMX_8BIT, 0x0231, 0x00 },
++	{ IMX_8BIT, 0x0233, 0x00 },
++	{ IMX_8BIT, 0x0234, 0x00 },
++	{ IMX_8BIT, 0x0235, 0x40 },
++	{ IMX_8BIT, 0x0238, 0x00 },
++	{ IMX_8BIT, 0x0239, 0x04 },
++	{ IMX_8BIT, 0x023B, 0x00 },
++	{ IMX_8BIT, 0x023C, 0x01 },
++	{ IMX_8BIT, 0x33B0, 0x04 },
++	{ IMX_8BIT, 0x33B1, 0x00 },
++	{ IMX_8BIT, 0x33B3, 0x00 },
++	{ IMX_8BIT, 0x33B4, 0x01 },
++	{ IMX_8BIT, 0x3800, 0x00 },
++	{ IMX_TOK_TERM, 0, 0 }
++};
++
+ /* 4 lane, 1/4 binning 30fps 720x592 */
+ static struct imx_reg const imx134_720_592_30fps[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
+@@ -492,6 +608,239 @@ static struct imx_reg const imx134_720_592_30fps[] = {
+ 	{ IMX_TOK_TERM, 0, 0 }
+ };
+ 
++static struct imx_reg const imx134_752_616_30fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	/* mode set clear */
++	{ IMX_8BIT, 0x3A43, 0x01 },
++	/* Clock Setting */
++	{ IMX_8BIT, 0x011E, 0x13 },
++	{ IMX_8BIT, 0x011F, 0x33 },
++	{ IMX_8BIT, 0x0301, 0x05 },
++	{ IMX_8BIT, 0x0303, 0x01 },
++	{ IMX_8BIT, 0x0305, 0x0C },
++	{ IMX_8BIT, 0x0309, 0x05 },
++	{ IMX_8BIT, 0x030B, 0x01 },
++	{ IMX_8BIT, 0x030C, 0x01 },
++	{ IMX_8BIT, 0x030D, 0xA9 },
++	{ IMX_8BIT, 0x030E, 0x01 },
++	{ IMX_8BIT, 0x3A06, 0x11 },
++
++	/* Mode setting */
++	{ IMX_8BIT, 0x0108, 0x03 },
++	{ IMX_8BIT, 0x0112, 0x0A },
++	{ IMX_8BIT, 0x0113, 0x0A },
++	{ IMX_8BIT, 0x0381, 0x01 },
++	{ IMX_8BIT, 0x0383, 0x01 },
++	{ IMX_8BIT, 0x0385, 0x01 },
++	{ IMX_8BIT, 0x0387, 0x01 },
++	{ IMX_8BIT, 0x0390, 0x01 },	/* binning */
++	{ IMX_8BIT, 0x0391, 0x44 },	/* 4x4 binning */
++	{ IMX_8BIT, 0x0392, 0x00 },
++	{ IMX_8BIT, 0x0401, 0x00 },	/* no resize */
++	{ IMX_8BIT, 0x0404, 0x00 },
++	{ IMX_8BIT, 0x0405, 0x10 },
++	{ IMX_8BIT, 0x4082, 0x01 },
++	{ IMX_8BIT, 0x4083, 0x01 },
++	{ IMX_8BIT, 0x7006, 0x04 },
++
++	/* Optionnal Function setting */
++	{ IMX_8BIT, 0x0700, 0x00 },
++	{ IMX_8BIT, 0x3A63, 0x00 },
++	{ IMX_8BIT, 0x4100, 0xF8 },
++	{ IMX_8BIT, 0x4203, 0xFF },
++	{ IMX_8BIT, 0x4344, 0x00 },
++	{ IMX_8BIT, 0x441C, 0x01 },
++
++	/* Size setting */
++	{ IMX_8BIT, 0x0344, 0x00 },      /* x_addr_start[15:8]:136 */
++	{ IMX_8BIT, 0x0345, 0x88 },      /* x_addr_start[7:0] */
++	{ IMX_8BIT, 0x0346, 0x00 },      /* y_addr_start[15:8]:0 */
++	{ IMX_8BIT, 0x0347, 0x00 },      /* y_addr_start[7:0] */
++	{ IMX_8BIT, 0x0348, 0x0C },      /* x_addr_end[15:8]:3145+134-1 */
++	{ IMX_8BIT, 0x0349, 0x47 },      /* x_addr_end[7:0] */
++	{ IMX_8BIT, 0x034A, 0x09 },      /* y_addr_end[15:8]:2463 */
++	{ IMX_8BIT, 0x034B, 0x9F },      /* y_addr_end[7:0] */
++	{ IMX_8BIT, 0x034C, 0x02 },      /* x_output_size[15:8]: 752*/
++	{ IMX_8BIT, 0x034D, 0xF0 },      /* x_output_size[7:0] */
++	{ IMX_8BIT, 0x034E, 0x02 },      /* y_output_size[15:8]:616 */
++	{ IMX_8BIT, 0x034F, 0x68 },      /* y_output_size[7:0] */
++	{ IMX_8BIT, 0x0350, 0x00 },
++	{ IMX_8BIT, 0x0351, 0x00 },
++	{ IMX_8BIT, 0x0352, 0x00 },
++	{ IMX_8BIT, 0x0353, 0x00 },
++
++	{ IMX_8BIT, 0x0354, 0x02 },
++	{ IMX_8BIT, 0x0355, 0xF0 },
++	{ IMX_8BIT, 0x0356, 0x02 },
++	{ IMX_8BIT, 0x0357, 0x68 },
++
++	{ IMX_8BIT, 0x301D, 0x30 },
++
++	{ IMX_8BIT, 0x3310, 0x02 },
++	{ IMX_8BIT, 0x3311, 0xF0 },
++	{ IMX_8BIT, 0x3312, 0x02 },
++	{ IMX_8BIT, 0x3313, 0x68 },
++
++	{ IMX_8BIT, 0x331C, 0x02 },
++	{ IMX_8BIT, 0x331D, 0xD0 },
++	{ IMX_8BIT, 0x4084, 0x00 },
++	{ IMX_8BIT, 0x4085, 0x00 },
++	{ IMX_8BIT, 0x4086, 0x00 },
++	{ IMX_8BIT, 0x4087, 0x00 },
++	{ IMX_8BIT, 0x4400, 0x00 },
++
++	/* Global Timing Setting */
++	{ IMX_8BIT, 0x0830, 0x77 },
++	{ IMX_8BIT, 0x0831, 0x2F },
++	{ IMX_8BIT, 0x0832, 0x4F },
++	{ IMX_8BIT, 0x0833, 0x37 },
++	{ IMX_8BIT, 0x0834, 0x2F },
++	{ IMX_8BIT, 0x0835, 0x37 },
++	{ IMX_8BIT, 0x0836, 0xAF },
++	{ IMX_8BIT, 0x0837, 0x37 },
++	{ IMX_8BIT, 0x0839, 0x1F },
++	{ IMX_8BIT, 0x083A, 0x17 },
++	{ IMX_8BIT, 0x083B, 0x02 },
++
++	/* Integration Time Setting */
++	{ IMX_8BIT, 0x0202, 0x09 },
++	{ IMX_8BIT, 0x0203, 0xD2 },
++
++	/* HDR Setting */
++	{ IMX_8BIT, 0x0230, 0x00 },
++	{ IMX_8BIT, 0x0231, 0x00 },
++	{ IMX_8BIT, 0x0233, 0x00 },
++	{ IMX_8BIT, 0x0234, 0x00 },
++	{ IMX_8BIT, 0x0235, 0x40 },
++	{ IMX_8BIT, 0x0238, 0x00 },
++	{ IMX_8BIT, 0x0239, 0x04 },
++	{ IMX_8BIT, 0x023B, 0x00 },
++	{ IMX_8BIT, 0x023C, 0x01 },
++	{ IMX_8BIT, 0x33B0, 0x04 },
++	{ IMX_8BIT, 0x33B1, 0x00 },
++	{ IMX_8BIT, 0x33B3, 0x00 },
++	{ IMX_8BIT, 0x33B4, 0x01 },
++	{ IMX_8BIT, 0x3800, 0x00 },
++	{ IMX_TOK_TERM, 0, 0 }
++};
++
++/* 1424x1168  */
++static struct imx_reg const imx134_1424_1168_30fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	/* mode set clear */
++	{ IMX_8BIT, 0x3A43, 0x01 },
++	/* Clock Setting */
++	{ IMX_8BIT, 0x011E, 0x13 },
++	{ IMX_8BIT, 0x011F, 0x33 },
++	{ IMX_8BIT, 0x0301, 0x05 },
++	{ IMX_8BIT, 0x0303, 0x01 },
++	{ IMX_8BIT, 0x0305, 0x0C },
++	{ IMX_8BIT, 0x0309, 0x05 },
++	{ IMX_8BIT, 0x030B, 0x01 },
++	{ IMX_8BIT, 0x030C, 0x01 },
++	{ IMX_8BIT, 0x030D, 0xA9 },
++	{ IMX_8BIT, 0x030E, 0x01 },
++	{ IMX_8BIT, 0x3A06, 0x11 },
++
++	/* Mode setting */
++	{ IMX_8BIT, 0x0108, 0x03 },
++	{ IMX_8BIT, 0x0112, 0x0A },
++	{ IMX_8BIT, 0x0113, 0x0A },
++	{ IMX_8BIT, 0x0381, 0x01 },
++	{ IMX_8BIT, 0x0383, 0x01 },
++	{ IMX_8BIT, 0x0385, 0x01 },
++	{ IMX_8BIT, 0x0387, 0x01 },
++	{ IMX_8BIT, 0x0390, 0x00 },	/* binning */
++	{ IMX_8BIT, 0x0391, 0x11 },	/* no binning */
++	{ IMX_8BIT, 0x0392, 0x00 },
++	{ IMX_8BIT, 0x0401, 0x02 },	/* resize */
++	{ IMX_8BIT, 0x0404, 0x00 },
++	{ IMX_8BIT, 0x0405, 0x22 },	/* 34/16=2.125 */
++	{ IMX_8BIT, 0x4082, 0x00 },	/* ?? */
++	{ IMX_8BIT, 0x4083, 0x00 },	/* ?? */
++	{ IMX_8BIT, 0x7006, 0x04 },
++
++	/* Optionnal Function setting */
++	{ IMX_8BIT, 0x0700, 0x00 },
++	{ IMX_8BIT, 0x3A63, 0x00 },
++	{ IMX_8BIT, 0x4100, 0xF8 },
++	{ IMX_8BIT, 0x4203, 0xFF },
++	{ IMX_8BIT, 0x4344, 0x00 },
++	{ IMX_8BIT, 0x441C, 0x01 },
++
++	/* Size setting */
++	{ IMX_8BIT, 0x0344, 0x00 },      /* x_addr_start[15:8]:136 */
++	{ IMX_8BIT, 0x0345, 0x80 },      /* x_addr_start[7:0] */
++	{ IMX_8BIT, 0x0346, 0x00 },      /* y_addr_start[15:8]:0 */
++	{ IMX_8BIT, 0x0347, 0x00 },      /* y_addr_start[7:0] */
++	{ IMX_8BIT, 0x0348, 0x0C },      /* x_addr_end[15:8]:3145+134-1 */
++	{ IMX_8BIT, 0x0349, 0x51 },      /* x_addr_end[7:0] */
++	{ IMX_8BIT, 0x034A, 0x09 },      /* y_addr_end[15:8]:2463 */
++	{ IMX_8BIT, 0x034B, 0xB1 },      /* y_addr_end[7:0] */
++	{ IMX_8BIT, 0x034C, 0x05 },      /* x_output_size[15:8]: 1424*/
++	{ IMX_8BIT, 0x034D, 0x90 },      /* x_output_size[7:0] */
++	{ IMX_8BIT, 0x034E, 0x04 },      /* y_output_size[15:8]:1168 */
++	{ IMX_8BIT, 0x034F, 0x90 },      /* y_output_size[7:0] */
++	{ IMX_8BIT, 0x0350, 0x00 },
++	{ IMX_8BIT, 0x0351, 0x00 },
++	{ IMX_8BIT, 0x0352, 0x00 },
++	{ IMX_8BIT, 0x0353, 0x00 },
++
++	{ IMX_8BIT, 0x0354, 0x0B },
++	{ IMX_8BIT, 0x0355, 0xD2 },
++	{ IMX_8BIT, 0x0356, 0x09 },
++	{ IMX_8BIT, 0x0357, 0xB2 },
++
++	{ IMX_8BIT, 0x301D, 0x30 },
++
++	{ IMX_8BIT, 0x3310, 0x05 },
++	{ IMX_8BIT, 0x3311, 0x90 },
++	{ IMX_8BIT, 0x3312, 0x04 },
++	{ IMX_8BIT, 0x3313, 0x90 },
++
++	{ IMX_8BIT, 0x331C, 0x02 },
++	{ IMX_8BIT, 0x331D, 0xD0 },
++	{ IMX_8BIT, 0x4084, 0x05 },
++	{ IMX_8BIT, 0x4085, 0x90 },
++	{ IMX_8BIT, 0x4086, 0x04 },
++	{ IMX_8BIT, 0x4087, 0x90 },
++	{ IMX_8BIT, 0x4400, 0x00 },
++
++	/* Global Timing Setting */
++	{ IMX_8BIT, 0x0830, 0x77 },
++	{ IMX_8BIT, 0x0831, 0x2F },
++	{ IMX_8BIT, 0x0832, 0x4F },
++	{ IMX_8BIT, 0x0833, 0x37 },
++	{ IMX_8BIT, 0x0834, 0x2F },
++	{ IMX_8BIT, 0x0835, 0x37 },
++	{ IMX_8BIT, 0x0836, 0xAF },
++	{ IMX_8BIT, 0x0837, 0x37 },
++	{ IMX_8BIT, 0x0839, 0x1F },
++	{ IMX_8BIT, 0x083A, 0x17 },
++	{ IMX_8BIT, 0x083B, 0x02 },
++
++	/* Integration Time Setting */
++	{ IMX_8BIT, 0x0202, 0x09 },
++	{ IMX_8BIT, 0x0203, 0xD2 },
++
++	/* HDR Setting */
++	{ IMX_8BIT, 0x0230, 0x00 },
++	{ IMX_8BIT, 0x0231, 0x00 },
++	{ IMX_8BIT, 0x0233, 0x00 },
++	{ IMX_8BIT, 0x0234, 0x00 },
++	{ IMX_8BIT, 0x0235, 0x40 },
++	{ IMX_8BIT, 0x0238, 0x00 },
++	{ IMX_8BIT, 0x0239, 0x04 },
++	{ IMX_8BIT, 0x023B, 0x00 },
++	{ IMX_8BIT, 0x023C, 0x01 },
++	{ IMX_8BIT, 0x33B0, 0x04 },
++	{ IMX_8BIT, 0x33B1, 0x00 },
++	{ IMX_8BIT, 0x33B3, 0x00 },
++	{ IMX_8BIT, 0x33B4, 0x01 },
++	{ IMX_8BIT, 0x3800, 0x00 },
++	{ IMX_TOK_TERM, 0, 0 }
++};
++
+ /* 4 lane, 1/4 binning, 16/35 down scaling, 30fps, dvs */
+ static struct imx_reg const imx134_240_196_30fps[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
+@@ -1294,6 +1643,8 @@ static struct imx_reg const imx134_1568_880_30fps[] = {
+ 
+ static struct imx_reg const imx134_1568_876_60fps_0625[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
++	/* mode set clear */
++	{ IMX_8BIT, 0x3A43, 0x01 },
+ 	/* Clock Setting */
+ 	{ IMX_8BIT, 0x011E, 0x13 },
+ 	{ IMX_8BIT, 0x011F, 0x33 },
+@@ -1406,6 +1757,8 @@ static struct imx_reg const imx134_1568_876_60fps_0625[] = {
+ /* 4 lane for 720p dvs,  vendor provide */
+ static struct imx_reg const imx134_1568_880[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
++	/* mode set clear */
++	{ IMX_8BIT, 0x3A43, 0x01 },
+ 	/* Clock Setting */
+ 	{ IMX_8BIT, 0x011E, 0x13 },
+ 	{ IMX_8BIT, 0x011F, 0x33 },
+@@ -1629,6 +1982,8 @@ static struct imx_reg const imx134_880_592[] = {
+ };
+ static struct imx_reg const imx134_2336_1308_60fps[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
++	/* mode set clear */
++	{ IMX_8BIT, 0x3A43, 0x01 },
+ 	/* Clock Setting */
+ 	{ IMX_8BIT, 0x011E, 0x13 },
+ 	{ IMX_8BIT, 0x011F, 0x33 },
+@@ -1757,6 +2112,24 @@ struct imx_resolution imx134_res_preview[] = {
+ 		.used = 0,
+ 	},
+ 	{
++		.desc = "imx134_820_552_30fps_preview",
++		.regs = imx134_820_552_30fps,
++		.width = 820,
++		.height = 552,
++		.fps_options = {
++			{
++				 .fps = 30,
++				 .pixels_per_line = 3600,
++				 .lines_per_frame = 2518,
++			},
++			{
++			}
++		},
++		.bin_factor_x = 2,
++		.bin_factor_y = 2,
++		.used = 0,
++	},
++	{
+ 		.desc = "imx134_820_616_preview_30fps",
+ 		.regs = imx134_820_616_30fps,
+ 		.width = 820,
+@@ -1833,9 +2206,9 @@ struct imx_resolution imx134_res_preview[] = {
+ struct imx_resolution imx134_res_still[] = {
+ 	{
+ 		.desc = "imx134_CIF_30fps",
+-		.regs = imx134_720_592_30fps,
+-		.width = 720,
+-		.height = 592,
++		.regs = imx134_1424_1168_30fps,
++		.width = 1424,
++		.height = 1168,
+ 		.fps_options = {
+ 			{
+ 				 .fps = 30,
+@@ -1845,15 +2218,15 @@ struct imx_resolution imx134_res_still[] = {
+ 			{
+ 			}
+ 		},
+-		.bin_factor_x = 2,
+-		.bin_factor_y = 2,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.used = 0,
+ 	},
+ 	{
+ 		.desc = "imx134_VGA_still_30fps",
+-		.regs = imx134_820_616_30fps,
+-		.width = 820,
+-		.height = 616,
++		.regs = imx134_1640_1232_30fps,
++		.width = 1640,
++		.height = 1232,
+ 		.fps_options = {
+ 			{
+ 				 .fps = 30,
+@@ -1863,8 +2236,8 @@ struct imx_resolution imx134_res_still[] = {
+ 			{
+ 			}
+ 		},
+-		.bin_factor_x = 2,
+-		.bin_factor_y = 2,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.used = 0,
+ 	},
+ 	{
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx135.h b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx135.h
+index f407dc4..58b43af 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx135.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx135.h
+@@ -653,6 +653,404 @@ static struct imx_reg const imx135_10m_for_mipi_342[] = {
+ 	{IMX_TOK_TERM, 0, 0},
+ };
+ 
++/*
++ * It is 8.5 DS from (3:2)8m cropped setting.
++ *
++ * The 8m(3:2) cropped setting is 2992x2448 effective res.
++ * The ISP effect cropped setting should be 1408x1152 effect res.
++ *
++ * Consider ISP 16x16 padding:
++ * sensor outputs 368x304
++ * cropped region is 3128x2584
++ */
++static struct imx_reg const imx135_368x304_cropped[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
++	/* Mode setting */
++	{IMX_8BIT, 0x0108, 0x03},
++	{IMX_8BIT, 0x0112, 0x0A},
++	{IMX_8BIT, 0x0113, 0x0A},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0387, 0x01},
++	{IMX_8BIT, 0x0390, 0x00},
++	{IMX_8BIT, 0x0391, 0x11}, /* no binning */
++	{IMX_8BIT, 0x0392, 0x00},
++	{IMX_8BIT, 0x0401, 0x02}, /* resize */
++	{IMX_8BIT, 0x0404, 0x00},
++	{IMX_8BIT, 0x0405, 0x88}, /* 136/16=8.5 */
++	{IMX_8BIT, 0x4082, 0x00},
++	{IMX_8BIT, 0x4083, 0x00},
++	{IMX_8BIT, 0x4203, 0xFF},
++	{IMX_8BIT, 0x7006, 0x04},
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x02}, /* X_ADD_STA */
++	{IMX_8BIT, 0x0345, 0x1C}, /* 540 */
++	{IMX_8BIT, 0x0346, 0x01}, /* Y_ADD_STA */
++	{IMX_8BIT, 0x0347, 0x0C}, /* 268 */
++	{IMX_8BIT, 0x0348, 0x0E}, /* X_ADD_END */
++	{IMX_8BIT, 0x0349, 0x53}, /* 3667 */
++	{IMX_8BIT, 0x034A, 0x0B}, /* Y_ADD_END */
++	{IMX_8BIT, 0x034B, 0x23}, /* 2851 */
++	{IMX_8BIT, 0x034C, 0x01}, /* X_OUT_SIZE */
++	{IMX_8BIT, 0x034D, 0x70}, /* 368 */
++	{IMX_8BIT, 0x034E, 0x01}, /* Y_OUT_SIZE */
++	{IMX_8BIT, 0x034F, 0x30}, /* 304 */
++	{IMX_8BIT, 0x0350, 0x00}, /* No Dig crop */
++	{IMX_8BIT, 0x0351, 0x00},
++	{IMX_8BIT, 0x0352, 0x00},
++	{IMX_8BIT, 0x0353, 0x00},
++	{IMX_8BIT, 0x0354, 0x0C}, /* Cut out siz same as the size after crop */
++	{IMX_8BIT, 0x0355, 0x38},
++	{IMX_8BIT, 0x0356, 0x0A},
++	{IMX_8BIT, 0x0357, 0x18},
++	{IMX_8BIT, 0x301D, 0x30}, /* ?? */
++	{IMX_8BIT, 0x3310, 0x01}, /* Write H and V size  same as output size? */
++	{IMX_8BIT, 0x3311, 0x70},
++	{IMX_8BIT, 0x3312, 0x01},
++	{IMX_8BIT, 0x3313, 0x30},
++	{IMX_8BIT, 0x331C, 0x02}, /* ?? */
++	{IMX_8BIT, 0x331D, 0xD0},
++	{IMX_8BIT, 0x4084, 0x01}, /* Scaling related? */
++	{IMX_8BIT, 0x4085, 0x70},
++	{IMX_8BIT, 0x4086, 0x01},
++	{IMX_8BIT, 0x4087, 0x30},
++	{IMX_8BIT, 0x4400, 0x00}, /* STATS off */
++	{IMX_TOK_TERM, 0, 0},
++};
++
++/*
++ * It is 1/4 binning from 8m cropped setting.
++ *
++ * The 8m cropped setting is 3264x2448 effective res.
++ * The xga cropped setting should be 816x612 effect res.
++ *
++ * Consider ISP 16x16 padding:
++ * sensor outputs 832x628
++ * cropped region is 3328x2512
++ */
++static struct imx_reg const imx135_xga_cropped[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
++	/* Mode setting */
++	{IMX_8BIT, 0x0108, 0x03},
++	{IMX_8BIT, 0x0112, 0x0A},
++	{IMX_8BIT, 0x0113, 0x0A},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0387, 0x01},
++	{IMX_8BIT, 0x0390, 0x01},
++	{IMX_8BIT, 0x0391, 0x44},
++	{IMX_8BIT, 0x0392, 0x00},
++	{IMX_8BIT, 0x0401, 0x00},
++	{IMX_8BIT, 0x0404, 0x00},
++	{IMX_8BIT, 0x0405, 0x10},
++	{IMX_8BIT, 0x4082, 0x00},
++	{IMX_8BIT, 0x4083, 0x00},
++/*	{IMX_8BIT, 0x4203, 0xFF}, */
++	{IMX_8BIT, 0x7006, 0x04},
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x01}, /* X_ADD_STA */
++	{IMX_8BIT, 0x0345, 0xB8}, /* 440 */
++	{IMX_8BIT, 0x0346, 0x01}, /* Y_ADD_STA */
++	{IMX_8BIT, 0x0347, 0x30}, /* 304 */
++	{IMX_8BIT, 0x0348, 0x0E}, /* X_ADD_END */
++	{IMX_8BIT, 0x0349, 0xB7}, /* 4207-440=3767 */
++	{IMX_8BIT, 0x034A, 0x0A}, /* Y_ADD_END */
++	{IMX_8BIT, 0x034B, 0xFF}, /* 3119-304=2815 */
++	{IMX_8BIT, 0x034C, 0x03}, /* X_OUT_SIZE */
++	{IMX_8BIT, 0x034D, 0x40}, /* 832 */
++	{IMX_8BIT, 0x034E, 0x02}, /* Y_OUT_SIZE */
++	{IMX_8BIT, 0x034F, 0x74}, /* 628 */
++	{IMX_8BIT, 0x0350, 0x00}, /* No Dig crop */
++	{IMX_8BIT, 0x0351, 0x00},
++	{IMX_8BIT, 0x0352, 0x00},
++	{IMX_8BIT, 0x0353, 0x00},
++	{IMX_8BIT, 0x0354, 0x03}, /* Cut out size same as the size after crop */
++	{IMX_8BIT, 0x0355, 0x40},
++	{IMX_8BIT, 0x0356, 0x02},
++	{IMX_8BIT, 0x0357, 0x74},
++	{IMX_8BIT, 0x301D, 0x30}, /* ?? */
++	{IMX_8BIT, 0x3310, 0x03}, /* Write H and V size  same as output size? */
++	{IMX_8BIT, 0x3311, 0x40},
++	{IMX_8BIT, 0x3312, 0x02},
++	{IMX_8BIT, 0x3313, 0x74},
++	{IMX_8BIT, 0x331C, 0x02}, /* ?? */
++	{IMX_8BIT, 0x331D, 0x21},
++	{IMX_8BIT, 0x4084, 0x03}, /* Scaling related? */
++	{IMX_8BIT, 0x4085, 0x40},
++	{IMX_8BIT, 0x4086, 0x02},
++	{IMX_8BIT, 0x4087, 0x74},
++	{IMX_8BIT, 0x4400, 0x00}, /* STATS off */
++	{IMX_TOK_TERM, 0, 0},
++};
++
++/*
++ * It is 28/16 DS from (16:9)8m cropped setting.
++ *
++ * The 8m(16:9) cropped setting is 3360x1890 effective res.
++ * - this is larger then the expected 3264x1836 FOV
++ *
++ * Consider ISP 16x16 padding:
++ * sensor outputs 1936x1096
++ * cropped region is 3388x1918
++ */
++static struct imx_reg const imx135_1936x1096_cropped[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
++	/* Mode setting */
++	{IMX_8BIT, 0x0108, 0x03},
++	{IMX_8BIT, 0x0112, 0x0A},
++	{IMX_8BIT, 0x0113, 0x0A},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0387, 0x01},
++	{IMX_8BIT, 0x0390, 0x00},
++	{IMX_8BIT, 0x0391, 0x11}, /* no binning */
++	{IMX_8BIT, 0x0392, 0x00},
++	{IMX_8BIT, 0x0401, 0x02}, /* resize */
++	{IMX_8BIT, 0x0404, 0x00},
++	{IMX_8BIT, 0x0405, 0x1C}, /* 28/16 */
++	{IMX_8BIT, 0x4082, 0x00},
++	{IMX_8BIT, 0x4083, 0x00},
++	{IMX_8BIT, 0x4203, 0xFF},
++	{IMX_8BIT, 0x7006, 0x04},
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x01}, /* X_ADD_STA */
++	{IMX_8BIT, 0x0345, 0x9A}, /* 410 */
++	{IMX_8BIT, 0x0346, 0x02}, /* Y_ADD_STA */
++	{IMX_8BIT, 0x0347, 0x58}, /* 600 */
++	{IMX_8BIT, 0x0348, 0x0E}, /* X_ADD_END */
++	{IMX_8BIT, 0x0349, 0xD5}, /* 3797 */
++	{IMX_8BIT, 0x034A, 0x09}, /* Y_ADD_END */
++	{IMX_8BIT, 0x034B, 0xD5}, /* 2517 */
++	{IMX_8BIT, 0x034C, 0x07}, /* X_OUT_SIZE */
++	{IMX_8BIT, 0x034D, 0x90}, /* 1936 */
++	{IMX_8BIT, 0x034E, 0x04}, /* Y_OUT_SIZE */
++	{IMX_8BIT, 0x034F, 0x48}, /* 1096 */
++	{IMX_8BIT, 0x0350, 0x00}, /* No Dig crop */
++	{IMX_8BIT, 0x0351, 0x00},
++	{IMX_8BIT, 0x0352, 0x00},
++	{IMX_8BIT, 0x0353, 0x00},
++	{IMX_8BIT, 0x0354, 0x0D}, /* Cut out siz same as the size after crop */
++	{IMX_8BIT, 0x0355, 0x3C},
++	{IMX_8BIT, 0x0356, 0x07},
++	{IMX_8BIT, 0x0357, 0x7E},
++	{IMX_8BIT, 0x301D, 0x30}, /* ?? */
++	{IMX_8BIT, 0x3310, 0x07}, /* Write H and V size  same as output size? */
++	{IMX_8BIT, 0x3311, 0x90},
++	{IMX_8BIT, 0x3312, 0x04},
++	{IMX_8BIT, 0x3313, 0x48},
++	{IMX_8BIT, 0x331C, 0x00}, /* ?? */
++	{IMX_8BIT, 0x331D, 0xAA},
++	{IMX_8BIT, 0x4084, 0x07}, /* Scaling related? */
++	{IMX_8BIT, 0x4085, 0x90},
++	{IMX_8BIT, 0x4086, 0x04},
++	{IMX_8BIT, 0x4087, 0x48},
++	{IMX_8BIT, 0x4400, 0x00}, /* STATS off */
++	{IMX_TOK_TERM, 0, 0},
++};
++
++/*
++ * It is 2.125 DS from (3:2)8m cropped setting.
++ *
++ * The 8m(3:2) cropped setting is 2992x2448 effective res.
++ * The ISP effect cropped setting should be 1408x1152 effect res.
++ *
++ * Consider ISP 16x16 padding:
++ * sensor outputs 1424x1168
++ * cropped region is 3026x2482
++ */
++static struct imx_reg const imx135_1424x1168_cropped[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
++	/* Mode setting */
++	{IMX_8BIT, 0x0108, 0x03},
++	{IMX_8BIT, 0x0112, 0x0A},
++	{IMX_8BIT, 0x0113, 0x0A},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0387, 0x01},
++	{IMX_8BIT, 0x0390, 0x00},
++	{IMX_8BIT, 0x0391, 0x11}, /* no binning */
++	{IMX_8BIT, 0x0392, 0x00},
++	{IMX_8BIT, 0x0401, 0x02}, /* resize */
++	{IMX_8BIT, 0x0404, 0x00},
++	{IMX_8BIT, 0x0405, 0x22}, /* 34/16=2.125 */
++	{IMX_8BIT, 0x4082, 0x00},
++	{IMX_8BIT, 0x4083, 0x00},
++	{IMX_8BIT, 0x4203, 0xFF},
++	{IMX_8BIT, 0x7006, 0x04},
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x02}, /* X_ADD_STA */
++	{IMX_8BIT, 0x0345, 0x4E}, /* 590 */
++	{IMX_8BIT, 0x0346, 0x01}, /* Y_ADD_STA */
++	{IMX_8BIT, 0x0347, 0x3E}, /* 318 */
++	{IMX_8BIT, 0x0348, 0x0E}, /* X_ADD_END */
++	{IMX_8BIT, 0x0349, 0x1F}, /* 3615 */
++	{IMX_8BIT, 0x034A, 0x0A}, /* Y_ADD_END */
++	{IMX_8BIT, 0x034B, 0xEF}, /* 2799 */
++	{IMX_8BIT, 0x034C, 0x05}, /* X_OUT_SIZE */
++	{IMX_8BIT, 0x034D, 0x90}, /* 1424 */
++	{IMX_8BIT, 0x034E, 0x04}, /* Y_OUT_SIZE */
++	{IMX_8BIT, 0x034F, 0x90}, /* 1168 */
++	{IMX_8BIT, 0x0350, 0x00}, /* No Dig crop */
++	{IMX_8BIT, 0x0351, 0x00},
++	{IMX_8BIT, 0x0352, 0x00},
++	{IMX_8BIT, 0x0353, 0x00},
++	{IMX_8BIT, 0x0354, 0x0B}, /* Cut out siz same as the size after crop */
++	{IMX_8BIT, 0x0355, 0xD2},
++	{IMX_8BIT, 0x0356, 0x09},
++	{IMX_8BIT, 0x0357, 0xB2},
++	{IMX_8BIT, 0x301D, 0x30}, /* ?? */
++	{IMX_8BIT, 0x3310, 0x05}, /* Write H and V size  same as output size? */
++	{IMX_8BIT, 0x3311, 0x90},
++	{IMX_8BIT, 0x3312, 0x04},
++	{IMX_8BIT, 0x3313, 0x90},
++	{IMX_8BIT, 0x331C, 0x00}, /* ?? */
++	{IMX_8BIT, 0x331D, 0xAA},
++	{IMX_8BIT, 0x4084, 0x05}, /* Scaling related? */
++	{IMX_8BIT, 0x4085, 0x90},
++	{IMX_8BIT, 0x4086, 0x04},
++	{IMX_8BIT, 0x4087, 0x90},
++	{IMX_8BIT, 0x4400, 0x00}, /* STATS off */
++	{IMX_TOK_TERM, 0, 0},
++};
++
++/*
++ * It is 1/2 binning from 8m cropped setting.
++ *
++ * The 8m cropped setting is 3264x2448 effective res.
++ * The 2m cropped setting should be 1632x1224 effect res.
++ *
++ * Consider ISP 16x16 padding:
++ * sensor outputs 1648x1240
++ * cropped region is 3296x2480
++ */
++static struct imx_reg const imx135_2m_cropped[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
++	/* Mode setting */
++	{IMX_8BIT, 0x0108, 0x03},
++	{IMX_8BIT, 0x0112, 0x0A},
++	{IMX_8BIT, 0x0113, 0x0A},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0387, 0x01},
++	{IMX_8BIT, 0x0390, 0x01},
++	{IMX_8BIT, 0x0391, 0x22},
++	{IMX_8BIT, 0x0392, 0x00},
++	{IMX_8BIT, 0x0401, 0x00},
++	{IMX_8BIT, 0x0404, 0x00},
++	{IMX_8BIT, 0x0405, 0x10},
++	{IMX_8BIT, 0x4082, 0x01},
++	{IMX_8BIT, 0x4083, 0x01},
++	{IMX_8BIT, 0x4203, 0xFF},
++	{IMX_8BIT, 0x7006, 0x04},
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x01}, /* X_ADD_STA */
++	{IMX_8BIT, 0x0345, 0xC8}, /* 464(1D0) -> 456(1C8)*/
++	{IMX_8BIT, 0x0346, 0x01}, /* Y_ADD_STA */
++	{IMX_8BIT, 0x0347, 0x40}, /* 320 */
++	{IMX_8BIT, 0x0348, 0x0E}, /* X_ADD_END */
++	{IMX_8BIT, 0x0349, 0xA7}, /* 4207-456=3751 */
++	{IMX_8BIT, 0x034A, 0x0A}, /* Y_ADD_END */
++	{IMX_8BIT, 0x034B, 0xEF}, /* 3119-320=2799 */
++	{IMX_8BIT, 0x034C, 0x06}, /* X_OUT_SIZE */
++	{IMX_8BIT, 0x034D, 0x70}, /* 1648 */
++	{IMX_8BIT, 0x034E, 0x04}, /* Y_OUT_SIZE */
++	{IMX_8BIT, 0x034F, 0xD8}, /* 1240 */
++	{IMX_8BIT, 0x0350, 0x00}, /* No Dig crop */
++	{IMX_8BIT, 0x0351, 0x00},
++	{IMX_8BIT, 0x0352, 0x00},
++	{IMX_8BIT, 0x0353, 0x00},
++	{IMX_8BIT, 0x0354, 0x06}, /* Cut out size same as the size after crop */
++	{IMX_8BIT, 0x0355, 0x70},
++	{IMX_8BIT, 0x0356, 0x04},
++	{IMX_8BIT, 0x0357, 0xD8},
++	{IMX_8BIT, 0x301D, 0x30}, /* ?? */
++	{IMX_8BIT, 0x3310, 0x06}, /* Write H and V size  same as output size? */
++	{IMX_8BIT, 0x3311, 0x70},
++	{IMX_8BIT, 0x3312, 0x04},
++	{IMX_8BIT, 0x3313, 0xD8},
++	{IMX_8BIT, 0x331C, 0x00}, /* ?? */
++	{IMX_8BIT, 0x331D, 0xAA},
++	{IMX_8BIT, 0x4084, 0x00}, /* Scaling related? */
++	{IMX_8BIT, 0x4085, 0x00},
++	{IMX_8BIT, 0x4086, 0x00},
++	{IMX_8BIT, 0x4087, 0x00},
++	{IMX_8BIT, 0x4400, 0x00}, /* STATS off */
++	{IMX_TOK_TERM, 0, 0},
++};
++
++/*
++ * 8M Cropped 16:9 setting
++ *
++ * Effect res: 3264x1836
++ * Sensor out: 3280x1852
++ */
++static struct imx_reg const imx135_6m_cropped[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_451_2MHZ_SALTBAY,
++	/* Mode setting */
++	{IMX_8BIT, 0x0108, 0x03},
++	{IMX_8BIT, 0x0112, 0x0A},
++	{IMX_8BIT, 0x0113, 0x0A},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0387, 0x01},
++	{IMX_8BIT, 0x0390, 0x00},
++	{IMX_8BIT, 0x0391, 0x11},
++	{IMX_8BIT, 0x0392, 0x00},
++	{IMX_8BIT, 0x0401, 0x00},
++	{IMX_8BIT, 0x0404, 0x00},
++	{IMX_8BIT, 0x0405, 0x10},
++	{IMX_8BIT, 0x4082, 0x01},
++	{IMX_8BIT, 0x4083, 0x01},
++	{IMX_8BIT, 0x4203, 0xFF},
++	{IMX_8BIT, 0x7006, 0x04},
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x01},
++	{IMX_8BIT, 0x0345, 0xD0},
++	{IMX_8BIT, 0x0346, 0x02}, /* 634 */
++	{IMX_8BIT, 0x0347, 0x7A},
++	{IMX_8BIT, 0x0348, 0x0E},
++	{IMX_8BIT, 0x0349, 0x9F},
++	{IMX_8BIT, 0x034A, 0x09}, /* 2485 */
++	{IMX_8BIT, 0x034B, 0xB5},
++	{IMX_8BIT, 0x034C, 0x0C}, /* 3280 */
++	{IMX_8BIT, 0x034D, 0xD0},
++	{IMX_8BIT, 0x034E, 0x07}, /* 1852 */
++	{IMX_8BIT, 0x034F, 0x3C},
++	{IMX_8BIT, 0x0350, 0x00}, /* No Dig crop */
++	{IMX_8BIT, 0x0351, 0x00},
++	{IMX_8BIT, 0x0352, 0x00},
++	{IMX_8BIT, 0x0353, 0x00},
++	{IMX_8BIT, 0x0354, 0x0C}, /* Cut out size same as the size after crop */
++	{IMX_8BIT, 0x0355, 0xD0},
++	{IMX_8BIT, 0x0356, 0x07},
++	{IMX_8BIT, 0x0357, 0x3C},
++	{IMX_8BIT, 0x301D, 0x30}, /* ?? */
++	{IMX_8BIT, 0x3310, 0x0C}, /* Write H and V size  same as output size? */
++	{IMX_8BIT, 0x3311, 0xD0},
++	{IMX_8BIT, 0x3312, 0x07},
++	{IMX_8BIT, 0x3313, 0x3C},
++	{IMX_8BIT, 0x331C, 0x00}, /* ?? */
++	{IMX_8BIT, 0x331D, 0x10},
++	{IMX_8BIT, 0x4084, 0x00}, /* Scaling related? */
++	{IMX_8BIT, 0x4085, 0x00},
++	{IMX_8BIT, 0x4086, 0x00},
++	{IMX_8BIT, 0x4087, 0x00},
++	{IMX_8BIT, 0x4400, 0x00}, /* STATS off */
++	{IMX_TOK_TERM, 0, 0},
++};
++
+ static struct imx_reg const imx135_8m_cropped[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
+ 	PLL_SETTINGS_FOR_MIPI_451_2MHZ_SALTBAY,
+@@ -683,9 +1081,9 @@ static struct imx_reg const imx135_8m_cropped[] = {
+ 	{IMX_8BIT, 0x0349, 0x9F},
+ 	{IMX_8BIT, 0x034A, 0x0A},
+ 	{IMX_8BIT, 0x034B, 0xE7},
+-	{IMX_8BIT, 0x034C, 0x0C}, /* 3280x2464 */
++	{IMX_8BIT, 0x034C, 0x0C}, /* 3280 */
+ 	{IMX_8BIT, 0x034D, 0xD0},
+-	{IMX_8BIT, 0x034E, 0x09},
++	{IMX_8BIT, 0x034E, 0x09}, /* 2464 */
+ 	{IMX_8BIT, 0x034F, 0xA0},
+ 	{IMX_8BIT, 0x0350, 0x00}, /* No Dig crop */
+ 	{IMX_8BIT, 0x0351, 0x00},
+@@ -938,6 +1336,68 @@ static struct imx_reg const imx135_6m_for_mipi_342[] = {
+ 	{IMX_TOK_TERM, 0, 0},
+ };
+ 
++/*
++ * FOV is: 3280x2464, larger then 3264x2448.
++ * Sensor output: 336x256
++ * Cropping region: 3444x2624
++ */
++static struct imx_reg const imx135_336x256[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
++	/* mode setting */
++	{IMX_8BIT, 0x0108, 0x03},
++	{IMX_8BIT, 0x0112, 0x0A},
++	{IMX_8BIT, 0x0113, 0x0A},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0387, 0x01},
++	{IMX_8BIT, 0x0390, 0x01},
++	{IMX_8BIT, 0x0391, 0x22},
++	{IMX_8BIT, 0x0392, 0x00},
++	{IMX_8BIT, 0x0401, 0x02}, /* 2x binning */
++	{IMX_8BIT, 0x0404, 0x00},
++	{IMX_8BIT, 0x0405, 0x52}, /* scaling: 82/16 */
++	{IMX_8BIT, 0x4082, 0x00},
++	{IMX_8BIT, 0x4083, 0x00},
++	{IMX_8BIT, 0x4203, 0xFF},
++	{IMX_8BIT, 0x7006, 0x04},
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x01}, /* x_start: 374 */
++	{IMX_8BIT, 0x0345, 0x76},
++	{IMX_8BIT, 0x0346, 0x00}, /* y_start: 248 */
++	{IMX_8BIT, 0x0347, 0xF8},
++	{IMX_8BIT, 0x0348, 0x0E}, /* x_end: 3817 */
++	{IMX_8BIT, 0x0349, 0xE9},
++	{IMX_8BIT, 0x034A, 0x0B}, /* y_end: 2871 */
++	{IMX_8BIT, 0x034B, 0x37},
++	{IMX_8BIT, 0x034C, 0x01}, /* x_out: 336 */
++	{IMX_8BIT, 0x034D, 0x50},
++	{IMX_8BIT, 0x034E, 0x01}, /* y_out: 256 */
++	{IMX_8BIT, 0x034F, 0x00},
++	{IMX_8BIT, 0x0350, 0x00},
++	{IMX_8BIT, 0x0351, 0x00},
++	{IMX_8BIT, 0x0352, 0x00},
++	{IMX_8BIT, 0x0353, 0x00},
++	{IMX_8BIT, 0x0354, 0x06}, /* dig x_out: 1722 */
++	{IMX_8BIT, 0x0355, 0xBA},
++	{IMX_8BIT, 0x0356, 0x05}, /* dig y_out: 1312  */
++	{IMX_8BIT, 0x0357, 0x20},
++	{IMX_8BIT, 0x301D, 0x30},
++	{IMX_8BIT, 0x3310, 0x01}, /* ?: x_out */
++	{IMX_8BIT, 0x3311, 0x50},
++	{IMX_8BIT, 0x3312, 0x01}, /* ?: y_out */
++	{IMX_8BIT, 0x3313, 0x00},
++	{IMX_8BIT, 0x331C, 0x02},
++	{IMX_8BIT, 0x331D, 0x4E},
++	{IMX_8BIT, 0x4084, 0x01}, /* ?: x_out */
++	{IMX_8BIT, 0x4085, 0x50},
++	{IMX_8BIT, 0x4086, 0x01}, /* ?: y_out */
++	{IMX_8BIT, 0x4087, 0x00},
++	{IMX_8BIT, 0x4400, 0x00},
++	{IMX_TOK_TERM, 0, 0},
++};
++
+ static struct imx_reg const imx135_1m[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
+ 	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
+@@ -1565,6 +2025,63 @@ static const struct imx_reg imx135_wvga_dvs_binning[] = {
+ 	{IMX_TOK_TERM, 0, 0}
+ };
+ 
++/* 480P 1036 x 696 */
++static const struct imx_reg imx135_480p_binning[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
++	/* Mode setting */
++	{IMX_8BIT, 0x0108, 0x03 },
++	{IMX_8BIT, 0x0112, 0x0A },
++	{IMX_8BIT, 0x0113, 0x0A },
++	{IMX_8BIT, 0x0381, 0x01 },
++	{IMX_8BIT, 0x0383, 0x01 },
++	{IMX_8BIT, 0x0385, 0x01 },
++	{IMX_8BIT, 0x0387, 0x01 },
++	{IMX_8BIT, 0x0390, 0x01 },
++	{IMX_8BIT, 0x0391, 0x44 },
++	{IMX_8BIT, 0x0392, 0x00 },
++	{IMX_8BIT, 0x0401, 0x00 },
++	{IMX_8BIT, 0x0404, 0x00 },
++	{IMX_8BIT, 0x0405, 0x10 },/* No scal */
++	{IMX_8BIT, 0x4082, 0x00 },
++	{IMX_8BIT, 0x4083, 0x00 },
++	{IMX_8BIT, 0x7006, 0x04 },
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x00 }, /* 52,20,4155, 3099 4144x2784*/
++	{IMX_8BIT, 0x0345, 0x20 },
++	{IMX_8BIT, 0x0346, 0x00 },
++	{IMX_8BIT, 0x0347, 0xA8 },
++	{IMX_8BIT, 0x0348, 0x10 },
++	{IMX_8BIT, 0x0349, 0x4F },
++	{IMX_8BIT, 0x034A, 0x0B },
++	{IMX_8BIT, 0x034B, 0x88 },
++	{IMX_8BIT, 0x034C, 0x04 }, /* 1036 * 696 */
++	{IMX_8BIT, 0x034D, 0x0C },
++	{IMX_8BIT, 0x034E, 0x02 },
++	{IMX_8BIT, 0x034F, 0xB8 },
++	{IMX_8BIT, 0x0350, 0x00 },
++	{IMX_8BIT, 0x0351, 0x00 },
++	{IMX_8BIT, 0x0352, 0x00 },
++	{IMX_8BIT, 0x0353, 0x00 },
++	{IMX_8BIT, 0x0354, 0x04 }, /* 1036x696 */
++	{IMX_8BIT, 0x0355, 0x0C },
++	{IMX_8BIT, 0x0356, 0x02 },
++	{IMX_8BIT, 0x0357, 0xB8 },
++	{IMX_8BIT, 0x301D, 0x30 },
++	{IMX_8BIT, 0x3310, 0x04 },
++	{IMX_8BIT, 0x3311, 0x0C },
++	{IMX_8BIT, 0x3312, 0x02 },
++	{IMX_8BIT, 0x3313, 0xB8 },
++	{IMX_8BIT, 0x331C, 0x02 },
++	{IMX_8BIT, 0x331D, 0x21 },
++	{IMX_8BIT, 0x4084, 0x04 },
++	{IMX_8BIT, 0x4085, 0x0C },
++	{IMX_8BIT, 0x4086, 0x02 },
++	{IMX_8BIT, 0x4087, 0xB8 },
++	{IMX_8BIT, 0x4400, 0x00 },
++	{IMX_TOK_TERM, 0, 0}
++};
++
+ /* 480P DVS 936 x 602 */
+ static const struct imx_reg imx135_480p_dvs_binning[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
+@@ -1622,6 +2139,63 @@ static const struct imx_reg imx135_480p_dvs_binning[] = {
+ 	{ IMX_TOK_TERM, 0, 0}
+ };
+ 
++/* VGA: H : 1036 V : 780 */
++static const struct imx_reg imx135_vga_binning[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
++	/* Mode setting */
++	{IMX_8BIT, 0x0108, 0x03 },
++	{IMX_8BIT, 0x0112, 0x0A },
++	{IMX_8BIT, 0x0113, 0x0A },
++	{IMX_8BIT, 0x0381, 0x01 },
++	{IMX_8BIT, 0x0383, 0x01 },
++	{IMX_8BIT, 0x0385, 0x01 },
++	{IMX_8BIT, 0x0387, 0x01 },
++	{IMX_8BIT, 0x0390, 0x01 },
++	{IMX_8BIT, 0x0391, 0x44 },
++	{IMX_8BIT, 0x0392, 0x00 },
++	{IMX_8BIT, 0x0401, 0x00 },
++	{IMX_8BIT, 0x0404, 0x00 },
++	{IMX_8BIT, 0x0405, 0x10 },
++	{IMX_8BIT, 0x4082, 0x00 },
++	{IMX_8BIT, 0x4083, 0x00 },
++	{IMX_8BIT, 0x7006, 0x04 },
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x00 }, /* 52,20,4155, 3099 4144x3120*/
++	{IMX_8BIT, 0x0345, 0x20 },
++	{IMX_8BIT, 0x0346, 0x00 },
++	{IMX_8BIT, 0x0347, 0x00 },
++	{IMX_8BIT, 0x0348, 0x10 },
++	{IMX_8BIT, 0x0349, 0x4F },
++	{IMX_8BIT, 0x034A, 0x0C },
++	{IMX_8BIT, 0x034B, 0x2F },
++	{IMX_8BIT, 0x034C, 0x04 }, /* 1036x780 */
++	{IMX_8BIT, 0x034D, 0x0C },
++	{IMX_8BIT, 0x034E, 0x03 },
++	{IMX_8BIT, 0x034F, 0x0C },
++	{IMX_8BIT, 0x0350, 0x00 },
++	{IMX_8BIT, 0x0351, 0x00 },
++	{IMX_8BIT, 0x0352, 0x00 },
++	{IMX_8BIT, 0x0353, 0x00 },
++	{IMX_8BIT, 0x0354, 0x04 }, /* 1036x780 */
++	{IMX_8BIT, 0x0355, 0x0C },
++	{IMX_8BIT, 0x0356, 0x03 },
++	{IMX_8BIT, 0x0357, 0x0C },
++	{IMX_8BIT, 0x301D, 0x30 },
++	{IMX_8BIT, 0x3310, 0x04 },
++	{IMX_8BIT, 0x3311, 0x0C },
++	{IMX_8BIT, 0x3312, 0x03 },
++	{IMX_8BIT, 0x3313, 0x0C },
++	{IMX_8BIT, 0x331C, 0x02 },
++	{IMX_8BIT, 0x331D, 0x21 },
++	{IMX_8BIT, 0x4084, 0x04 },
++	{IMX_8BIT, 0x4085, 0x0C },
++	{IMX_8BIT, 0x4086, 0x03 },
++	{IMX_8BIT, 0x4087, 0x0C },
++	{IMX_8BIT, 0x4400, 0x00 },
++	{IMX_TOK_TERM, 0, 0}
++};
++
+ /* VGA: H : 820 V : 616 */
+ static const struct imx_reg imx135_vga_dvs_binning[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
+@@ -1791,13 +2365,70 @@ static const struct imx_reg imx135_qvga__dvs_binning[] = {
+ 	{IMX_8BIT, 0x4084, 0x01 },
+ 	{IMX_8BIT, 0x4085, 0x98 },
+ 	{IMX_8BIT, 0x4086, 0x01 },
+-	{IMX_8BIT, 0x4087, 0x34 },
++	{IMX_8BIT, 0x4087, 0x34 },
++	{IMX_8BIT, 0x4400, 0x00 },
++	{IMX_TOK_TERM, 0, 0}
++};
++
++/* CIF H : 368 V : 304 */
++static const struct imx_reg imx135_cif_binning[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
++	/* Mode setting */
++	{IMX_8BIT, 0x0108, 0x03 },
++	{IMX_8BIT, 0x0112, 0x0A },
++	{IMX_8BIT, 0x0113, 0x0A },
++	{IMX_8BIT, 0x0381, 0x01 },
++	{IMX_8BIT, 0x0383, 0x01 },
++	{IMX_8BIT, 0x0385, 0x01 },
++	{IMX_8BIT, 0x0387, 0x01 },
++	{IMX_8BIT, 0x0390, 0x01 },
++	{IMX_8BIT, 0x0391, 0x44 },
++	{IMX_8BIT, 0x0392, 0x00 },
++	{IMX_8BIT, 0x0401, 0x02 },
++	{IMX_8BIT, 0x0404, 0x00 },
++	{IMX_8BIT, 0x0405, 0x28 },
++	{IMX_8BIT, 0x4082, 0x00 },
++	{IMX_8BIT, 0x4083, 0x00 },
++	{IMX_8BIT, 0x7006, 0x04 },
++	/* Size setting */
++	{IMX_8BIT, 0x0344, 0x01 }, /* 264,42,3943,3081 3680x3040 */
++	{IMX_8BIT, 0x0345, 0x08 },
++	{IMX_8BIT, 0x0346, 0x00 },
++	{IMX_8BIT, 0x0347, 0x2a },
++	{IMX_8BIT, 0x0348, 0x0F },
++	{IMX_8BIT, 0x0349, 0x67 },
++	{IMX_8BIT, 0x034A, 0x0c },
++	{IMX_8BIT, 0x034B, 0x09 },
++	{IMX_8BIT, 0x034C, 0x01 }, /* 368x304 */
++	{IMX_8BIT, 0x034D, 0x70 },
++	{IMX_8BIT, 0x034E, 0x01 },
++	{IMX_8BIT, 0x034F, 0x30 },
++	{IMX_8BIT, 0x0350, 0x00 },
++	{IMX_8BIT, 0x0351, 0x00 },
++	{IMX_8BIT, 0x0352, 0x00 },
++	{IMX_8BIT, 0x0353, 0x00 },
++	{IMX_8BIT, 0x0354, 0x03 }, /* 920x760 */
++	{IMX_8BIT, 0x0355, 0x98 },
++	{IMX_8BIT, 0x0356, 0x02 },
++	{IMX_8BIT, 0x0357, 0xf8 },
++	{IMX_8BIT, 0x301D, 0x30 },
++	{IMX_8BIT, 0x3310, 0x01 },
++	{IMX_8BIT, 0x3311, 0x70 },
++	{IMX_8BIT, 0x3312, 0x01 },
++	{IMX_8BIT, 0x3313, 0x30 },
++	{IMX_8BIT, 0x331C, 0x02 }, /* TODO! binning 4x4 must be 021c? */
++	{IMX_8BIT, 0x331D, 0x1C },
++	{IMX_8BIT, 0x4084, 0x01 },
++	{IMX_8BIT, 0x4085, 0x70 },
++	{IMX_8BIT, 0x4086, 0x01 },
++	{IMX_8BIT, 0x4087, 0x30 },
+ 	{IMX_8BIT, 0x4400, 0x00 },
+ 	{IMX_TOK_TERM, 0, 0}
+ };
+ 
+-/* CIF H : 368 V : 304 */
+-static const struct imx_reg imx135_cif_binning[] = {
++/* CIF H : 1888 V : 1548 */
++static const struct imx_reg imx135_cif_binning_1888x1548[] = {
+ 	GROUPED_PARAMETER_HOLD_ENABLE,
+ 	PLL_SETTINGS_FOR_MIPI_209_6MHZ_SALTBAY,
+ 	/* Mode setting */
+@@ -1809,46 +2440,46 @@ static const struct imx_reg imx135_cif_binning[] = {
+ 	{IMX_8BIT, 0x0385, 0x01 },
+ 	{IMX_8BIT, 0x0387, 0x01 },
+ 	{IMX_8BIT, 0x0390, 0x01 },
+-	{IMX_8BIT, 0x0391, 0x44 },
++	{IMX_8BIT, 0x0391, 0x22 },
+ 	{IMX_8BIT, 0x0392, 0x00 },
+-	{IMX_8BIT, 0x0401, 0x02 },
++	{IMX_8BIT, 0x0401, 0x00 },
+ 	{IMX_8BIT, 0x0404, 0x00 },
+-	{IMX_8BIT, 0x0405, 0x28 },
++	{IMX_8BIT, 0x0405, 0x10 },
+ 	{IMX_8BIT, 0x4082, 0x00 },
+ 	{IMX_8BIT, 0x4083, 0x00 },
+ 	{IMX_8BIT, 0x7006, 0x04 },
+ 	/* Size setting */
+-	{IMX_8BIT, 0x0344, 0x01 }, /* 264,42,3943,3081 3680x3040 */
+-	{IMX_8BIT, 0x0345, 0x08 },
++	{IMX_8BIT, 0x0344, 0x00 }, /* 264,42, 3776x3096 */
++	{IMX_8BIT, 0x0345, 0xD8 },
+ 	{IMX_8BIT, 0x0346, 0x00 },
+-	{IMX_8BIT, 0x0347, 0x2a },
++	{IMX_8BIT, 0x0347, 0x0C },
+ 	{IMX_8BIT, 0x0348, 0x0F },
+-	{IMX_8BIT, 0x0349, 0x67 },
+-	{IMX_8BIT, 0x034A, 0x0c },
+-	{IMX_8BIT, 0x034B, 0x09 },
+-	{IMX_8BIT, 0x034C, 0x01 }, /* 368x304 */
+-	{IMX_8BIT, 0x034D, 0x70 },
+-	{IMX_8BIT, 0x034E, 0x01 },
+-	{IMX_8BIT, 0x034F, 0x30 },
++	{IMX_8BIT, 0x0349, 0x97 },
++	{IMX_8BIT, 0x034A, 0x0C },
++	{IMX_8BIT, 0x034B, 0x23 },
++	{IMX_8BIT, 0x034C, 0x07 }, /* 1888x1548 */
++	{IMX_8BIT, 0x034D, 0x60 },
++	{IMX_8BIT, 0x034E, 0x06 },
++	{IMX_8BIT, 0x034F, 0x0C },
+ 	{IMX_8BIT, 0x0350, 0x00 },
+ 	{IMX_8BIT, 0x0351, 0x00 },
+ 	{IMX_8BIT, 0x0352, 0x00 },
+ 	{IMX_8BIT, 0x0353, 0x00 },
+-	{IMX_8BIT, 0x0354, 0x03 }, /* 920x760 */
+-	{IMX_8BIT, 0x0355, 0x98 },
+-	{IMX_8BIT, 0x0356, 0x02 },
+-	{IMX_8BIT, 0x0357, 0xf8 },
++	{IMX_8BIT, 0x0354, 0x07 }, /* 1888x1548 */
++	{IMX_8BIT, 0x0355, 0x60 },
++	{IMX_8BIT, 0x0356, 0x06 },
++	{IMX_8BIT, 0x0357, 0x0C },
+ 	{IMX_8BIT, 0x301D, 0x30 },
+-	{IMX_8BIT, 0x3310, 0x01 },
+-	{IMX_8BIT, 0x3311, 0x70 },
+-	{IMX_8BIT, 0x3312, 0x01 },
+-	{IMX_8BIT, 0x3313, 0x30 },
++	{IMX_8BIT, 0x3310, 0x07 },
++	{IMX_8BIT, 0x3311, 0x60 },
++	{IMX_8BIT, 0x3312, 0x06 },
++	{IMX_8BIT, 0x3313, 0x0C },
+ 	{IMX_8BIT, 0x331C, 0x02 }, /* TODO! binning 4x4 must be 021c? */
+ 	{IMX_8BIT, 0x331D, 0x1C },
+-	{IMX_8BIT, 0x4084, 0x01 },
+-	{IMX_8BIT, 0x4085, 0x70 },
+-	{IMX_8BIT, 0x4086, 0x01 },
+-	{IMX_8BIT, 0x4087, 0x30 },
++	{IMX_8BIT, 0x4084, 0x07 },
++	{IMX_8BIT, 0x4085, 0x60 },
++	{IMX_8BIT, 0x4086, 0x06 },
++	{IMX_8BIT, 0x4087, 0x0C },
+ 	{IMX_8BIT, 0x4400, 0x00 },
+ 	{IMX_TOK_TERM, 0, 0}
+ };
+@@ -1920,7 +2551,7 @@ static const struct imx_reg imx135_qcif_dvs_binning[] = {
+  * than these take 8MP or 6MP espectively for down scaling based on the
+  * aspect ratio.
+  */
+-struct imx_resolution imx135_res_preview[] = {
++struct imx_resolution imx135_res_preview_mofd[] = {
+ 	{
+ 		.desc = "imx135_cif_binning_preview",
+ 		.regs = imx135_cif_binning,
+@@ -1940,30 +2571,30 @@ struct imx_resolution imx135_res_preview[] = {
+ 		.mipi_freq = 209600,
+ 	},
+ 	{
+-		 .desc = "imx135_480p_binning_preview",
+-		 .regs = imx135_480p_dvs_binning,
+-		 .width = 936,
+-		 .height = 602,
++		.desc = "imx135_vga_binning_preview",
++		.regs = imx135_vga_binning,
++		.width = 1036,
++		.height = 780,
+ 		.fps_options = {
+-			{ /* Binning Pixel clock: 335.36MHz */
++			{
+ 				 .fps = 30,
+-				 .pixels_per_line = 5464,
+-				 .lines_per_frame = 2046,
++				 .pixels_per_line = 9144,
++				 .lines_per_frame = 1226,
+ 			},
+ 			{
+ 			}
+ 		},
+-		 .bin_factor_x = 1,
+-		 .bin_factor_y = 1,
++		.bin_factor_x = 2,
++		.bin_factor_y = 2,
+ 		.mipi_freq = 209600,
+ 	},
+ 	{
+-		.desc = "imx135_vga_dvs_binning_preview",
+-		.regs = imx135_vga_dvs_binning,
+-		.width = 820,
+-		.height = 616,
++		 .desc = "imx135_480p_preview",
++		 .regs = imx135_480p_binning,
++		 .width = 1036,
++		 .height = 696,
+ 		.fps_options = {
+-			{
++			{ /* Binning Pixel clock: 335.36MHz */
+ 				 .fps = 30,
+ 				 .pixels_per_line = 9144,
+ 				 .lines_per_frame = 1226,
+@@ -1971,8 +2602,8 @@ struct imx_resolution imx135_res_preview[] = {
+ 			{
+ 			}
+ 		},
+-		.bin_factor_x = 2,
+-		.bin_factor_y = 2,
++		 .bin_factor_x = 2,
++		 .bin_factor_y = 2,
+ 		.mipi_freq = 209600,
+ 	},
+ 	{
+@@ -2091,6 +2722,88 @@ struct imx_resolution imx135_res_preview[] = {
+ 	},
+ };
+ 
++struct imx_resolution imx135_res_preview[] = {
++	{
++		.desc = "imx135_xga_cropped_video",
++		.regs = imx135_xga_cropped,
++		.width = 832,
++		.height = 628,
++		.fps_options = {
++			{ /* Binning Pixel clock: 335.36MHz */
++				 .fps = 30,
++				 .pixels_per_line = 5464,
++				 .lines_per_frame = 2046,
++
++			},
++			{
++			}
++		},
++		.bin_factor_x = 2,
++		.bin_factor_y = 2,
++		.used = 0,
++		.mipi_freq = 209600,
++	},
++	{
++		.desc = "imx135_2m_cropped_video",
++		.regs = imx135_2m_cropped,
++		.width = 1648,
++		.height = 1240,
++		.fps_options = {
++			{ /* Pixel clock: 335.36MHz */
++				 .fps = 30,
++				 .pixels_per_line = 5464,
++				 .lines_per_frame = 2046,
++
++			},
++			{
++			}
++		},
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
++		.used = 0,
++		.mipi_freq = 209600,
++	},
++	{
++		.desc = "imx135_1936x1096_cropped",
++		.regs = imx135_1936x1096_cropped,
++		.width = 1936,
++		.height = 1096,
++		.fps_options = {
++			{ /* Pixel clock: 335.36MHz */
++				 .fps = 30,
++				 .pixels_per_line = 5464,
++				 .lines_per_frame = 2046,
++
++			},
++			{
++			}
++		},
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.used = 0,
++		.mipi_freq = 209600,
++	},
++	{
++		.desc = "imx135_8m_cropped_video",
++		.regs = imx135_8m_cropped,
++		.width = 3280,
++		.height = 2464,
++		.fps_options = {
++			{ /* Pixel clock: 360.96MHz */
++				 .fps = 30,
++				 .pixels_per_line = 4572,
++				 .lines_per_frame = 2624,
++			},
++			{
++			}
++		},
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.used = 0,
++		.mipi_freq = 451200,
++	},
++};
++
+ /*
+  * ISP Scaling is now supported in online capture use cases. Because of that
+  * we need only few modes to cover the different aspect ratios from the
+@@ -2101,60 +2814,59 @@ struct imx_resolution imx135_res_preview[] = {
+  * than these take 8MP or 6MP espectively for down scaling based on the
+  * aspect ratio.
+  */
+-struct imx_resolution imx135_res_still[] = {
++struct imx_resolution imx135_res_still_mofd[] = {
+ 	{
+ 		.desc = "imx135_cif_binning_still",
+-		.regs = imx135_cif_binning,
+-		.width = 368,
+-		.height = 304,
++		.regs = imx135_cif_binning_1888x1548,
++		.width = 1888,
++		.height = 1548,
+ 		.fps_options = {
+ 			{ /* Binning Pixel clock: 335.36MHz */
+ 				 .fps = 30,
+-				 .pixels_per_line = 9114,
+-				 .lines_per_frame = 1226,
++				 .pixels_per_line = 5464,
++				 .lines_per_frame = 2046,
+ 			},
+ 			{
+ 			}
+ 		},
+-		.bin_factor_x = 2,
+-		.bin_factor_y = 2,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.mipi_freq = 209600,
+ 	},
+ 	{
+-		 .desc = "imx135_480p_binning_still",
+-		 .regs = imx135_480p_dvs_binning,
+-		 .width = 936,
+-		 .height = 602,
++		.desc = "imx135_vga_binning_preview",
++		.regs = imx135_vga_binning,
++		.width = 1036,
++		.height = 780,
+ 		.fps_options = {
+-			{ /* Binning Pixel clock: 335.36MHz */
++			{
+ 				 .fps = 30,
+-				 .pixels_per_line = 9114,
+-				 .lines_per_frame = 2453,
++				 .pixels_per_line = 9144,
++				 .lines_per_frame = 1226,
+ 			},
+ 			{
+ 			}
+ 		},
+-		 .bin_factor_x = 1,
+-		 .bin_factor_y = 1,
++		.bin_factor_x = 2,
++		.bin_factor_y = 2,
+ 		.mipi_freq = 209600,
+ 	},
+ 	{
+-		.desc = "imx135_1m_still",
+-		.regs = imx135_1m,
+-		.width = 1040,
+-		.height = 784,
++		 .desc = "imx135_480p_preview",
++		 .regs = imx135_480p_binning,
++		 .width = 1036,
++		 .height = 696,
+ 		.fps_options = {
+-			{
++			{ /* Binning Pixel clock: 335.36MHz */
+ 				 .fps = 30,
+-				 .pixels_per_line = 5464,
+-				 .lines_per_frame = 2046,
++				 .pixels_per_line = 9144,
++				 .lines_per_frame = 1226,
+ 			},
+ 			{
+ 			}
+ 		},
+-		.bin_factor_x = 1,
+-		.bin_factor_y = 1,
+-		.used = 0,
++		 .bin_factor_x = 2,
++		 .bin_factor_y = 2,
+ 		.mipi_freq = 209600,
+ 	},
+ 	{
+@@ -2278,6 +2990,142 @@ struct imx_resolution imx135_res_still[] = {
+ 	},
+ };
+ 
++struct imx_resolution imx135_res_still[] = {
++	{
++		.desc = "imx135_qvga",
++		.regs = imx135_336x256,
++		.width = 336,
++		.height = 256,
++		.fps_options = {
++			{ /* Pixel clock: 360.96MHz */
++				 .fps = 30,
++				 .pixels_per_line = 4572,
++				 .lines_per_frame = 2624,
++			},
++			{
++			}
++		},
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
++		.used = 0,
++		.mipi_freq = 451200,
++	},
++	{
++		.desc = "imx135_cif",
++		.regs = imx135_368x304_cropped,
++		.width = 368,
++		.height = 304,
++		.fps_options = {
++			{ /* Pixel clock: 360.96MHz */
++				 .fps = 30,
++				 .pixels_per_line = 4572,
++				 .lines_per_frame = 2624,
++			},
++			{
++			}
++		},
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
++		.used = 0,
++		.mipi_freq = 451200,
++	},
++	{
++		.desc = "imx135_xga_cropped_video",
++		.regs = imx135_xga_cropped,
++		.width = 832,
++		.height = 628,
++		.fps_options = {
++			{ /* Pixel clock: 360.96MHz */
++				 .fps = 30,
++				 .pixels_per_line = 4572,
++				 .lines_per_frame = 2624,
++			},
++			{
++			}
++		},
++		.bin_factor_x = 2,
++		.bin_factor_y = 2,
++		.used = 0,
++		.mipi_freq = 451200,
++	},
++	{
++		.desc = "imx135_2M_for_11:9",
++		.regs = imx135_1424x1168_cropped,
++		.width = 1424,
++		.height = 1168,
++		.fps_options = {
++			{ /* Pixel clock: 360.96MHz */
++				 .fps = 30,
++				 .pixels_per_line = 4572,
++				 .lines_per_frame = 2624,
++			},
++			{
++			}
++		},
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
++		.used = 0,
++		.mipi_freq = 451200,
++	},
++	{
++		.desc = "imx135_2m_cropped_video",
++		.regs = imx135_2m_cropped,
++		.width = 1648,
++		.height = 1240,
++		.fps_options = {
++			{ /* Pixel clock: 360.96MHz */
++				 .fps = 15,
++				 .pixels_per_line = 6466,
++				 .lines_per_frame = 3710,
++			},
++			{
++			}
++		},
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
++		.used = 0,
++		.mipi_freq = 451200,
++	},
++	{
++		.desc = "imx135_6m_cropped_video",
++		.regs = imx135_6m_cropped,
++		.width = 3280,
++		.height = 1852,
++		.fps_options = {
++			{ /* Pixel clock: 360.96MHz */
++				 .fps = 8,
++				 .pixels_per_line = 8850,
++				 .lines_per_frame = 5080,
++			},
++			{
++			}
++		},
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.used = 0,
++		.mipi_freq = 451200,
++	},
++	{
++		.desc = "imx135_8m_cropped_video",
++		.regs = imx135_8m_cropped,
++		.width = 3280,
++		.height = 2464,
++		.fps_options = {
++			{ /* Pixel clock: 360.96MHz */
++				 .fps = 8,
++				 .pixels_per_line = 8850,
++				 .lines_per_frame = 5080,
++			},
++			{
++			}
++		},
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.used = 0,
++		.mipi_freq = 451200,
++	},
++};
++
+ /*
+  * ISP scaling is not supported in case of video modes. So we need to have
+  * separate sensor mode for video use cases
+-- 
+1.9.1
+

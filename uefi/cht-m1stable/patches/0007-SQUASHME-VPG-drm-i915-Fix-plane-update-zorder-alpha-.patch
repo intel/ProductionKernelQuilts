@@ -1,0 +1,364 @@
+From 7f60c05eeaf6cc739ec89d546fc8d6ff4618e6ab Mon Sep 17 00:00:00 2001
+Message-Id: <7f60c05eeaf6cc739ec89d546fc8d6ff4618e6ab.1417465742.git.chang-joon.lee@intel.com>
+In-Reply-To: <664d811e547fec51f0453c5acda92012de288ecd.1417465742.git.chang-joon.lee@intel.com>
+References: <664d811e547fec51f0453c5acda92012de288ecd.1417465742.git.chang-joon.lee@intel.com>
+From: Vidya Srinivas <vidya.srinivas@intel.com>
+Date: Mon, 10 Nov 2014 16:55:16 +0530
+Subject: [PATCH 07/11] SQUASHME! [VPG]: drm/i915: Fix plane
+ update/zorder/alpha implementation.
+
+SQUASHME! - This patch should be squashed into the following exising patch:
+	Author: Arun R Murthy <arun.r.murthy@intel.com>
+	Change-Id: Id9fb3280aa59680a27536658dcaa335504a02e31
+    REVERTME [VPG]: drm/i915: Add atomicity to i915.
+
+Plane alpha should not be based on the z-order but should be
+changed only upon getting update from the user space.
+If the input format is RGBA and if alpha is set to '1' then
+no change else if alpha is set to '0' then chnage format to
+RGBX. If input format is RGBX then its always RGBX irrespective
+of the alpha value set by user space
+
+Issue: GMIN-3045
+Change-Id: Iaadcac25432f3068a40d038bf70cd7866d98440f
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+Signed-off-by: Sangani, Suryanarayana R <suryanarayana.r.sangani@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |   91 +++++++++++++++-------------------
+ drivers/gpu/drm/i915/intel_drv.h     |    2 +
+ drivers/gpu/drm/i915/intel_sprite.c  |   54 ++++++++------------
+ 3 files changed, 63 insertions(+), 84 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index b4d6983..88079e2 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2577,6 +2577,7 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 	int pipe = intel_crtc->pipe;
+ 	unsigned long linear_offset;
+ 	bool rotate = false;
++	bool alpha_changed = false;
+ 	u32 dspcntr;
+ 	u32 reg;
+ 	u32 mask;
+@@ -2610,6 +2611,12 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 	} else
+ 		dspcntr = I915_READ(reg);
+ 
++	/* Update plane alpha */
++	 if (intel_crtc->flags & DRM_MODE_SET_DISPLAY_PLANE_UPDATE_ALPHA) {
++		alpha_changed = true;
++		intel_crtc->flags &= ~DRM_MODE_SET_DISPLAY_PLANE_UPDATE_ALPHA;
++	 }
++
+ 	/* Mask out pixel format bits in case we change it */
+ 	dspcntr &= ~DISPPLANE_PIXFORMAT_MASK;
+ 
+@@ -2633,32 +2640,37 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 		dspcntr |= DISPPLANE_BGRX888;
+ 		break;
+ 	case DRM_FORMAT_ARGB8888:
+-		if (intel_crtc->primary_alpha)
+-			dspcntr |= DISPPLANE_BGRA888;
+-		else
++		if (alpha_changed && !intel_crtc->alpha)
+ 			dspcntr |= DISPPLANE_BGRX888;
++		else
++			dspcntr |= DISPPLANE_BGRA888;
+ 		break;
+ 	case DRM_FORMAT_XBGR8888:
+ 		dspcntr |= DISPPLANE_RGBX888;
+ 		break;
+ 	case DRM_FORMAT_ABGR8888:
+-		if (intel_crtc->primary_alpha)
+-			dspcntr |= DISPPLANE_RGBA888;
+-		else
++		if (alpha_changed && !intel_crtc->alpha)
+ 			dspcntr |= DISPPLANE_RGBX888;
++		else
++			dspcntr |= DISPPLANE_RGBA888;
+ 		break;
+ 	case DRM_FORMAT_XRGB2101010:
+-	case DRM_FORMAT_ARGB2101010:
+ 		dspcntr |= DISPPLANE_BGRX101010;
+ 		break;
++	case DRM_FORMAT_ARGB2101010:
++		if (alpha_changed && !intel_crtc->alpha)
++			dspcntr |= DISPPLANE_BGRX101010;
++		else
++			dspcntr |= DISPPLANE_BGRA101010;
++		break;
+ 	case DRM_FORMAT_XBGR2101010:
+ 		dspcntr |= DISPPLANE_RGBX101010;
+ 		break;
+ 	case DRM_FORMAT_ABGR2101010:
+-		if (intel_crtc->primary_alpha)
+-			dspcntr |= DISPPLANE_RGBA101010;
+-		else
++		if (alpha_changed && !intel_crtc->alpha)
+ 			dspcntr |= DISPPLANE_RGBX101010;
++		else
++			dspcntr |= DISPPLANE_RGBA101010;
+ 		break;
+ 	default:
+ 		BUG();
+@@ -10463,6 +10475,8 @@ static void i915_commit(struct drm_i915_private *dev_priv,
+ 		plane = intel_plane->plane;
+ 		if (intel_plane->pri_update && (reg->dspcntr & (1 << 31))) {
+ 			I915_WRITE(DSPCNTR(pipe), reg->dspcntr);
++			I915_MODIFY_DISPBASE(DSPSURF(pipe),
++				I915_READ(DSPSURF(pipe)));
+ 			intel_plane->pri_update = false;
+ 		}
+ 	} else {
+@@ -10513,6 +10527,7 @@ static void i915_commit(struct drm_i915_private *dev_priv,
+ }
+ 
+ int intel_set_disp_plane_update(struct drm_mode_set_display *disp,
++	struct intel_crtc *intel_crtc,
+ 	struct drm_device *dev, struct drm_file *file_priv, int i)
+ {
+ 	struct drm_mode_crtc_page_flip *flip;
+@@ -10541,6 +10556,13 @@ int intel_set_disp_plane_update(struct drm_mode_set_display *disp,
+ 		flip->flags = disp->plane[i].flags;
+ 		flip->reserved = 0;
+ 		flip->user_data = disp->plane[i].user_data;
++		if (disp->plane[i].update_flag &
++			DRM_MODE_SET_DISPLAY_PLANE_UPDATE_ALPHA) {
++			intel_crtc->flags |=
++				DRM_MODE_SET_DISPLAY_PLANE_UPDATE_ALPHA;
++			intel_crtc->alpha =
++				disp->plane[i].alpha;
++		}
+ 		tmp_ret = drm_mode_page_flip_ioctl(dev, flip,
+ 					file_priv);
+ 		if (tmp_ret) {
+@@ -10593,6 +10615,13 @@ int intel_set_disp_plane_update(struct drm_mode_set_display *disp,
+ 			intel_plane->rrb2_enable =
+ 				disp->plane[i].rrb2_enable;
+ 		}
++		if (disp->plane[i].update_flag &
++			DRM_MODE_SET_DISPLAY_PLANE_UPDATE_ALPHA) {
++			intel_plane->flags |=
++				DRM_MODE_SET_DISPLAY_PLANE_UPDATE_ALPHA;
++			intel_plane->alpha =
++				disp->plane[i].alpha;
++		}
+ 		tmp_ret = drm_mode_setplane(dev, plane, file_priv);
+ 		if (tmp_ret) {
+ 			DRM_ERROR("drm_mode_setplane failed\n");
+@@ -10694,7 +10723,7 @@ int intel_set_disp_calc_flip(struct drm_mode_set_display *disp,
+ 
+ 		if (disp->plane[i].update_flag &
+ 			DRM_MODE_SET_DISPLAY_PLANE_UPDATE_PRESENT) {
+-			ret = intel_set_disp_plane_update(disp,
++			ret = intel_set_disp_plane_update(disp, intel_crtc,
+ 					dev, file_priv, i);
+ 		}
+ 	}
+@@ -10708,8 +10737,7 @@ int intel_set_disp_commit_regs(struct drm_mode_set_display *disp,
+ 	struct drm_plane *drm_plane;
+ 	struct drm_mode_object *obj;
+ 	struct intel_plane *intel_plane;
+-	struct drm_i915_set_plane_alpha *alpha;
+-	int i, tmp_ret, ret = 0;
++	int i, ret = 0;
+ 
+ 	/* make sure to start from a fresh vsync, it we are close to vblank */
+ 	if (disp->update_flag & DRM_MODE_SET_DISPLAY_UPDATE_ZORDER) {
+@@ -10726,35 +10754,6 @@ int intel_set_disp_commit_regs(struct drm_mode_set_display *disp,
+ 		if (!(disp->update_flag & DRM_MODE_SET_DISPLAY_UPDATE_PLANE(i)))
+ 			continue;
+ 
+-		/* Update Alpha */
+-		if (disp->plane[i].update_flag &
+-				DRM_MODE_SET_DISPLAY_PLANE_UPDATE_ALPHA) {
+-			alpha = kzalloc(sizeof(struct drm_i915_set_plane_alpha),
+-					GFP_KERNEL);
+-			if (!alpha) {
+-				DRM_ERROR("Failed to alloc memory-set alpha\n");
+-				disp->errored |= (1 << i);
+-				ret = -ENOMEM;
+-			} else {
+-				alpha->alpha = disp->plane[i].alpha;
+-				alpha->plane = disp->plane[i].obj_id;
+-				tmp_ret = i915_set_plane_alpha(dev,
+-					(void *)alpha, NULL);
+-				if (tmp_ret) {
+-					DRM_ERROR(
+-						"i915_set_plane_alpha failed\n");
+-					DRM_ERROR(
+-						"::plane %u(obj id %u)alpha %u ret %d SKIPPED\n",
+-						alpha->plane,
+-						disp->plane[i].obj_id,
+-						alpha->alpha, tmp_ret);
+-					ret = -EINVAL;
+-					disp->errored |= (1 << i);
+-				}
+-				kfree(alpha);
+-			}
+-		}
+-
+ 		if (disp->plane[i].update_flag &
+ 			DRM_MODE_SET_DISPLAY_PLANE_UPDATE_PRESENT) {
+ 			if (disp->plane[i].obj_type == DRM_MODE_OBJECT_CRTC) {
+@@ -12548,14 +12547,6 @@ static void intel_crtc_init(struct drm_device *dev, int pipe)
+ 	intel_crtc->pfit_en_status = false;
+ 	intel_crtc->sprite_unpin_work = NULL;
+ 
+-	/*
+-	 * The alpha flags are used to force alpha off when a plane is at the
+-	 * bottom of the stack. The default is true, to ensure that formats
+-	 * with Alpha use alpha, unless overridden by setting z-order
+-	 */
+-	intel_crtc->primary_alpha = true;
+-	intel_crtc->sprite0_alpha = true;
+-	intel_crtc->sprite1_alpha = true;
+ 	intel_crtc->rotate180 = false;
+ 	/* Flag for wake from sleep */
+ 	dev_priv->is_resuming = false;
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 44273bb..c75142b 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -404,6 +404,7 @@ struct intel_crtc {
+ 	u8 lut_r[256], lut_g[256], lut_b[256];
+ 	u32 flags;
+ 	__u32 z_order;
++	u32 alpha;
+ 	/*
+ 	 * Whether the crtc and the connected output pipeline is active. Implies
+ 	 * that crtc->enabled is set, i.e. the current mode configuration has
+@@ -498,6 +499,7 @@ struct intel_plane {
+ 	u32 flags;
+ 	__u32 z_order;
+ 	__u32 rrb2_enable;
++	u32 alpha;
+ 	int crtc_x, crtc_y;
+ 	unsigned int crtc_w, crtc_h;
+ 	uint32_t src_x, src_y;
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 0da5945..ca0f04e 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -318,7 +318,6 @@ int i915_set_plane_zorder(struct drm_device *dev, void *data,
+ 	u32 order = zorder->order;
+ 	int s1_zorder, s1_bottom, s2_zorder, s2_bottom;
+ 	int pipe = (order >> 31) & 0x1;
+-	int z_order = order & 0x000F;
+ 
+ 	struct intel_crtc *intel_crtc =
+ 			to_intel_crtc(dev_priv->plane_to_crtc_mapping[pipe]);
+@@ -377,20 +376,6 @@ calc_zorder:
+ 	else
+ 		I915_WRITE(SPCNTR(pipe, 1), val);
+ 
+-	if (z_order != P1S1S2C1 && z_order != P1S2S1C1)
+-		intel_crtc->primary_alpha = true;
+-	else
+-		intel_crtc->primary_alpha = false;
+-
+-	if (z_order != S1P1S2C1 && z_order != S1S2P1C1)
+-		intel_crtc->sprite0_alpha = true;
+-	else
+-		intel_crtc->sprite0_alpha = false;
+-
+-	if (z_order != S2P1S1C1 && z_order != S2S1P1C1)
+-		intel_crtc->sprite1_alpha = true;
+-	else
+-		intel_crtc->sprite1_alpha = false;
+ 	return 0;
+ }
+ 
+@@ -411,7 +396,7 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	int plane = intel_plane->plane;
+ 	u32 sprctl;
+ 	bool rotate = false;
+-	bool alpha = true;
++	bool alpha_changed = false;
+ 	unsigned long sprsurf_offset, linear_offset;
+ 	int pixel_size = drm_format_plane_cpp(fb->pixel_format, 0);
+ 	struct drm_display_mode *mode = &intel_crtc->config.requested_mode;
+@@ -427,6 +412,12 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	sprctl &= ~SP_YUV_BYTE_ORDER_MASK;
+ 	sprctl &= ~SP_TILED;
+ 
++	/* Update plane alpha */
++	if (intel_plane->flags & DRM_MODE_SET_DISPLAY_PLANE_UPDATE_ALPHA) {
++		alpha_changed = true;
++		intel_plane->flags &= ~DRM_MODE_SET_DISPLAY_PLANE_UPDATE_ALPHA;
++	}
++
+ 	/* calculate the plane rrb2 */
+ 	if (intel_plane->flags & DRM_MODE_SET_DISPLAY_PLANE_UPDATE_RRB2) {
+ 		if (intel_plane->rrb2_enable)
+@@ -438,14 +429,6 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 		intel_plane->flags &= ~DRM_MODE_SET_DISPLAY_PLANE_UPDATE_RRB2;
+ 	}
+ 
+-	/* plane alpha */
+-	if (plane && intel_crtc->sprite1_alpha)
+-		alpha = true;
+-	else if (!plane && intel_crtc->sprite0_alpha)
+-		alpha = true;
+-	else
+-		alpha = false;
+-
+ 	switch (fb->pixel_format) {
+ 	case DRM_FORMAT_YUYV:
+ 		sprctl |= SP_FORMAT_YUV422 | SP_YUV_ORDER_YUYV;
+@@ -466,28 +449,28 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 		sprctl |= SP_FORMAT_BGRX8888;
+ 		break;
+ 	case DRM_FORMAT_ARGB8888:
+-		if (alpha)
+-			sprctl |= SP_FORMAT_BGRA8888;
+-		else
++		if (alpha_changed && !intel_plane->alpha)
+ 			sprctl |= SP_FORMAT_BGRX8888;
++		else
++			sprctl |= SP_FORMAT_BGRA8888;
+ 		break;
+ 	case DRM_FORMAT_XBGR2101010:
+ 		sprctl |= SP_FORMAT_RGBX1010102;
+ 		break;
+ 	case DRM_FORMAT_ABGR2101010:
+-		if (alpha)
+-			sprctl |= SP_FORMAT_RGBA1010102;
+-		else
++		if (alpha_changed && !intel_plane->alpha)
+ 			sprctl |= SP_FORMAT_RGBX1010102;
++		else
++			sprctl |= SP_FORMAT_RGBA1010102;
+ 		break;
+ 	case DRM_FORMAT_XBGR8888:
+ 		sprctl |= SP_FORMAT_RGBX8888;
+ 		break;
+ 	case DRM_FORMAT_ABGR8888:
+-		if (alpha)
+-			sprctl |= SP_FORMAT_RGBA8888;
+-		else
++		if (alpha_changed && !intel_plane->alpha)
+ 			sprctl |= SP_FORMAT_RGBX8888;
++		else
++			sprctl |= SP_FORMAT_RGBA8888;
+ 		break;
+ 	default:
+ 		/*
+@@ -1807,8 +1790,11 @@ intel_disable_plane(struct drm_plane *plane)
+ 		bool primary_was_enabled = intel_crtc->primary_enabled;
+ 		intel_crtc->primary_enabled = true;
+ 		intel_plane->disable_plane(plane, plane->crtc);
+-		if (!primary_was_enabled && intel_crtc->primary_enabled)
++		if (!primary_was_enabled && intel_crtc->primary_enabled) {
++			if (dev_priv->atomic_update)
++				intel_update_primary_plane(plane, intel_crtc);
+ 			intel_post_enable_primary(plane->crtc);
++		}
+ 	}
+ 
+ 	mutex_lock(&dev->struct_mutex);
+-- 
+1.7.9.5
+

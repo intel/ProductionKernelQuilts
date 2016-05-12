@@ -1,0 +1,143 @@
+From 4834147892d0bb13181222174db9f9cc728cfe0a Mon Sep 17 00:00:00 2001
+From: Liam Girdwood <lrg@ti.com>
+Date: Wed, 5 Dec 2012 15:55:26 +0000
+Subject: [PATCH 04/39] ASoC: core: add support for dynamic controls and
+ widgets
+
+Issue: GMINL-3679
+
+Add support to the ASoC and DAPM core to allow firmware based runtime
+generated kcontrols and widgets to be used along side standard ones.
+Each widget/component maintains a list of mixer/enum kcontrols that
+can be removed when required
+
+Change-Id: I7c34a2622b45e5ea9c166a8fa84d0408d408c269
+Signed-off-by: Liam Girdwood <lrg@ti.com>
+---
+ sound/soc/soc-core.c | 14 +++++++++++++-
+ sound/soc/soc-dapm.c | 13 +++++++++----
+ 2 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/sound/soc/soc-core.c b/sound/soc/soc-core.c
+index d290f0f..6e8b4cd 100644
+--- a/sound/soc/soc-core.c
++++ b/sound/soc/soc-core.c
+@@ -43,6 +43,7 @@
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dpcm.h>
++#include <sound/soc-fw.h>
+ #include <sound/initval.h>
+ 
+ #define CREATE_TRACE_POINTS
+@@ -1924,6 +1925,9 @@ static int soc_cleanup_card_resources(struct snd_soc_card *card)
+ 	/* remove and free each DAI */
+ 	soc_remove_dai_links(card);
+ 
++	/* remove any dynamic kcontrols */
++	snd_soc_fw_dcontrols_remove_all(card, SND_SOC_FW_INDEX_ALL);
++
+ 	soc_cleanup_card_debugfs(card);
+ 
+ 	/* remove the card */
+@@ -2594,8 +2598,9 @@ int snd_soc_info_enum_double(struct snd_kcontrol *kcontrol,
+ 	if (uinfo->value.enumerated.item >= e->items)
+ 		uinfo->value.enumerated.item = e->items - 1;
+ 	strlcpy(uinfo->value.enumerated.name,
+-		e->texts[uinfo->value.enumerated.item],
++		snd_soc_get_enum_text(e, uinfo->value.enumerated.item),
+ 		sizeof(uinfo->value.enumerated.name));
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(snd_soc_info_enum_double);
+@@ -3891,6 +3896,7 @@ int snd_soc_register_card(struct snd_soc_card *card)
+ 	if (card->rtd == NULL)
+ 		return -ENOMEM;
+ 	card->num_rtd = 0;
++
+ 	card->rtd_aux = &card->rtd[card->num_links];
+ 
+ 	for (i = 0; i < card->num_links; i++)
+@@ -3898,6 +3904,8 @@ int snd_soc_register_card(struct snd_soc_card *card)
+ 
+ 	INIT_LIST_HEAD(&card->list);
+ 	INIT_LIST_HEAD(&card->dapm_dirty);
++	INIT_LIST_HEAD(&card->denums);
++	INIT_LIST_HEAD(&card->dmixers);
+ 	card->instantiated = 0;
+ 	mutex_init(&card->mutex);
+ 	mutex_init(&card->dapm_mutex);
+@@ -4287,6 +4295,8 @@ int snd_soc_add_platform(struct device *dev, struct snd_soc_platform *platform,
+ 	platform->dapm.platform = platform;
+ 	platform->dapm.stream_event = platform_drv->stream_event;
+ 	mutex_init(&platform->mutex);
++	INIT_LIST_HEAD(&platform->denums);
++	INIT_LIST_HEAD(&platform->dmixers);
+ 
+ 	mutex_lock(&client_mutex);
+ 	list_add(&platform->list, &platform_list);
+@@ -4444,6 +4454,8 @@ int snd_soc_register_codec(struct device *dev,
+ 	codec->driver = codec_drv;
+ 	codec->num_dai = num_dai;
+ 	mutex_init(&codec->mutex);
++	INIT_LIST_HEAD(&codec->denums);
++	INIT_LIST_HEAD(&codec->dmixers);
+ 
+ 	for (i = 0; i < num_dai; i++) {
+ 		fixup_codec_formats(&dai_drv[i].playback);
+diff --git a/sound/soc/soc-dapm.c b/sound/soc/soc-dapm.c
+index 12f38b2..93ce561 100644
+--- a/sound/soc/soc-dapm.c
++++ b/sound/soc/soc-dapm.c
+@@ -41,6 +41,7 @@
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
++#include <sound/soc-fw.h>
+ #include <sound/initval.h>
+ 
+ #include <trace/events/asoc.h>
+@@ -648,11 +649,11 @@ static int dapm_connect_mux(struct snd_soc_dapm_context *dapm,
+ 	int i;
+ 
+ 	for (i = 0; i < e->items; i++) {
+-		if (!(strcmp(control_name, e->texts[i]))) {
++		if (!(strcmp(control_name, snd_soc_get_enum_text(e, i)))) {
+ 			list_add(&path->list, &dapm->card->paths);
+ 			list_add(&path->list_sink, &dest->sources);
+ 			list_add(&path->list_source, &src->sinks);
+-			path->name = (char*)e->texts[i];
++			path->name = (char *)snd_soc_get_enum_text(e, i);
+ 			dapm_set_path_status(dest, path, 0);
+ 			return 0;
+ 		}
+@@ -2142,12 +2143,12 @@ static int soc_dapm_mux_update_power(struct snd_soc_card *card,
+ 
+ 	/* find dapm widget path assoc with kcontrol */
+ 	dapm_kcontrol_for_each_path(path, kcontrol) {
+-		if (!path->name || !e->texts[mux])
++		if (!path->name || !snd_soc_get_enum_text(e, mux))
+ 			continue;
+ 
+ 		found = 1;
+ 		/* we now need to match the string in the enum to the path */
+-		if (!(strcmp(path->name, e->texts[mux]))) {
++		if (!(strcmp(path->name, snd_soc_get_enum_text(e, mux)))) {
+ 			path->connect = 1; /* new connection */
+ 			dapm_mark_dirty(path->source, "mux connection");
+ 		} else {
+@@ -2322,6 +2323,10 @@ static void dapm_free_widgets(struct snd_soc_dapm_context *dapm)
+ 		list_for_each_entry_safe(p, next_p, &w->sinks, list_source)
+ 			dapm_free_path(p);
+ 
++		/* check and free and dynamic widget kcontrols */
++		if (w->index)
++			snd_soc_fw_dcontrols_remove_widget(w);
++
+ 		kfree(w->kcontrols);
+ 		kfree(w->name);
+ 		kfree(w);
+-- 
+1.9.1
+

@@ -1,0 +1,855 @@
+From c3069fc290d28d3ba013ecb72de2ffe87bc9c6fd Mon Sep 17 00:00:00 2001
+From: Daniel Drubin <idaniel.drubin@intel.com>
+Date: Wed, 20 Jan 2016 19:15:45 +0200
+Subject: [PATCH 4/6] ISH DMA Rx implementation
+
+Implemented FW->host part of ISH DMA protocol
+Some printk->dev_err tuning
+Fixed delay bug in sync_fw_clock
+Fixed indentation
+
+Change-Id: I872ba45a836c80b843bcbb4a18803917f5fe89e1
+Signed-off-by: Daniel Drubin <daniel.drubin@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-16663
+Reviewed-on: https://android.intel.com:443/460520
+---
+ drivers/misc/intel-ish/bus.c             |   2 -
+ drivers/misc/intel-ish/client.c          | 154 ++++++++++++++++++++++++++-----
+ drivers/misc/intel-ish/client.h          |  11 ++-
+ drivers/misc/intel-ish/hbm.c             | 101 +++++++++++++++++++-
+ drivers/misc/intel-ish/hbm.h             |  77 +++++++++++-----
+ drivers/misc/intel-ish/heci-hid-client.c |  25 ++---
+ drivers/misc/intel-ish/heci_dev.h        |   1 +
+ drivers/misc/intel-ish/hw-ish-regs.h     |   2 +-
+ drivers/misc/intel-ish/hw-ish.c          |  19 ++--
+ drivers/misc/intel-ish/hw-ish.h          |   1 +
+ drivers/misc/intel-ish/init.c            |   8 +-
+ drivers/misc/intel-ish/pci-ish.c         |  18 ++--
+ drivers/misc/intel-ish/platform-config.h |   4 +-
+ 13 files changed, 324 insertions(+), 99 deletions(-)
+
+diff --git a/drivers/misc/intel-ish/bus.c b/drivers/misc/intel-ish/bus.c
+index 7c32a95..6c5a13b 100644
+--- a/drivers/misc/intel-ish/bus.c
++++ b/drivers/misc/intel-ish/bus.c
+@@ -442,8 +442,6 @@ int __init heci_cl_bus_init(void)
+ 
+ 	ISH_DBG_PRINT(KERN_ALERT "%s(): Registering HECI bus\n", __func__);
+ 	rv = bus_register(&heci_cl_bus_type);
+-	if (!rv)
+-		heci_cl_alloc_dma_buf();
+ 	return	rv;
+ }
+ 
+diff --git a/drivers/misc/intel-ish/client.c b/drivers/misc/intel-ish/client.c
+index b9acd6e..57eafc1 100644
+--- a/drivers/misc/intel-ish/client.c
++++ b/drivers/misc/intel-ish/client.c
+@@ -34,35 +34,35 @@ static void no_dev_dbg(void *v, char *s, ...)
+ #define dev_dbg no_dev_dbg
+ /* #define dev_dbg dev_err */
+ 
+-int	host_dma_enabled;
+-void	*host_dma_buf;
+-unsigned	host_dma_buf_size = (1024*1024);
+-uint64_t	host_dma_buf_phys;
+-int	dma_ready = 1;
++int	host_dma_enabled;       /* New bi-directional DMA */
++int	dma_ready = 1;          /* Legacy host->FW only DMA */
+ 
++void	*host_dma_tx_buf;
++unsigned	host_dma_tx_buf_size = (1024*1024);
++uint64_t	host_dma_tx_buf_phys;
++
++void	*host_dma_rx_buf;
++unsigned	host_dma_rx_buf_size = (1024*1024);
++uint64_t	host_dma_rx_buf_phys;
+ 
+ void	heci_cl_alloc_dma_buf(void)
+ {
+ 	int	order;
+ 	unsigned	temp;
+ 
+-	/*
+-	 * Try to allocate 256 contiguous pages (1 M)
+-	 * for DMA and enabled host DMA
+-	 */
+-	for (order = 0, temp = host_dma_buf_size / PAGE_SIZE + 1; temp;
++	for (order = 0, temp = host_dma_tx_buf_size / PAGE_SIZE + 1; temp;
+ 			temp >>= 1)
+ 		++order;
+-	host_dma_buf = (void *)__get_free_pages(GFP_KERNEL, order);
+-	if (host_dma_buf) {
+-		host_dma_buf_phys = __pa(host_dma_buf);
+-		host_dma_enabled = 1;
+-	}
++	host_dma_tx_buf = (void *)__get_free_pages(GFP_KERNEL, order);
++	if (host_dma_tx_buf)
++		host_dma_tx_buf_phys = __pa(host_dma_tx_buf);
+ 
+-	ISH_DBG_PRINT(KERN_ALERT
+-		"%s(): host_dma_enabled=%d host_dma_buf=%p host_dma_buf_phys=%llX host_dma_buf_size=%u order=%d\n",
+-		__func__, host_dma_enabled, host_dma_buf, host_dma_buf_phys,
+-		host_dma_buf_size, order);
++	for (order = 0, temp = host_dma_rx_buf_size / PAGE_SIZE + 1; temp;
++			temp >>= 1)
++		++order;
++	host_dma_rx_buf = (void *)__get_free_pages(GFP_KERNEL, order);
++	if (host_dma_rx_buf)
++		host_dma_rx_buf_phys = __pa(host_dma_rx_buf);
+ }
+ 
+ 
+@@ -870,7 +870,7 @@ int heci_cl_send(struct heci_cl *cl, u8 *buf, size_t length)
+ 				dev->me_clients[id].props.dma_hdr_len & 0x7F;
+ 			spin_unlock_irqrestore(&dev->me_clients_lock, me_flags);
+ 			/* DMA max msg size is 1M */
+-			if (length > host_dma_buf_size) {
++			if (length > host_dma_tx_buf_size) {
+ 				++cl->err_send_msg;
+ 				return	-EMSGSIZE;
+ 			}
+@@ -892,14 +892,14 @@ int heci_cl_send(struct heci_cl *cl, u8 *buf, size_t length)
+ 			 * First 'preview_len' bytes of buffer are preview
+ 			 * bytes, omitted from DMA message
+ 			 */
+-			memcpy(host_dma_buf, buf + preview_len,
++			memcpy(host_dma_tx_buf, buf + preview_len,
+ 				length - preview_len);
+ 			heci_hbm_hdr(&hdr, len);
+ 			heci_dma_request_msg.hbm_cmd = CLIENT_DMA_REQ_CMD;
+ 			heci_dma_request_msg.me_addr = cl->me_client_id;
+ 			heci_dma_request_msg.host_addr = cl->host_client_id;
+ 			heci_dma_request_msg.reserved = 0;
+-			heci_dma_request_msg.msg_addr = host_dma_buf_phys;
++			heci_dma_request_msg.msg_addr = host_dma_tx_buf_phys;
+ 			heci_dma_request_msg.msg_len = length - preview_len;
+ 			heci_dma_request_msg.reserved2 = 0;
+ 			memcpy(heci_dma_request_msg.msg_preview, buf,
+@@ -1232,7 +1232,7 @@ void	recv_heci_cl_msg(struct heci_device *dev, struct heci_msg_hdr *heci_hdr)
+ 		do_gettimeofday(&tv);
+ 		cl->rx_sec = tv.tv_sec;
+ 		cl->rx_usec = tv.tv_usec;
+-		++cl->recv_msg_cnt;
++		++cl->recv_msg_cnt_ipc;
+ 		heci_cl_read_complete(complete_rb);
+ 	}
+ 
+@@ -1241,3 +1241,111 @@ eoi:
+ }
+ EXPORT_SYMBOL(recv_heci_cl_msg);
+ 
++void	recv_heci_cl_msg_dma(struct heci_device *dev, void *msg,
++	struct dma_xfer_hbm *hbm)
++{
++	struct heci_cl *cl;
++	struct heci_cl_rb *rb, *next;
++	struct heci_cl_rb *new_rb;
++	unsigned char *buffer = NULL;
++	struct heci_cl_rb *complete_rb = NULL;
++	unsigned long   dev_flags;
++	unsigned long   flags;
++
++	spin_lock_irqsave(&dev->read_list_spinlock, dev_flags);
++	list_for_each_entry_safe(rb, next, &dev->read_list.list, list) {
++		cl = rb->cl;
++		if (!cl || !(cl->host_client_id == hbm->host_client_id &&
++				cl->me_client_id == hbm->fw_client_id) ||
++				!(cl->state == HECI_CL_CONNECTED))
++			continue;
++
++		/*
++		 * FIXME: in both if() closes rb must return to free pool
++		 * and/or disband and/or disconnect client
++		 */
++		if (rb->buffer.size == 0 || rb->buffer.data == NULL) {
++			spin_unlock_irqrestore(&dev->read_list_spinlock,
++				dev_flags);
++			dev_err(&dev->pdev->dev,
++				"response buffer is not allocated.\n");
++			list_del(&rb->list);
++			goto    eoi;
++		}
++
++		if (rb->buffer.size < hbm->msg_length) {
++			spin_unlock_irqrestore(&dev->read_list_spinlock,
++				dev_flags);
++			dev_err(&dev->pdev->dev,
++				"message overflow. size %d len %d idx %ld\n",
++				rb->buffer.size, hbm->msg_length, rb->buf_idx);
++			list_del(&rb->list);
++			goto    eoi;
++		}
++
++		buffer = rb->buffer.data;
++		memcpy(buffer, msg, hbm->msg_length);
++		rb->buf_idx = hbm->msg_length;
++
++		/* Last fragment in message - it's complete */
++		cl->status = 0;
++		list_del(&rb->list);
++		complete_rb = rb;
++
++		--cl->out_flow_ctrl_creds;
++		/*
++		 * the whole msg arrived, send a new FC, and add a new
++		 * rb buffer for the next coming msg
++		 */
++		spin_lock_irqsave(&cl->free_list_spinlock, flags);
++
++		if (!list_empty(&cl->free_rb_list.list)) {
++			new_rb = list_entry(cl->free_rb_list.list.next,
++				struct heci_cl_rb, list);
++			list_del_init(&new_rb->list);
++			spin_unlock_irqrestore(&cl->free_list_spinlock,
++				flags);
++			new_rb->cl = cl;
++			new_rb->buf_idx = 0;
++			INIT_LIST_HEAD(&new_rb->list);
++			list_add_tail(&new_rb->list,
++				&dev->read_list.list);
++
++			heci_hbm_cl_flow_control_req(dev, cl);
++		} else {
++			spin_unlock_irqrestore(&cl->free_list_spinlock,
++				flags);
++		}
++
++		/* One more fragment in message (this is always last) */
++		++cl->recv_msg_num_frags;
++
++		/*
++		 * We can safely break here (and in BH too),
++		 * a single input message can go only to a single request!
++		 */
++		break;
++	}
++
++	spin_unlock_irqrestore(&dev->read_list_spinlock, dev_flags);
++	/* If it's nobody's message, just read and discard it */
++	if (!buffer) {
++		dev_err(&dev->pdev->dev, "%s(): Dropped msg - no request\n",
++			__func__);
++		goto    eoi;
++	}
++
++	/* Looks like this is interrupt-safe */
++	if (complete_rb) {
++		struct timeval  tv;
++		do_gettimeofday(&tv);
++		cl->rx_sec = tv.tv_sec;
++		cl->rx_usec = tv.tv_usec;
++		++cl->recv_msg_cnt_dma;
++		heci_cl_read_complete(complete_rb);
++		}
++
++eoi:
++	return;
++}
++EXPORT_SYMBOL(recv_heci_cl_msg_dma);
+diff --git a/drivers/misc/intel-ish/client.h b/drivers/misc/intel-ish/client.h
+index 8614020..dbd71bb 100644
+--- a/drivers/misc/intel-ish/client.h
++++ b/drivers/misc/intel-ish/client.h
+@@ -97,7 +97,8 @@ struct heci_cl {
+ 
+ 	/* Send/recv stats */
+ 	unsigned	send_msg_cnt;
+-	unsigned	recv_msg_cnt;
++	unsigned	recv_msg_cnt_ipc;
++	unsigned	recv_msg_cnt_dma;
+ 	unsigned	recv_msg_num_frags;
+ 	unsigned	heci_flow_ctrl_cnt;
+ 	unsigned	out_flow_ctrl_cnt;
+@@ -110,6 +111,12 @@ struct heci_cl {
+ 
+ extern int	dma_ready;
+ extern int	host_dma_enabled;
++extern void	*host_dma_tx_buf;
++extern unsigned	host_dma_tx_buf_size;
++extern uint64_t	host_dma_tx_buf_phys;
++extern void	*host_dma_rx_buf;
++extern unsigned	host_dma_rx_buf_size;
++extern uint64_t	host_dma_rx_buf_phys;
+ 
+ int heci_can_client_connect(struct heci_device *heci_dev, uuid_le *uuid);
+ int heci_me_cl_by_uuid(struct heci_device *dev, const uuid_le *cuuid);
+@@ -187,6 +194,8 @@ void heci_cl_all_read_wakeup(struct heci_device *dev);
+ void heci_cl_send_msg(struct heci_device *dev, struct heci_cl *cl);
+ void heci_cl_alloc_dma_buf(void);
+ void recv_heci_cl_msg(struct heci_device *dev, struct heci_msg_hdr *heci_hdr);
++void recv_heci_cl_msg_dma(struct heci_device *dev, void *msg,
++	struct dma_xfer_hbm *hbm);
+ 
+ #endif /* _HECI_CLIENT_H_ */
+ 
+diff --git a/drivers/misc/intel-ish/hbm.c b/drivers/misc/intel-ish/hbm.c
+index 67680aa..21d9883 100644
+--- a/drivers/misc/intel-ish/hbm.c
++++ b/drivers/misc/intel-ish/hbm.c
+@@ -536,6 +536,54 @@ static void heci_hbm_fw_disconnect_req(struct heci_device *dev,
+ }
+ 
+ 
++/*
++ * heci_hbm_dma_xfer_ack - receive ack for HECI-over-DMA client message
++ *
++ * Constraint:
++ * First implementation is one HECI message per DMA transfer
++ */
++void heci_hbm_dma_xfer_ack(struct heci_device *dev,
++	struct dma_xfer_hbm *dma_xfer)
++{
++}
++
++
++/*
++ * heci_hbm_dma_xfer - receive HECI-over-DMA client message
++ */
++void heci_hbm_dma_xfer(struct heci_device *dev, struct dma_xfer_hbm *dma_xfer)
++{
++	void    *msg;
++	uint64_t	offs;
++	struct heci_msg_hdr hdr;
++	struct heci_msg_hdr	*heci_hdr = (struct heci_msg_hdr *) &dev->heci_msg_hdr;
++	struct dma_xfer_hbm	*prm = dma_xfer;
++	unsigned	msg_offs;
++
++	for (msg_offs = 0; msg_offs < heci_hdr->length;
++		msg_offs += sizeof(struct dma_xfer_hbm)) {
++
++		offs = dma_xfer->msg_addr - host_dma_rx_buf_phys;
++		if (offs > host_dma_rx_buf_size) {
++			dev_err(&dev->pdev->dev, "Bad DMA Rx message address\n");
++			return;
++		}
++		if (dma_xfer->msg_length > host_dma_rx_buf_size - offs) {
++			dev_err(&dev->pdev->dev, "Bad DMA Rx message size\n");
++			return;
++		}
++		msg = host_dma_rx_buf + offs;
++		recv_heci_cl_msg_dma(dev, msg, dma_xfer);
++		dma_xfer->hbm = DMA_XFER_ACK;   /* Prepare for response */
++		++dma_xfer;
++	}
++
++	/* Send DMA_XFER_ACK [...] */
++	heci_hbm_hdr(&hdr, heci_hdr->length);
++	heci_write_message(dev, &hdr, (unsigned char *)prm);
++}
++
++
+ /**
+  * heci_hbm_dispatch - bottom half read routine after ISR to
+  * handle the read bus message cmd processing.
+@@ -555,6 +603,8 @@ void heci_hbm_dispatch(struct heci_device *dev, struct heci_bus_message *hdr)
+ 	struct hbm_host_enum_response *enum_res;
+ 	struct heci_msg_hdr heci_hdr;
+ 	unsigned char data[4];	/* All HBM messages are 4 bytes */
++	struct dma_alloc_notify   dma_alloc_notify;
++	struct dma_xfer_hbm     *dma_xfer;
+ 
+ 	heci_msg = hdr;
+ 	dev_dbg(&dev->pdev->dev, "bus cmd = %lu\n", heci_msg->hbm_cmd);
+@@ -654,6 +704,22 @@ void heci_hbm_dispatch(struct heci_device *dev, struct heci_bus_message *hdr)
+ 		/* request property for the next client */
+ 		heci_hbm_prop_req(dev);
+ 
++		if (dev->dev_state != HECI_DEV_ENABLED)
++			break;
++
++		heci_cl_alloc_dma_buf();
++		if (host_dma_rx_buf) {
++			const size_t len = sizeof(dma_alloc_notify);
++
++			memset(&dma_alloc_notify, 0, sizeof(dma_alloc_notify));
++			dma_alloc_notify.hbm = DMA_BUFFER_ALLOC_NOTIFY;
++			dma_alloc_notify.buf_size = host_dma_rx_buf_size;
++			dma_alloc_notify.buf_address = host_dma_rx_buf_phys;
++			heci_hbm_hdr(&heci_hdr, len);
++			heci_write_message(dev, &heci_hdr,
++				(unsigned char *)&dma_alloc_notify);
++		}
++
+ 		break;
+ 
+ 	case HOST_ENUM_RES_CMD:
+@@ -705,12 +771,36 @@ void heci_hbm_dispatch(struct heci_device *dev, struct heci_bus_message *hdr)
+ 			wake_up(&dev->wait_dma_ready);
+ 		break;
+ 
++	case DMA_BUFFER_ALLOC_RESPONSE:
++		host_dma_enabled = 1;
++		break;
++
++	case DMA_XFER:
++		dma_xfer = (struct dma_xfer_hbm *)heci_msg;
++		if (!host_dma_enabled) {
++			dev_err(&dev->pdev->dev,
++				"DMA XFER requested but DMA is not enabled\n");
++			break;
++		}
++		heci_hbm_dma_xfer(dev, dma_xfer);
++		break;
++
++	case DMA_XFER_ACK:
++		dma_xfer = (struct dma_xfer_hbm *)heci_msg;
++		if (!host_dma_enabled || !host_dma_tx_buf) {
++			dev_err(&dev->pdev->dev,
++				"DMA XFER acknowledged but DMA Tx\n"
++				"is not enabled\n");
++			break;
++		}
++		heci_hbm_dma_xfer_ack(dev, dma_xfer);
++		break;
++
+ 	default:
+ 		/*BUG();*/
+ 		dev_err(&dev->pdev->dev, "unknown HBM: %u\n",
+ 			(unsigned)heci_msg->hbm_cmd);
+ 		break;
+-
+ 	}
+ }
+ EXPORT_SYMBOL(heci_hbm_dispatch);
+@@ -798,7 +888,8 @@ void	recv_hbm(struct heci_device *dev, struct heci_msg_hdr *heci_hdr)
+ 	 */
+ 	if (heci_msg->hbm_cmd == CLIENT_CONNECT_RES_CMD ||
+ 			heci_msg->hbm_cmd == CLIENT_DISCONNECT_RES_CMD ||
+-			heci_msg->hbm_cmd == CLIENT_DISCONNECT_REQ_CMD) {
++			heci_msg->hbm_cmd == CLIENT_DISCONNECT_REQ_CMD ||
++			heci_msg->hbm_cmd == DMA_XFER) {
+ 		heci_hbm_dispatch(dev, heci_msg);
+ 		goto	eoi;
+ 	}
+@@ -888,7 +979,7 @@ void send_suspend(struct heci_device *dev)
+ 	dev->print_log(dev, "%s() sends SUSPEND notification\n", __func__);
+ 	state_status_msg.states_status = current_state;
+ 
+-	heci_write_message(dev, &heci_hdr, &state_status_msg);
++	heci_write_message(dev, &heci_hdr, (unsigned char *)&state_status_msg);
+ }
+ EXPORT_SYMBOL(send_suspend);
+ 
+@@ -907,7 +998,7 @@ void send_resume(struct heci_device *dev)
+ 	dev->print_log(dev, "%s() sends RESUME notification\n", __func__);
+ 	state_status_msg.states_status = current_state;
+ 
+-	heci_write_message(dev, &heci_hdr, &state_status_msg);
++	heci_write_message(dev, &heci_hdr, (unsigned char *)&state_status_msg);
+ }
+ EXPORT_SYMBOL(send_resume);
+ 
+@@ -922,6 +1013,6 @@ void query_subscribers(struct heci_device *dev)
+ 	memset(&query_subscribers_msg, 0, len);
+ 	query_subscribers_msg.hdr.cmd = SYSTEM_STATE_QUERY_SUBSCRIBERS;
+ 
+-	heci_write_message(dev, &heci_hdr, &query_subscribers_msg);
++	heci_write_message(dev, &heci_hdr, (unsigned char *)&query_subscribers_msg);
+ }
+ 
+diff --git a/drivers/misc/intel-ish/hbm.h b/drivers/misc/intel-ish/hbm.h
+index 94eb0ab..6be4044 100644
+--- a/drivers/misc/intel-ish/hbm.h
++++ b/drivers/misc/intel-ish/hbm.h
+@@ -25,58 +25,64 @@ struct heci_cl;
+ /*
+  * Timeouts in Seconds
+  */
+-#define HECI_INTEROP_TIMEOUT         7  /* Timeout on ready message */
+-#define HECI_CONNECT_TIMEOUT         3  /* HPS: at least 2 seconds */
++#define HECI_INTEROP_TIMEOUT		7  /* Timeout on ready message */
++#define HECI_CONNECT_TIMEOUT		3  /* HPS: at least 2 seconds */
+ 
+-#define HECI_CL_CONNECT_TIMEOUT     15  /* HPS: Client Connect Timeout */
+-#define HECI_CLIENTS_INIT_TIMEOUT   15  /* HPS: Clients Enumeration Timeout */
++#define HECI_CL_CONNECT_TIMEOUT		15  /* HPS: Client Connect Timeout */
++#define HECI_CLIENTS_INIT_TIMEOUT	15  /* HPS: Clients Enumeration Timeout */
+ 
+ #if 0
+-#define HECI_IAMTHIF_STALL_TIMER    12  /* HPS */
+-#define HECI_IAMTHIF_READ_TIMER     10  /* HPS */
++#define HECI_IAMTHIF_STALL_TIMER	12  /* HPS */
++#define HECI_IAMTHIF_READ_TIMER		10  /* HPS */
+ #endif
+ 
+ 
+ /*
+  * HECI Version
+  */
+-#define HBM_MINOR_VERSION                   0
+-#define HBM_MAJOR_VERSION                   1
+-#define HBM_TIMEOUT                         1	/* 1 second */
++#define HBM_MINOR_VERSION		0
++#define HBM_MAJOR_VERSION		1
++#define HBM_TIMEOUT			1 /* 1 second */
+ 
+ /* Host bus message command opcode */
+-#define HECI_HBM_CMD_OP_MSK                  0x7f
++#define HECI_HBM_CMD_OP_MSK		0x7f
+ /* Host bus message command RESPONSE */
+-#define HECI_HBM_CMD_RES_MSK                 0x80
++#define HECI_HBM_CMD_RES_MSK		0x80
+ 
+ /*
+  * HECI Bus Message Command IDs
+  */
+-#define HOST_START_REQ_CMD                  0x01
+-#define HOST_START_RES_CMD                  0x81
++#define HOST_START_REQ_CMD		0x01
++#define HOST_START_RES_CMD		0x81
+ 
+-#define HOST_STOP_REQ_CMD                   0x02
+-#define HOST_STOP_RES_CMD                   0x82
++#define HOST_STOP_REQ_CMD		0x02
++#define HOST_STOP_RES_CMD		0x82
+ 
+-#define ME_STOP_REQ_CMD                     0x03
++#define ME_STOP_REQ_CMD			0x03
+ 
+-#define HOST_ENUM_REQ_CMD                   0x04
+-#define HOST_ENUM_RES_CMD                   0x84
++#define HOST_ENUM_REQ_CMD		0x04
++#define HOST_ENUM_RES_CMD		0x84
+ 
+-#define HOST_CLIENT_PROPERTIES_REQ_CMD      0x05
+-#define HOST_CLIENT_PROPERTIES_RES_CMD      0x85
++#define HOST_CLIENT_PROPERTIES_REQ_CMD	0x05
++#define HOST_CLIENT_PROPERTIES_RES_CMD	0x85
+ 
+-#define CLIENT_CONNECT_REQ_CMD              0x06
+-#define CLIENT_CONNECT_RES_CMD              0x86
++#define CLIENT_CONNECT_REQ_CMD		0x06
++#define CLIENT_CONNECT_RES_CMD		0x86
+ 
+-#define CLIENT_DISCONNECT_REQ_CMD           0x07
+-#define CLIENT_DISCONNECT_RES_CMD           0x87
++#define CLIENT_DISCONNECT_REQ_CMD	0x07
++#define CLIENT_DISCONNECT_RES_CMD	0x87
+ 
+-#define HECI_FLOW_CONTROL_CMD                0x08
++#define HECI_FLOW_CONTROL_CMD		0x08
+ 
+ #define CLIENT_DMA_REQ_CMD		0x10
+ #define CLIENT_DMA_RES_CMD		0x90
+ 
++#define DMA_BUFFER_ALLOC_NOTIFY		0x11
++#define DMA_BUFFER_ALLOC_RESPONSE	0x91
++
++#define DMA_XFER			0x12
++#define DMA_XFER_ACK			0x92
++
+ /*
+  * HECI Stop Reason
+  * used by hbm_host_stop_request.reason
+@@ -280,6 +286,27 @@ struct hbm_client_dma_response {
+ 	u32 msg_len;
+ } __packed;
+ 
++struct dma_alloc_notify {
++	u8 hbm;
++	u8 status;
++	u8 reserved[2];
++	u32 buf_size;
++	u64 buf_address;
++	/* [...] May come more size/address pairs */
++} __packed;
++
++
++struct dma_xfer_hbm {
++	u8 hbm;
++	u8 fw_client_id;
++	u8 host_client_id;
++	u8 reserved;
++	u64 msg_addr;
++	u32 msg_length;
++	u32 reserved2;
++} __packed;
++
++
+ /**
+  * enum heci_hbm_state - host bus message protocol state
+  *
+diff --git a/drivers/misc/intel-ish/heci-hid-client.c b/drivers/misc/intel-ish/heci-hid-client.c
+index 85622c5..ddd7ad9 100644
+--- a/drivers/misc/intel-ish/heci-hid-client.c
++++ b/drivers/misc/intel-ish/heci-hid-client.c
+@@ -232,12 +232,6 @@ static void	process_recv(void *recv_buf, size_t data_len)
+ 			break;
+ 
+ 		case HOSTIF_GET_REPORT_DESCRIPTOR:
+-			ISH_DBG_PRINT(KERN_ALERT
+-				"[hid-ish]: %s(): received HOSTIF_GET_REPORT_DESCRIPTOR [cur_pos=%u] [%02X %02X %02X %02X]\n",
+-				__func__, cur_pos, ((unsigned char*)recv_msg)[0], ((unsigned char*)recv_msg)[1], ((unsigned char*)recv_msg)[2], ((unsigned char*)recv_msg)[3]);
+-			ISH_DBG_PRINT(KERN_ALERT
+-				"[hid-ish]: %s(): Length of report descriptor is %u\n",
+-				__func__, (unsigned)payload_len);
+ 			if ((!(recv_msg->hdr.command & ~CMD_MASK) ||
+ 					init_done)) {
+ 				++bad_recv_cnt;
+@@ -572,7 +566,7 @@ struct heci_cl_driver	hid_heci_cl_driver = {
+ 
+ /****************************************************************/
+ 
+-void workqueue_init_function(struct work_struct *work)
++static void workqueue_init_function(struct work_struct *work)
+ {
+ 	int	rv;
+ 	static unsigned char	buf[4096];
+@@ -595,7 +589,7 @@ void workqueue_init_function(struct work_struct *work)
+ 		__func__, hid_heci_client_found);
+ 
+ 	if (!hid_heci_client_found) {
+-		printk(KERN_ERR "[hid-ish]: timed out waiting for hid_heci_client_found\n");
++		dev_err(NULL, "[hid-ish]: timed out waiting for hid_heci_client_found\n");
+ 		rv = -ENODEV;
+ 		goto	ret;
+ 	}
+@@ -676,15 +670,8 @@ void workqueue_init_function(struct work_struct *work)
+ 	}
+ 
+ 	/* Send GET_HID_DESCRIPTOR for each device */
+-
+-	/*
+-	 * Temporary work-around for multi-descriptor traffic:
+-	 * read only the first one
+-	 * Will be removed when multi-TLC are supported
+-	 */
+-
+ 	num_hid_devices = hid_dev_count;
+-	dev_err(&hid_heci_cl->device->dev,
++	dev_warn(&hid_heci_cl->device->dev,
+ 		"[hid-ish]: enum_devices_done OK, num_hid_devices=%d\n",
+ 		num_hid_devices);
+ 
+@@ -713,12 +700,14 @@ void workqueue_init_function(struct work_struct *work)
+ 			wait_event_timeout(init_wait, hid_descr_done, 30 * HZ);
+ #endif
+ 		if (!hid_descr_done) {
+-			printk(KERN_ERR "[hid-ish]: timed out waiting for hid_descr_done\n");
++			dev_err(&hid_heci_cl->device->dev,
++				"[hid-ish]: timed out waiting for hid_descr_done\n");
+ 			continue;
+ 		}
+ 
+ 		if (!hid_descr[i]) {
+-			printk(KERN_ERR "[hid-ish]: failed to allocate HID descriptor buffer\n");
++			dev_err(&hid_heci_cl->device->dev,
++				"[hid-ish]: failed to allocate HID descriptor buffer\n");
+ 			continue;
+ 		}
+ 
+diff --git a/drivers/misc/intel-ish/heci_dev.h b/drivers/misc/intel-ish/heci_dev.h
+index bc857c5..db8f36d 100644
+--- a/drivers/misc/intel-ish/heci_dev.h
++++ b/drivers/misc/intel-ish/heci_dev.h
+@@ -269,6 +269,7 @@ struct heci_device {
+ 	const struct heci_hw_ops *ops;
+ 
+ 	size_t	mtu;
++	u32     heci_msg_hdr;
+ 	char hw[0] __aligned(sizeof(void *));
+ };
+ 
+diff --git a/drivers/misc/intel-ish/hw-ish-regs.h b/drivers/misc/intel-ish/hw-ish-regs.h
+index 9d3db55..e1c50cdd 100644
+--- a/drivers/misc/intel-ish/hw-ish-regs.h
++++ b/drivers/misc/intel-ish/hw-ish-regs.h
+@@ -85,7 +85,7 @@ ISS FW may not write to them */
+ 
+ /*
+  * FW status bits (relevant)
+- */ 
++ */
+ #define	IPC_FWSTS_ILUP		0x1
+ #define	IPC_FWSTS_HECI_UP	(1<<1)
+ #define	IPC_FWSTS_DMA0		(1<<16)
+diff --git a/drivers/misc/intel-ish/hw-ish.c b/drivers/misc/intel-ish/hw-ish.c
+index caa7539..b029e71 100644
+--- a/drivers/misc/intel-ish/hw-ish.c
++++ b/drivers/misc/intel-ish/hw-ish.c
+@@ -132,7 +132,7 @@ void ish_intr_enable(struct heci_device *dev)
+ 	dev_dbg(&dev->pdev->dev, "ish_intr_enable\n");
+ 	if (dev->pdev->revision == REVISION_ID_CHT_A0 ||
+ 			(dev->pdev->revision & REVISION_ID_SI_MASK) ==
+-			REVISION_ID_CHT_A0_SI)
++			REVISION_ID_CHT_Ax_SI)
+ 		ish_reg_write(dev, IPC_REG_HOST_COMM, 0x81);
+ 	else if (dev->pdev->revision == REVISION_ID_CHT_B0 ||
+ 			(dev->pdev->revision & REVISION_ID_SI_MASK) ==
+@@ -159,7 +159,7 @@ void ish_intr_disable(struct heci_device *dev)
+ 	dev_dbg(&dev->pdev->dev, "ish_intr_disable\n");
+ 	if (dev->pdev->revision == REVISION_ID_CHT_A0 ||
+ 			(dev->pdev->revision & REVISION_ID_SI_MASK) ==
+-			REVISION_ID_CHT_A0_SI)
++			REVISION_ID_CHT_Ax_SI)
+ 		/*ish_reg_write(dev, IPC_REG_HOST_COMM, 0xC1)*/;
+ 	else if (dev->pdev->revision == REVISION_ID_CHT_B0 ||
+ 			(dev->pdev->revision & REVISION_ID_SI_MASK) ==
+@@ -473,7 +473,8 @@ static void	fw_reset_work_fn(struct work_struct *unused)
+ 			__func__);
+ 
+ 	} else
+-		printk(KERN_ERR "[heci-ish]: FW reset failed (%d)\n", rv);
++		dev_err(&heci_dev->pdev->dev,
++			"[heci-ish]: FW reset failed (%d)\n", rv);
+ }
+ 
+ 
+@@ -615,6 +616,7 @@ irqreturn_t ish_irq_handler(int irq, void *dev_id)
+ 	sync_fw_clock(dev);
+ 
+ 	heci_hdr = (struct heci_msg_hdr *)&msg_hdr;
++	dev->heci_msg_hdr = msg_hdr;
+ 
+ 	/* Sanity check: HECI frag. length in header */
+ 	if (heci_hdr->length > dev->mtu) {
+@@ -761,9 +763,10 @@ static int ish_hw_reset(struct heci_device *dev)
+ 	writel(0, hw->mem_addr + IPC_REG_ISH_RMP2);
+ 
+ 	for (dma_delay = 0; dma_delay < MAX_DMA_DELAY &&
+-		ish_reg_read(dev, IPC_REG_ISH_HOST_FWSTS) & (IPC_ISH_IN_DMA);
+-		dma_delay += 5);
+-			mdelay(5);
++			ish_reg_read(dev, IPC_REG_ISH_HOST_FWSTS) &
++				(IPC_ISH_IN_DMA);
++			dma_delay += 5)
++		mdelay(5);
+ 
+ 	if (dma_delay >= MAX_DMA_DELAY) {
+ 		dev_err(&pdev->dev,
+@@ -967,10 +970,6 @@ struct heci_device *ish_dev_init(struct pci_dev *pdev)
+ 
+ void	heci_device_disable(struct heci_device *dev)
+ {
+-	unsigned long	flags;
+-	struct wr_msg_ctl_info	*ipc_link;
+-	struct heci_cl	*cl;
+-
+ 	dev->dev_state = HECI_DEV_DISABLED;
+ 	ish_clr_host_rdy(dev);
+ 	ish_intr_disable(dev);
+diff --git a/drivers/misc/intel-ish/hw-ish.h b/drivers/misc/intel-ish/hw-ish.h
+index cc56113..6b2c516 100644
+--- a/drivers/misc/intel-ish/hw-ish.h
++++ b/drivers/misc/intel-ish/hw-ish.h
+@@ -17,6 +17,7 @@
+ #define _HECI_HW_ISH_H_
+ 
+ #include <linux/pci.h>
++#include <linux/interrupt.h>
+ #include "hw-ish-regs.h"
+ #include "heci_dev.h"
+ 
+diff --git a/drivers/misc/intel-ish/init.c b/drivers/misc/intel-ish/init.c
+index 39336b9..2547c2a 100644
+--- a/drivers/misc/intel-ish/init.c
++++ b/drivers/misc/intel-ish/init.c
+@@ -100,7 +100,7 @@ void heci_device_init(struct heci_device *dev)
+ 			list_add_tail(&tx_buf->link,
+ 				&dev->wr_free_list_head.link);
+ 		}
+-		printk(KERN_ALERT "[heci-ish]: success Tx FIFO allocations\n");
++		dev_dbg(&dev->pdev->dev, "[heci-ish]: success Tx FIFO allocations\n");
+ 	} while (0);
+ }
+ EXPORT_SYMBOL_GPL(heci_device_init);
+@@ -158,7 +158,7 @@ reset_done:
+ 	}
+ 
+ 	if (!heci_hw_is_ready(dev)) {
+-		dev_err(&dev->pdev->dev, "ME is not ready.\n");
++		dev_err(&dev->pdev->dev, "ISH is not ready (FWSTS).\n");
+ 		goto err;
+ 	}
+ 
+@@ -245,10 +245,6 @@ EXPORT_SYMBOL_GPL(heci_reset);
+ 
+ void heci_stop(struct heci_device *dev)
+ {
+-	dev_dbg(&dev->pdev->dev, "stopping the device.\n");
+-	dev->dev_state = HECI_DEV_POWER_DOWN;
+-	heci_reset(dev, 0);
+-	flush_scheduled_work();
+ }
+ EXPORT_SYMBOL_GPL(heci_stop);
+ 
+diff --git a/drivers/misc/intel-ish/pci-ish.c b/drivers/misc/intel-ish/pci-ish.c
+index 4e1bf46..6e149e4 100644
+--- a/drivers/misc/intel-ish/pci-ish.c
++++ b/drivers/misc/intel-ish/pci-ish.c
+@@ -616,8 +616,12 @@ ssize_t show_heci_dev_props(struct device *dev,
+ 					(unsigned)cl->send_msg_cnt);
+ 				scnprintf(buf + strlen(buf),
+ 					PAGE_SIZE - strlen(buf),
+-					"Rx count: %u\n",
+-					(unsigned)cl->recv_msg_cnt);
++					"Rx IPC count: %u\n",
++					(unsigned)cl->recv_msg_cnt_ipc);
++				scnprintf(buf + strlen(buf),
++					PAGE_SIZE - strlen(buf),
++					"Rx DMA count: %u\n",
++					(unsigned)cl->recv_msg_cnt_dma);
+ 				scnprintf(buf + strlen(buf),
+ 					PAGE_SIZE - strlen(buf),
+ 					"FC count: %u\n",
+@@ -790,7 +794,7 @@ struct my_work_t {
+ 
+ struct my_work_t *work;
+ 
+-void workqueue_init_function(struct work_struct *work)
++static void workqueue_init_function(struct work_struct *work)
+ {
+ 	struct heci_device *dev = ((struct my_work_t *)work)->dev;
+ 	int err;
+@@ -827,12 +831,14 @@ void workqueue_init_function(struct work_struct *work)
+ 		__func__,
+ 		dev->pdev->revision == REVISION_ID_CHT_A0 ||
+ 		(dev->pdev->revision & REVISION_ID_SI_MASK) ==
+-		REVISION_ID_CHT_A0_SI ? "CHT Ax" :
++		REVISION_ID_CHT_Ax_SI ? "CHT Ax" :
+ 		dev->pdev->revision == REVISION_ID_CHT_B0 ||
+ 		(dev->pdev->revision & REVISION_ID_SI_MASK) ==
+ 		REVISION_ID_CHT_Bx_SI ? "CHT Bx" :
+ 		(dev->pdev->revision & REVISION_ID_SI_MASK) ==
+-		REVISION_ID_CHT_Kx_SI ? "CHT Kx/Cx" : "Unknown",
++		REVISION_ID_CHT_Kx_SI ? "CHT Kx/Cx" :
++		(dev->pdev->revision & REVISION_ID_SI_MASK) ==
++		REVISION_ID_CHT_Dx_SI ? "CHT Dx" : "Unknown",
+ 		dev->pdev->revision);
+ #else
+ 	dev->print_log = ish_print_log_nolog;
+@@ -891,7 +897,7 @@ static int ish_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		"[heci-ish] %s() running on %s revision [%02X]\n", __func__,
+ 		pdev->revision == REVISION_ID_CHT_A0 ||
+ 		(pdev->revision & REVISION_ID_SI_MASK) ==
+-			REVISION_ID_CHT_A0_SI ? "CHT A0" :
++			REVISION_ID_CHT_Ax_SI ? "CHT A0" :
+ 		pdev->revision == REVISION_ID_CHT_B0 ||
+ 		(pdev->revision & REVISION_ID_SI_MASK) ==
+ 			REVISION_ID_CHT_Bx_SI ? "CHT B0" :
+diff --git a/drivers/misc/intel-ish/platform-config.h b/drivers/misc/intel-ish/platform-config.h
+index 2696bac..49c3261 100644
+--- a/drivers/misc/intel-ish/platform-config.h
++++ b/drivers/misc/intel-ish/platform-config.h
+@@ -17,7 +17,7 @@
+ #define PLATFORM_CONFIG__H
+ 
+ /* Build ID string */
+-#define	BUILD_ID	"0195-fix-recv-hid-hw-reset"
++#define BUILD_ID        "236-dx-si-dma-impl-upstream-rc"
+ 
+ #define	ISH_DEBUG	0
+ #if ISH_DEBUG
+@@ -49,7 +49,7 @@
+ #endif
+ 
+ #define	REVISION_ID_CHT_A0	0x6
+-#define	REVISION_ID_CHT_A0_SI	0x0
++#define	REVISION_ID_CHT_Ax_SI	0x0
+ #define	REVISION_ID_CHT_Bx_SI	0x10
+ #define	REVISION_ID_CHT_Kx_SI	0x20
+ #define	REVISION_ID_CHT_Dx_SI	0x30
+-- 
+1.9.1
+

@@ -1,0 +1,70 @@
+From f0b8b4229ab0311ea7cecca541f082e06f104e46 Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 14 Oct 2015 15:35:05 +0100
+Subject: [PATCH] REVERTME [VPG]: drm/i915: Fix for scheduler hang due to
+ unexpected seqno values
+
+The deferred context initialisation submits a request (for the golden
+context render state setup). This is not tracked by the scheduler.
+Generally this is not an issue. However, there is a race condition
+where it can cause a scheduler hang.
+
+Specifically, when the scheduler's flight queue is full no more work
+will be submitted until an in flight request completes. A new context
+is then created and so the last thing in the request queue is the
+deferred initialisation. If everything then completes
+'instantaneously' such that by the time the interrupt handler gets to
+run, the seqno it sees is the one for the deferred init and all the
+previous batch buffer completion ones are 'lost'. Unfortunately, as
+the scheduler is looking for an exact match on the seqno value, it
+will see this unexpected seqno and ignore it. It will then wait
+forever for seqno values that will never arrive.
+
+Note that the reason the scheduler looks for an exact match is because
+it needs to cope with seqno values arriving out of order due batch
+buffers being pre-empted. In the initial design, simple re-ordering of
+batch buffers prior to hardware submission also cause out of order
+seqno completion. However, that has now been resolved by the lazy
+allocation of seqno values.
+
+This patch implements a quick/simple fix for the race condition by
+making the scheduler check for greater than rather than an exact
+match. In this particular tree, at this particular time, this should
+be a safe work around as pre-emption is not enabled. It is not really
+a proper fix. However, implementing a real fix is non-trivial and a
+much greater risk for a customer release branch.
+
+As this patch is just a work-around and not the proper fix, it is
+marked as a REVERTME. Going forward, the entire interrupt handling
+procedure has been re-written (and largely moved out of the scheduler
+and in to the request handling code). This new version eliminates the
+unexpected seqno issue completely. That version is (or soon will be)
+in the dev tree. So this patch is not required beyond the frozen
+release branch.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-5743
+Change-Id: Id9b899c4a4644ce52616e83580cc13f19152235d
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_scheduler.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index e2bcd98..9234e32 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -582,8 +582,10 @@ static void i915_scheduler_seqno_complete(struct intel_engine_cs *ring, uint32_t
+ 			return;
+ 		}
+ 
+-		if (seqno == node->params.request->seqno)
++		if ((node->params.request->seqno != 0) &&
++		    (i915_seqno_passed(seqno, node->params.request->seqno))) {
+ 			break;
++		}
+ 	}
+ 
+ 	/*
+-- 
+1.9.1
+

@@ -1,0 +1,174 @@
+From cf21baf7030b26390bc9237329dc5baabd1d4051 Mon Sep 17 00:00:00 2001
+Message-Id: <cf21baf7030b26390bc9237329dc5baabd1d4051.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 12 Aug 2014 17:52:19 +0100
+Subject: [PATCH 34/61] FOR_UPSTREAM [VPG]: drm/i915: Add scheduler hook to
+ GPU reset
+
+When the watchdog resets the GPU, the scheduler needs to know so that it can
+clean up it's view of the world. All in flight nodes must be marked as dead so
+that the scheduler does not wait forever for them to complete. Also, all queued
+nodes must be marked as dead so that the scheduler does not dead lock the reset
+code by saying that the ring can not be idled and it must come back again
+later.
+
+Change-Id: I184eb59c5c1a1385f9c17db66c7cc46f8904eebd
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c       |    2 ++
+ drivers/gpu/drm/i915/i915_scheduler.c |   61 ++++++++++++++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_scheduler.h |    8 ++++-
+ 3 files changed, 66 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 45227d3..bae1627 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2838,6 +2838,8 @@ void i915_gem_reset(struct drm_device *dev)
+ 	struct intel_engine_cs *ring;
+ 	int i;
+ 
++	i915_scheduler_kill_all(dev);
++
+ 	/*
+ 	 * Before we free the objects from the requests, we need to inspect
+ 	 * them for finding the guilty party. As the requests only borrow
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 8c8c344..6b844b6 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -337,6 +337,54 @@ static void i915_scheduler_node_kill(struct i915_scheduler_queue_entry *node)
+ 	node->status = i915_sqs_dead;
+ }
+ 
++/* Abandon a queued node completely. For example because the driver is being
++ * reset and it is not valid to preserve absolutely any state at all across the
++ * reinitialisation sequence. */
++static void i915_scheduler_node_kill_queued(struct i915_scheduler_queue_entry *node)
++{
++	BUG_ON(!node);
++	BUG_ON(!I915_SQS_IS_QUEUED(node));
++
++	node->status = i915_sqs_dead;
++}
++
++/* The system is toast. Terminate all nodes with extreme prejudice. */
++void i915_scheduler_kill_all(struct drm_device *dev)
++{
++	struct i915_scheduler_queue_entry   *node;
++	struct drm_i915_private             *dev_priv = dev->dev_private;
++	struct i915_scheduler               *scheduler = dev_priv->scheduler;
++	unsigned long   flags;
++	int             r;
++
++	spin_lock_irqsave(&scheduler->lock, flags);
++
++	for (r = 0; r < I915_NUM_RINGS; r++) {
++		list_for_each_entry(node, &scheduler->node_queue[r], link) {
++			switch (node->status) {
++			case I915_SQS_CASE_COMPLETE:
++			break;
++
++			case I915_SQS_CASE_FLYING:
++				i915_scheduler_node_kill(node);
++			break;
++
++			case I915_SQS_CASE_QUEUED:
++				i915_scheduler_node_kill_queued(node);
++			break;
++
++			default:
++				/* Wot no state?! */
++				BUG();
++			}
++		}
++	}
++
++	spin_unlock_irqrestore(&scheduler->lock, flags);
++
++	queue_work(dev_priv->wq, &dev_priv->mm.scheduler_work);
++}
++
+ /*
+  * The batch tagged with the indicated seqence number has completed.
+  * Search the queue for it, update its status and those of any batches
+@@ -1014,7 +1062,7 @@ int i915_scheduler_submit(struct intel_engine_cs *ring, bool was_locked)
+ 		scheduler->flags[ring->id] &= ~i915_sf_submitting;
+ 
+ 		if (ret) {
+-			bool requeue = true;
++			int requeue = 1;
+ 
+ 			/* Oh dear! Either the node is broken or the ring is
+ 			 * busy. So need to kill the node or requeue it and try
+@@ -1024,7 +1072,7 @@ int i915_scheduler_submit(struct intel_engine_cs *ring, bool was_locked)
+ 			case ENODEV:
+ 			case ENOENT:
+ 				/* Fatal errors. Kill the node. */
+-				requeue = false;
++				requeue = -1;
+ 			break;
+ 
+ 			case EAGAIN:
+@@ -1043,13 +1091,18 @@ int i915_scheduler_submit(struct intel_engine_cs *ring, bool was_locked)
+ 			break;
+ 			}
+ 
+-			if (requeue) {
++			/* Check that the watchdog/reset code has not nuked
++			 * the node while we weren't looking: */
++			if (node->status == i915_sqs_dead)
++				requeue = 0;
++
++			if (requeue == 1) {
+ 				i915_scheduler_node_requeue(node);
+ 				/* No point spinning if the ring is currently
+ 				 * unavailable so just give up and come back
+ 				 * later. */
+ 				break;
+-			} else
++			} else if (requeue == -1)
+ 				i915_scheduler_node_kill(node);
+ 		}
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index e72cf49..19a010d 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -36,7 +36,7 @@ enum i915_scheduler_queue_status {
+ 	i915_sqs_flying,
+ 	/* Finished processing on the hardware: */
+ 	i915_sqs_complete,
+-	/* Killed by catastrophic submission failure: */
++	/* Killed by watchdog or catastrophic submission failure: */
+ 	i915_sqs_dead,
+ 	/* Limit value for use with arrays/loops */
+ 	i915_sqs_MAX
+@@ -47,6 +47,11 @@ enum i915_scheduler_queue_status {
+ #define I915_SQS_IS_COMPLETE(node)	(((node)->status == i915_sqs_complete) || \
+ 					 ((node)->status == i915_sqs_dead))
+ 
++#define I915_SQS_CASE_QUEUED		i915_sqs_queued
++#define I915_SQS_CASE_FLYING		i915_sqs_flying
++#define I915_SQS_CASE_COMPLETE		i915_sqs_complete:		\
++					case i915_sqs_dead
++
+ struct i915_scheduler_obj_entry {
+ 	struct drm_i915_gem_object          *obj;
+ };
+@@ -96,6 +101,7 @@ int         i915_scheduler_closefile(struct drm_device *dev,
+ int         i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe);
+ int         i915_scheduler_handle_irq(struct intel_engine_cs *ring);
+ bool        i915_scheduler_is_ring_idle(struct intel_engine_cs *ring);
++void        i915_scheduler_kill_all(struct drm_device *dev);
+ void        i915_gem_scheduler_work_handler(struct work_struct *work);
+ int         i915_scheduler_flush(struct intel_engine_cs *ring, bool is_locked);
+ int         i915_scheduler_flush_request(struct drm_i915_gem_request *req,
+-- 
+1.7.9.5
+

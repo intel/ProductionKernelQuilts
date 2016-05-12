@@ -1,0 +1,459 @@
+From a9edeb35c37a2d7bf38de8fdb5aa5b562b6662bb Mon Sep 17 00:00:00 2001
+Message-Id: <a9edeb35c37a2d7bf38de8fdb5aa5b562b6662bb.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: Akashdeep Sharma <akashdeep.sharma@intel.com>
+Date: Mon, 2 Feb 2015 10:10:22 +0530
+Subject: [PATCH 04/61] MUST_REBASE [VPG]: video/adf: Audio Hotplug and DIP
+
+These changes are to send Hot plug, unplug, mode change events to
+HDMI LPE audio driver and program DIP CTL register.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5532
+Change-Id: I50a0a3240115b86a5931472e72901173472e72f1
+Signed-off-by: Akashdeep Sharma <akashdeep.sharma@intel.com>
+---
+ .../adf/intel/core/common/hdmi/gen_hdmi_audio.c    |   25 +++++++-
+ .../adf/intel/core/common/hdmi/gen_hdmi_edid.c     |   35 +++++++++++
+ .../adf/intel/core/common/hdmi/gen_hdmi_hotplug.c  |   16 ++++-
+ .../adf/intel/core/common/hdmi/gen_hdmi_pipe.c     |    2 +
+ .../adf/intel/core/common/hdmi/gen_hdmi_pipe_ops.c |   38 ++++++++++++
+ .../video/adf/intel/core/common/hdmi/hdmi_edid.h   |    2 +
+ drivers/video/adf/intel/core/vlv/vlv_hdmi_port.c   |   62 ++++++++++++++++++++
+ .../adf/intel/include/core/common/dp/dp_panel.h    |    4 +-
+ .../intel/include/core/common/hdmi/gen_hdmi_pipe.h |   13 +++-
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |    1 +
+ .../adf/intel/include/core/vlv/vlv_hdmi_port.h     |    5 ++
+ 11 files changed, 194 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_audio.c b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_audio.c
+index adf7f37..6159be8 100644
+--- a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_audio.c
++++ b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_audio.c
+@@ -16,6 +16,7 @@
+ 
+ #include <core/common/hdmi/gen_hdmi_audio.h>
+ #include <core/common/hdmi/gen_hdmi_pipe.h>
++#include <core/vlv/vlv_dc_config.h>
+ #include <core/vlv/vlv_dc_regs.h>
+ #include <core/vlv/chv_dc_regs.h>
+ #include <intel_adf.h>
+@@ -25,6 +26,7 @@
+ #define IS_HDMI_AUDIO_REG(reg) ((reg >= 0x65000) && (reg < 0x65FFF))
+ 
+ static struct hdmi_audio_priv hdmi_priv;
++static struct hdmi_pipe *pipe;
+ 
+ void adf_hdmi_audio_signal_event(enum had_event_type event)
+ {
+@@ -35,6 +37,12 @@ void adf_hdmi_audio_signal_event(enum had_event_type event)
+ 	}
+ }
+ 
++void adf_hdmi_audio_init(struct hdmi_pipe *hdmi_pipe)
++{
++	pr_debug("ADF: HDMI:%s\n", __func__);
++	pipe = hdmi_pipe;
++}
++
+ /**
+  * mid_hdmi_audio_get_caps:
+  * used to return the HDMI audio capabilities.
+@@ -47,8 +55,11 @@ static int adf_hdmi_audio_get_caps(enum had_caps_list get_element,
+ 
+ 	switch (get_element) {
+ 	case HAD_GET_ELD:
++		memcpy(capabilities, pipe->config.ctx.monitor->eld,
++						HDMI_MAX_ELD_LENGTH);
+ 		break;
+ 	case HAD_GET_SAMPLING_FREQ:
++		memcpy(capabilities, &(pipe->tmds_clock), sizeof(uint32_t));
+ 		break;
+ 	default:
+ 		break;
+@@ -83,12 +94,19 @@ static int adf_hdmi_audio_set_caps(enum had_caps_list set_element,
+ 		void *capabilties)
+ {
+ 	int ret = 0;
++	struct intel_pipeline *pipeline = pipe->base.pipeline;
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_hdmi_port *hdmi_port;
++	hdmi_port = &disp->port.hdmi_port;
++
+ 	pr_debug("ADF: HDMI:%s\n", __func__);
+ 
+ 	switch (set_element) {
+ 	case HAD_SET_ENABLE_AUDIO:
++		vlv_hdmi_port_enable_audio(hdmi_port);
+ 		break;
+ 	case HAD_SET_DISABLE_AUDIO:
++		vlv_hdmi_port_disable_audio(hdmi_port);
+ 		break;
+ 	case HAD_SET_ENABLE_AUDIO_INT:
+ 		break;
+@@ -212,12 +230,17 @@ int adf_hdmi_audio_register(
+ 	hdmi_priv.had_pvt_data = had_data;
+ 	hdmi_priv.had_interface = driver;
+ 
++	if (pipe->config.ctx.monitor)
++		if (pipe->config.ctx.monitor->is_hdmi == false)
++			return 0;
++
+ 	/*
+ 	 * The Audio driver is loading now and we need to notify
+ 	 * it if there is an HDMI device attached
+ 	 */
++	if (atomic_read(&pipe->config.ctx.connected))
++		adf_hdmi_audio_signal_event(HAD_EVENT_HOT_PLUG);
+ 
+-	adf_hdmi_audio_signal_event(HAD_EVENT_HOT_PLUG);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(adf_hdmi_audio_register);
+diff --git a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_edid.c b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_edid.c
+index ab5d47d..38533d5 100644
+--- a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_edid.c
++++ b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_edid.c
+@@ -2776,6 +2776,41 @@ static bool cea_db_is_hdmi_vsdb(const u8 *db)
+ 	return hdmi_id == HDMI_IDENTIFIER;
+ }
+ 
++bool detect_monitor_audio(struct edid *edid)
++{
++	u8 *edid_ext;
++	int i, j;
++	bool has_audio = false;
++	int start_offset, end_offset;
++
++	edid_ext = find_cea_extension(edid);
++	if (!edid_ext)
++		goto end;
++
++	has_audio = ((edid_ext[3] & EDID_BASIC_AUDIO) != 0);
++
++	if (has_audio) {
++		pr_debug("Monitor has basic audio support\n");
++		goto end;
++	}
++
++	if (cea_db_offsets(edid_ext, &start_offset, &end_offset))
++		goto end;
++
++	for_each_cea_db(edid_ext, i, start_offset, end_offset) {
++		if (cea_db_tag(&edid_ext[i]) == AUDIO_BLOCK) {
++			has_audio = true;
++			for (j = 1; j < cea_db_payload_len(&edid_ext[i]) + 1;
++						j += 3)
++				pr_debug("CEA audio format %d\n",
++						(edid_ext[i + j] >> 3) & 0xf);
++			goto end;
++		}
++	}
++end:
++	return has_audio;
++}
++
+ bool detect_hdmi_monitor(struct edid *edid)
+ {
+ 	u8 *edid_ext;
+diff --git a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_hotplug.c b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_hotplug.c
+index 9eb481b..ff5a453 100644
+--- a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_hotplug.c
++++ b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_hotplug.c
+@@ -349,6 +349,7 @@ intel_adf_hdmi_get_monitor(struct edid *edid)
+ 
+ 	INIT_LIST_HEAD(&monitor->probed_modes);
+ 	monitor->is_hdmi = _monitor_is_hdmi(edid);
++	monitor->has_audio = detect_monitor_audio(edid);
+ 	monitor->quant_range_selectable = _monitor_quant_range_selectable(edid);
+ 
+ 	/* Get all the modes supported in EDID */
+@@ -497,7 +498,7 @@ read_edid:
+ 
+ 		/* Notify audio about hotplug */
+ 		ret = intel_adf_hdmi_notify_audio(hdmi_pipe, live_status);
+-		if (ret) {
++		if (!ret) {
+ 			pr_err("ADF: HDMI: %s Noti to audio failed\n",
+ 				__func__);
+ 			return ret;
+@@ -616,8 +617,17 @@ int intel_adf_hdmi_handle_events(struct hdmi_pipe *hdmi_pipe, u32 events)
+ 
+ bool hdmi_notify_audio(struct hdmi_pipe *hdmi_pipe, bool connected)
+ {
+-	pr_info("ADF: HDMI: %s FIXME\n", __func__);
+-	return false;
++	pr_info("ADF: HDMI:%s HDMI %s\n", __func__,
++			connected ? "connected" : "disconnected");
++
++	if (connected) {
++		if (hdmi_pipe->config.ctx.monitor->has_audio)
++			adf_hdmi_audio_signal_event(HAD_EVENT_HOT_PLUG);
++	} else {
++		adf_hdmi_audio_signal_event(HAD_EVENT_HOT_UNPLUG);
++	}
++
++	return true;
+ }
+ 
+ int intel_adf_hdmi_notify_audio(struct hdmi_pipe *hdmi_pipe, bool connected)
+diff --git a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_pipe.c b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_pipe.c
+index a1478ef..adac57e 100644
+--- a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_pipe.c
++++ b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_pipe.c
+@@ -209,6 +209,8 @@ int hdmi_pipe_init(struct hdmi_pipe *pipe,
+ 		goto fail_pipe;
+ 	}
+ 
++	adf_hdmi_audio_init(pipe);
++
+ 	/*
+ 	 * Configure HDMI
+ 	 * This function can probe HDMI and try to do a modeset
+diff --git a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_pipe_ops.c b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_pipe_ops.c
+index c56c171..be9c08e 100644
+--- a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_pipe_ops.c
++++ b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_pipe_ops.c
+@@ -257,6 +257,34 @@ static int hdmi_prepare(struct intel_pipe *pipe,
+ 	return err;
+ }
+ 
++static int hdmi_write_dip(struct intel_pipe *pipe)
++{
++	int err = 0;
++	struct hdmi_pipe *hdmi_pipe = hdmi_pipe_from_intel_pipe(pipe);
++	struct intel_pipeline *pipeline = hdmi_pipe->base.pipeline;
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_hdmi_port *hdmi_port;
++
++	pr_info("ADF:HDMI: %s\n", __func__);
++
++	if (!pipeline) {
++		pr_err("ADF:HDMI: %s: Pipeline not set\n", __func__);
++		return -EINVAL;
++	}
++
++	hdmi_port = &disp->port.hdmi_port;
++	if (!hdmi_port) {
++		pr_err("ADF:HDMI: %s: Port not set\n", __func__);
++		return -EINVAL;
++	}
++
++	err = vlv_hdmi_port_write_dip(hdmi_port, true);
++	if (err)
++		pr_err("ADF: HDMI: %s: Port DIP write\n", __func__);
++
++	return err;
++}
++
+ static int hdmi_modeset(struct intel_pipe *pipe,
+ 		struct drm_mode_modeinfo *mode)
+ {
+@@ -299,6 +327,16 @@ static int hdmi_modeset(struct intel_pipe *pipe,
+ 		pr_err("ADF:HDMI: %s: Pipeline on failed\n", __func__);
+ 		goto out;
+ 	}
++
++	hdmi_pipe->tmds_clock = mode->clock;
++	adf_hdmi_audio_signal_event(HAD_EVENT_MODE_CHANGING);
++
++	err = hdmi_write_dip(pipe);
++	if (err) {
++		pr_err("ADF:HDMI: %s: DIP write failed\n", __func__);
++		goto out;
++	}
++
+ 	hdmi_pipe->dpms_state = DRM_MODE_DPMS_ON;
+ 
+ 	/* Update the latest applied mode to current context */
+diff --git a/drivers/video/adf/intel/core/common/hdmi/hdmi_edid.h b/drivers/video/adf/intel/core/common/hdmi/hdmi_edid.h
+index e2622b5..d0c5705 100644
+--- a/drivers/video/adf/intel/core/common/hdmi/hdmi_edid.h
++++ b/drivers/video/adf/intel/core/common/hdmi/hdmi_edid.h
+@@ -329,5 +329,7 @@ bool edid_is_valid(struct edid *edid);
+ int mode_vrefresh(const struct drm_mode_modeinfo *mode);
+ int hdmi_avi_infoframe_from_mode(struct hdmi_monitor *monitor,
+ 					const struct drm_mode_modeinfo *mode);
++/* Added for HDMI audio */
++bool detect_monitor_audio(struct edid *edid);
+ 
+ #endif /* HDMI_EDID_H_ */
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_hdmi_port.c b/drivers/video/adf/intel/core/vlv/vlv_hdmi_port.c
+index d1390bf..4a1f37d 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_hdmi_port.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_hdmi_port.c
+@@ -66,6 +66,68 @@ u32 vlv_hdmi_port_disable(struct vlv_hdmi_port *port)
+ 	return 0;
+ }
+ 
++void vlv_hdmi_port_enable_audio(struct vlv_hdmi_port *port)
++{
++	u32 temp;
++	pr_info("ADF: HDMI: %s\n", __func__);
++
++	temp = REG_READ(port->control_reg);
++	if (temp & SDVO_ENABLE)
++		temp |= SDVO_AUDIO_ENABLE;
++
++	REG_WRITE(port->control_reg, temp);
++	REG_READ(port->control_reg);
++}
++
++void vlv_hdmi_port_disable_audio(struct vlv_hdmi_port *port)
++{
++	u32 temp;
++	pr_info("ADF: HDMI: %s\n", __func__);
++
++	temp = REG_READ(port->control_reg) & ~SDVO_AUDIO_ENABLE;
++	REG_WRITE(port->control_reg, temp);
++	REG_READ(port->control_reg);
++}
++
++u32 vlv_hdmi_port_write_dip(struct vlv_hdmi_port *port, bool enable)
++{
++	u32 val = REG_READ(port->dip_ctrl);
++	u32 dip_port = VIDEO_DIP_PORT(port->port_id);
++
++	pr_info("ADF: HDMI: %s\n", __func__);
++
++	val |= VIDEO_DIP_SELECT_AVI | VIDEO_DIP_FREQ_VSYNC;
++
++	if (!enable) {
++		if (!(val & VIDEO_DIP_ENABLE))
++			return 0;
++		val &= ~VIDEO_DIP_ENABLE;
++		REG_WRITE(port->dip_ctrl, val);
++		REG_POSTING_READ(port->dip_ctrl);
++		return 0;
++	}
++
++	if (dip_port != (val & VIDEO_DIP_PORT_MASK)) {
++		if (val & VIDEO_DIP_ENABLE) {
++			val &= ~VIDEO_DIP_ENABLE;
++			REG_WRITE(port->dip_ctrl, val);
++			REG_POSTING_READ(port->dip_ctrl);
++		}
++		val &= ~VIDEO_DIP_PORT_MASK;
++		val |= dip_port;
++	}
++
++	val |= VIDEO_DIP_ENABLE;
++	val |= VIDEO_DIP_ENABLE_AVI | VIDEO_DIP_ENABLE_SPD;
++	val &= ~(VIDEO_DIP_ENABLE_VENDOR |
++		VIDEO_DIP_ENABLE_GAMUT | VIDEO_DIP_ENABLE_GCP);
++
++	REG_WRITE(port->dip_ctrl, val);
++	REG_POSTING_READ(port->dip_ctrl);
++
++	return 0;
++}
++
+ bool vlv_hdmi_port_init(struct vlv_hdmi_port *port, enum port enum_port,
+ 		enum pipe pipe)
+ {
+diff --git a/drivers/video/adf/intel/include/core/common/dp/dp_panel.h b/drivers/video/adf/intel/include/core/common/dp/dp_panel.h
+index 5cbdf84..b2be2df 100644
+--- a/drivers/video/adf/intel/include/core/common/dp/dp_panel.h
++++ b/drivers/video/adf/intel/include/core/common/dp/dp_panel.h
+@@ -340,7 +340,7 @@ DP_LANE_SYMBOL_LOCKED)
+ # define DP_PSR_SINK_INTERNAL_ERROR         7
+ # define DP_PSR_SINK_STATE_MASK             0x07
+ 
+-# define MAX_ELD_LENGTH			    128
++# define DP_MAX_ELD_LENGTH			    128
+ 
+ enum vswing_level {
+ 	e0_4 = 0,
+@@ -382,7 +382,7 @@ struct dp_panel {
+ 	enum vswing_level max_vswing;
+ 	struct edid *edid;
+ 
+-	uint8_t eld[MAX_ELD_LENGTH];
++	uint8_t eld[DP_MAX_ELD_LENGTH];
+ 
+ 	/* information parsed from edid*/
+ 	bool is_hdmi;
+diff --git a/drivers/video/adf/intel/include/core/common/hdmi/gen_hdmi_pipe.h b/drivers/video/adf/intel/include/core/common/hdmi/gen_hdmi_pipe.h
+index 05f35a1..0545ce1 100644
+--- a/drivers/video/adf/intel/include/core/common/hdmi/gen_hdmi_pipe.h
++++ b/drivers/video/adf/intel/include/core/common/hdmi/gen_hdmi_pipe.h
+@@ -18,8 +18,9 @@
+ #define GEN_HDMI_PIPE_H_
+ 
+ #include "core/intel_dc_config.h"
++#include "core/common/hdmi/gen_hdmi_audio.h"
+ 
+-#define MAX_ELD_LENGTH 128
++#define HDMI_MAX_ELD_LENGTH	84
+ #define HDMI_DIP_PACKET_HEADER_LEN	3
+ #define HDMI_DIP_PACKET_DATA_LEN	28
+ #define CHV_HDMI_MAX_CLK_KHZ 297000
+@@ -56,7 +57,7 @@ struct  hdmi_avi_info_packet {
+ struct hdmi_monitor {
+ 	struct edid *edid;
+ 
+-	uint8_t eld[MAX_ELD_LENGTH];
++	uint8_t eld[HDMI_MAX_ELD_LENGTH];
+ 
+ 	/* information parsed from edid*/
+ 	bool is_hdmi;
+@@ -75,7 +76,7 @@ struct hdmi_monitor {
+ 
+ struct hdmi_audio {
+ 	bool status;
+-	uint8_t eld[MAX_ELD_LENGTH];
++	uint8_t eld[HDMI_MAX_ELD_LENGTH];
+ };
+ 
+ struct hdmi_context {
+@@ -137,6 +138,9 @@ struct hdmi_pipe {
+ 	struct hdmi_config config;
+ 	struct hdmi_port *port;
+ 	struct work_struct hotplug_work;
++
++	/* Added for HDMI audio */
++	uint32_t tmds_clock;
+ };
+ 
+ static inline struct hdmi_pipe *
+@@ -190,4 +194,7 @@ hdmi_pipe_init(struct hdmi_pipe *pipe, struct device *dev,
+ extern void
+ hdmi_pipe_destroy(struct hdmi_pipe *pipe);
+ 
++/* Added for HDMI audio */
++extern void adf_hdmi_audio_init(struct hdmi_pipe *hdmi_pipe);
++extern void adf_hdmi_audio_signal_event(enum had_event_type event);
+ #endif /* GEN_HDMI_PIPE_H_ */
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index 4fef636..5c21438 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -2618,6 +2618,7 @@ extern int chv_cursor_offsets[];
+ #define   VIDEO_DIP_PORT_B		(1 << 29)
+ #define   VIDEO_DIP_PORT_C		(2 << 29)
+ #define   VIDEO_DIP_PORT_D		(3 << 29)
++#define   VIDEO_DIP_PORT(port)		((port) << 29)
+ #define   VIDEO_DIP_PORT_MASK		(3 << 29)
+ #define   VIDEO_DIP_ENABLE_GCP		(1 << 25)
+ #define   VIDEO_DIP_ENABLE_AVI		(1 << 21)
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_hdmi_port.h b/drivers/video/adf/intel/include/core/vlv/vlv_hdmi_port.h
+index ad7cdfb..8d3f466 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_hdmi_port.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_hdmi_port.h
+@@ -40,4 +40,9 @@ bool vlv_hdmi_port_init(struct vlv_hdmi_port *port, enum port, enum pipe);
+ bool vlv_hdmi_port_destroy(struct vlv_hdmi_port *port);
+ u32 vlv_hdmi_port_prepare(struct vlv_hdmi_port *port, u32 val);
+ 
++/* Added for HDMI audio */
++void vlv_hdmi_port_enable_audio(struct vlv_hdmi_port *port);
++void vlv_hdmi_port_disable_audio(struct vlv_hdmi_port *port);
++u32 vlv_hdmi_port_write_dip(struct vlv_hdmi_port *port, bool enable);
++
+ #endif /* _VLV_HDMI_PORT_H_ */
+-- 
+1.7.9.5
+

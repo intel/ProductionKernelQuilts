@@ -1,0 +1,145 @@
+From cd821519c626671e889dbe37dfc98ee0f42c9e8a Mon Sep 17 00:00:00 2001
+Message-Id: <cd821519c626671e889dbe37dfc98ee0f42c9e8a.1415245452.git.chang-joon.lee@intel.com>
+In-Reply-To: <76203ad7c635d495ef3ec1e07b47bad9db4745ba.1415245452.git.chang-joon.lee@intel.com>
+References: <76203ad7c635d495ef3ec1e07b47bad9db4745ba.1415245452.git.chang-joon.lee@intel.com>
+From: Michel Thierry <michel.thierry@intel.com>
+Date: Wed, 6 Aug 2014 15:04:44 +0200
+Subject: [PATCH 06/30] FROM_UPSTREAM [VPG]: drm/i915: vma/ppgtt lifetime
+ rules
+
+VMAs should take a reference of the address space they use.
+
+Now, when the fd is closed, it will release the ref that the context was
+holding, but it will still be referenced by any vmas that are still
+active.
+
+ppgtt_release() should then only be called when the last thing referencing
+it releases the ref, and it can just call the base cleanup and free the
+ppgtt.
+
+Note that with this we will extend the lifetime of ppgtts which
+contain shared objects. But all the non-shared objects will get
+removed as soon as they drop of the active list and for the shared
+ones the shrinker can eventually reap them. Since we currently can't
+evict ppgtt pagetables either I don't think that temporary leak is
+important.
+
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+[danvet: Add note about potential ppgtt leak with this approach.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit b9d06dd9d1dd3672b391e6387d62aa8dc4e377bd)
+
+Change-Id: If2a9eaeb802a87fca9361c64e47e656bd87a91ab
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: b9d06dd9d1dd3672b391e6387d62aa8dc4e377bd
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMINL-2586
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    2 ++
+ drivers/gpu/drm/i915/i915_gem.c         |    8 ++++++++
+ drivers/gpu/drm/i915/i915_gem_context.c |   23 +++--------------------
+ drivers/gpu/drm/i915/i915_gem_gtt.c     |    5 +++++
+ 4 files changed, 18 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9503241..c4ea3b1 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2719,7 +2719,9 @@ void i915_gem_object_ggtt_unpin(struct drm_i915_gem_object *obj);
+ 
+ /* i915_gem_context.c */
+ #define ctx_to_ppgtt(ctx) container_of((ctx)->vm, struct i915_hw_ppgtt, base)
++#define vm_to_ppgtt(vm) container_of(vm, struct i915_hw_ppgtt, base)
+ int __must_check i915_gem_context_init(struct drm_device *dev);
++void ppgtt_release(struct kref *kref);
+ void i915_gem_context_fini(struct drm_device *dev);
+ void i915_gem_context_reset(struct drm_device *dev);
+ int i915_gem_context_open(struct drm_device *dev, struct drm_file *file);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index bbebf1e..1afdbcc 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4691,12 +4691,20 @@ struct i915_vma *i915_gem_obj_to_vma(struct drm_i915_gem_object *obj,
+ 
+ void i915_gem_vma_destroy(struct i915_vma *vma)
+ {
++	struct i915_address_space *vm = NULL;
++	struct i915_hw_ppgtt *ppgtt = NULL;
+ 	WARN_ON(vma->node.allocated);
+ 
+ 	/* Keep the vma as a placeholder in the execbuffer reservation lists */
+ 	if (!list_empty(&vma->exec_list))
+ 		return;
+ 
++	vm = vma->vm;
++	ppgtt = vm_to_ppgtt(vm);
++
++	if (ppgtt)
++		kref_put(&ppgtt->ref, ppgtt_release);
++
+ 	list_del(&vma->vma_link);
+ 
+ 	kfree(vma);
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 0425bd0..c33c70f 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -108,30 +108,13 @@ static void do_ppgtt_cleanup(struct i915_hw_ppgtt *ppgtt)
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Make sure vmas are unbound before we take down the drm_mm
+-	 *
+-	 * FIXME: Proper refcounting should take care of this, this shouldn't be
+-	 * needed at all.
+-	 */
+-	if (!list_empty(&vm->active_list)) {
+-		struct i915_vma *vma;
+-
+-		list_for_each_entry(vma, &vm->active_list, mm_list)
+-			if (WARN_ON(list_empty(&vma->vma_link) ||
+-				    list_is_singular(&vma->vma_link)))
+-				break;
+-
+-		i915_gem_evict_vm(&ppgtt->base, true);
+-	} else {
+-		i915_gem_retire_requests(dev);
+-		i915_gem_evict_vm(&ppgtt->base, false);
+-	}
++	/* vmas should already be unbound */
++	WARN_ON(!list_empty(&vm->active_list));
+ 
+ 	ppgtt->base.cleanup(&ppgtt->base);
+ }
+ 
+-static void ppgtt_release(struct kref *kref)
++void ppgtt_release(struct kref *kref)
+ {
+ 	struct i915_hw_ppgtt *ppgtt =
+ 		container_of(kref, struct i915_hw_ppgtt, ref);
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 95b6b0e..9014d8c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -2203,10 +2203,15 @@ i915_gem_obj_lookup_or_create_vma(struct drm_i915_gem_object *obj,
+ 				  struct i915_address_space *vm)
+ {
+ 	struct i915_vma *vma;
++	struct i915_hw_ppgtt *ppgtt = NULL;
+ 
+ 	vma = i915_gem_obj_to_vma(obj, vm);
+ 	if (!vma)
+ 		vma = __i915_gem_vma_create(obj, vm);
+ 
++	ppgtt = vm_to_ppgtt(vm);
++	if (ppgtt)
++		kref_get(&ppgtt->ref);
++
+ 	return vma;
+ }
+-- 
+1.7.9.5
+

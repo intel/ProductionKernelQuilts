@@ -1,0 +1,182 @@
+From a3b5bff157aa55ff1d0a8ad00dbe6a7acbdc976a Mon Sep 17 00:00:00 2001
+From: Ecco park <eccopark@broadcom.com>
+Date: Wed, 30 Jul 2014 14:07:57 -0700
+Subject: [PATCH 39/77] net: wireless: bcmdhd fix RTT issue
+
+16520514 Blocking issues to RTT usage
+Signed-off-by: Ecco park <eccopark@broadcom.com>
+---
+ drivers/net/wireless/bcmdhd/dhd_rtt.c      | 25 ++++++++++----
+ drivers/net/wireless/bcmdhd/dhd_rtt.h      |  2 ++
+ drivers/net/wireless/bcmdhd/wl_cfgvendor.c | 53 ++++++++++++++----------------
+ 3 files changed, 45 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/net/wireless/bcmdhd/dhd_rtt.c b/drivers/net/wireless/bcmdhd/dhd_rtt.c
+index 30e87f3cf0e8..167abf0fec22 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_rtt.c
++++ b/drivers/net/wireless/bcmdhd/dhd_rtt.c
+@@ -226,12 +226,17 @@ dhd_rtt_start(dhd_pub_t *dhd) {
+ 	/* mac address */
+ 	bcopy(&rtt_target->addr, &tof_params->tgt_mac, ETHER_ADDR_LEN);
+ 	/* frame count */
++	if (rtt_target->ftm_cnt > RTT_MAX_FRAME_CNT)
++		rtt_target->ftm_cnt = RTT_MAX_FRAME_CNT;
+ 
+ 	if (rtt_target->ftm_cnt)
+ 		tof_params->ftm_cnt = htol16(rtt_target->ftm_cnt);
+ 	else
+ 		tof_params->ftm_cnt = htol16(DEFAULT_FTM_CNT);
+ 
++	if (rtt_target->retry_cnt > RTT_MAX_RETRY_CNT)
++		rtt_target->retry_cnt = RTT_MAX_RETRY_CNT;
++
+ 	/* retry count */
+ 	if (rtt_target->retry_cnt)
+ 		tof_params->retry_cnt = htol16(rtt_target->retry_cnt);
+@@ -279,7 +284,7 @@ dhd_rtt_start(dhd_pub_t *dhd) {
+ 			break;
+ 		}
+ 		rspec |= bw;
+-		tof_params->tx_rate = htol16(rspec);
++		tof_params->tx_rate = htol16(rspec & 0xffff);
+ 		tof_params->vht_rate = htol16(rspec >> 16);
+ 	}
+ 
+@@ -460,6 +465,7 @@ dhd_rtt_event_handler(dhd_pub_t *dhd, wl_event_msg_t *event, void *event_data)
+ 	wl_proxd_event_data_t* evp;
+ 	struct rtt_noti_callback *iter;
+ 	rtt_result_t *rtt_result, *entry, *next;
++	gfp_t kflags;
+ 	NULL_CHECK(dhd, "dhd is NULL", err);
+ 	rtt_status = GET_RTTSTATE(dhd);
+ 	NULL_CHECK(rtt_status, "rtt_status is NULL", err);
+@@ -471,6 +477,7 @@ dhd_rtt_event_handler(dhd_pub_t *dhd, wl_event_msg_t *event, void *event_data)
+ 	if (event_type != WLC_E_PROXD) {
+ 		goto exit;
+ 	}
++	kflags = in_softirq()? GFP_ATOMIC : GFP_KERNEL;
+ 	evp = (wl_proxd_event_data_t*)event_data;
+ 	DHD_RTT(("%s enter : mode: %s, reason :%d \n", __FUNCTION__,
+ 			(ntoh16(evp->mode) == WL_PROXD_MODE_INITIATOR)?
+@@ -486,7 +493,9 @@ dhd_rtt_event_handler(dhd_pub_t *dhd, wl_event_msg_t *event, void *event_data)
+ 		} else {
+ 			DHD_RTT(("WLC_E_PROXD_COMPLETED\n"));
+ 		}
+-		mutex_lock(&rtt_status->rtt_mutex);
++
++		if(!in_atomic())
++			mutex_lock(&rtt_status->rtt_mutex);
+ 		ftm_cnt = ltoh16(evp->ftm_cnt);
+ 
+ 		if (ftm_cnt > 0)
+@@ -496,14 +505,15 @@ dhd_rtt_event_handler(dhd_pub_t *dhd, wl_event_msg_t *event, void *event_data)
+ 		/* check whether the results is already reported or not*/
+ 		list_for_each_entry(entry, &rtt_status->rtt_results_cache, list) {
+ 			if (!memcmp(&entry->peer_mac, &evp->peer_mac, ETHER_ADDR_LEN))	{
+-				mutex_unlock(&rtt_status->rtt_mutex);
++				if(!in_atomic())
++					mutex_unlock(&rtt_status->rtt_mutex);
+ 				goto exit;
+ 			}
+ 		}
+-
+-		rtt_result = kzalloc(len + sizeof(ftm_sample_t) * ftm_cnt, GFP_KERNEL);
++		rtt_result = kzalloc(len + sizeof(ftm_sample_t) * ftm_cnt, kflags);
+ 		if (!rtt_result) {
+-			mutex_unlock(&rtt_status->rtt_mutex);
++			if(!in_atomic())
++				mutex_unlock(&rtt_status->rtt_mutex);
+ 			err = -ENOMEM;
+ 			goto exit;
+ 		}
+@@ -547,7 +557,8 @@ dhd_rtt_event_handler(dhd_pub_t *dhd, wl_event_msg_t *event, void *event_data)
+ 			bzero(&rtt_status->rtt_config, sizeof(rtt_config_params_t));
+ 			rtt_status->cur_idx = 0;
+ 		}
+-		mutex_unlock(&rtt_status->rtt_mutex);
++		if(!in_atomic())
++			mutex_unlock(&rtt_status->rtt_mutex);
+ 
+ 		break;
+ 	case WLC_E_PROXD_GONE:
+diff --git a/drivers/net/wireless/bcmdhd/dhd_rtt.h b/drivers/net/wireless/bcmdhd/dhd_rtt.h
+index cf04533c1b50..b96d3e4f6f0a 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_rtt.h
++++ b/drivers/net/wireless/bcmdhd/dhd_rtt.h
+@@ -26,6 +26,8 @@
+ #define __DHD_RTT_H__
+ 
+ #define RTT_MAX_TARGET_CNT 10
++#define RTT_MAX_FRAME_CNT 25
++#define RTT_MAX_RETRY_CNT 10
+ #define DEFAULT_FTM_CNT 6
+ #define DEFAULT_RETRY_CNT 6
+ 
+diff --git a/drivers/net/wireless/bcmdhd/wl_cfgvendor.c b/drivers/net/wireless/bcmdhd/wl_cfgvendor.c
+index 68b2dcb931a3..a75225c19ef1 100644
+--- a/drivers/net/wireless/bcmdhd/wl_cfgvendor.c
++++ b/drivers/net/wireless/bcmdhd/wl_cfgvendor.c
+@@ -751,35 +751,32 @@ void wl_cfgvendor_rtt_evt(void *ctx, void *rtt_data)
+ 	/* fill in the rtt results on each entry */
+ 	list_for_each_entry(rtt_result, rtt_list, list) {
+ 		entry_len = 0;
+-		if (rtt_result->TOF_type == TOF_TYPE_ONE_WAY) {
+-			entry_len = sizeof(rtt_report_t);
+-			rtt_report = kzalloc(entry_len, kflags);
+-			if (!rtt_report) {
+-				WL_ERR(("rtt_report alloc failed"));
+-				goto exit;
+-			}
+-			rtt_report->addr = rtt_result->peer_mac;
+-			rtt_report->num_measurement = 1; /* ONE SHOT */
+-			rtt_report->status = rtt_result->err_code;
+-			rtt_report->type = (rtt_result->TOF_type == TOF_TYPE_ONE_WAY) ? RTT_ONE_WAY: RTT_TWO_WAY;
+-			rtt_report->peer = rtt_result->target_info->peer;
+-			rtt_report->channel = rtt_result->target_info->channel;
+-			rtt_report->rssi = rtt_result->avg_rssi;
+-			/* tx_rate */
+-			rtt_report->tx_rate = rtt_result->tx_rate;
+-			/* RTT */
+-			rtt_report->rtt = rtt_result->meanrtt;
+-			rtt_report->rtt_sd = rtt_result->sdrtt;
+-			/* convert to centi meter */
+-			if (rtt_result->distance != 0xffffffff)
+-				rtt_report->distance = (rtt_result->distance >> 2) * 25;
+-			else /* invalid distance */
+-				rtt_report->distance = -1;
+-
+-			rtt_report->ts = rtt_result->ts;
+-			nla_append(skb, entry_len, rtt_report);
+-			kfree(rtt_report);
++		entry_len = sizeof(rtt_report_t);
++		rtt_report = kzalloc(entry_len, kflags);
++		if (!rtt_report) {
++			WL_ERR(("rtt_report alloc failed"));
++			goto exit;
+ 		}
++		rtt_report->addr = rtt_result->peer_mac;
++		rtt_report->num_measurement = 1; /* ONE SHOT */
++		rtt_report->status = rtt_result->err_code;
++		rtt_report->type = (rtt_result->TOF_type == TOF_TYPE_ONE_WAY) ? RTT_ONE_WAY: RTT_TWO_WAY;
++		rtt_report->peer = rtt_result->target_info->peer;
++		rtt_report->channel = rtt_result->target_info->channel;
++		rtt_report->rssi = rtt_result->avg_rssi;
++		/* tx_rate */
++		rtt_report->tx_rate = rtt_result->tx_rate;
++		/* RTT */
++		rtt_report->rtt = rtt_result->meanrtt;
++		rtt_report->rtt_sd = rtt_result->sdrtt;
++		/* convert to centi meter */
++		if (rtt_result->distance != 0xffffffff)
++			rtt_report->distance = (rtt_result->distance >> 2) * 25;
++		else /* invalid distance */
++			rtt_report->distance = -1;
++		rtt_report->ts = rtt_result->ts;
++		nla_append(skb, entry_len, rtt_report);
++		kfree(rtt_report);
+ 	}
+ 	cfg80211_vendor_event(skb, kflags);
+ exit:
+-- 
+2.0.3
+

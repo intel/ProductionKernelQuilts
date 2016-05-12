@@ -1,0 +1,96 @@
+From 7e157b2bb0159ca38eadb0bee29d7ece8e9642b5 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Thu, 21 Jan 2016 16:15:12 +0530
+Subject: [PATCH 06/13] USBC/Protocol: Enable/Disable msg auto retry as
+ required.
+
+Auto pd msg retry in hardware should be able to disable
+for src_cap message as this should not retry from hardware
+on transmission error. This patch disables auto retry when
+pd is disabled and enable it while sending pd messages
+except for source cap in protocol.
+
+Change-Id: Ic43141683d660c42c9ad1eaeb6770c40dbcbecb4
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-15674
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Reviewed-on: https://android.intel.com:443/456422
+---
+ drivers/usb/typec/pd/protocol.c | 28 ++++++++++++++++++++++++++++
+ drivers/usb/typec/pd/protocol.h |  3 ++-
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/typec/pd/protocol.c b/drivers/usb/typec/pd/protocol.c
+index 0cc3669..d9053fd 100644
+--- a/drivers/usb/typec/pd/protocol.c
++++ b/drivers/usb/typec/pd/protocol.c
+@@ -198,6 +198,7 @@ static int pd_prot_rcv_pkt_from_policy(struct pd_prot *prot, u8 msg_type,
+ 						void *buf, int len)
+ {
+ 	struct pd_packet *pkt;
++	int ret;
+ 
+ 	if (msg_type == PD_CMD_HARD_RESET) {
+ 		pd_prot_reset_protocol(prot);
+@@ -209,6 +210,21 @@ static int pd_prot_rcv_pkt_from_policy(struct pd_prot *prot, u8 msg_type,
+ 		pd_prot_reset_protocol(prot);
+ 	}
+ 
++	/*
++	 * By default msg auto retry is disabled.
++	 * Except for src_cap, enable it while sending msg.
++	 */
++	if (msg_type != PD_DATA_MSG_SRC_CAP
++		&& !prot->is_auto_retry_enable) {
++		ret = typec_enable_auto_retry(prot->phy, true);
++		if (ret)
++			dev_warn(prot->phy->dev,
++			"%s: failed to enable msg auto retry, ret=%d\n",
++			__func__, ret);
++		else
++			prot->is_auto_retry_enable = true;
++	}
++
+ 	pkt = &prot->tx_buf;
+ 	memset(pkt, 0, sizeof(struct pd_packet));
+ 	pkt->header.msg_type = msg_type;
+@@ -567,11 +583,23 @@ static void prot_role_chnage_worker(struct work_struct *work)
+ 
+ static void pd_protocol_enable_pd(struct pd_prot *prot, bool en)
+ {
++	int ret;
++
+ 	mutex_lock(&prot->rx_data_lock);
+ 	prot->is_pd_enabled = en;
+ 	mutex_unlock(&prot->rx_data_lock);
+ 	prot_clear_rx_msg_list(prot);
+ 	typec_enable_autocrc(prot->phy, en);
++	/* Disable msg auto retry while disabling PD */
++	if (!en) {
++		ret = typec_enable_auto_retry(prot->phy, false);
++		if (ret)
++			dev_warn(prot->phy->dev,
++			"%s: failed to disable msg auto retry, ret=%d\n",
++			__func__, ret);
++		else
++			prot->is_auto_retry_enable = false;
++	}
+ }
+ 
+ int protocol_bind_pe(struct policy *p)
+diff --git a/drivers/usb/typec/pd/protocol.h b/drivers/usb/typec/pd/protocol.h
+index 1596d4b..85bd0a9 100644
+--- a/drivers/usb/typec/pd/protocol.h
++++ b/drivers/usb/typec/pd/protocol.h
+@@ -66,7 +66,8 @@ struct pd_prot {
+ 					enum pwr_role prole);
+ 	void (*protocol_enable_pd)(struct pd_prot *prot, bool en);
+ 
+-	bool is_pd_enabled;
++	unsigned is_pd_enabled:1;
++	unsigned is_auto_retry_enable:1;
+ };
+ 
+ static inline int pd_prot_send_phy_packet(struct pd_prot *pd, void *buf,
+-- 
+1.9.1
+

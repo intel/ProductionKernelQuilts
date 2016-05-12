@@ -1,0 +1,108 @@
+From 525dd5df292ea6af8395bb5fa547a53508e7e3ea Mon Sep 17 00:00:00 2001
+From: raosrini <srinidhi.rao@intel.com>
+Date: Thu, 16 Apr 2015 10:41:43 +0530
+Subject: [PATCH] extcon-dc-ti: Check USB host mode during probe separately
+
+in extcon-dc-ti-pwrsrc probe, if usb host mode is not set,
+it configures the USB MUX mode to PMIC. This creates a problem
+if a SDP charger cable is connected during boot-up. It clashes
+with charger cable detection and even if charger driver has
+USB MUX to SOC, extcon sets the MUX back to PMIC. Thus ADB
+connection fails if SDP charger cable is connect before boot.
+
+Hence during probe, need to check the usb host mode during
+probe in a separate function and it should do nothing if
+usb host mode is not set.
+
+Change-Id: I35a5fc7cb8e0e1402a79d875143701473623488e
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1422
+Signed-off-by: raosrini <srinidhi.rao@intel.com>
+---
+ drivers/extcon/extcon-dc-ti-pwrsrc.c | 29 ++++++++++++++++++++++++++++-
+ drivers/power/bq24192_charger.c      |  9 +++++++++
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/extcon/extcon-dc-ti-pwrsrc.c b/drivers/extcon/extcon-dc-ti-pwrsrc.c
+index e8f29aa..706d393 100644
+--- a/drivers/extcon/extcon-dc-ti-pwrsrc.c
++++ b/drivers/extcon/extcon-dc-ti-pwrsrc.c
+@@ -163,6 +163,33 @@ static bool is_usb_host_mode(struct extcon_dev *evdev)
+ 	return !!evdev->state;
+ }
+ 
++static void check_usb_otg_bootup(struct dc_pwrsrc_info *info)
++{
++	int ret;
++
++	mutex_lock(&info->lock);
++
++	if (info->cable_obj.edev)
++		info->usb_host = is_usb_host_mode(info->cable_obj.edev);
++
++	if (info->usb_host) {
++		/* Drive the charger Hi-Z mode */
++		ret = bq24192_vbus_enable();
++		if (ret)
++			dev_warn(&info->pdev->dev,
++				"Err in VBUS enable %d", ret);
++
++		/* Set USB MUX to SoC Mode */
++		ret = bq24192_set_usb_port(info->usb_host);
++		if (ret)
++			dev_warn(&info->pdev->dev,
++				"Err in switch USB enable %d", ret);
++	}
++
++	mutex_unlock(&info->lock);
++
++	return;
++}
+ static void extcon_event_worker(struct work_struct *work)
+ {
+ 	struct dc_pwrsrc_info *info =
+@@ -256,7 +283,7 @@ static int dc_ti_pwrsrc_probe(struct platform_device *pdev)
+ 	/* Unmask VBUS interrupt */
+ 	intel_soc_pmic_clearb(DC_PS_IRQ_MASK_REG, IRQ_MASK_VBUS);
+ 	/* Handle Host OTG device connections */
+-	extcon_event_worker(&info->dc_pwrsrc_wrk.work);
++	check_usb_otg_bootup(info);
+ 	return 0;
+ 
+ intr_reg_failed:
+diff --git a/drivers/power/bq24192_charger.c b/drivers/power/bq24192_charger.c
+index f854902..32c00ea 100644
+--- a/drivers/power/bq24192_charger.c
++++ b/drivers/power/bq24192_charger.c
+@@ -1020,6 +1020,9 @@ i2c_write_fail:
+ 
+ int bq24192_vbus_enable(void)
+ {
++	if (!bq24192_client)
++		return -EAGAIN;
++
+ 	struct bq24192_chip *chip = i2c_get_clientdata(bq24192_client);
+ 	return bq24192_turn_otg_vbus(chip, true);
+ }
+@@ -1027,6 +1030,9 @@ EXPORT_SYMBOL(bq24192_vbus_enable);
+ 
+ int bq24192_vbus_disable(void)
+ {
++	if (!bq24192_client)
++		return -EAGAIN;
++
+ 	struct bq24192_chip *chip = i2c_get_clientdata(bq24192_client);
+ 	return bq24192_turn_otg_vbus(chip, false);
+ }
+@@ -1034,6 +1040,9 @@ EXPORT_SYMBOL(bq24192_vbus_disable);
+ 
+ int bq24192_set_usb_port(int port_mode)
+ {
++	if (!bq24192_client)
++		return -EAGAIN;
++
+ 	struct bq24192_chip *chip = i2c_get_clientdata(bq24192_client);
+ 	if ((chip->chip_type == BQ24297) &&
+ 			chip->switch_io)
+-- 
+1.9.1
+

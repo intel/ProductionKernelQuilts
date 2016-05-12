@@ -1,0 +1,145 @@
+From 2780c34647a0f16426c4d9ce4cba5820e9ca18db Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Thu, 24 Dec 2015 14:49:36 +0530
+Subject: [PATCH 09/14] USBC/PHY: Provide interface to set the swap state to
+ handle pr swap.
+
+Device policy manager needs an interface to set/clear the
+power role state in phy to handle power role swap events.
+
+Change-Id: I784e1b00d3c23ad348d40e19ab7221a8700faf35
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-15496
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Reviewed-on: https://android.intel.com:443/452123
+---
+ drivers/usb/typec/phy-fusb300.c | 57 +++++++++++++++++++++++++++++------------
+ include/linux/usb_typec_phy.h   |  9 +++++++
+ 2 files changed, 49 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/usb/typec/phy-fusb300.c b/drivers/usb/typec/phy-fusb300.c
+index c05b9df..b646661 100644
+--- a/drivers/usb/typec/phy-fusb300.c
++++ b/drivers/usb/typec/phy-fusb300.c
+@@ -452,11 +452,40 @@ static int fusb300_switch_mode(struct typec_phy *phy, enum typec_mode mode)
+ 	return 0;
+ }
+ 
++static int fusb300_set_swap_state(struct typec_phy *phy,
++						bool swap)
++{
++	struct fusb300_chip *chip;
++
++	if (!phy)
++		return -ENODEV;
++	chip = dev_get_drvdata(phy->dev);
++
++	dev_dbg(phy->dev, "%s cur_state=%d, swap=%d\n", __func__,
++				phy->state, swap);
++
++	mutex_lock(&chip->lock);
++	if (swap) {
++		if (phy->state == TYPEC_STATE_ATTACHED_UFP)
++			phy->state = TYPEC_STATE_PD_PU_SWAP;
++		else if (phy->state == TYPEC_STATE_ATTACHED_DFP)
++			phy->state = TYPEC_STATE_PU_PD_SWAP;
++	} else {
++		if (phy->state == TYPEC_STATE_PD_PU_SWAP)
++			phy->state = TYPEC_STATE_ATTACHED_DFP;
++		else if (phy->state == TYPEC_STATE_PU_PD_SWAP)
++			phy->state = TYPEC_STATE_ATTACHED_UFP;
++	}
++	mutex_unlock(&chip->lock);
++	return 0;
++}
++
+ static int fusb300_set_pu_pd(struct typec_phy *phy,
+ 					enum typec_cc_pull pull)
+ {
+ 	struct fusb300_chip *chip;
+ 	u8 val = 0;
++	int ret = 0;
+ 
+ 	if (!phy)
+ 		return -ENODEV;
+@@ -487,26 +516,11 @@ static int fusb300_set_pu_pd(struct typec_phy *phy,
+ 			val);
+ 	} else {
+ 		dev_warn(phy->dev, "%s: Invalid CC\n", __func__);
+-		goto pu_pd_error;
++		ret = -EINVAL;
+ 	}
+ 
+-	/* If cc pulled up in UFP state, this pull-up is for pr swap.
+-	 * Change the state to TYPEC_STATE_PD_PU_SWAP.
+-	 */
+-	if (pull == TYPEC_CC_PULL_UP
+-			&& phy->state == TYPEC_STATE_ATTACHED_UFP)
+-		phy->state = TYPEC_STATE_PD_PU_SWAP;
+-
+-	/* If cc pulled down in DFP state, this pull-down is for pr swap.
+-	 * Change the state to TYPEC_STATE_PU_PD_SWAP.
+-	 */
+-	if (pull == TYPEC_CC_PULL_DOWN
+-			&& phy->state == TYPEC_STATE_ATTACHED_DFP)
+-		phy->state = TYPEC_STATE_PU_PD_SWAP;
+-
+-pu_pd_error:
+ 	mutex_unlock(&chip->lock);
+-	return 0;
++	return ret;
+ }
+ 
+ static int fusb300_setup_cc(struct typec_phy *phy, enum typec_cc_pin cc,
+@@ -1439,6 +1453,14 @@ static void fusb300_valid_disconnect(struct work_struct *work)
+ 	 */
+ 	msleep(PD_DEBOUNCE_MAX_TIME);
+ 
++	if (phy->state == TYPEC_STATE_PD_PU_SWAP
++		 || phy->state == TYPEC_STATE_PU_PD_SWAP) {
++		dev_dbg(chip->dev,
++			"%s: In pr swap state, ignore vbud/comp change",
++			__func__);
++		return;
++	}
++
+ 	/*
+ 	 * do measurement on the already setup cc and
+ 	 * check whether the disconnect is a valid one
+@@ -1751,6 +1773,7 @@ static int fusb300_probe(struct i2c_client *client,
+ 	chip->phy.recv_packet = fusb300_recv_pkt;
+ 	chip->phy.is_vbus_on = fusb300_is_vbus_on;
+ 	chip->phy.set_pu_pd = fusb300_set_pu_pd;
++	chip->phy.set_swap_state = fusb300_set_swap_state;
+ 	chip->phy.is_vconn_enabled = fusb300_is_vconn_enabled;
+ 	chip->phy.enable_vconn = fusb300_enable_vconn;
+ 	if (!chip->is_fusb300) {
+diff --git a/include/linux/usb_typec_phy.h b/include/linux/usb_typec_phy.h
+index 5f107b4..77f94b7 100644
+--- a/include/linux/usb_typec_phy.h
++++ b/include/linux/usb_typec_phy.h
+@@ -220,6 +220,7 @@ struct typec_phy {
+ 	bool (*is_pd_capable)(struct typec_phy *phy);
+ 	int (*enable_autocrc)(struct typec_phy *phy, bool en);
+ 	int (*set_pu_pd)(struct typec_phy *phy, enum typec_cc_pull pull);
++	int (*set_swap_state)(struct typec_phy *phy, bool swap);
+ 	int (*enable_detection)(struct typec_phy *phy, bool en);
+ 	bool (*is_vbus_on)(struct typec_phy *phy);
+ 	bool (*is_vconn_enabled)(struct typec_phy *phy);
+@@ -328,6 +329,14 @@ static inline int typec_enable_autocrc(struct typec_phy *phy, bool en)
+ 	return -ENOTSUPP;
+ }
+ 
++static inline int typec_set_swap_state(struct typec_phy *phy, bool swap)
++{
++	if (phy && phy->set_swap_state)
++		return phy->set_swap_state(phy, swap);
++
++	return -ENOTSUPP;
++}
++
+ static inline int typec_register_prot_notifier(struct typec_phy *phy,
+ 						struct notifier_block *nb)
+ {
+-- 
+1.9.1
+

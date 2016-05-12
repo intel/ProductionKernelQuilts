@@ -1,0 +1,135 @@
+From 34db415755307ad6e106ba595fea8e8cd3994ed2 Mon Sep 17 00:00:00 2001
+Message-Id: <34db415755307ad6e106ba595fea8e8cd3994ed2.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Tom O'Rourke <Tom.O'Rourke@intel.com>
+Date: Wed, 23 Oct 2013 17:20:12 -0700
+Subject: [PATCH 047/312] MUST_REBASE [VPG]: drm/i915: Signal curd in
+ intel_gen6_powersave_work
+
+The core_ufo restore daemon (curd) will restore proprietary
+hardware state in response to SIGHUP.  This change adds a
+sysfs interface for storing the curd struct pid and sends
+SIGHUP to curd in intel_gen6_powersave_work.
+
+This change addresses a problem where proprietary hardware
+state is reset to default values after S3 suspend/resume.
+
+(cherry picked from commit 3eeb940bc7f266db2e1f01a9765eed8ed16b988e)
+
+Conflicts:
+	drivers/gpu/drm/i915/i915_drv.h
+
+For: VIZ-2949
+For: AXIA-4687
+Change-Id: I85c072fff3d7859e1fa72bd9fcd4de5363c187be
+Signed-off-by: Tom O'Rourke <Tom.O'Rourke@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h   |    5 +++++
+ drivers/gpu/drm/i915/i915_sysfs.c |   42 +++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_pm.c   |    5 +++++
+ 3 files changed, 52 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9471906..0611468 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1449,6 +1449,11 @@ struct drm_i915_private {
+ 	/* Display functions */
+ 	struct drm_i915_display_funcs display;
+ 
++	/* curd information */
++	struct {
++		struct pid *pid;
++	} curd;
++
+ 	/* PCH chipset type */
+ 	enum intel_pch pch_type;
+ 	unsigned short pch_id;
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.c b/drivers/gpu/drm/i915/i915_sysfs.c
+index 06e490b..5254d14 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -105,6 +105,46 @@ forcewake_store(struct device *kdev, struct device_attribute *attr,
+ }
+ 
+ static ssize_t
++show_curd(struct device *kdev, struct device_attribute *attr, char *buf)
++{
++	struct drm_minor *minor = dev_to_drm_minor(kdev);
++	struct drm_device *dev = minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	ssize_t count = 0;
++
++	count = snprintf(buf, PAGE_SIZE, "%d\n", pid_nr(dev_priv->curd.pid));
++
++	return count;
++}
++
++static ssize_t
++curd_store(struct device *kdev, struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	struct drm_minor *minor = dev_to_drm_minor(kdev);
++	struct drm_device *dev = minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct pid *p;
++	u32 val;
++	ssize_t ret;
++
++	ret = kstrtou32(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	if (1 == val) {
++		p = get_task_pid(current, PIDTYPE_PID);
++		put_pid(dev_priv->curd.pid);
++		dev_priv->curd.pid = p;
++	} else if (0 == val) {
++		put_pid(dev_priv->curd.pid);
++		dev_priv->curd.pid = NULL;
++	}
++
++	return count;
++}
++
++static ssize_t
+ show_rc6_mask(struct device *kdev, struct device_attribute *attr, char *buf)
+ {
+ 	struct drm_minor *dminor = dev_to_drm_minor(kdev);
+@@ -141,6 +181,7 @@ show_rc6pp_ms(struct device *kdev, struct device_attribute *attr, char *buf)
+ 
+ static DEVICE_ATTR(forcewake, S_IRUSR | S_IWUSR, show_forcewake,
+ 		   forcewake_store);
++static DEVICE_ATTR(curd, S_IRUSR | S_IWUSR, show_curd, curd_store);
+ static DEVICE_ATTR(rc6_enable, S_IRUGO, show_rc6_mask, NULL);
+ static DEVICE_ATTR(rc6_residency_ms, S_IRUGO, show_rc6_ms, NULL);
+ static DEVICE_ATTR(rc6p_residency_ms, S_IRUGO, show_rc6p_ms, NULL);
+@@ -148,6 +189,7 @@ static DEVICE_ATTR(rc6pp_residency_ms, S_IRUGO, show_rc6pp_ms, NULL);
+ 
+ static struct attribute *rc6_attrs[] = {
+ 	&dev_attr_forcewake.attr,
++	&dev_attr_curd.attr,
+ 	&dev_attr_rc6_enable.attr,
+ 	&dev_attr_rc6_residency_ms.attr,
+ 	&dev_attr_rc6p_residency_ms.attr,
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 4e7e78a..aa77d52 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4884,6 +4884,11 @@ static void intel_gen6_powersave_work(struct work_struct *work)
+ 	dev_priv->rps.enabled = true;
+ 	mutex_unlock(&dev_priv->rps.hw_lock);
+ 
++	if (kill_pid_info(SIGHUP, SEND_SIG_FORCED, dev_priv->curd.pid)) {
++		put_pid(dev_priv->curd.pid);
++		dev_priv->curd.pid = NULL;
++	}
++
+ 	intel_runtime_pm_put(dev_priv);
+ }
+ 
+-- 
+1.7.9.5
+

@@ -1,0 +1,144 @@
+From 772941b594290b2c9061f752d851a8b9d47cb866 Mon Sep 17 00:00:00 2001
+Message-Id: <772941b594290b2c9061f752d851a8b9d47cb866.1423172493.git.feitong.yi@intel.com>
+In-Reply-To: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+References: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+From: Akash Goel <akash.goel@intel.com>
+Date: Fri, 2 Jan 2015 16:29:30 +0530
+Subject: [PATCH 04/29] FROM_UPSTREAM [VPG]: drm/i915: Support creation of
+ unbound wc user mappings for objects
+
+This patch provides support to create write-combining virtual mappings of
+GEM object. It intends to provide the same funtionality of 'mmap_gtt'
+interface without the constraints and contention of a limited aperture
+space, but requires clients handles the linear to tile conversion on their
+own. This is for improving the CPU write operation performance, as with such
+mapping, writes and reads are almost 50% faster than with mmap_gtt. Similar
+to the GTT mmapping, unlike the regular CPU mmapping, it avoids the cache
+flush after update from CPU side, when object is passed onto GPU.  This
+type of mapping is specially useful in case of sub-region update,
+i.e. when only a portion of the object is to be updated. Using a CPU mmap
+in such cases would normally incur a clflush of the whole object, and
+using a GTT mmapping would likely require eviction of an active object or
+fence and thus stall. The write-combining CPU mmap avoids both.
+
+To ensure the cache coherency, before using this mapping, the GTT domain
+has been reused here. This provides the required cache flush if the object
+is in CPU domain or synchronization against the concurrent rendering.
+Although the access through an uncached mmap should automatically
+invalidate the cache lines, this may not be true for non-temporal write
+instructions and also not all pages of the object may be updated at any
+given point of time through this mapping.  Having a call to get_pages in
+set_to_gtt_domain function, as added in the earlier patch 'drm/i915:
+Broaden application of set-domain(GTT)', would guarantee the clflush and
+so there will be no cachelines holding the data for the object before it
+is accessed through this map.
+
+The drm_i915_gem_mmap structure (for the DRM_I915_GEM_MMAP_IOCTL) has been
+extended with a new flags field (defaulting to 0 for existent users). In
+order for userspace to detect the extended ioctl, a new parameter
+I915_PARAM_MMAP_VERSION has been added for versioning the ioctl interface.
+
+v2: Fix error handling, invalid flag detection, renaming (ickle)
+
+v3: Rebase to latest drm-intel-nightly codebase
+
+The new mmapping is exercised by igt/gem_mmap_wc,
+igt/gem_concurrent_blit and igt/gem_gtt_speed.
+
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+Change-Id: Ie883942f9e689525f72fe9a8d3780c3a9faa769a
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 1816f92363036600f2387bb8273b1e5e1f5b304e
+Issue: GMINL-4760
+---
+ drivers/gpu/drm/i915/i915_dma.c |    3 +++
+ drivers/gpu/drm/i915/i915_gem.c |   19 +++++++++++++++++++
+ include/uapi/drm/i915_drm.h     |    9 +++++++++
+ 3 files changed, 31 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 9b6fb57..71060fd 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1039,6 +1039,9 @@ static int i915_getparam(struct drm_device *dev, void *data,
+ 	case I915_PARAM_HAS_DPST:
+ 		value = I915_HAS_DPST(dev);
+ 		break;
++	case I915_PARAM_MMAP_VERSION:
++		value = 1;
++		break;
+ 	default:
+ 		DRM_DEBUG("Unknown parameter %d\n", param->param);
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 95a0da2..63608f0 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1546,6 +1546,12 @@ i915_gem_mmap_ioctl(struct drm_device *dev, void *data,
+ 	unsigned long addr;
+ 	int ret;
+ 
++	if (args->flags & ~(I915_MMAP_WC))
++		return -EINVAL;
++
++	if (args->flags & I915_MMAP_WC && !cpu_has_pat)
++		return -ENODEV;
++
+ 	obj = drm_gem_object_lookup(dev, file, args->handle);
+ 	if (obj == NULL)
+ 		return -ENOENT;
+@@ -1561,6 +1567,19 @@ i915_gem_mmap_ioctl(struct drm_device *dev, void *data,
+ 	addr = vm_mmap(obj->filp, 0, args->size,
+ 		       PROT_READ | PROT_WRITE, MAP_SHARED,
+ 		       args->offset);
++	if (args->flags & I915_MMAP_WC) {
++		struct mm_struct *mm = current->mm;
++		struct vm_area_struct *vma;
++
++		down_write(&mm->mmap_sem);
++		vma = find_vma(mm, addr);
++		if (vma)
++			vma->vm_page_prot =
++			  pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
++		else
++			addr = -ENOMEM;
++		up_write(&mm->mmap_sem);
++	}
+ 	drm_gem_object_unreference_unlocked(obj);
+ 	if (IS_ERR((void *)addr))
+ 		return addr;
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 0be5530..c2975c5 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -435,6 +435,7 @@ typedef struct drm_i915_irq_wait {
+ #define I915_PARAM_CMD_PARSER_VERSION	 28
+ #define I915_PARAM_HAS_DPST		 29
+ #define I915_PARAM_EU_COUNT		 30
++#define I915_PARAM_MMAP_VERSION		 31
+ 
+ typedef struct drm_i915_getparam {
+ 	int param;
+@@ -582,6 +583,14 @@ struct drm_i915_gem_mmap {
+ 	 * This is a fixed-size type for 32/64 compatibility.
+ 	 */
+ 	__u64 addr_ptr;
++
++	/**
++	 * Flags for extended behaviour.
++	 *
++	 * Added in version 2.
++	 */
++	__u64 flags;
++#define I915_MMAP_WC 0x1
+ };
+ 
+ struct drm_i915_gem_mmap_gtt {
+-- 
+1.7.9.5
+

@@ -1,0 +1,168 @@
+From 4c6991545fefd338be9b9f00221fd87d0b96e284 Mon Sep 17 00:00:00 2001
+Message-Id: <4c6991545fefd338be9b9f00221fd87d0b96e284.1443127809.git.yunwei.zhang@intel.com>
+In-Reply-To: <e1b2a1693f0b49269998c391abb456b0391b67de.1443127809.git.yunwei.zhang@intel.com>
+References: <e1b2a1693f0b49269998c391abb456b0391b67de.1443127809.git.yunwei.zhang@intel.com>
+From: Todd Previte <tprevite@gmail.com>
+Date: Mon, 4 May 2015 07:48:20 -0700
+Subject: [PATCH 8/9] FROM_UPSTREAM [VPG]: drm/i915: Implement the
+ intel_dp_autotest_edid function for DP EDID complaince tests
+
+Updates the EDID compliance test function to perform the analyze and react to
+the EDID data read as a result of a hot plug event. The results of this
+analysis are handed off to userspace so that the userspace app can set the
+display mode appropriately for the test result/response.
+
+The compliance_test_active flag now appears at the end of the individual
+test handling functions. This is so that the kernel-side operations can
+be completed without the risk of interruption from the userspace app
+that is polling on that flag.
+
+V2:
+- Addressed mailing list feedback
+- Removed excess debug messages
+- Removed extraneous comments
+- Fixed formatting issues (line length > 80)
+- Updated the debug message in compute_edid_checksum to output hex values
+  instead of decimal
+V3:
+- Addressed more list feedback
+- Added the test_active flag to the autotest function
+- Removed test_active flag from handler
+- Added failsafe check on the compliance test active flag
+  at the end of the test handler
+- Fixed checkpatch.pl issues
+V4:
+- Removed the checksum computation function and its use as it has been
+  rendered superfluous by changes to the core DRM EDID functions
+- Updated to use the raw header corruption detection mechanism
+- Moved the declaration of the test_data variable here
+V5:
+- Update test active flag variable name to match the change in the
+  first patch of the series.
+- Relocated the test active flag declaration and initialization
+  to this patch
+V6:
+- Updated to use the new flag for raw EDID header corruption
+- Removed the extra EDID read from the autotest function
+- Added the edid_checksum variable to struct intel_dp so that the
+  autotest function can write it to the sink device
+- Moved the update to the hpd_pulse function to another patch
+- Removed extraneous constants
+V7:
+- Fixed erroneous placement of the checksum assignment. In some cases
+  such as when the EDID read fails and is NULL, this causes a NULL ptr
+  dereference in the kernel. Bad news. Fixed now.
+V8:
+- Updated to support the kfree() on the EDID data added previously
+V9:
+- Updated for the long_hpd flag propagation
+V10:
+- Updated to use actual checksum from the EDID read that occurs during
+  normal hot plug path execution
+- Removed variables from intel_dp struct that are no longer needed
+- Updated the patch subject to more closely match the nature and contents
+  of the patch
+- Fixed formatting problem (long line)
+V11:
+- Removed extra debug messages
+- Updated comments to be more informative
+- Removed extra variable
+V12:
+- Removed the 4 bit offset of the resolution setting in compliance data
+- Changed to DRM_DEBUG_KMS instead of DRM_DEBUG_DRIVER
+
+Change-Id: I051ca27b960b39fd5be44d633b3112d7bf55ee1d
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-17498
+Signed-off-by: Todd Previte <tprevite@gmail.com>
+Reviewed-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+---
+ drivers/gpu/drm/i915/intel_dp.c  | 42 ++++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_drv.h |  2 ++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 071fb5d..d8bce26 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -38,6 +38,12 @@
+ 
+ #define DP_LINK_CHECK_TIMEOUT	(10 * 1000)
+ 
++/* Compliance test status bits  */
++#define INTEL_DP_RESOLUTION_SHIFT_MASK	0
++#define INTEL_DP_RESOLUTION_PREFERRED	(1 << INTEL_DP_RESOLUTION_SHIFT_MASK)
++#define INTEL_DP_RESOLUTION_STANDARD	(2 << INTEL_DP_RESOLUTION_SHIFT_MASK)
++#define INTEL_DP_RESOLUTION_FAILSAFE	(3 << INTEL_DP_RESOLUTION_SHIFT_MASK)
++
+ struct dp_link_dpll {
+ 	int link_bw;
+ 	struct dpll dpll;
+@@ -4390,6 +4396,39 @@ static uint8_t intel_dp_autotest_video_pattern(struct intel_dp *intel_dp)
+ static uint8_t intel_dp_autotest_edid(struct intel_dp *intel_dp)
+ {
+ 	uint8_t test_result = DP_TEST_NAK;
++	struct intel_connector *intel_connector = intel_dp->attached_connector;
++	struct drm_connector *connector = &intel_connector->base;
++
++	if (intel_connector->edid == NULL ||
++	    connector->edid_corrupt == 1 ||
++	    intel_dp->aux.i2c_defer_count > 6) {
++		/* Check EDID read for NACKs, DEFERs and corruption
++		 * (DP CTS 1.2 Core r1.1)
++		 *    4.2.2.4 : Failed EDID read, I2C_NAK
++		 *    4.2.2.5 : Failed EDID read, I2C_DEFER
++		 *    4.2.2.6 : EDID corruption detected
++		 * Use failsafe mode for all cases
++		 */
++		if (intel_dp->aux.i2c_nack_count > 0 ||
++			intel_dp->aux.i2c_defer_count > 0)
++			DRM_DEBUG_KMS("EDID read had %d NACKs, %d DEFERs\n",
++				      intel_dp->aux.i2c_nack_count,
++				      intel_dp->aux.i2c_defer_count);
++		intel_dp->compliance_test_data = INTEL_DP_RESOLUTION_FAILSAFE;
++	} else {
++		if (!drm_dp_dpcd_write(&intel_dp->aux,
++					DP_TEST_EDID_CHECKSUM,
++					&intel_connector->edid->checksum,
++					1));
++			DRM_DEBUG_KMS("Failed to write EDID checksum\n");
++
++		test_result = DP_TEST_ACK | DP_TEST_EDID_CHECKSUM_WRITE;
++		intel_dp->compliance_test_data = INTEL_DP_RESOLUTION_STANDARD;
++	}
++
++	/* Set test active flag here so userspace doesn't interrupt things */
++	intel_dp->compliance_test_active = 1;
++
+ 	return test_result;
+ }
+ 
+@@ -4405,7 +4444,10 @@ static void intel_dp_handle_test_request(struct intel_dp *intel_dp)
+ 	uint8_t rxdata = 0;
+ 	int status = 0;
+ 
++	intel_dp->compliance_test_active = 0;
+ 	intel_dp->compliance_test_type = 0;
++	intel_dp->compliance_test_data = 0;
++
+ 	intel_dp->aux.i2c_nack_count = 0;
+ 	intel_dp->aux.i2c_defer_count = 0;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 26c9d4c..111fe8d 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -720,6 +720,8 @@ struct intel_dp {
+ 
+ 	/* Displayport compliance testing */
+ 	unsigned long compliance_test_type;
++	unsigned long compliance_test_data;
++	bool compliance_test_active;
+ };
+ 
+ struct intel_digital_port {
+-- 
+1.9.1
+

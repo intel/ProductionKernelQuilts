@@ -1,0 +1,195 @@
+From 026030d5ace1d8b146030716ae8176c0702d4a26 Mon Sep 17 00:00:00 2001
+From: Ecco park <eccopark@broadcom.com>
+Date: Fri, 19 Sep 2014 15:20:40 -0700
+Subject: [PATCH 05/27] net: wireless: bcmdhd add RECOVERY mechanism of PCIe
+ LinkDown
+
+17294478 [WiFi] - Need Sub-System Restart for WiFi
+17728059 APR (N6): Kernel panics at dhd_prot_process_msgtype
+17721881 [WiFi] - Watchdog reset after Event HANG sent up
+
+Signed-off-by: Ecco park <eccopark@broadcom.com>
+Change-Id: I5a0157cf519e6188467922aa5d0ab57e602c3b7e
+---
+ drivers/net/wireless/bcmdhd/Makefile         |  4 ++
+ drivers/net/wireless/bcmdhd/dhd_pcie.h       |  7 +++
+ drivers/net/wireless/bcmdhd/dhd_pcie_linux.c | 83 ++++++++++++++++++++--------
+ 3 files changed, 71 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/net/wireless/bcmdhd/Makefile b/drivers/net/wireless/bcmdhd/Makefile
+index 039a905..e24df53 100644
+--- a/drivers/net/wireless/bcmdhd/Makefile
++++ b/drivers/net/wireless/bcmdhd/Makefile
+@@ -159,6 +159,10 @@ ifneq ($(CONFIG_BCMDHD_PCIE),)
+   DHDCFLAGS += -DCUSTOM_DHD_WATCHDOG_MS=0
+ 
+   DHDCFLAGS += -DSAR_SUPPORT
++ifneq ($(CONFIG_ARCH_MSM),)
++  DHDCFLAGS += -DMSM_PCIE_LINKDOWN_RECOVERY
++endif
++
+ endif
+ endif
+ 
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie.h b/drivers/net/wireless/bcmdhd/dhd_pcie.h
+index 7ce8aa3..095e574 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie.h
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie.h
+@@ -30,6 +30,9 @@
+ 
+ #include <bcmpcie.h>
+ #include <hnd_cons.h>
++#ifdef MSM_PCIE_LINKDOWN_RECOVERY
++#include <mach/msm_pcie.h>
++#endif /* MSM_PCIE_LINKDOWN_RECOVERY */
+ 
+ /* defines */
+ 
+@@ -157,6 +160,10 @@ typedef struct dhd_bus {
+ 	uint32 max_sub_queues;
+ 	bool	db1_for_mb;
+ 	bool	suspended;
++#ifdef MSM_PCIE_LINKDOWN_RECOVERY
++	struct msm_pcie_register_event pcie_event;
++	bool islinkdown;
++#endif /* MSM_PCIE_LINKDOWN_RECOVERY */
+ } dhd_bus_t;
+ 
+ /* function declarations */
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c b/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c
+index c3c3474..820cd44 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c
+@@ -527,7 +527,24 @@ int dhdpcie_scan_resource(dhdpcie_info_t *dhdpcie_info)
+ 	return -1; /* FAILURE */
+ 
+ }
+-
++#ifdef MSM_PCIE_LINKDOWN_RECOVERY
++void dhdpcie_linkdown_cb(struct msm_pcie_notify *noti)
++{
++	struct pci_dev *pdev = (struct pci_dev *)noti->user;
++	dhdpcie_info_t *pch;
++	dhd_bus_t *bus;
++	dhd_pub_t *dhd;
++	if (pdev && (pch = pci_get_drvdata(pdev))) {
++		if ((bus = pch->bus) && (dhd = bus->dhd)) {
++			DHD_ERROR(("%s: Event HANG send up "
++				"due to PCIe linkdown\n", __FUNCTION__));
++			bus->islinkdown = TRUE;
++			DHD_OS_WAKE_LOCK_CTRL_TIMEOUT_ENABLE(dhd, DHD_EVENT_TIMEOUT_MS);
++			dhd_os_check_hang(dhd, 0, -ETIMEDOUT);
++		}
++	}
++}
++#endif /* MSM_PCIE_LINKDOWN_RECOVERY */
+ int dhdpcie_init(struct pci_dev *pdev)
+ {
+ 
+@@ -568,6 +585,15 @@ int dhdpcie_init(struct pci_dev *pdev)
+ 
+ 		dhdpcie_info->bus = bus;
+ 		dhdpcie_info->bus->dev = pdev;
++#ifdef MSM_PCIE_LINKDOWN_RECOVERY
++		bus->islinkdown = FALSE;
++		bus->pcie_event.events = MSM_PCIE_EVENT_LINKDOWN;
++		bus->pcie_event.user = pdev;
++		bus->pcie_event.mode = MSM_PCIE_TRIGGER_CALLBACK;
++		bus->pcie_event.callback = dhdpcie_linkdown_cb;
++		bus->pcie_event.options = MSM_PCIE_CONFIG_NO_RECOVERY;
++		msm_pcie_register_event(&bus->pcie_event);
++#endif /* MSM_PCIE_LINKDOWN_RECOVERY */
+ 
+ 		if (bus->intr) {
+ 			/* Register interrupt callback, but mask it (not operational yet). */
+@@ -672,7 +698,7 @@ int
+ dhdpcie_start_host_pcieclock(dhd_bus_t *bus)
+ {
+ 	int ret=0;
+-
++	int options = 0;
+ 	DHD_TRACE(("%s Enter:\n", __FUNCTION__));
+ 
+ 	if(bus == NULL)
+@@ -681,46 +707,57 @@ dhdpcie_start_host_pcieclock(dhd_bus_t *bus)
+ 	if(bus->dev == NULL)
+ 		return BCME_ERROR;
+ 
+-#if defined (CONFIG_ARCH_MSM)
+-	ret = msm_pcie_pm_control(MSM_PCIE_RESUME,
+-				  bus->dev->bus->number,
+-				  NULL, NULL, 0);
++#ifdef CONFIG_ARCH_MSM
++#ifdef MSM_PCIE_LINKDOWN_RECOVERY
++	if (bus->islinkdown)
++		options = MSM_PCIE_CONFIG_NO_CFG_RESTORE;
++#endif /* MSM_PCIE_LINKDOWN_RECOVERY */
++
++	ret = msm_pcie_pm_control(MSM_PCIE_RESUME, bus->dev->bus->number,
++		bus->dev, NULL, options);
++#ifdef MSM_PCIE_LINKDOWN_RECOVERY
++	if (bus->islinkdown && !ret) {
++		msm_pcie_recover_config(bus->dev);
++		if (bus->dhd)
++			DHD_OS_WAKE_UNLOCK(bus->dhd);
++		bus->islinkdown = FALSE;
++	}
++#endif /* MSM_PCIE_LINKDOWN_RECOVERY */
++
+ 	if (ret) {
+ 		DHD_ERROR(("%s Failed to bring up PCIe link\n", __FUNCTION__));
+-		goto done;
+ 	}
+-#endif
+-
+-done:
++#endif /* CONFIG_ARCH_MSM */
+ 	DHD_TRACE(("%s Exit:\n", __FUNCTION__));
+-
+ 	return ret;
+ }
+ 
+ int
+ dhdpcie_stop_host_pcieclock(dhd_bus_t *bus)
+ {
+-	int ret=0;
+-
++	int ret = 0;
++	int options = 0;
+ 	DHD_TRACE(("%s Enter:\n", __FUNCTION__));
+ 
+-	if(bus == NULL)
++	if (bus == NULL)
+ 		return BCME_ERROR;
+ 
+-	if(bus->dev == NULL)
++	if (bus->dev == NULL)
+ 		return BCME_ERROR;
+ 
+-#if defined (CONFIG_ARCH_MSM)
+-	ret = msm_pcie_pm_control(MSM_PCIE_SUSPEND,
+-			bus->dev->bus->number,
+-			NULL, NULL, 0);
++#ifdef CONFIG_ARCH_MSM
++#ifdef MSM_PCIE_LINKDOWN_RECOVERY
++	if (bus->islinkdown)
++		options = MSM_PCIE_CONFIG_NO_CFG_RESTORE | MSM_PCIE_CONFIG_LINKDOWN;
++#endif /* MSM_PCIE_LINKDOWN_RECOVERY */
++
++	ret = msm_pcie_pm_control(MSM_PCIE_SUSPEND, bus->dev->bus->number,
++		bus->dev, NULL, options);
++
+ 	if (ret) {
+ 		DHD_ERROR(("Failed to stop PCIe link\n"));
+-		goto done;
+ 	}
+-#endif
+-
+-done:
++#endif /* CONFIG_ARCH_MSM */
+ 	DHD_TRACE(("%s Exit:\n", __FUNCTION__));
+ 	return ret;
+ }
+-- 
+1.9.1
+

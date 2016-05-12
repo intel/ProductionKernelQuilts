@@ -1,0 +1,120 @@
+From ea7b7263b7a78f4b6f813428e2eb4d7238928d21 Mon Sep 17 00:00:00 2001
+From: Jianxu Zheng <jian.xu.zheng@intel.com>
+Date: Thu, 18 Sep 2014 17:30:25 +0800
+Subject: [PATCH 173/176] atomisp2: add delay between the 2 depth sensors
+ stream on
+
+A delay is needed between ov680 and ov8858 stream on.
+Otherwise the 1st frame from ov680 or ov8858 would be corrupted.
+It's acquired by a new IOCTL from the sensor drivers.
+
+Depends on: I9c8033d810c5e8fa075857e84c2d0b47f0eb4fe2
+Depends on: I5d1f9baab7e13a9a905a5e5573978780d1f8d507
+Depends on: I44535029b4469853cafdba0315f48666b780260d
+Depends on: I88f80633cdc910b8905d36342e795e275c5cb46c
+Depends on: I6ad3b618554ddcbf0133734904690c5ece687e75
+
+Change-Id: I412ef6aaacec0c2d5943d911c2f393d71cebc855
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-8035
+Signed-off-by: Jianxu Zheng <jian.xu.zheng@intel.com>
+Signed-off-by: Vivek Kumar <vivek007.kumar@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/28237
+Reviewed-by: Soren Friis <soren.friis@intel.com>
+Integrator: Wei Tao <wei.tao@intel.com>
+Approver: Wei Tao <wei.tao@intel.com>
+Build: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+Maintainer: Wei Tao <wei.tao@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.c      |  5 +++--
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.c    | 25 +++++++++++++++++-----
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.h    |  2 +-
+ 3 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index 0bc9933..ee3c7c3 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -1376,8 +1376,9 @@ static void __atomisp_css_recover(struct atomisp_device *isp, bool isp_timeout)
+ 	}
+ 
+ 	if (depth_mode) {
+-		if (atomisp_stream_on_master_slave_sensor(isp))
+-			dev_warn(isp->dev, "master slave sensor stream on failed!\n");
++		if (atomisp_stream_on_master_slave_sensor(isp, true))
++			dev_warn(isp->dev,
++				 "master slave sensor stream on failed!\n");
+ 	}
+ }
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index 9771a12..a51af20 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -1548,9 +1548,9 @@ static unsigned int atomisp_sensor_start_stream(struct atomisp_sub_device *asd)
+ 	else
+ 		return 1;
+ }
+-int atomisp_stream_on_master_slave_sensor(struct atomisp_device *isp)
++int atomisp_stream_on_master_slave_sensor(struct atomisp_device *isp, bool isp_timeout)
+ {
+-	unsigned int master = -1, slave = -1;
++	unsigned int master = -1, slave = -1, delay_slave = 0;
+ 	int i, ret;
+ 
+ 	/*
+@@ -1571,14 +1571,29 @@ int atomisp_stream_on_master_slave_sensor(struct atomisp_device *isp)
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = v4l2_subdev_call(isp->inputs[master].camera, video, s_stream, 1);
++	if (isp_timeout) {
++		ret = v4l2_subdev_call(isp->inputs[master].camera, core,
++				       ioctl, ATOMISP_IOC_G_DEPTH_SYNC_COMP,
++				       &delay_slave);
++		if (ret)
++			dev_warn(isp->dev,
++				 "get depth sensor %s compensation delay failed.\n",
++				 isp->inputs[master].camera->name);
++	}
++
++	ret = v4l2_subdev_call(isp->inputs[master].camera,
++			       video, s_stream, 1);
+ 	if (ret) {
+ 		dev_err(isp->dev, "depth mode master sensor %s stream-on failed.\n",
+ 			isp->inputs[master].camera->name);
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = v4l2_subdev_call(isp->inputs[slave].camera, video, s_stream, 1);
++	if (isp_timeout && delay_slave != 0)
++		udelay(delay_slave);
++
++	ret = v4l2_subdev_call(isp->inputs[slave].camera,
++			       video, s_stream, 1);
+ 	if (ret) {
+ 		dev_err(isp->dev, "depth mode slave sensor %s stream-on failed.\n",
+ 			isp->inputs[slave].camera->name);
+@@ -1788,7 +1803,7 @@ start_sensor:
+ 
+ 	if (asd->depth_mode->val && atomisp_streaming_count(isp) ==
+ 			ATOMISP_DEPTH_SENSOR_STREAMON_COUNT) {
+-		ret = atomisp_stream_on_master_slave_sensor(isp);
++		ret = atomisp_stream_on_master_slave_sensor(isp, false);
+ 		if (ret) {
+ 			dev_err(isp->dev, "master slave sensor stream on failed!\n");
+ 			goto out;
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.h
+index 03c34d3..a2c4c81 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.h
+@@ -63,5 +63,5 @@ unsigned int atomisp_streaming_count(struct atomisp_device *isp);
+ long atomisp_compat_ioctl32(struct file *file,
+ 			    unsigned int cmd, unsigned long arg);
+ 
+-int atomisp_stream_on_master_slave_sensor(struct atomisp_device *isp);
++int atomisp_stream_on_master_slave_sensor(struct atomisp_device *isp, bool isp_timeout);
+ #endif /* __ATOMISP_IOCTL_H__ */
+-- 
+1.9.1
+

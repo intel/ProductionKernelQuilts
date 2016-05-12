@@ -1,0 +1,102 @@
+From 65b712cc26a0a20cdf2c11be54e53bf7a104b8c7 Mon Sep 17 00:00:00 2001
+From: arun <arun.radhakrishnan@intel.com>
+Date: Wed, 30 Mar 2016 12:50:29 -0600
+Subject: [PATCH 1/3] iio: ak0911: fix issue with sampl frequency read/write
+
+it was observed that the magnetometer sampling frequencywas not
+being set and read out correctly. Updated the following to fix
+the set/read issue
+- updated the AK09911_CNTL2_CONTINUOUS_SHIFT to 1
+
+- changed the IIO_CHAN_INFO_SAMP_FREQ to info_mask_shared_by_type
+  within the channel description so that in_magn_sampling_frequency
+  is enabled within the sysfs
+
+- the datasheet specifies that when user wants to change operation
+  freq, transit to Power-down mode first and then change mode,
+  sleep for 100us after power down.
+
+Change-Id: I4de166ce7025f8601bf60c023383909fe6e709ee
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-27165
+Signed-off-by: Arun Radhakrishnan <arun.radhakrishnan@intel.com>
+Reviewed-on: https://android.intel.com:443/488364
+---
+ drivers/iio/magnetometer/ak09911.c | 33 ++++++++++++++++++++++++++-------
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/iio/magnetometer/ak09911.c b/drivers/iio/magnetometer/ak09911.c
+index 68b22e3..bfec743e 100644
+--- a/drivers/iio/magnetometer/ak09911.c
++++ b/drivers/iio/magnetometer/ak09911.c
+@@ -70,7 +70,7 @@
+ #define AK09911_CNTL2_CONTINUOUS_MASK	(AK09911_CNTL2_CONTINUOUS_1_BIT | \
+ 					AK09911_CNTL2_CONTINUOUS_2_BIT | \
+ 					AK09911_CNTL2_CONTINUOUS_3_BIT)
+-#define AK09911_CNTL2_CONTINUOUS_SHIFT	0
++#define AK09911_CNTL2_CONTINUOUS_SHIFT	1
+ 
+ #define AK09911_MAX_CONVERSION_TIMEOUT		500
+ #define AK09911_CONVERSION_DONE_POLL_TIME	10
+@@ -234,11 +234,13 @@ static int ak09911_read_axis(struct iio_dev *indio_dev, int index, int *val)
+ 	meas_reg = ret;
+ 
+ 	/* datasheet recommends reading ST2 register after each
+-	 * data read operation */
++	 * data read operation, read ST2 when we reach index z */
++	 if(index == 2) {
+ 	ret = i2c_smbus_read_byte_data(client, AK09911_REG_ST2);
+-	if (ret < 0) {
+-		dev_err(&client->dev, "Read AK09911_REG_ST2 reg fails\n");
+-		goto fn_exit;
++		if (ret < 0) {
++			dev_err(&client->dev, "Read AK09911_REG_ST2 reg fails\n");
++			goto fn_exit;
++		}
+ 	}
+ 	mutex_unlock(&data->lock);
+ 
+@@ -294,6 +296,11 @@ static int ak09911_read_raw(struct iio_dev *indio_dev,
+ 		data->reg_cntl2 = ret;
+ 
+ 		i = data->reg_cntl2 >> AK09911_CNTL2_CONTINUOUS_SHIFT;
++		if (i == 0) {
++			*val  = 0;
++			*val2 = 0;
++			return IIO_VAL_INT_PLUS_MICRO;
++		}
+ 		i = i - 1;
+ 		if (i < 0 || i >= ARRAY_SIZE(ak09911_samp_freq))
+ 			return -EINVAL;
+@@ -313,8 +320,8 @@ static int ak09911_read_raw(struct iio_dev *indio_dev,
+ 		.modified = 1,						\
+ 		.channel2 = IIO_MOD_##axis,				\
+ 		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |		\
+-				BIT(IIO_CHAN_INFO_SCALE) |		\
+-				BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
++				BIT(IIO_CHAN_INFO_SCALE),  		\
++		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SAMP_FREQ),\
+ 		.address = index,					\
+ 	}
+ 
+@@ -359,6 +366,18 @@ static int ak09911_write_raw(struct iio_dev *indio_dev,
+ 					AK09911_CNTL2_CONTINUOUS_MASK,
+ 				(i + 1) << AK09911_CNTL2_CONTINUOUS_SHIFT);
+ #else
++		/* When user wants to change operation mode,
++		* transit to Power-down mode first and then
++		* transit to other modes*/
++		ret = i2c_smbus_write_byte_data(data->client,
++				AK09911_REG_CNTL2, AK09911_MODE_POWERDOWN);
++		if (ret < 0) {
++			dev_err(&data->client->dev, "Error in switching to powerdown\n");
++			return ret;
++		}
++		/*After Power-down mode is set, at least 100 μ s (Twat)
++		 *  is needed before setting another mode*/
++				usleep_range(100, 500);
+ 		ret = i2c_smbus_write_byte_data(data->client,
+ 				AK09911_REG_CNTL2, data->reg_cntl2);
+ #endif
+-- 
+1.9.1
+

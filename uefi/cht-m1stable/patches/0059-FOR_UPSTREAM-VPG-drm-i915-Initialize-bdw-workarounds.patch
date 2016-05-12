@@ -1,0 +1,327 @@
+From e06350fb221675ec143e0d85b402eadbb2115da1 Mon Sep 17 00:00:00 2001
+Message-Id: <e06350fb221675ec143e0d85b402eadbb2115da1.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Michel Thierry <michel.thierry@intel.com>
+Date: Fri, 5 Sep 2014 11:18:34 +0100
+Subject: [PATCH 59/71] FOR_UPSTREAM [VPG]: drm/i915: Initialize bdw
+ workarounds in logical ring mode too
+
+Following the legacy ring submission example, update the
+ring->init_context() hook to support the execlist submission mode.
+
+Issue: VIZ-4092
+Issue: GMIN-3475
+Cc: Deepak S <deepak.s@intel.com>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+(cherry picked from commit 3a26bd3be676a663406f740b8b78ec936c3294d3)
+
+Change-Id: I4587650d8da59b00f013ac46fe6d246f7f7f2b47
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |    2 +-
+ drivers/gpu/drm/i915/intel_lrc.c        |   66 ++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   79 ++++++++++++++++++-------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    8 ++--
+ 4 files changed, 117 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index d4e7fbf..3351bd6 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -799,7 +799,7 @@ done:
+ 
+ 	if (uninitialized) {
+ 		if (ring->init_context) {
+-			ret = ring->init_context(ring);
++			ret = ring->init_context(ring->buffer);
+ 			if (ret)
+ 				DRM_ERROR("ring init context: %d\n", ret);
+ 		}
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index f39f1d2..45bd88c 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1173,6 +1173,62 @@ int intel_logical_ring_begin(struct intel_ringbuffer *ringbuf, int num_dwords)
+ 	return 0;
+ }
+ 
++static inline void intel_logical_ring_emit_wa(struct intel_ringbuffer *ringbuf,
++				       u32 addr, u32 value)
++{
++	struct intel_engine_cs *ring = ringbuf->ring;
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (WARN_ON(dev_priv->num_wa_regs >= I915_MAX_WA_REGS))
++		return;
++
++	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
++	intel_logical_ring_emit(ringbuf, addr);
++	intel_logical_ring_emit(ringbuf, value);
++
++	dev_priv->intel_wa_regs[dev_priv->num_wa_regs].addr = addr;
++	dev_priv->intel_wa_regs[dev_priv->num_wa_regs].mask = value & 0xFFFF;
++	/* value is updated with the status of remaining bits of this
++	 * register when it is read from debugfs file
++	 */
++	dev_priv->intel_wa_regs[dev_priv->num_wa_regs].value = value;
++	dev_priv->num_wa_regs++;
++}
++
++static int bdw_init_logical_workarounds(struct intel_ringbuffer *ringbuf)
++{
++	int ret;
++	struct intel_engine_cs *ring = ringbuf->ring;
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/*
++	 * workarounds applied in this fn are part of register state context,
++	 * they need to be re-initialized followed by gpu reset, suspend/resume,
++	 * module reload.
++	 */
++	dev_priv->num_wa_regs = 0;
++	memset(dev_priv->intel_wa_regs, 0, sizeof(dev_priv->intel_wa_regs));
++
++	/*
++	 * update the number of dwords required based on the
++	 * actual number of workarounds applied
++	 */
++	ret = intel_logical_ring_begin(ringbuf, 24);
++	if (ret)
++		return ret;
++
++	bdw_emit_workarounds(ringbuf);
++
++	intel_logical_ring_advance(ringbuf);
++
++	DRM_DEBUG_DRIVER("Number of Workarounds applied: %d\n",
++			 dev_priv->num_wa_regs);
++
++	return 0;
++}
++
+ static int gen8_init_common_ring(struct intel_engine_cs *ring)
+ {
+ 	struct drm_device *dev = ring->dev;
+@@ -1473,6 +1529,10 @@ static int logical_render_ring_init(struct drm_device *dev)
+ 	if (HAS_L3_DPF(dev))
+ 		ring->irq_keep_mask |= GT_RENDER_L3_PARITY_ERROR_INTERRUPT;
+ 
++	if (IS_BROADWELL(dev))
++		ring->init_context = bdw_init_logical_workarounds;
++	ring->emit_wa = intel_logical_ring_emit_wa;
++
+ 	ring->init = gen8_init_render_ring;
+ 	ring->cleanup = intel_fini_pipe_control;
+ 	ring->get_seqno = gen8_get_seqno;
+@@ -1932,6 +1992,12 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	}
+ 
+ 	if (ring->id == RCS && !ctx->rcs_initialized) {
++		if (ring->init_context) {
++			ret = ring->init_context(ringbuf);
++			if (ret)
++				DRM_ERROR("ring init context: %d\n", ret);
++		}
++
+ 		ret = intel_lr_context_render_state_init(ring, ctx);
+ 		if (ret) {
+ 			DRM_ERROR("Init render state failed: %d\n", ret);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 284a54e7..686ce85 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1059,9 +1059,10 @@ get_pipe_control_scratch_addr(struct intel_engine_cs *ring)
+ 	return ring->scratch.gtt_offset;
+ }
+ 
+-static inline void intel_ring_emit_wa(struct intel_engine_cs *ring,
++static inline void intel_ring_emit_wa(struct intel_ringbuffer *ringbuf,
+ 				       u32 addr, u32 value)
+ {
++	struct intel_engine_cs *ring = ringbuf->ring;
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+@@ -1083,62 +1084,44 @@ static inline void intel_ring_emit_wa(struct intel_engine_cs *ring,
+ 	return;
+ }
+ 
+-int bdw_init_workarounds(struct intel_engine_cs *ring)
++void bdw_emit_workarounds(struct intel_ringbuffer *ringbuf)
+ {
+-	int ret;
+-	struct drm_device *dev = ring->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+-	/*
+-	 * workarounds applied in this fn are part of register state context,
+-	 * they need to be re-initialized followed by gpu reset, suspend/resume,
+-	 * module reload.
+-	 */
+-	dev_priv->num_wa_regs = 0;
+-	memset(dev_priv->intel_wa_regs, 0, sizeof(dev_priv->intel_wa_regs));
+-
+-	/*
+-	 * update the number of dwords required based on the
+-	 * actual number of workarounds applied
+-	 */
+-	ret = intel_ring_begin(ring, 24);
+-	if (ret)
+-		return ret;
++	struct intel_engine_cs *ring = ringbuf->ring;
+ 
+ 	/* WaDisablePartialInstShootdown:bdw */
+ 	/* WaDisableThreadStallDopClockGating:bdw */
+ 	/* FIXME: Unclear whether we really need this on production bdw. */
+-	intel_ring_emit_wa(ring, GEN8_ROW_CHICKEN,
++	ring->emit_wa(ringbuf, GEN8_ROW_CHICKEN,
+ 			   _MASKED_BIT_ENABLE(PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE
+ 					     | STALL_DOP_GATING_DISABLE));
+ 
+ 	/* WaDisableDopClockGating:bdw May not be needed for production */
+-	intel_ring_emit_wa(ring, GEN7_ROW_CHICKEN2,
++	ring->emit_wa(ringbuf, GEN7_ROW_CHICKEN2,
+ 			   _MASKED_BIT_ENABLE(DOP_CLOCK_GATING_DISABLE));
+ 
+ 	/*
+ 	 * This GEN8_CENTROID_PIXEL_OPT_DIS W/A is only needed for
+ 	 * pre-production hardware
+ 	 */
+-	intel_ring_emit_wa(ring, HALF_SLICE_CHICKEN3,
++	ring->emit_wa(ringbuf, HALF_SLICE_CHICKEN3,
+ 			   _MASKED_BIT_ENABLE(GEN8_CENTROID_PIXEL_OPT_DIS
+ 					      | GEN8_SAMPLER_POWER_BYPASS_DIS));
+ 
+-	intel_ring_emit_wa(ring, GEN7_HALF_SLICE_CHICKEN1,
++	ring->emit_wa(ringbuf, GEN7_HALF_SLICE_CHICKEN1,
+ 			   _MASKED_BIT_ENABLE(GEN7_SINGLE_SUBSCAN_DISPATCH_ENABLE));
+ 
+-	intel_ring_emit_wa(ring, COMMON_SLICE_CHICKEN2,
++	ring->emit_wa(ringbuf, COMMON_SLICE_CHICKEN2,
+ 			   _MASKED_BIT_ENABLE(GEN8_CSC2_SBE_VUE_CACHE_CONSERVATIVE));
+ 
+ 	/* Use Force Non-Coherent whenever executing a 3D context. This is a
+ 	 * workaround for for a possible hang in the unlikely event a TLB
+ 	 * invalidation occurs during a PSD flush.
+ 	 */
+-	intel_ring_emit_wa(ring, HDC_CHICKEN0,
++	ring->emit_wa(ringbuf, HDC_CHICKEN0,
+ 			   _MASKED_BIT_ENABLE(HDC_FORCE_NON_COHERENT));
+ 
+ 	/* Wa4x4STCOptimizationDisable:bdw */
+-	intel_ring_emit_wa(ring, CACHE_MODE_1,
++	ring->emit_wa(ringbuf, CACHE_MODE_1,
+ 			   _MASKED_BIT_ENABLE(GEN8_4x4_STC_OPTIMIZATION_DISABLE));
+ 
+ 	/*
+@@ -1149,8 +1132,34 @@ int bdw_init_workarounds(struct intel_engine_cs *ring)
+ 	 * disable bit, which we don't touch here, but it's good
+ 	 * to keep in mind (see 3DSTATE_PS and 3DSTATE_WM).
+ 	 */
+-	intel_ring_emit_wa(ring, GEN7_GT_MODE,
++	ring->emit_wa(ringbuf, GEN7_GT_MODE,
+ 			   GEN6_WIZ_HASHING_MASK | GEN6_WIZ_HASHING_16x4);
++}
++
++static int bdw_init_workarounds(struct intel_ringbuffer *ringbuf)
++{
++	int ret;
++	struct intel_engine_cs *ring = ringbuf->ring;
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/*
++	 * workarounds applied in this fn are part of register state context,
++	 * they need to be re-initialized followed by gpu reset, suspend/resume,
++	 * module reload.
++	 */
++	dev_priv->num_wa_regs = 0;
++	memset(dev_priv->intel_wa_regs, 0, sizeof(dev_priv->intel_wa_regs));
++
++	/*
++	 * update the number of dwords required based on the
++	 * actual number of workarounds applied
++	 */
++	ret = intel_ring_begin(ring, 24);
++	if (ret)
++		return ret;
++
++	bdw_emit_workarounds(ringbuf);
+ 
+ 	intel_ring_advance(ring);
+ 
+@@ -1160,9 +1169,10 @@ int bdw_init_workarounds(struct intel_engine_cs *ring)
+ 	return 0;
+ }
+ 
+-int chv_init_workarounds(struct intel_engine_cs *ring)
++static int chv_init_workarounds(struct intel_ringbuffer *ringbuf)
+ {
+ 	int ret;
++	struct intel_engine_cs *ring = ringbuf->ring;
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+@@ -1179,19 +1189,19 @@ int chv_init_workarounds(struct intel_engine_cs *ring)
+ 		return ret;
+ 
+ 	/* WaDisablePartialInstShootdown:chv */
+-	intel_ring_emit_wa(ring, GEN8_ROW_CHICKEN,
++	intel_ring_emit_wa(ringbuf, GEN8_ROW_CHICKEN,
+ 			   _MASKED_BIT_ENABLE(PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE));
+ 
+ 	/* WaDisableThreadStallDopClockGating:chv */
+-	intel_ring_emit_wa(ring, GEN8_ROW_CHICKEN,
++	intel_ring_emit_wa(ringbuf, GEN8_ROW_CHICKEN,
+ 			   _MASKED_BIT_ENABLE(STALL_DOP_GATING_DISABLE));
+ 
+ 	/* WaDisableDopClockGating:chv (pre-production hw) */
+-	intel_ring_emit_wa(ring, GEN7_ROW_CHICKEN2,
++	intel_ring_emit_wa(ringbuf, GEN7_ROW_CHICKEN2,
+ 			   _MASKED_BIT_ENABLE(DOP_CLOCK_GATING_DISABLE));
+ 
+ 	/* WaDisableSamplerPowerBypass:chv (pre-production hw) */
+-	intel_ring_emit_wa(ring, HALF_SLICE_CHICKEN3,
++	intel_ring_emit_wa(ringbuf, HALF_SLICE_CHICKEN3,
+ 			   _MASKED_BIT_ENABLE(GEN8_SAMPLER_POWER_BYPASS_DIS));
+ 
+ 	intel_ring_advance(ring);
+@@ -2794,6 +2804,7 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
+ 				ring->init_context = chv_init_workarounds;
+ 			else
+ 				ring->init_context = bdw_init_workarounds;
++			ring->emit_wa = intel_ring_emit_wa;
+ 			ring->flush = gen8_render_ring_flush;
+ 			ring->irq_get = gen8_ring_get_irq;
+ 			ring->irq_put = gen8_ring_put_irq;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 3d80076..68d8919 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -187,7 +187,10 @@ struct intel_engine_cs {
+ 
+ 	int		(*init)(struct intel_engine_cs *ring);
+ 
+-	int		(*init_context)(struct intel_engine_cs *ring);
++	int		(*init_context)(struct intel_ringbuffer *ringbuf);
++
++	void	(*emit_wa)(struct intel_ringbuffer *ringbuf,
++		       u32 addr, u32 value);
+ 
+ 	void		(*write_tail)(struct intel_engine_cs *ring,
+ 				      u32 value);
+@@ -469,8 +472,7 @@ int intel_init_vebox_ring_buffer(struct drm_device *dev);
+ u64 intel_ring_get_active_head(struct intel_engine_cs *ring);
+ void intel_ring_setup_status_page(struct intel_engine_cs *ring);
+ u32 get_pipe_control_scratch_addr(struct intel_engine_cs *ring);
+-int bdw_init_workarounds(struct intel_engine_cs *ring);
+-int chv_init_workarounds(struct intel_engine_cs *ring);
++void bdw_emit_workarounds(struct intel_ringbuffer *ringbuf);
+ 
+ static inline u32 intel_ring_get_tail(struct intel_ringbuffer *ringbuf)
+ {
+-- 
+1.7.9.5
+

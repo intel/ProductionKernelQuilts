@@ -1,0 +1,93 @@
+From 26c5975c86ab3da0cd6e1a2273526be24bcb6046 Mon Sep 17 00:00:00 2001
+Message-Id: <26c5975c86ab3da0cd6e1a2273526be24bcb6046.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: Thomas Daniel <thomas.daniel@intel.com>
+Date: Wed, 29 Oct 2014 09:52:51 +0000
+Subject: [PATCH 09/63] FROM_UPSTREAM [VPG]: drm/i915/bdw: Setup global
+ hardware status page in execlists mode
+
+Write HWS_PGA address even in execlists mode as the global hardware status
+page is still required.  This address was previously uninitialized and
+HWSP writes would clobber whatever buffer happened to reside at GGTT
+address 0.
+
+v2: Break out hardware status page setup into a separate function.
+
+Issue: VIZ-2020
+Change-Id: I1d69a650292186780ba359849dfe5b886af75fd3
+Signed-off-by: Thomas Daniel <thomas.daniel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 1df06b75f0235c6c4f836e5c03fb499ba70a54bd
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/intel_lrc.c |   38 ++++++++++++++++++++++++++------------
+ 1 file changed, 26 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index d3ac286..886b1df 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -2117,6 +2117,27 @@ static uint32_t get_lr_context_size(struct intel_engine_cs *ring)
+ 	return ret;
+ }
+ 
++static int lrc_setup_hardware_status_page(struct intel_engine_cs *ring,
++		struct drm_i915_gem_object *default_ctx_obj)
++{
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++
++	/* The status page is offset 0 from the default context object
++	 * in LRC mode. */
++	ring->status_page.gfx_addr = i915_gem_obj_ggtt_offset(default_ctx_obj);
++	ring->status_page.page_addr =
++			kmap(sg_page(default_ctx_obj->pages->sgl));
++	if (ring->status_page.page_addr == NULL)
++		return -ENOMEM;
++	ring->status_page.obj = default_ctx_obj;
++
++	I915_WRITE(RING_HWS_PGA(ring->mmio_base),
++			(u32)ring->status_page.gfx_addr);
++	POSTING_READ(RING_HWS_PGA(ring->mmio_base));
++
++	return 0;
++}
++
+ /**
+  * intel_lr_context_deferred_create() - create the LRC specific bits of a context
+  * @ctx: LR context to create.
+@@ -2138,7 +2159,6 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	uint32_t context_size;
+ 	struct intel_ringbuffer *ringbuf;
+ 	int ret;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	WARN_ON(ctx->legacy_hw_ctx.rcs_state != NULL);
+ 	if (ctx->engine[ring->id].state)
+@@ -2203,17 +2223,11 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	ctx->engine[ring->id].state = ctx_obj;
+ 
+ 	if (ctx == ring->default_context) {
+-		/* The status page is offset 0 from the default context object
+-		 * in LRC mode. */
+-		ring->status_page.gfx_addr = i915_gem_obj_ggtt_offset(ctx_obj);
+-		ring->status_page.page_addr =
+-				kmap(sg_page(ctx_obj->pages->sgl));
+-		if (ring->status_page.page_addr == NULL)
+-			return -ENOMEM;
+-		ring->status_page.obj = ctx_obj;
+-
+-		I915_WRITE(RING_HWS_PGA(ring->mmio_base), (u32)ring->status_page.gfx_addr);
+-		POSTING_READ(RING_HWS_PGA(ring->mmio_base));
++		ret = lrc_setup_hardware_status_page(ring, ctx_obj);
++		if (ret) {
++			DRM_ERROR("Failed to setup hardware status page\n");
++			goto error;
++		}
+ 	}
+ 
+ 	if (ring->id == RCS && !ctx->rcs_initialized) {
+-- 
+1.7.9.5
+

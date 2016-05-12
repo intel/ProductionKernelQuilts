@@ -1,0 +1,294 @@
+From a02e9e2c02c7e344908bde7c05bde9a2ea06cf56 Mon Sep 17 00:00:00 2001
+From: Yuyang Du <yuyang.du@intel.com>
+Date: Mon, 17 Nov 2014 18:32:56 -0500
+Subject: [PATCH] sched: Define SD_WORKLOAD_CONSOLIDATION and attach to
+ sched_domain
+
+Workload consolidation is a sched policy, adaptive to CPU topology.
+We define SD_WORKLOAD_CONSOLIDATION, and add fields in sched_domain:
+
+- total_groups: the group number in total in this domain
+- group_number: this CPU's group sequence number
+- consolidating_coeff: the degree of consolidation, changeable via sysctl
+  to make consolidation more aggressive or less
+- first_group: the number of this domain's first group ordered by CPU number
+
+This patchset enables SD_WORKLOAD_CONSOLIDATION in MC domain by default.
+Thanks to PeterZ and Dietmar for pointing this out and help me finally
+understand it.
+
+Change-Id: Ic6ecbbb53921fcf51ff03b131972cd660c91428e
+Orig-Change-Id: I425582da6bed5ee2390296b32de1677ce484644d
+Orig-Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-20603
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9774
+Signed-off-by: Yuyang Du <yuyang.du@intel.com>
+Signed-off-by: Srinidhi Kasagar <srinidhi.kasagar@intel.com>
+---
+ include/linux/sched.h    |  6 ++++++
+ include/linux/topology.h |  7 +++++++
+ kernel/sched/core.c      | 44 ++++++++++++++++++++++++++++++++++++++++----
+ kernel/sched/fair.c      |  6 ++++++
+ kernel/sched/sched.h     | 18 +++++++++++++++---
+ 5 files changed, 74 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ad83725..235c309 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -869,6 +869,7 @@ enum cpu_idle_type {
+ #define SD_PREFER_SIBLING	0x1000	/* Prefer to place tasks in a sibling domain */
+ #define SD_OVERLAP		0x2000	/* sched_domains of this level overlap */
+ #define SD_NUMA			0x4000	/* cross-node balancing */
++#define SD_WORKLOAD_CONSOLIDATION  0x8000	/* consolidate CPU workload */
+ 
+ extern int __weak arch_sd_sibiling_asym_packing(void);
+ 
+@@ -953,6 +954,11 @@ struct sched_domain {
+ 		struct rcu_head rcu;	/* used during destruction */
+ 	};
+ 
++	unsigned int total_groups;		/* total group number */
++	unsigned int group_number;		/* this CPU's group sequence */
++	unsigned int consolidating_coeff;	/* consolidating coefficient */
++	struct sched_group *first_group;	/* ordered by CPU number */
++
+ 	unsigned int span_weight;
+ 	/*
+ 	 * Span of all CPUs in this domain.
+diff --git a/include/linux/topology.h b/include/linux/topology.h
+index 12ae6ce..65b4974 100644
+--- a/include/linux/topology.h
++++ b/include/linux/topology.h
+@@ -84,6 +84,7 @@ int arch_update_cpu_topology(void);
+  */
+ #define ARCH_HAS_SCHED_WAKE_IDLE
+ /* Common values for SMT siblings */
++
+ #ifndef SD_SIBLING_INIT
+ #define SD_SIBLING_INIT (struct sched_domain) {				\
+ 	.min_interval		= 1,					\
+@@ -102,12 +103,14 @@ int arch_update_cpu_topology(void);
+ 				| 0*SD_SERIALIZE			\
+ 				| 0*SD_PREFER_SIBLING			\
+ 				| arch_sd_sibling_asym_packing()	\
++				| 0*SD_WORKLOAD_CONSOLIDATION		\
+ 				,					\
+ 	.last_balance		= jiffies,				\
+ 	.balance_interval	= 1,					\
+ 	.smt_gain		= 1178,	/* 15% */			\
+ 	.max_newidle_lb_cost	= 0,					\
+ 	.next_decay_max_lb_cost	= jiffies,				\
++	.consolidating_coeff	= 0,					\
+ }
+ #endif
+ #endif /* CONFIG_SCHED_SMT */
+@@ -134,11 +137,13 @@ int arch_update_cpu_topology(void);
+ 				| 0*SD_SHARE_CPUPOWER			\
+ 				| 1*SD_SHARE_PKG_RESOURCES		\
+ 				| 0*SD_SERIALIZE			\
++				| 0*SD_WORKLOAD_CONSOLIDATION		\
+ 				,					\
+ 	.last_balance		= jiffies,				\
+ 	.balance_interval	= 1,					\
+ 	.max_newidle_lb_cost	= 0,					\
+ 	.next_decay_max_lb_cost	= jiffies,				\
++	.consolidating_coeff	= 0,					\
+ }
+ #endif
+ #endif /* CONFIG_SCHED_MC */
+@@ -167,11 +172,13 @@ int arch_update_cpu_topology(void);
+ 				| 0*SD_SHARE_PKG_RESOURCES		\
+ 				| 0*SD_SERIALIZE			\
+ 				| 1*SD_PREFER_SIBLING			\
++				| 1*SD_WORKLOAD_CONSOLIDATION		\
+ 				,					\
+ 	.last_balance		= jiffies,				\
+ 	.balance_interval	= 1,					\
+ 	.max_newidle_lb_cost	= 0,					\
+ 	.next_decay_max_lb_cost	= jiffies,				\
++	.consolidating_coeff	= 160,					\
+ }
+ #endif
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 27f3e9b..7ef1b2a 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4886,7 +4886,7 @@ set_table_entry(struct ctl_table *entry,
+ static struct ctl_table *
+ sd_alloc_ctl_domain_table(struct sched_domain *sd)
+ {
+-	struct ctl_table *table = sd_alloc_ctl_entry(13);
++	struct ctl_table *table = sd_alloc_ctl_entry(14);
+ 
+ 	if (table == NULL)
+ 		return NULL;
+@@ -4916,7 +4916,9 @@ sd_alloc_ctl_domain_table(struct sched_domain *sd)
+ 		sizeof(int), 0644, proc_dointvec_minmax, false);
+ 	set_table_entry(&table[11], "name", sd->name,
+ 		CORENAME_MAX_SIZE, 0444, proc_dostring, false);
+-	/* &table[12] is terminator */
++	set_table_entry(&table[12], "consolidating_coeff", &sd->consolidating_coeff,
++		sizeof(int), 0644, proc_dointvec, false);
++	/* &table[13] is terminator */
+ 
+ 	return table;
+ }
+@@ -5517,7 +5519,7 @@ static void update_top_cache_domain(int cpu)
+ 	int id = cpu;
+ 	int size = 1;
+ 
+-	sd = highest_flag_domain(cpu, SD_SHARE_PKG_RESOURCES);
++	sd = highest_flag_domain(cpu, SD_SHARE_PKG_RESOURCES, 1);
+ 	if (sd) {
+ 		id = cpumask_first(sched_domain_span(sd));
+ 		size = cpumask_weight(sched_domain_span(sd));
+@@ -5532,10 +5534,40 @@ static void update_top_cache_domain(int cpu)
+ 	sd = lowest_flag_domain(cpu, SD_NUMA);
+ 	rcu_assign_pointer(per_cpu(sd_numa, cpu), sd);
+ 
+-	sd = highest_flag_domain(cpu, SD_ASYM_PACKING);
++	sd = highest_flag_domain(cpu, SD_ASYM_PACKING, 1);
+ 	rcu_assign_pointer(per_cpu(sd_asym, cpu), sd);
+ }
+ 
++DEFINE_PER_CPU(struct sched_domain *, sd_wc);
++
++static void update_wc_domain(struct sched_domain *sd, int cpu)
++{
++	while (sd) {
++		int i = 0, j = 0, first, min = INT_MAX;
++		struct sched_group *group;
++
++		group = sd->groups;
++		first = group_first_cpu(group);
++		do {
++			int k = group_first_cpu(group);
++			i += 1;
++			if (k < first)
++				j += 1;
++			if (k < min) {
++				sd->first_group = group;
++				min = k;
++			}
++		} while (group = group->next, group != sd->groups);
++
++		sd->total_groups = i;
++		sd->group_number = j;
++		sd = sd->parent;
++	}
++
++	sd = highest_flag_domain(cpu, SD_WORKLOAD_CONSOLIDATION, 0);
++	rcu_assign_pointer(per_cpu(sd_wc, cpu), sd);
++}
++
+ /*
+  * Attach the domain 'sd' to 'cpu' as its base domain. Callers must
+  * hold the hotplug lock.
+@@ -5584,6 +5616,8 @@ cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
+ 	destroy_sched_domains(tmp, cpu);
+ 
+ 	update_top_cache_domain(cpu);
++
++	update_wc_domain(sd, cpu);
+ }
+ 
+ /* cpus with isolated domains */
+@@ -6927,6 +6961,8 @@ void __init sched_init(void)
+ #endif
+ 		init_rq_hrtick(rq);
+ 		atomic_set(&rq->nr_iowait, 0);
++
++		init_workload_consolidation(rq);
+ 	}
+ 
+ 	set_load_weight(&init_task);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index e5e927c..105a270 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7381,6 +7381,7 @@ __init void init_sched_fair_class(void)
+  * - enter and exit idle
+  * - update_blocked_averages
+  */
++
+ void update_cpu_concurrency(struct rq *rq)
+ {
+ 	struct sched_avg *sa = &rq->concurrency.avg;
+@@ -7390,4 +7391,9 @@ void update_cpu_concurrency(struct rq *rq)
+ 	}
+ }
+ 
++void init_workload_consolidation(struct rq *rq)
++{
++	rq->concurrency.unload = 0;
++}
++
+ #endif /* SMP */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 2e88c8c..0711d8f 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -514,6 +514,9 @@ extern struct root_domain def_root_domain;
+ 
+ struct cpu_concurrency_t {
+ 	struct sched_avg avg;
++	int unload;
++	int dst_cpu;
++	struct cpu_stop_work unload_work;
+ };
+ 
+ #endif /* CONFIG_SMP */
+@@ -717,16 +720,22 @@ extern int migrate_swap(struct task_struct *, struct task_struct *);
+  *		be returned.
+  * @flag:	The flag to check for the highest sched_domain
+  *		for the given cpu.
++ * @all:	The flag is contained by all sched_domains from the hightest down
+  *
+  * Returns the highest sched_domain of a cpu which contains the given flag.
+  */
+-static inline struct sched_domain *highest_flag_domain(int cpu, int flag)
++static inline struct
++sched_domain *highest_flag_domain(int cpu, int flag, int all)
+ {
+ 	struct sched_domain *sd, *hsd = NULL;
+ 
+ 	for_each_domain(cpu, sd) {
+-		if (!(sd->flags & flag))
+-			break;
++		if (!(sd->flags & flag)) {
++			if (all)
++				break;
++			else
++				continue;
++		}
+ 		hsd = sd;
+ 	}
+ 
+@@ -751,6 +760,7 @@ DECLARE_PER_CPU(int, sd_llc_id);
+ DECLARE_PER_CPU(struct sched_domain *, sd_numa);
+ DECLARE_PER_CPU(struct sched_domain *, sd_busy);
+ DECLARE_PER_CPU(struct sched_domain *, sd_asym);
++DECLARE_PER_CPU(struct sched_domain *, sd_wc);
+ 
+ struct sched_group_power {
+ 	atomic_t ref;
+@@ -1185,6 +1195,7 @@ extern void idle_enter_fair(struct rq *this_rq);
+ extern void idle_exit_fair(struct rq *this_rq);
+ 
+ extern void update_cpu_concurrency(struct rq *rq);
++extern void init_workload_consolidation(struct rq *rq);
+ 
+ #else	/* CONFIG_SMP */
+ 
+@@ -1193,6 +1204,7 @@ static inline void idle_balance(int cpu, struct rq *rq)
+ }
+ 
+ static inline void update_cpu_concurrency(struct rq *rq) {}
++static inline void init_workload_consolidation(struct rq *rq) {}
+ 
+ #endif
+ 
+-- 
+1.9.1
+

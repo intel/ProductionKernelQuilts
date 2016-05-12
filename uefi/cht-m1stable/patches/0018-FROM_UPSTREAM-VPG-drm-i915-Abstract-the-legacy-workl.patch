@@ -1,0 +1,181 @@
+From ca8e708d8bbcf9893303cf0c31a0c6c84f8815ed Mon Sep 17 00:00:00 2001
+Message-Id: <ca8e708d8bbcf9893303cf0c31a0c6c84f8815ed.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 24 Jul 2014 17:04:21 +0100
+Subject: [PATCH 18/71] FROM_UPSTREAM [VPG]: drm/i915: Abstract the legacy
+ workload submission mechanism away
+
+As suggested by Daniel Vetter. The idea, in subsequent patches, is to
+provide an alternative to these vfuncs for the Execlists submission
+mechanism.
+
+v2: Splitted into two and reordered to illustrate our intentions, instead
+of showing it off. Also, remove the add_request vfunc and added the
+stop_ring one.
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+[danvet:
+- Make checkpatch happy.
+- Be grumpy about the excessive vtable.
+- Ditch gt->is_ring_initialized.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Change-Id: I779ebaf3855c6bd47636858f1e084681631429f4
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: a83014d3f8b936778a9bc9b3d4137769bb26d9eb
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |   23 +++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gem.c            |   15 +++++++++++----
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   20 ++++++++++----------
+ 3 files changed, 44 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 0d4b282..97e7c84 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1772,6 +1772,20 @@ struct drm_i915_private {
+ 	/* Old ums support infrastructure, same warning applies. */
+ 	struct i915_ums_state ums;
+ 
++	/* Abstract the submission mechanism (legacy ringbuffer or execlists) away */
++	struct {
++		int (*do_execbuf)(struct drm_device *dev, struct drm_file *file,
++				  struct intel_engine_cs *ring,
++				  struct intel_context *ctx,
++				  struct drm_i915_gem_execbuffer2 *args,
++				  struct list_head *vmas,
++				  struct drm_i915_gem_object *batch_obj,
++				  u64 exec_start, u32 flags);
++		int (*init_rings)(struct drm_device *dev);
++		void (*cleanup_ring)(struct intel_engine_cs *ring);
++		void (*stop_ring)(struct intel_engine_cs *ring);
++	} gt;
++
+ 	/*
+ 	 * NOTE: This is the dri1/ums dungeon, don't add stuff here. Your patch
+ 	 * will be rejected. Instead look for a better place.
+@@ -2374,6 +2388,14 @@ int i915_gem_set_domain_ioctl(struct drm_device *dev, void *data,
+ 			      struct drm_file *file_priv);
+ int i915_gem_sw_finish_ioctl(struct drm_device *dev, void *data,
+ 			     struct drm_file *file_priv);
++int i915_gem_ringbuffer_submission(struct drm_device *dev,
++				   struct drm_file *file,
++				   struct intel_engine_cs *ring,
++				   struct intel_context *ctx,
++				   struct drm_i915_gem_execbuffer2 *args,
++				   struct list_head *vmas,
++				   struct drm_i915_gem_object *batch_obj,
++				   u64 exec_start, u32 flags);
+ int i915_gem_execbuffer(struct drm_device *dev, void *data,
+ 			struct drm_file *file_priv);
+ int i915_gem_execbuffer2(struct drm_device *dev, void *data,
+@@ -2526,6 +2548,7 @@ void i915_gem_reset(struct drm_device *dev);
+ bool i915_gem_clflush_object(struct drm_i915_gem_object *obj, bool force);
+ int __must_check i915_gem_object_finish_gpu(struct drm_i915_gem_object *obj);
+ int __must_check i915_gem_init(struct drm_device *dev);
++int i915_gem_init_rings(struct drm_device *dev);
+ int __must_check i915_gem_init_hw(struct drm_device *dev);
+ int i915_gem_l3_remap(struct intel_engine_cs *ring, int slice);
+ void i915_gem_init_swizzling(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index c0f97cb..1f3ceaf 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4540,7 +4540,7 @@ i915_gem_stop_ringbuffers(struct drm_device *dev)
+ 	int i;
+ 
+ 	for_each_ring(ring, dev_priv, i)
+-		intel_stop_ring_buffer(ring);
++		dev_priv->gt.stop_ring(ring);
+ }
+ 
+ int
+@@ -4657,7 +4657,7 @@ intel_enable_blt(struct drm_device *dev)
+ 	return true;
+ }
+ 
+-static int i915_gem_init_rings(struct drm_device *dev)
++int i915_gem_init_rings(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int ret;
+@@ -4740,7 +4740,7 @@ i915_gem_init_hw(struct drm_device *dev)
+ 
+ 	i915_gem_init_swizzling(dev);
+ 
+-	ret = i915_gem_init_rings(dev);
++	ret = dev_priv->gt.init_rings(dev);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -4781,6 +4781,13 @@ int i915_gem_init(struct drm_device *dev)
+ 			DRM_DEBUG_DRIVER("allow wake ack timed out\n");
+ 	}
+ 
++	if (!i915.enable_execlists) {
++		dev_priv->gt.do_execbuf = i915_gem_ringbuffer_submission;
++		dev_priv->gt.init_rings = i915_gem_init_rings;
++		dev_priv->gt.cleanup_ring = intel_cleanup_ring_buffer;
++		dev_priv->gt.stop_ring = intel_stop_ring_buffer;
++	}
++
+ 	i915_gem_init_userptr(dev);
+ 	i915_gem_init_global_gtt(dev);
+ 
+@@ -4816,7 +4823,7 @@ i915_gem_cleanup_ringbuffer(struct drm_device *dev)
+ 	int i;
+ 
+ 	for_each_ring(ring, dev_priv, i)
+-		intel_cleanup_ring_buffer(ring);
++		dev_priv->gt.cleanup_ring(ring);
+ }
+ 
+ int
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index fe371b7..0ece129 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1036,14 +1036,14 @@ i915_reset_gen7_sol_offsets(struct drm_device *dev,
+ 	return 0;
+ }
+ 
+-static int
+-legacy_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+-			     struct intel_engine_cs *ring,
+-			     struct intel_context *ctx,
+-			     struct drm_i915_gem_execbuffer2 *args,
+-			     struct list_head *vmas,
+-			     struct drm_i915_gem_object *batch_obj,
+-			     u64 exec_start, u32 flags)
++int
++i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
++			       struct intel_engine_cs *ring,
++			       struct intel_context *ctx,
++			       struct drm_i915_gem_execbuffer2 *args,
++			       struct list_head *vmas,
++			       struct drm_i915_gem_object *batch_obj,
++			       u64 exec_start, u32 flags)
+ {
+ 	struct drm_clip_rect *cliprects = NULL;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1407,8 +1407,8 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	else
+ 		exec_start += i915_gem_obj_offset(batch_obj, vm);
+ 
+-	ret = legacy_ringbuffer_submission(dev, file, ring, ctx,
+-			args, &eb->vmas, batch_obj, exec_start, flags);
++	ret = dev_priv->gt.do_execbuf(dev, file, ring, ctx, args,
++				      &eb->vmas, batch_obj, exec_start, flags);
+ 	if (ret)
+ 		goto err;
+ 
+-- 
+1.7.9.5
+

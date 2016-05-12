@@ -1,0 +1,134 @@
+From 828f5f2eb8a2713c993caf0efb6a64e6c4a93dc0 Mon Sep 17 00:00:00 2001
+From: Tuukka Toivonen <tuukka.toivonen@intel.com>
+Date: Wed, 3 Dec 2014 18:38:19 +0200
+Subject: [PATCH 213/215] imx: retry failed i2c transfers up to 5 times
+
+Retry failed i2c transfers up to 5 times before giving up. This gives
+robustness against random transfer errors.
+
+Change-Id: I9f5fa37fcd55366b122555e1ae627d34311739f5
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-4551
+Signed-off-by: Tuukka Toivonen <tuukka.toivonen@intel.com>
+Signed-off-by: Tommi Franttila <tommi.franttila@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/34912
+Approver: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+---
+ .../camera/drivers/media/i2c/imx/imx.c             | 80 ++++++++++++----------
+ 1 file changed, 45 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+index caafcc4..91fb994 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+@@ -67,7 +67,8 @@ imx_read_reg(struct i2c_client *client, u16 len, u16 reg, u16 *val)
+ {
+ 	struct i2c_msg msg[2];
+ 	u16 data[IMX_SHORT_MAX];
+-	int err, i;
++	int ret, i;
++	int retry = 0;
+ 
+ 	if (len > IMX_BYTE_MAX) {
+ 		dev_err(&client->dev, "%s error, invalid data length\n",
+@@ -75,27 +76,33 @@ imx_read_reg(struct i2c_client *client, u16 len, u16 reg, u16 *val)
+ 		return -EINVAL;
+ 	}
+ 
+-	memset(msg, 0 , sizeof(msg));
+-	memset(data, 0 , sizeof(data));
+-
+-	msg[0].addr = client->addr;
+-	msg[0].flags = 0;
+-	msg[0].len = I2C_MSG_LENGTH;
+-	msg[0].buf = (u8 *)data;
+-	/* high byte goes first */
+-	data[0] = cpu_to_be16(reg);
+-
+-	msg[1].addr = client->addr;
+-	msg[1].len = len;
+-	msg[1].flags = I2C_M_RD;
+-	msg[1].buf = (u8 *)data;
+-
+-	err = i2c_transfer(client->adapter, msg, 2);
+-	if (err != 2) {
+-		if (err >= 0)
+-			err = -EIO;
+-		goto error;
+-	}
++	do {
++		memset(msg, 0 , sizeof(msg));
++		memset(data, 0 , sizeof(data));
++
++		msg[0].addr = client->addr;
++		msg[0].flags = 0;
++		msg[0].len = I2C_MSG_LENGTH;
++		msg[0].buf = (u8 *)data;
++		/* high byte goes first */
++		data[0] = cpu_to_be16(reg);
++
++		msg[1].addr = client->addr;
++		msg[1].len = len;
++		msg[1].flags = I2C_M_RD;
++		msg[1].buf = (u8 *)data;
++
++		ret = i2c_transfer(client->adapter, msg, 2);
++		if (ret != 2) {
++			dev_err(&client->dev,
++			  "retrying i2c read from offset 0x%x error %d... %d\n",
++			  reg, ret, retry);
++			msleep(20);
++		}
++	} while (ret != 2 && retry++ < I2C_RETRY_COUNT);
++
++	if (ret != 2)
++		return -EIO;
+ 
+ 	/* high byte comes first */
+ 	if (len == IMX_8BIT) {
+@@ -107,26 +114,29 @@ imx_read_reg(struct i2c_client *client, u16 len, u16 reg, u16 *val)
+ 	}
+ 
+ 	return 0;
+-
+-error:
+-	dev_err(&client->dev, "read from offset 0x%x error %d", reg, err);
+-	return err;
+ }
+ 
+ static int imx_i2c_write(struct i2c_client *client, u16 len, u8 *data)
+ {
+ 	struct i2c_msg msg;
+-	const int num_msg = 1;
+ 	int ret;
++	int retry = 0;
++
++	do {
++		msg.addr = client->addr;
++		msg.flags = 0;
++		msg.len = len;
++		msg.buf = data;
++
++		ret = i2c_transfer(client->adapter, &msg, 1);
++		if (ret != 1) {
++			dev_err(&client->dev,
++				"retrying i2c write transfer... %d\n", retry);
++				msleep(20);
++		}
++	} while (ret != 1 && retry++ < I2C_RETRY_COUNT);
+ 
+-	msg.addr = client->addr;
+-	msg.flags = 0;
+-	msg.len = len;
+-	msg.buf = data;
+-
+-	ret = i2c_transfer(client->adapter, &msg, 1);
+-
+-	return ret == num_msg ? 0 : -EIO;
++	return ret == 1 ? 0 : -EIO;
+ }
+ 
+ int
+-- 
+1.9.1
+

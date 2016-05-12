@@ -1,0 +1,225 @@
+From e098ddcb44c7f3a6f1b712eb8d38cc3108ac480a Mon Sep 17 00:00:00 2001
+From: Bin Han <bin.b.han@intel.com>
+Date: Sat, 11 Oct 2014 13:10:20 +0800
+Subject: [PATCH 152/164] atomisp2: use refcount to track MMU L2 page table
+
+BZ: 226052
+
+In the past, atomisp2 driver loops all the L2 page table entry when HAL close
+the device nodes and release unused L2 page table. This patch adds refcount
+for each L2 page table to track how many entries have been occupied in the
+page table. If the refcount decreases to 0 which means the page table is
+empry, driver just releases the page table.
+
+Change-Id: I5a0ac78e7f370cbc732f406d9a3465060ae54845
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-8929
+Signed-off-by: Bin Han <bin.b.han@intel.com>
+Reviewed-on: https://android.intel.com:443/286835
+Reviewed-on: https://icggerrit.ir.intel.com/29109
+Approver: Wei Tao <wei.tao@intel.com>
+Build: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+Maintainer: Wei Tao <wei.tao@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_fops.c     |    1 -
+ .../media/pci/atomisp2/atomisp_driver/hmm/hmm.c    |    5 --
+ .../pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c   |    7 ---
+ .../pci/atomisp2/atomisp_driver/include/hmm/hmm.h  |    1 -
+ .../atomisp_driver/include/hmm/hmm_bo_dev.h        |    5 --
+ .../atomisp2/atomisp_driver/include/mmu/isp_mmu.h  |    5 +-
+ .../pci/atomisp2/atomisp_driver/mmu/isp_mmu.c      |   52 ++++----------------
+ 7 files changed, 10 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
+index ef02027..5b2f03e 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
+@@ -959,7 +959,6 @@ static int atomisp_release(struct file *file)
+ 		isp->css_env.isp_css_fw.bytes = 0;
+ 	}
+ 
+-	hmm_cleanup_mmu_l2();
+ 	hmm_pool_unregister(HMM_POOL_TYPE_DYNAMIC);
+ 
+ 	ret = v4l2_subdev_call(isp->flash, core, s_power, 0);
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm.c
+index 8be8da1..0258a68 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm.c
+@@ -81,11 +81,6 @@ void hmm_cleanup(void)
+ 	hmm_bo_device_exit(&bo_device);
+ }
+ 
+-void hmm_cleanup_mmu_l2(void)
+-{
+-	hmm_bo_device_cleanup_mmu_l2(&bo_device);
+-}
+-
+ ia_css_ptr hmm_alloc(size_t bytes, enum hmm_bo_type type,
+ 		int from_highmem, void *userptr, bool cached)
+ {
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c
+index 29ceeae..6955e9b 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c
+@@ -127,13 +127,6 @@ void hmm_bo_device_exit(struct hmm_bo_device *bdev)
+ #endif
+ }
+ 
+-void hmm_bo_device_cleanup_mmu_l2(struct hmm_bo_device *bdev)
+-{
+-	check_bodev_null_return_void(bdev);
+-
+-	isp_mmu_clean_l2(&bdev->mmu);
+-}
+-
+ int hmm_bo_device_inited(struct hmm_bo_device *bdev)
+ {
+ 	check_bodev_null_return(bdev, -EINVAL);
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm.h
+index e1ca178..686d74f 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm.h
+@@ -41,7 +41,6 @@ void hmm_pool_unregister(enum hmm_pool_type pool_type);
+ 
+ int hmm_init(void);
+ void hmm_cleanup(void);
+-void hmm_cleanup_mmu_l2(void);
+ 
+ ia_css_ptr hmm_alloc(size_t bytes, enum hmm_bo_type type,
+ 		int from_highmem, void *userptr, bool cached);
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo_dev.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo_dev.h
+index cb322ad..04dad7a 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo_dev.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo_dev.h
+@@ -77,11 +77,6 @@ int hmm_bo_device_init(struct hmm_bo_device *bdev,
+ void hmm_bo_device_exit(struct hmm_bo_device *bdev);
+ 
+ /*
+- * only clean up empty MMU L2 tables.
+- */
+-void hmm_bo_device_cleanup_mmu_l2(struct hmm_bo_device *bdev);
+-
+-/*
+  * whether the bo device is inited or not.
+  */
+ int hmm_bo_device_inited(struct hmm_bo_device *bdev);
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/mmu/isp_mmu.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/mmu/isp_mmu.h
+index a4c72d7..790d506 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/mmu/isp_mmu.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/mmu/isp_mmu.h
+@@ -115,6 +115,7 @@ struct isp_mmu_client {
+ struct isp_mmu {
+ 	struct isp_mmu_client *driver;
+ 	unsigned int l1_pte;
++	int l2_pgt_refcount[ISP_L1PT_PTES];
+ 	phys_addr_t base_address;
+ 
+ 	struct mutex pt_mutex;
+@@ -141,10 +142,6 @@ int isp_mmu_init(struct isp_mmu *mmu, struct isp_mmu_client *driver);
+  * cleanup all mmu related things.
+  */
+ void isp_mmu_exit(struct isp_mmu *mmu);
+-/*
+- * just cleanup empty L2 page tables.
+- */
+-void isp_mmu_clean_l2(struct isp_mmu *mmu);
+ 
+ /*
+  * setup/remove address mapping for pgnr continous physical pages
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/mmu/isp_mmu.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/mmu/isp_mmu.c
+index 4267ec3..a8dc94f 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/mmu/isp_mmu.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/mmu/isp_mmu.c
+@@ -246,6 +246,7 @@ static int mmu_l2_map(struct isp_mmu *mmu, phys_addr_t l1_pt,
+ 		pte = isp_pgaddr_to_pte_valid(mmu, phys);
+ 
+ 		atomisp_set_pte(l2_pt, idx, pte);
++		mmu->l2_pgt_refcount[l1_idx]++;
+ 		ptr += (1U << ISP_L2PT_OFFSET);
+ 		phys += (1U << ISP_L2PT_OFFSET);
+ 	} while (ptr < end && idx < ISP_L2PT_PTES - 1);
+@@ -294,6 +295,7 @@ static int mmu_l1_map(struct isp_mmu *mmu, phys_addr_t l1_pt,
+ 			l2_pte = isp_pgaddr_to_pte_valid(mmu, l2_pt);
+ 
+ 			atomisp_set_pte(l1_pt, idx, l2_pte);
++			mmu->l2_pgt_refcount[idx] = 0;
+ 		}
+ 
+ 		l2_pt = isp_pte_to_pgaddr(mmu, l2_pte);
+@@ -360,6 +362,7 @@ static int mmu_map(struct isp_mmu *mmu, unsigned int isp_virt,
+ 		}
+ 		mmu->base_address = l1_pt;
+ 		mmu->l1_pte = isp_pgaddr_to_pte_valid(mmu, l1_pt);
++		memset(mmu->l2_pgt_refcount, 0, sizeof(int) * ISP_L1PT_PTES);
+ 	}
+ 
+ 	l1_pt = isp_pte_to_pgaddr(mmu, mmu->l1_pte);
+@@ -406,9 +409,14 @@ static void mmu_l2_unmap(struct isp_mmu *mmu, phys_addr_t l1_pt,
+ 						 l2_pt, idx, ptr, pte);
+ 
+ 		atomisp_set_pte(l2_pt, idx, mmu->driver->null_pte);
+-
++		mmu->l2_pgt_refcount[l1_idx]--;
+ 		ptr += (1U << ISP_L2PT_OFFSET);
+ 	} while (ptr < end && idx < ISP_L2PT_PTES - 1);
++
++	if (mmu->l2_pgt_refcount[l1_idx] == 0) {
++		free_page_table(mmu, l2_pt);
++		atomisp_set_pte(l1_pt, l1_idx, mmu->driver->null_pte);
++	}
+ }
+ 
+ /*
+@@ -563,48 +571,6 @@ int isp_mmu_init(struct isp_mmu *mmu, struct isp_mmu_client *driver)
+ 	return 0;
+ }
+ 
+-/* cleanup empty L2 page tables */
+-void isp_mmu_clean_l2(struct isp_mmu *mmu)
+-{
+-	unsigned int idx, idx2;
+-	unsigned int pte;
+-	phys_addr_t l1_pt, l2_pt;
+-
+-	if (!mmu)
+-		return;
+-
+-	if (!ISP_PTE_VALID(mmu, mmu->l1_pte)) {
+-		dev_warn(atomisp_dev, "invalid L1PT: pte = 0x%x\n",
+-			    (unsigned int)mmu->l1_pte);
+-		return;
+-	}
+-
+-	l1_pt = isp_pte_to_pgaddr(mmu, mmu->l1_pte);
+-
+-	for (idx = 0; idx < ISP_L1PT_PTES; idx++) {
+-		bool l2_pt_is_empty = true;
+-
+-		pte = atomisp_get_pte(l1_pt, idx);
+-		if (!ISP_PTE_VALID(mmu, pte))
+-			continue;
+-
+-		l2_pt = isp_pte_to_pgaddr(mmu, pte);
+-		for (idx2 = 0; idx2 < ISP_L2PT_PTES; idx2++) {
+-			if (atomisp_get_pte(l2_pt, idx2) !=
+-			    mmu->driver->null_pte) {
+-				l2_pt_is_empty = false;
+-				break;
+-			}
+-		}
+-
+-		if (l2_pt_is_empty) {
+-			free_page_table(mmu, l2_pt);
+-			atomisp_set_pte(l1_pt, idx, mmu->driver->null_pte);
+-			dev_dbg(atomisp_dev, "free l1_pte index %d\n", idx);
+-		}
+-	}
+-}
+-
+ /*Free L1 and L2 page table*/
+ void isp_mmu_exit(struct isp_mmu *mmu)
+ {
+-- 
+1.7.9.5
+

@@ -1,0 +1,96 @@
+From 59f0f14335b484a260140b16ed7d10ed4d95a45c Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@redhat.com>
+Date: Fri, 6 Jun 2014 14:38:13 -0700
+Subject: [PATCH 3/4] sysrq: rcu-ify __handle_sysrq
+
+Echoing values into /proc/sysrq-trigger seems to be a popular way to get
+information out of the kernel.  However, dumping information about
+thousands of processes, or hundreds of CPUs to serial console can result
+in IRQs being blocked for minutes, resulting in various kinds of cascade
+failures.
+
+The most common failure is due to interrupts being blocked for a very
+long time.  This can lead to things like failed IO requests, and other
+things the system cannot easily recover from.
+
+This problem is easily fixable by making __handle_sysrq use RCU instead
+of spin_lock_irqsave.
+
+This leaves the warning that RCU grace periods have not elapsed for a
+long time, but the system will come back from that automatically.
+
+It also leaves sysrq-from-irq-context when the sysrq keys are pressed,
+but that is probably desired since people want that to work in
+situations where the system is already hosed.
+
+The callers of register_sysrq_key and unregister_sysrq_key appear to be
+capable of sleeping.
+
+Change-Id: I1b018d8735bd9f2cc98cc90f08a47919bbdf8808
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-28132
+Signed-off-by: Rik van Riel <riel@redhat.com>
+Reported-by: Madper Xie <cxie@redhat.com>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Richard Weinberger <richard@nod.at>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Reviewed-on: https://android.intel.com:443/491582
+---
+ drivers/tty/sysrq.c | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/tty/sysrq.c b/drivers/tty/sysrq.c
+index ce396ec..fc67a89 100644
+--- a/drivers/tty/sysrq.c
++++ b/drivers/tty/sysrq.c
+@@ -510,9 +510,8 @@ void __handle_sysrq(int key, bool check_mask)
+ 	struct sysrq_key_op *op_p;
+ 	int orig_log_level;
+ 	int i;
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&sysrq_key_table_lock, flags);
++	rcu_read_lock();
+ 	/*
+ 	 * Raise the apparent loglevel to maximum so that the sysrq header
+ 	 * is shown to provide the user with positive feedback.  We do not
+@@ -554,7 +553,7 @@ void __handle_sysrq(int key, bool check_mask)
+ 		printk("\n");
+ 		console_loglevel = orig_log_level;
+ 	}
+-	spin_unlock_irqrestore(&sysrq_key_table_lock, flags);
++	rcu_read_unlock();
+ }
+ 
+ void handle_sysrq(int key)
+@@ -1043,16 +1042,23 @@ static int __sysrq_swap_key_ops(int key, struct sysrq_key_op *insert_op_p,
+                                 struct sysrq_key_op *remove_op_p)
+ {
+ 	int retval;
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&sysrq_key_table_lock, flags);
++	spin_lock(&sysrq_key_table_lock);
+ 	if (__sysrq_get_key_op(key) == remove_op_p) {
+ 		__sysrq_put_key_op(key, insert_op_p);
+ 		retval = 0;
+ 	} else {
+ 		retval = -1;
+ 	}
+-	spin_unlock_irqrestore(&sysrq_key_table_lock, flags);
++	spin_unlock(&sysrq_key_table_lock);
++
++	/*
++	 * A concurrent __handle_sysrq either got the old op or the new op.
++	 * Wait for it to go away before returning, so the code for an old
++	 * op is not freed (eg. on module unload) while it is in use.
++	 */
++	synchronize_rcu();
++
+ 	return retval;
+ }
+ 
+-- 
+1.9.1
+

@@ -1,0 +1,653 @@
+From 5d3f8f3856cf72bd820014c91ebc74f4bccc2c3b Mon Sep 17 00:00:00 2001
+From: Jayachandran B <jayachandran.b@intel.com>
+Date: Fri, 12 Dec 2014 09:06:22 +0530
+Subject: [PATCH] Input: Enable Vibra in CHT Platform
+
+Enable Vibra Driver for Cherrytrail - CRCPMIC
+
+Issue : GMINL-4758
+
+Change-Id: I2231ba1018580c766277db08f9b30e32a63dae6c
+Signed-off-by: Arulselvan M <arulselvan.m@intel.com>
+---
+ drivers/acpi/acpi_platform.c              |    1 +
+ drivers/input/misc/Kconfig                |    9 +
+ drivers/input/misc/Makefile               |    2 +
+ drivers/input/misc/intel_mid_vibra.c      |  256 +++++++++++++++++++++++++++++
+ drivers/input/misc/intel_mid_vibra_acpi.c |  190 +++++++++++++++++++++
+ drivers/input/misc/mid_vibra.h            |   70 ++++++++
+ include/linux/input/intel_mid_vibra.h     |   45 +++++
+ 7 files changed, 573 insertions(+)
+ create mode 100644 drivers/input/misc/intel_mid_vibra.c
+ create mode 100644 drivers/input/misc/intel_mid_vibra_acpi.c
+ create mode 100644 drivers/input/misc/mid_vibra.h
+ create mode 100644 include/linux/input/intel_mid_vibra.h
+
+diff --git a/drivers/acpi/acpi_platform.c b/drivers/acpi/acpi_platform.c
+index 29fa482..52f3281 100644
+--- a/drivers/acpi/acpi_platform.c
++++ b/drivers/acpi/acpi_platform.c
+@@ -48,6 +48,7 @@ static const struct acpi_device_id acpi_platform_device_ids[] = {
+ 	{ "DMA0F28", 0 },
+ 	{ "ADMA0F28", 0 },
+ 	{ "808622A8", 0 },
++	{ "VIBR22A8", 0 },
+ 	{ }
+ };
+ 
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+index 117f5a5..aa06af9 100644
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -692,4 +692,13 @@ config INPUT_SOC_BUTTON_ARRAY
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called soc_button_array.
+ 
++config INPUT_INTEL_MID_VIBRA
++        tristate "Support for Intel MID Vibrator"
++        help
++        This option enables support for Intel Mid Vibrator Driver. Say Y
++        here if you want to enable the vibrator functionality for CTP
++
++        To compile this driver as a module, choose M here. The module will
++        be called intel_mid_vibra.
++
+ endif
+diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+index 01af35b..773aeff 100644
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -66,3 +66,5 @@ obj-$(CONFIG_INPUT_XEN_KBDDEV_FRONTEND)	+= xen-kbdfront.o
+ obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
+ obj-$(CONFIG_INPUT_IDEAPAD_SLIDEBAR)	+= ideapad_slidebar.o
+ obj-$(CONFIG_INPUT_SOC_BUTTON_ARRAY)	+= soc_button_array.o
++intel-mid-vibra-objs := intel_mid_vibra.o intel_mid_vibra_acpi.o
++obj-$(CONFIG_INPUT_INTEL_MID_VIBRA)    += intel-mid-vibra.o
+diff --git a/drivers/input/misc/intel_mid_vibra.c b/drivers/input/misc/intel_mid_vibra.c
+new file mode 100644
+index 0000000..711ce42
+--- /dev/null
++++ b/drivers/input/misc/intel_mid_vibra.c
+@@ -0,0 +1,256 @@
++/*
++ *  intel_mid_vibra_acpi.c - Intel Vibrator for for Intel CherryTrail platform
++ *
++ *  Copyright (C) 2014 Intel Corp
++ *  Author: B, Jayachandran <jayachandran.b@intel.com>
++ *
++ *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; version 2 of the License.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ */
++
++
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/delay.h>
++#include <linux/gpio.h>
++#include <linux/i2c.h>
++#include <linux/acpi.h>
++#include <linux/pm_runtime.h>
++#include <linux/input/intel_mid_vibra.h>
++#include "mid_vibra.h"
++
++
++static void vibra_disable(struct vibra_info *info)
++{
++	pr_err("%s: Disable", __func__);
++	mutex_lock(&info->lock);
++	vibra_gpio_set_value_cansleep(info, 0)
++	info->enabled = false;
++	info->pwm_configure(info, false);
++	pm_runtime_put(info->dev);
++	mutex_unlock(&info->lock);
++	mutex_lock(&info->lock);
++	vibra_gpio_set_value_cansleep(info, 0)
++	info->enabled = false;
++	info->pwm_configure(info, false);
++	pm_runtime_put(info->dev);
++	mutex_unlock(&info->lock);
++}
++
++static void vibra_drv_enable(struct vibra_info *info)
++{
++	pr_debug("%s: Enable", __func__);
++	mutex_lock(&info->lock);
++	pm_runtime_get_sync(info->dev);
++	info->pwm_configure(info, true);
++	vibra_gpio_set_value_cansleep(info, 1)
++	info->enabled = true;
++	mutex_unlock(&info->lock);
++}
++
++/*******************************************************************************
++ * SYSFS                                                                       *
++ ******************************************************************************/
++
++static ssize_t vibra_show_vibrator(struct device *dev,
++	struct device_attribute *attr, char *buf)
++{
++	struct vibra_info *info = dev_get_drvdata(dev);
++
++	return sprintf(buf, "%d\n", info->enabled);
++
++}
++
++static ssize_t vibra_set_vibrator(struct device *dev,
++	struct device_attribute *attr, const char *buf, size_t len)
++{
++	long vibrator_enable;
++	struct vibra_info *info = dev_get_drvdata(dev);
++
++	if (kstrtol(buf, 0, &vibrator_enable))
++		return -EINVAL;
++	if (vibrator_enable == info->enabled)
++		return len;
++	else if (vibrator_enable == 0)
++		info->disable(info);
++	else if (vibrator_enable == 1)
++		info->enable(info);
++	else
++		return -EINVAL;
++	return len;
++}
++unsigned long mid_vibra_base_unit;
++unsigned long mid_vibra_duty_cycle;
++
++static DEVICE_ATTR(vibrator, S_IRUGO | S_IWUSR,
++		   vibra_show_vibrator, vibra_set_vibrator);
++static DEVICE_ULONG_ATTR(pwm_baseunit, S_IRUGO | S_IWUSR,
++				 mid_vibra_base_unit);
++static DEVICE_ULONG_ATTR(pwm_ontime_div, S_IRUGO | S_IWUSR,
++				 mid_vibra_duty_cycle);
++
++static struct attribute *vibra_attrs[] = {
++	&dev_attr_vibrator.attr,
++	&dev_attr_pwm_baseunit.attr.attr,
++	&dev_attr_pwm_ontime_div.attr.attr,
++	0,
++};
++
++static const struct attribute_group vibra_attr_group = {
++	.attrs = vibra_attrs,
++};
++
++
++/*** Module ***/
++#if CONFIG_PM
++static int intel_vibra_runtime_suspend(struct device *dev)
++{
++	struct vibra_info *info = dev_get_drvdata(dev);
++
++	pr_debug("In %s\n", __func__);
++	info->pwm_configure(info, false);
++	return 0;
++}
++
++static int intel_vibra_runtime_resume(struct device *dev)
++{
++	pr_debug("In %s\n", __func__);
++	return 0;
++}
++
++static void intel_vibra_complete(struct device *dev)
++{
++	pr_debug("In %s\n", __func__);
++	intel_vibra_runtime_resume(dev);
++}
++
++static const struct dev_pm_ops intel_mid_vibra_pm_ops = {
++	.prepare = intel_vibra_runtime_suspend,
++	.complete = intel_vibra_complete,
++	.runtime_suspend = intel_vibra_runtime_suspend,
++	.runtime_resume = intel_vibra_runtime_resume,
++};
++#endif
++struct vibra_info *mid_vibra_setup(struct device *dev,
++				 struct mid_vibra_pdata *data)
++{
++	struct vibra_info *info;
++	pr_debug("probe data div %x, base %x, alt_fn %d ext_drv %d, name:%s",
++							data->time_divisor,
++							data->base_unit,
++							data->alt_fn,
++							data->ext_drv,
++							data->name);
++
++	info =  devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
++	if (!info) {
++		pr_err("%s: no memory for driver context", __func__);
++		return NULL;
++	}
++
++	info->alt_fn = data->alt_fn;
++	info->ext_drv = data->ext_drv;
++	info->gpio_en = data->gpio_en;
++	info->gpio_pwm = data->gpio_pwm;
++	info->name = data->name;
++	info->use_gpio_en = data->use_gpio_en;
++
++	info->dev = dev;
++	mutex_init(&info->lock);
++	info->vibra_attr_group = &vibra_attr_group;
++	mid_vibra_base_unit = data->base_unit;
++	mid_vibra_duty_cycle = data->time_divisor;
++	info->base_unit = &mid_vibra_base_unit;
++	info->duty_cycle = &mid_vibra_duty_cycle;
++
++	if (!strncmp(info->name, "VIBR22A8", 8)) {
++		info->enable = vibra_drv_enable;
++	} else {
++		pr_err("%s: unsupported vibrator device", __func__);
++		return NULL;
++	}
++	info->disable = vibra_disable;
++
++	return info;
++}
++
++static const struct acpi_device_id vibra_acpi_ids[];
++
++void *mid_vibra_acpi_get_drvdata(const char *hid)
++{
++	const struct acpi_device_id *id;
++
++	for (id = vibra_acpi_ids; id->id[0]; id++)
++		if (!strncmp(id->id, hid, 16))
++			return (void *)id->driver_data;
++	return 0;
++}
++
++static const struct acpi_device_id vibra_acpi_ids[] = {
++	{ "VIBR22A8", (kernel_ulong_t) &pmic_vibra_data_cht },
++	{},
++};
++MODULE_DEVICE_TABLE(acpi, vibra_acpi_ids);
++
++static struct platform_driver plat_vibra_driver = {
++	.driver = {
++		.name = "intel_mid_pmic_vibra",
++		.owner = THIS_MODULE,
++		.acpi_match_table = ACPI_PTR(vibra_acpi_ids),
++#ifdef CONFIG_PM
++		.pm = &intel_mid_vibra_pm_ops,
++#endif
++	},
++	.probe = intel_mid_plat_vibra_probe,
++	.remove = intel_mid_plat_vibra_remove,
++};
++
++/**
++* intel_mid_vibra_init - Module init function
++*
++* Registers platform
++* Init all data strutures
++*/
++static int __init intel_mid_vibra_init(void)
++{
++	int ret = 0;
++	ret = platform_driver_register(&plat_vibra_driver);
++	if (ret)
++		pr_err("Platform register failed\n");
++
++	return ret;
++}
++
++/**
++* intel_mid_vibra_exit - Module exit function
++*
++* Unregisters platform
++* Frees all data strutures
++*/
++static void __exit intel_mid_vibra_exit(void)
++{
++	platform_driver_unregister(&plat_vibra_driver);
++	pr_debug("intel_mid_vibra driver exited\n");
++	return;
++}
++
++late_initcall(intel_mid_vibra_init);
++module_exit(intel_mid_vibra_exit);
++
++MODULE_ALIAS("acpi:intel_mid_vibra");
++MODULE_DESCRIPTION("Intel(R) MID Vibra driver");
++MODULE_LICENSE("GPL v2");
++MODULE_AUTHOR("KP Jeeja <jeeja.kp@intel.com>");
+diff --git a/drivers/input/misc/intel_mid_vibra_acpi.c b/drivers/input/misc/intel_mid_vibra_acpi.c
+new file mode 100644
+index 0000000..1f08d8a
+--- /dev/null
++++ b/drivers/input/misc/intel_mid_vibra_acpi.c
+@@ -0,0 +1,190 @@
++/*
++ *  intel_mid_vibra_acpi.c - Intel vibrator driver
++ *
++ *  Copyright (C) 2013 Intel Corp
++ *  Author: B, Jayachandran <jayachandran.b@intel.com>
++ *  Author: Omair Md Abdullah <omair.m.abdullah@intel.com>
++ *
++ *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; version 2 of the License.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/delay.h>
++#include <linux/gpio.h>
++#include <linux/pm_runtime.h>
++#include <linux/acpi.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/input/intel_mid_vibra.h>
++#include "mid_vibra.h"
++
++#define CRYSTALCOVE_PMIC_PWM_EN_GPIO_REG        0x2F
++/* PWM enable gpio register settings: drive type = CMOS; pull disabled */
++#define CRYSTALCOVE_PMIC_PWM_EN_GPIO_VALUE	0x22
++#define CRYSTALCOVE_PMIC_PWM1_CLKDIV_REG	0x4C
++#define CRYSTALCOVE_PMIC_PWM1_DUTYCYC_REG	0x4F
++#define CRYSTALCOVE_PMIC_PWM_ENABLE		0x80
++
++#define CRYSTALCOVE_PMIC_VIBRA_MAX_BASEUNIT	0x7F
++
++struct mid_vibra_pdata pmic_vibra_data_cht = {
++	.time_divisor	= 0x7f, /* for 50% duty cycle */
++	.base_unit	= 0x0,
++	.gpio_pwm	= -1,
++	.name		= "VIBR22A8",
++	.use_gpio_en    = false,
++		/* CHT vibra doesnt use gpio enable control */
++};
++
++static int vibra_pmic_pwm_configure(struct vibra_info *info, bool enable)
++{
++	u8 clk_div;
++	u8 duty_cyc;
++
++	if (enable) {
++		/* disable PWM before updating clock div*/
++		intel_soc_pmic_writeb(CRYSTALCOVE_PMIC_PWM1_CLKDIV_REG, 0);
++
++		/* validate the input values */
++		if (*info->base_unit > info->max_base_unit) {
++			*info->base_unit = info->max_base_unit;
++			pr_err("%s:base_unit i/p is greater than max using max",
++								__func__);
++		}
++		if (*info->duty_cycle > info->max_duty_cycle) {
++			*info->duty_cycle = info->max_duty_cycle;
++			pr_err("%s:duty_cycle i/p greater than max", __func__);
++		}
++
++		clk_div = *info->base_unit;
++		duty_cyc = *info->duty_cycle;
++
++		clk_div = clk_div | CRYSTALCOVE_PMIC_PWM_ENABLE;
++		intel_soc_pmic_writeb(CRYSTALCOVE_PMIC_PWM1_DUTYCYC_REG,
++						duty_cyc);
++		intel_soc_pmic_writeb(CRYSTALCOVE_PMIC_PWM1_CLKDIV_REG,
++						clk_div);
++	} else {
++		/*disable PWM block */
++		clk_div =  intel_soc_pmic_readb(
++					CRYSTALCOVE_PMIC_PWM1_CLKDIV_REG);
++		intel_soc_pmic_writeb(CRYSTALCOVE_PMIC_PWM1_CLKDIV_REG,
++				      (clk_div & ~CRYSTALCOVE_PMIC_PWM_ENABLE));
++	}
++	clk_div =  intel_soc_pmic_readb(CRYSTALCOVE_PMIC_PWM1_CLKDIV_REG);
++	duty_cyc =  intel_soc_pmic_readb(CRYSTALCOVE_PMIC_PWM1_DUTYCYC_REG);
++	pr_debug("%s: clk_div_reg = %#x, duty_cycle_reg = %#x\n",
++						__func__, clk_div, duty_cyc);
++	return 0;
++}
++
++#if IS_ENABLED(CONFIG_ACPI)
++
++int intel_mid_plat_vibra_probe(struct platform_device *pdev)
++{
++	struct vibra_info *info;
++	struct device *dev = &pdev->dev;
++	acpi_handle handle = ACPI_HANDLE(dev);
++	struct acpi_device *device;
++	const char *hid;
++	struct mid_vibra_pdata *data;
++	int ret;
++
++	ret = acpi_bus_get_device(handle, &device);
++	if (ret) {
++		pr_err("%s: could not get acpi device - %d\n", __func__, ret);
++		return -ENODEV;
++	}
++	hid = acpi_device_hid(device);
++	pr_debug("%s for %s", __func__, hid);
++
++	data = mid_vibra_acpi_get_drvdata(hid);
++	if (!data) {
++		pr_err("Invalid driver data\n");
++		return -ENODEV;
++	}
++
++	if (data->use_gpio_en) {
++		if (data->gpio_en < 0) {
++			pr_err("Invalid gpio number from acpi\n");
++			return -ENODEV;
++		}
++	}
++
++	info = mid_vibra_setup(dev, data);
++	if (!info)
++		return -ENODEV;
++
++	info->pwm_configure = vibra_pmic_pwm_configure;
++	info->max_base_unit = CRYSTALCOVE_PMIC_VIBRA_MAX_BASEUNIT;
++	info->max_duty_cycle = INTEL_VIBRA_MAX_TIMEDIVISOR;
++
++	if (data->use_gpio_en) {
++		pr_debug("%s: using gpio_en: %d", __func__, info->gpio_en);
++		ret = gpio_request_one(info->gpio_en, GPIOF_DIR_OUT,
++				"VIBRA ENABLE");
++		if (ret != 0) {
++			pr_err("gpio_request(%d) fails:%d\n",
++					info->gpio_en, ret);
++			return ret;
++		}
++		/* Re configure the PWM EN GPIO to have drive type as CMOS
++		 * and pull disable
++		 */
++		intel_soc_pmic_writeb(CRYSTALCOVE_PMIC_PWM_EN_GPIO_REG,
++				CRYSTALCOVE_PMIC_PWM_EN_GPIO_VALUE);
++	}
++
++	ret = sysfs_create_group(&dev->kobj, info->vibra_attr_group);
++	if (ret) {
++		pr_err("could not register sysfs files\n");
++		vibra_gpio_free(info);
++		return ret;
++	}
++
++	platform_set_drvdata(pdev, info);
++	pm_runtime_allow(&pdev->dev);
++	pm_runtime_put_noidle(&pdev->dev);
++	pr_info("%s: vibra probe success\n", __func__);
++	return ret;
++}
++
++int intel_mid_plat_vibra_remove(struct platform_device *pdev)
++{
++	struct vibra_info *info = platform_get_drvdata(pdev);
++	vibra_gpio_free(info);
++	sysfs_remove_group(&info->dev->kobj, info->vibra_attr_group);
++	platform_set_drvdata(pdev, NULL);
++	return 0;
++}
++
++#else
++int intel_mid_plat_vibra_probe(struct platform_device *pdev)
++{
++	return -EINVAL;
++}
++
++int intel_mid_plat_vibra_remove(struct platform_device *pdev)
++{
++	return -EINVAL;
++}
++#endif
++
++MODULE_ALIAS("platform:intel_mid_vibra");
++MODULE_DESCRIPTION("Intel(R) MID ACPI Vibra driver");
++MODULE_LICENSE("GPL v2");
++MODULE_AUTHOR("Jayachandran.B <jayachandran.b@intel.com>");
++MODULE_AUTHOR("Omair Md Abdullah <omair.m.abdullah@intel.com>");
+diff --git a/drivers/input/misc/mid_vibra.h b/drivers/input/misc/mid_vibra.h
+new file mode 100644
+index 0000000..dd1385d
+--- /dev/null
++++ b/drivers/input/misc/mid_vibra.h
+@@ -0,0 +1,70 @@
++/*
++ *  mid_vibra.h - Intel vibrator header
++ *
++ *  Copyright (C) 2013 Intel Corp
++ *  Author: B, Jayachandran <jayachandran.b@intel.com>
++ *  Author: Omair Md Abdullah <omair.m.abdullah@intel.com>
++ *
++ *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; version 2 of the License.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ */
++
++#ifndef __MID_VIBRA_H
++#define __MID_VIBRA_H
++
++#include <linux/gpio.h>
++
++struct vibra_info {
++	int     enabled;
++	struct mutex	lock;
++	struct device	*dev;
++	void __iomem	*shim;
++	const char	*name;
++	unsigned long *base_unit;
++	unsigned long *duty_cycle;
++	unsigned int max_base_unit;
++	u8  max_duty_cycle;
++	int gpio_en;
++	int gpio_pwm;
++	int alt_fn;
++	int ext_drv;
++	bool use_gpio_en; /* Whether vibra uses gpio based enable control */
++
++	void (*enable)(struct vibra_info *info);
++	void (*disable)(struct vibra_info *info);
++	int (*pwm_configure)(struct vibra_info *info, bool enable);
++
++	const struct attribute_group *vibra_attr_group;
++};
++
++struct vibra_info *mid_vibra_setup(struct device *dev,
++			struct mid_vibra_pdata *data);
++void *mid_vibra_acpi_get_drvdata(const char *hid);
++int intel_mid_plat_vibra_probe(struct platform_device *pdev);
++int intel_mid_plat_vibra_remove(struct platform_device *pdev);
++
++extern struct mid_vibra_pdata pmic_vibra_data_cht;
++
++#define vibra_gpio_set_value(info, v) \
++{if ((info)->use_gpio_en) \
++gpio_set_value((info)->gpio_en, (v)); }
++
++#define vibra_gpio_set_value_cansleep(info, v) \
++{if ((info)->use_gpio_en) \
++gpio_set_value_cansleep((info)->gpio_en, (v)); }
++
++#define vibra_gpio_free(info) \
++{if ((info)->use_gpio_en) \
++gpio_free((info)->gpio_en); }
++
++#endif /* __MID_VIBRA_H */
+diff --git a/include/linux/input/intel_mid_vibra.h b/include/linux/input/intel_mid_vibra.h
+new file mode 100644
+index 0000000..fadac35
+--- /dev/null
++++ b/include/linux/input/intel_mid_vibra.h
+@@ -0,0 +1,45 @@
++/*
++ *  mid_vibra.h - Intel vibrator header
++ *
++ *  Copyright (C) 2013 Intel Corp
++ *  Author: B, Jayachandran <jayachandran.b@intel.com>
++ *  Author: Omair Md Abdullah <omair.m.abdullah@intel.com>
++ *
++ *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; version 2 of the License.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ */
++
++#ifndef __INTEL_MID_VIBRA_H
++#define __INTEL_MID_VIBRA_H
++
++#define INTEL_VIBRA_DRV_NAME "intel_vibra_driver"
++
++#define INTEL_VIBRA_MAX_TIMEDIVISOR  0xFF
++#define INTEL_VIBRA_MAX_BASEUNIT 0x8000
++
++#define INTEL_VIBRA_ENABLE_GPIO 40
++#define INTEL_PWM_ENABLE_GPIO 49
++
++
++struct mid_vibra_pdata {
++	u8 time_divisor;
++	u8 base_unit;
++	u8 alt_fn;
++	u8 ext_drv;
++	int gpio_en;
++	int gpio_pwm;
++	const char *name;
++	bool use_gpio_en; /* whether vibra needs gpio based enable control */
++};
++
++#endif /* __INTEL_MID_VIBRA_H */
+-- 
+1.7.9.5
+

@@ -1,0 +1,149 @@
+From a41a60d70a1f79fe19db540d23c494f8322c0e96 Mon Sep 17 00:00:00 2001
+From: Bin Han <bin.b.han@intel.com>
+Date: Wed, 5 Nov 2014 12:05:34 +0800
+Subject: [PATCH 155/164] atomisp2: add raw_buffer_locked_count for debugging
+ purpose
+
+BZ: 228347
+
+FW has limitation on the max number of the locked raw buffer, so this patch adds
+an overall locked raw buffer count for debugging purpose.
+
+Change-Id: I0ded5a140b8981bcf9a8511233c0c44e67228f1a
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-8929
+Signed-off-by: Bin Han <bin.b.han@intel.com>
+Reviewed-on: https://android.intel.com:443/296984
+Reviewed-on: https://icggerrit.ir.intel.com/29117
+Approver: Wei Tao <wei.tao@intel.com>
+Build: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+Maintainer: Wei Tao <wei.tao@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.c      |   50 +++++++++++++++++---
+ .../atomisp2/atomisp_driver/atomisp_compat_css20.c |    4 +-
+ .../pci/atomisp2/atomisp_driver/atomisp_subdev.h   |    1 +
+ 3 files changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index 85860a2..c1573f4 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -1447,12 +1447,13 @@ void atomisp_wdt_work(struct work_struct *work)
+ 			if (asd->enable_raw_buffer_lock->val) {
+ 				unsigned int j;
+ 
+-				for (j = 0; j <= ATOMISP_MAX_EXP_ID/32; j++) {
+-					dev_err(isp->dev,
+-						"%s, raw_buffer_bitmap[%d]: 0x%x\n",
++				dev_err(isp->dev, "%s, raw_buffer_locked_count %d\n",
++					__func__,
++				        asd->raw_buffer_locked_count);
++				for (j = 0; j <= ATOMISP_MAX_EXP_ID/32; j++)
++					dev_err(isp->dev, "%s, raw_buffer_bitmap[%d]: 0x%x\n",
+ 						__func__, j,
+ 						asd->raw_buffer_bitmap[j]);
+-				}
+ 			}
+ 		}
+ 
+@@ -5501,6 +5502,7 @@ void atomisp_init_raw_buffer_bitmap(struct atomisp_sub_device *asd)
+ 	unsigned long flags;
+ 	spin_lock_irqsave(&asd->raw_buffer_bitmap_lock, flags);
+ 	memset(asd->raw_buffer_bitmap, 0, sizeof(asd->raw_buffer_bitmap));
++	asd->raw_buffer_locked_count = 0;
+ 	spin_unlock_irqrestore(&asd->raw_buffer_bitmap_lock, flags);
+ }
+ 
+@@ -5516,7 +5518,36 @@ int atomisp_set_raw_buffer_bitmap(struct atomisp_sub_device *asd, int exp_id)
+ 	bit = exp_id % 32;
+ 	spin_lock_irqsave(&asd->raw_buffer_bitmap_lock, flags);
+ 	(*bitmap) |= (1 << bit);
++	asd->raw_buffer_locked_count ++;
+ 	spin_unlock_irqrestore(&asd->raw_buffer_bitmap_lock, flags);
++
++	dev_dbg(asd->isp->dev, "%s: exp_id %d,  raw_buffer_locked_count %d\n",
++	        __func__, exp_id, asd->raw_buffer_locked_count);
++
++	/* Check if the raw buffer after next is still locked!!! */
++	exp_id += 2;
++	if (exp_id > ATOMISP_MAX_EXP_ID)
++		exp_id -= ATOMISP_MAX_EXP_ID;
++	bitmap = asd->raw_buffer_bitmap + exp_id / 32;
++	bit = exp_id % 32;
++	if ((*bitmap) & (1 << bit)) {
++		int ret;
++
++		/* WORKAROUND unlock the raw buffer compulsively */
++		ret = atomisp_css_exp_id_unlock(asd, exp_id);
++		if (ret) {
++			dev_err(asd->isp->dev, "%s exp_id is wrapping back to %d but force unlock failed,, err %d.\n",
++			        __func__, exp_id, ret);
++			return ret;
++		}
++
++		spin_lock_irqsave(&asd->raw_buffer_bitmap_lock, flags);
++		(*bitmap) &= ~(1 << bit);
++		asd->raw_buffer_locked_count --;
++		spin_unlock_irqrestore(&asd->raw_buffer_bitmap_lock, flags);
++		dev_warn(asd->isp->dev, "%s exp_id is wrapping back to %d but it is still locked so force unlock it, raw_buffer_locked_count %d\n",
++		         __func__, exp_id, asd->raw_buffer_locked_count);
++	}
+ 	return 0;
+ }
+ 
+@@ -5549,7 +5580,11 @@ static int __clear_raw_buffer_bitmap(struct atomisp_sub_device *asd, int exp_id)
+ 	bit = exp_id % 32;
+ 	spin_lock_irqsave(&asd->raw_buffer_bitmap_lock, flags);
+ 	(*bitmap) &= ~(1 << bit);
++	asd->raw_buffer_locked_count --;
+ 	spin_unlock_irqrestore(&asd->raw_buffer_bitmap_lock, flags);
++
++	dev_dbg(asd->isp->dev, "%s: exp_id %d,  raw_buffer_locked_count %d\n",
++	        __func__, exp_id, asd->raw_buffer_locked_count);
+ 	return 0;
+ }
+ 
+@@ -5588,9 +5623,10 @@ int atomisp_exp_id_unlock(struct atomisp_sub_device *asd, int *exp_id)
+ 
+ 	dev_dbg(isp->dev, "%s exp_id %d\n", __func__, value);
+ 	ret = atomisp_css_exp_id_unlock(asd, value);
+-	if (ret) {
+-		dev_err(isp->dev, "%s exp_id %d failed.\n", __func__, value);
+-	}
++	if (ret)
++		dev_err(isp->dev, "%s exp_id %d failed, err %d.\n",
++		        __func__, value, ret);
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+index 4676d04..05757b8 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+@@ -3419,7 +3419,9 @@ int atomisp_css_exp_id_unlock(struct atomisp_sub_device *asd, int exp_id)
+ 	ret = ia_css_unlock_raw_frame(
+ 		asd->stream_env[ATOMISP_INPUT_STREAM_GENERAL].stream,
+ 		exp_id);
+-	if (ret != IA_CSS_SUCCESS)
++	if (ret == IA_CSS_ERR_QUEUE_IS_FULL)
++		return -EAGAIN;
++	else if (ret != IA_CSS_SUCCESS)
+ 		return -EIO;
+ 
+ 	return 0;
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+index 7696cb1..ed23f0a 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+@@ -342,6 +342,7 @@ struct atomisp_sub_device {
+ 	bool yuvpp_mode;	/* CSI2+ yuvpp pipe */
+ 
+ 	int raw_buffer_bitmap[ATOMISP_MAX_EXP_ID/32 + 1]; /* Record each Raw Buffer lock status */
++	int raw_buffer_locked_count;
+ 	spinlock_t raw_buffer_bitmap_lock;
+ 
+ 	bool high_speed_mode; /* Indicate whether now is a high speed mode */
+-- 
+1.7.9.5
+

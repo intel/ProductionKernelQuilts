@@ -1,0 +1,221 @@
+From 9a03d0960d0d4c3a8720ff0012a2fc8d8b5d087d Mon Sep 17 00:00:00 2001
+Message-Id: <9a03d0960d0d4c3a8720ff0012a2fc8d8b5d087d.1425610844.git.chang-joon.lee@intel.com>
+In-Reply-To: <6fa2ab23adf6d7de781e906d04a0224410262d9b.1425610844.git.chang-joon.lee@intel.com>
+References: <6fa2ab23adf6d7de781e906d04a0224410262d9b.1425610844.git.chang-joon.lee@intel.com>
+From: Nabendu Maiti <nabendu.bikash.maiti@intel.com>
+Date: Wed, 24 Dec 2014 12:11:26 +0530
+Subject: [PATCH 08/27] MUST_REBASE [VPG]: video/adf: Add support for CHT B0
+ horizontal mirroring.
+
+This patch adds support for cherryview display horizontal mirroring.
+It is verified on CHT_RVP B0. Userland shall send H_FLIP transform to
+mirror.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5604
+Change-Id: I9021eba7c0786a34dabceeb3ceee07fc62909826
+Signed-off-by: Nabendu Maiti <nabendu.bikash.maiti@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/vlv_pri_plane.c   |   41 ++++++++++--
+ drivers/video/adf/intel/core/vlv/vlv_sp_plane.c    |   68 ++++++++++++++------
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |    1 +
+ 3 files changed, 82 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+index c0f9070..507a8f5 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+@@ -119,9 +119,16 @@ static const u32 pri_supported_formats[] = {
+ 	DRM_FORMAT_ABGR2101010,
+ };
+ 
++#if defined(CONFIG_ADF_INTEL_CHV)
+ static const u32 pri_supported_transforms[] = {
++	INTEL_ADF_TRANSFORM_FLIPH,
+ 	INTEL_ADF_TRANSFORM_ROT180,
+ };
++#else
++static const u32 pri_supported_transforms[] = {
++	INTEL_ADF_TRANSFORM_ROT180,
++};
++#endif
+ 
+ static const u32 pri_supported_blendings[] = {
+ 	INTEL_PLANE_BLENDING_NONE,
+@@ -325,19 +332,39 @@ static int vlv_pri_calculate(struct intel_plane *plane,
+ 	dspaddr_offset = vlv_compute_page_offset(&src_x, &src_y,
+ 				buf->tiling_mode, bpp, regs->stride);
+ 	regs->linearoff -= dspaddr_offset;
+-	if (config->transform & INTEL_ADF_TRANSFORM_ROT180) {
++	regs->tileoff = (src_y << 16) | src_x;
++
++	/*
++	 * H mirroring available on PIPE B Pri and sp plane only
++	 * For CHV, FLIPH and 180 are mutually exclusive
++	 */
++	if ((intel_adf_get_platform_id() == gen_cherryview) &&
++	    STEP_FROM(pipeline->dc_stepping, STEP_B0))
++		regs->dspcntr &= ~(DISPPLANE_H_MIRROR_ENABLE |
++				   DISPPLANE_180_ROTATION_ENABLE);
++	else
++		regs->dspcntr &= ~DISPPLANE_180_ROTATION_ENABLE;
++
++	switch (config->transform) {
++	case INTEL_ADF_TRANSFORM_FLIPH:
++		if ((intel_adf_get_platform_id() == gen_cherryview) &&
++		    STEP_FROM(pipeline->dc_stepping, STEP_B0) &&
++		    (pipe == PIPE_B)) {
++			regs->dspcntr |= DISPPLANE_H_MIRROR_ENABLE;
++			regs->tileoff = (src_y << 16) | (src_x + buf->w - 1);
++			regs->linearoff += ((buf->w - 1) * bpp);
++		}
++		break;
++	case INTEL_ADF_TRANSFORM_ROT180:
+ 		regs->dspcntr |= DISPPLANE_180_ROTATION_ENABLE;
+ 		regs->linearoff =  regs->linearoff + (buf->h - 1) *
+-						regs->stride + buf->w * bpp;
++			regs->stride + buf->w * bpp;
+ 		regs->tileoff = (((src_y + buf->h - 1) << 16) |
+-							(src_x + buf->w - 1));
+-	} else {
+-		regs->dspcntr &= ~DISPPLANE_180_ROTATION_ENABLE;
+-		regs->tileoff = (src_y << 16) | src_x;
++				 (src_x + buf->w - 1));
++		break;
+ 	}
+ 
+ 	regs->surfaddr = (buf->gtt_offset_in_pages + dspaddr_offset);
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+index 30fca10..ec08428 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+@@ -294,12 +294,13 @@ static int vlv_sp_calculate(struct intel_plane *planeptr,
+ 	u32 bpp = 0, prev_bpp = 0;
+ 	u32 sprctl, prev_sprctl;
+ 	u32 mask, shift;
+-	u32 dst_w = (config->dst_w & VLV_SP_12BIT_MASK) - 1;
+-	u32 dst_h = (config->dst_h & VLV_SP_12BIT_MASK) - 1;
+ 	u32 src_x = config->src_x & VLV_SP_12BIT_MASK;
+ 	u32 src_y = config->src_y & VLV_SP_12BIT_MASK;
+ 	u32 dst_x = config->dst_x & VLV_SP_12BIT_MASK;
+ 	u32 dst_y = config->dst_y & VLV_SP_12BIT_MASK;
++	u32 dst_w = (config->dst_w & VLV_SP_12BIT_MASK) - 1;
++	u32 dst_h = (config->dst_h & VLV_SP_12BIT_MASK) - 1;
++	u32 src_w = (config->src_w & VLV_SP_12BIT_MASK) - 1;
+ 	u8 i = 0;
+ 
+ 	/*
+@@ -381,37 +382,55 @@ static int vlv_sp_calculate(struct intel_plane *planeptr,
+ 
+ 	sprctl |= SP_ENABLE;
+ 	regs->dspcntr = sprctl;
++
++	if (buf->tiling_mode != I915_TILING_NONE)
++		regs->dspcntr |= SP_TILED;
++	else
++		regs->dspcntr &= ~SP_TILED;
++
+ 	linear_offset = src_y * buf->stride + src_x * bpp;
+ 	sprsurf_offset = vlv_compute_page_offset(&src_x, &src_y,
+ 			buf->tiling_mode, bpp, buf->stride);
+ 	linear_offset -= sprsurf_offset;
+ 
++	regs->linearoff = linear_offset;
+ 	regs->stride = buf->stride;
+ 	regs->pos = ((dst_y << 16) | dst_x);
+ 	regs->size = (dst_h << 16) | dst_w;
+-	regs->surfaddr = (buf->gtt_offset_in_pages + sprsurf_offset);
++	regs->tileoff = (src_y << 16) | src_x;
+ 
+-	if (buf->tiling_mode != I915_TILING_NONE) {
+-		regs->dspcntr |= SP_TILED;
+-		if (config->transform & INTEL_ADF_TRANSFORM_ROT180) {
+-			regs->dspcntr |= DISPPLANE_180_ROTATION_ENABLE;
+-			regs->tileoff = ((src_y + dst_h) << 16) |
+-							(src_x + dst_w);
+-		} else {
+-			regs->dspcntr &= ~DISPPLANE_180_ROTATION_ENABLE;
+-			regs->tileoff = (src_y << 16) | src_x;
+-		}
+-	} else {
+-		if (config->transform & INTEL_ADF_TRANSFORM_ROT180) {
+-			regs->dspcntr |= DISPPLANE_180_ROTATION_ENABLE;
+-			regs->linearoff = linear_offset + dst_h *
+-					regs->stride + (dst_w + 1) * bpp;
+-		} else {
+-			regs->dspcntr &= ~DISPPLANE_180_ROTATION_ENABLE;
+-			regs->linearoff = linear_offset;
++	/*
++	 * H mirroring available on PIPE B Pri and sp plane only
++	 * For CHV, FLIPH and 180 are mutually exclusive
++	 */
++	if ((intel_adf_get_platform_id() == gen_cherryview) &&
++	    STEP_FROM(pipeline->dc_stepping, STEP_B0))
++		regs->dspcntr &= ~(DISPPLANE_H_MIRROR_ENABLE |
++				   DISPPLANE_180_ROTATION_ENABLE);
++	else
++		regs->dspcntr &= ~DISPPLANE_180_ROTATION_ENABLE;
++
++	switch (config->transform) {
++	case INTEL_ADF_TRANSFORM_FLIPH:
++		if ((intel_adf_get_platform_id() == gen_cherryview) &&
++		    STEP_FROM(pipeline->dc_stepping, STEP_B0) &&
++		    (pipe == PIPE_B)) {
++			regs->dspcntr |= DISPPLANE_H_MIRROR_ENABLE;
++			regs->tileoff = (src_y << 16) | (src_x + src_w - 1);
++			regs->linearoff += ((src_w - 1) * bpp);
+ 		}
++		break;
++	case INTEL_ADF_TRANSFORM_ROT180:
++		regs->dspcntr |= DISPPLANE_180_ROTATION_ENABLE;
++		regs->linearoff =  regs->linearoff + (dst_h - 1) *
++			regs->stride + dst_w * bpp;
++		regs->tileoff = (((src_y + dst_h - 1) << 16) |
++			(src_x + dst_w - 1));
++		break;
+ 	}
+ 
++	regs->surfaddr = (buf->gtt_offset_in_pages + sprsurf_offset);
++
+ 	/* when in maxfifo display control register cannot be modified */
+ 	if (vlv_config->status.maxfifo_enabled &&
+ 					regs->dspcntr != prev_sprctl) {
+@@ -697,9 +716,16 @@ static const u32 sprite_supported_formats[] = {
+ 	DRM_FORMAT_ABGR2101010,
+ };
+ 
++#if defined(CONFIG_ADF_INTEL_VLV) && !defined(CONFIG_ADF_INTEL_CHV)
++static const u32 sprite_supported_transforms[] = {
++	INTEL_ADF_TRANSFORM_ROT180,
++};
++#elif defined(CONFIG_ADF_INTEL_CHV)
+ static const u32 sprite_supported_transforms[] = {
++	INTEL_ADF_TRANSFORM_FLIPH,
+ 	INTEL_ADF_TRANSFORM_ROT180,
+ };
++#endif
+ 
+ static const u32 sprite_supported_blendings[] = {
+ 	INTEL_PLANE_BLENDING_NONE,
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index ecd253d..e133305 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -3989,6 +3989,7 @@ extern int chv_cursor_offsets[];
+ #define   DISPPLANE_180_ROTATION_ENABLE		(1<<15)
+ #define   DISPPLANE_TRICKLE_FEED_DISABLE	(1<<14) /* Ironlake */
+ #define   DISPPLANE_TILED			(1<<10)
++#define   DISPPLANE_H_MIRROR_ENABLE		(1<<8)
+ #define _DSPAADDR		(VLV_DISPLAY_BASE + 0x70184)
+ #define _DSPASTRIDE		(VLV_DISPLAY_BASE + 0x70188)
+ #define _DSPAPOS		(VLV_DISPLAY_BASE + 0x7018C) /* reserved */
+-- 
+1.7.9.5
+

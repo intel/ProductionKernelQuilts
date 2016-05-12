@@ -1,0 +1,104 @@
+From e84d5a80881a03a034b1ccad359473119fedd3bf Mon Sep 17 00:00:00 2001
+Message-Id: <e84d5a80881a03a034b1ccad359473119fedd3bf.1423172493.git.feitong.yi@intel.com>
+In-Reply-To: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+References: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 13 Jan 2015 13:32:52 +0000
+Subject: [PATCH 03/29] FROM_UPSTREAM [VPG]: drm/i915: Performed deferred
+ clflush inside set-cache-level
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently we are hitting the WARN inside
+i915_gem_object_set_cache_level() as we can now have an unbound object
+in the GTT write domain (due to 43566dedde54f9 "drm/i915: Broaden
+application of set-domain(GTT)"). To avoid the warning, we need to track
+when we elided the clflush on a cacheable object and then evict the
+cache for the object when we move the object out of a cacheable domain.
+
+Reported-by: Jani Nikula <jani.nikula@linux.intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Tested-by: Jani Nikula <jani.nikula@intel.com>
+Tested-By: PRC QA PRTS (Patch Regression Test System Contact: shuang.he@intel.com)
+
+Change-Id: Ibe4ded8917550054787a328bf166bb3aa4bb4198
+Upstream-repo: http://patchwork.freedesktop.org/patch/40370/
+For: GMINL-4760
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h |    1 +
+ drivers/gpu/drm/i915/i915_gem.c |   32 +++++++++-----------------------
+ 2 files changed, 10 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 70c847c..58bf56c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2031,6 +2031,7 @@ struct drm_i915_gem_object {
+ 	unsigned int fenced_gpu_access:1;
+ 
+ 	unsigned int cache_level:3;
++	unsigned int cache_dirty:1;
+ 
+ 	unsigned int has_aliasing_ppgtt_mapping:1;
+ 	unsigned int has_global_gtt_mapping:1;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 669e339..95a0da2 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3824,11 +3824,14 @@ i915_gem_clflush_object(struct drm_i915_gem_object *obj,
+ 	 * snooping behaviour occurs naturally as the result of our domain
+ 	 * tracking.
+ 	 */
+-	if (!force && cpu_cache_is_coherent(obj->base.dev, obj->cache_level))
++	if (!force && cpu_cache_is_coherent(obj->base.dev, obj->cache_level)) {
++		obj->cache_dirty = true;
+ 		return false;
++	}
+ 
+ 	trace_i915_gem_object_clflush(obj);
+ 	drm_clflush_sg(obj->pages);
++	obj->cache_dirty = false;
+ 
+ 	return true;
+ }
+@@ -4001,28 +4004,11 @@ int i915_gem_object_set_cache_level(struct drm_i915_gem_object *obj,
+ 		vma->node.color = cache_level;
+ 	obj->cache_level = cache_level;
+ 
+-	if (cpu_write_needs_clflush(obj)) {
+-		u32 old_read_domains, old_write_domain;
+-
+-		/* If we're coming from LLC cached, then we haven't
+-		 * actually been tracking whether the data is in the
+-		 * CPU cache or not, since we only allow one bit set
+-		 * in obj->write_domain and have been skipping the clflushes.
+-		 * Just set it to the CPU cache for now.
+-		 */
+-		i915_gem_object_retire(obj);
+-		WARN_ON(obj->base.write_domain & ~I915_GEM_DOMAIN_CPU);
+-
+-		old_read_domains = obj->base.read_domains;
+-		old_write_domain = obj->base.write_domain;
+-
+-		obj->base.read_domains = I915_GEM_DOMAIN_CPU;
+-		obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+-
+-		trace_i915_gem_object_change_domain(obj,
+-						    old_read_domains,
+-						    old_write_domain);
+-	}
++	if (obj->cache_dirty &&
++	    obj->base.write_domain != I915_GEM_DOMAIN_CPU &&
++	    cpu_write_needs_clflush(obj) &&
++	    i915_gem_clflush_object(obj, true))
++		i915_gem_chipset_flush(obj->base.dev);
+ 
+ 	i915_gem_verify_gtt(dev);
+ 	return 0;
+-- 
+1.7.9.5
+

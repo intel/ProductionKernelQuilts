@@ -1,0 +1,258 @@
+From ed09cfc695492a6880d96154d2c416f1cf075934 Mon Sep 17 00:00:00 2001
+From: Jenny TC <jenny.tc@intel.com>
+Date: Mon, 27 Oct 2014 09:45:33 +0530
+Subject: [PATCH 1/2] PMIC-WCOVE: Enable ext-charger register
+
+Whiskey Cove PMIC has an external charger connected to PMIC
+I2C bus. The PMIC I2C bus driver is enumerated by wcove mfd
+driver. The wcove PMIC driver defines the virtual IRQ number
+for PMIC I2C bus driver and for the external charger driver.
+Also the external charger slave address is configured in PMIC
+Translation table. Since the PMIC I2C is a virtual I2C bus
+enumerated by mfd device, using ACPI for PMIC I2C and external
+charger enumeration doesn't sounds good. Also all the resources
+for PMIC I2C bus (IRQ number) and external charger (IRQ, slave
+address and bus number) are available with WCOVE mfd driver,
+this driver seems to be the right place for defining the
+external charger i2c device.
+
+v1: correct the external charger name in wcove mfd cell struct:
+Instead of static device name provide generic name to the external charger
+device in the mfd cell structure for whiskey cove mfd.
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-7388
+
+Change-Id: I0a9a86ae175b8e8a73e38963914275d2dc9fae7f
+Signed-off-by: Jenny TC <jenny.tc@intel.com>
+Signed-off-by: Albin B <albin.bala.krishnan@intel.com>
+
+Change-Id: Ibcb9aa1739db82a9d577ddee3b32cb351ee1cb32
+---
+ drivers/i2c/busses/i2c-wcove-pmic.c      | 17 +++++-----
+ drivers/mfd/intel_soc_pmic_wc.c          | 38 +++++++++++++++++++--
+ drivers/power/bq24192_charger.c          | 58 +++++++++++++++++++-------------
+ include/linux/mfd/intel_soc_pmic_wcove.h |  2 ++
+ 4 files changed, 80 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-wcove-pmic.c b/drivers/i2c/busses/i2c-wcove-pmic.c
+index f2c0fdc46810..5055f2a6f5fb 100644
+--- a/drivers/i2c/busses/i2c-wcove-pmic.c
++++ b/drivers/i2c/busses/i2c-wcove-pmic.c
+@@ -77,6 +77,8 @@ enum I2C_STATUS {
+ };
+ 
+ static struct pmic_i2c_dev *pmic_dev;
++struct i2c_adapter *wcove_pmic_i2c_adapter;
++EXPORT_SYMBOL(wcove_pmic_i2c_adapter);
+ 
+ static irqreturn_t pmic_thread_handler(int id, void *data)
+ {
+@@ -248,7 +250,6 @@ static const struct i2c_algorithm pmic_i2c_algo = {
+ 
+ static int pmic_i2c_probe(struct platform_device *pdev)
+ {
+-	struct i2c_adapter *adap;
+ 	int ret;
+ 
+ 	pmic_dev = kzalloc(sizeof(struct pmic_i2c_dev), GFP_KERNEL);
+@@ -272,13 +273,13 @@ static int pmic_i2c_probe(struct platform_device *pdev)
+ 	if (unlikely(ret))
+ 		goto unmask_irq_failed;
+ 
+-	adap = &pmic_dev->adapter;
+-	adap->owner = THIS_MODULE;
+-	adap->class = I2C_CLASS_HWMON;
+-	adap->algo = &pmic_i2c_algo;
+-	strcpy(adap->name, "PMIC I2C Adapter");
+-	adap->nr = pdev->id;
+-	ret = i2c_add_numbered_adapter(adap);
++	wcove_pmic_i2c_adapter = &pmic_dev->adapter;
++	wcove_pmic_i2c_adapter->owner = THIS_MODULE;
++	wcove_pmic_i2c_adapter->class = I2C_CLASS_HWMON;
++	wcove_pmic_i2c_adapter->algo = &pmic_i2c_algo;
++	strcpy(wcove_pmic_i2c_adapter->name, "PMIC I2C Adapter");
++	wcove_pmic_i2c_adapter->nr = pdev->id;
++	ret = i2c_add_numbered_adapter(wcove_pmic_i2c_adapter);
+ 
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "Error adding the adapter\n");
+diff --git a/drivers/mfd/intel_soc_pmic_wc.c b/drivers/mfd/intel_soc_pmic_wc.c
+index 57f0fb671ec7..157c9e848b8a 100644
+--- a/drivers/mfd/intel_soc_pmic_wc.c
++++ b/drivers/mfd/intel_soc_pmic_wc.c
+@@ -58,7 +58,7 @@
+ #define MTHRMIRQ3	0xDA
+ #define MCHGRIRQ	0x17
+ 
+-#define WCOVE_PMIC_I2C_ID 21
++static bool wcove_init_done;
+ 
+ static struct gpadc_regmap_t whiskeycove_gpadc_regmaps[GPADC_NUM_CHANNELS] = {
+ 	{"VBAT",	5,	0x4F03, 0x4F04, 0xFF, 0xFF, 0xFF, 0xFF},
+@@ -382,12 +382,12 @@ static struct mfd_cell whiskey_cove_dev[] = {
+ 	},
+ 	{
+ 		.name = "wcove_pmic_i2c",
+-		.id = WCOVE_PMIC_I2C_ID,
++		.id = 0,
+ 		.num_resources = ARRAY_SIZE(pmic_i2c_resources),
+ 		.resources = pmic_i2c_resources,
+ 	},
+ 	{
+-		.name = "bd71621",
++		.name = "ext-charger",
+ 		.id = 0,
+ 		.num_resources = ARRAY_SIZE(charger_resources),
+ 		.resources = charger_resources,
+@@ -549,6 +549,7 @@ static int whiskey_cove_init(void)
+ 	wcove_set_ccsm_config();
+ 	wcove_set_bcu_pdata();
+ 	wc_set_adc_pdata();
++	wcove_init_done = true;
+ 
+ 	return 0;
+ }
+@@ -562,6 +563,37 @@ struct intel_soc_pmic whiskey_cove_pmic = {
+ 	.irq_num	= WHISKEY_COVE_IRQ_NUM,
+ };
+ 
++#define TT_I2CDADDR_ADDR		0x00
++static u8 pmic_read_tt(u8 addr)
++{
++	int ret;
++
++	ret = intel_soc_pmic_writeb(pmic_wcove_regmap.pmic_chrttaddr,
++			addr);
++
++	/* Delay the TT read by 2ms to ensure that the data is populated
++	 * in data register
++	 */
++	usleep_range(2000, 3000);
++
++	return intel_soc_pmic_readb(pmic_wcove_regmap.pmic_chrttdata);
++}
++
++
++static void __init register_external_charger(void)
++{
++	static struct i2c_board_info i2c_info;
++
++	if (!wcove_init_done)
++		return;
++
++	strncpy(i2c_info.type, "ext-charger", I2C_NAME_SIZE);
++	i2c_info.addr = pmic_read_tt(TT_I2CDADDR_ADDR);
++	i2c_info.irq = INTEL_PMIC_IRQBASE + CHGR_IRQ;
++	i2c_new_device(wcove_pmic_i2c_adapter, &i2c_info);
++}
++late_initcall(register_external_charger);
++
+ MODULE_LICENSE("GPL V2");
+ MODULE_AUTHOR("Yang Bin <bin.yang@intel.com");
+ 
+diff --git a/drivers/power/bq24192_charger.c b/drivers/power/bq24192_charger.c
+index 5513e6583e2b..455df0470987 100644
+--- a/drivers/power/bq24192_charger.c
++++ b/drivers/power/bq24192_charger.c
+@@ -2106,24 +2106,29 @@ static int bq24192_probe(struct i2c_client *client,
+ 	}
+ 
+ 	chip->client = client;
++	if (id) {
++		chip->pdata = (struct bq24192_platform_data *)id->driver_data;
++	} else {
+ #ifdef CONFIG_ACPI
+-	dev = &client->dev;
+-	if (!ACPI_HANDLE(dev)) {
+-		i2c_set_clientdata(client, NULL);
+-		kfree(chip);
+-		return -ENODEV;
+-	}
+-	acpi_id = acpi_match_device(dev->driver->acpi_match_table, dev);
+-	if (!acpi_id) {
+-		i2c_set_clientdata(client, NULL);
+-		kfree(chip);
+-		return -ENODEV;
+-	}
++		dev = &client->dev;
++		if (!ACPI_HANDLE(dev)) {
++			i2c_set_clientdata(client, NULL);
++			kfree(chip);
++			return -ENODEV;
++		}
++		acpi_id = acpi_match_device(dev->driver->acpi_match_table, dev);
++		if (!acpi_id) {
++			i2c_set_clientdata(client, NULL);
++			kfree(chip);
++			return -ENODEV;
++		}
+ 
+-	chip->pdata = (struct bq24192_platform_data *)acpi_id->driver_data;
++		chip->pdata = (struct bq24192_platform_data *)
++						acpi_id->driver_data;
+ #else
+-	chip->pdata = client->dev.platform_data;
++		chip->pdata = client->dev.platform_data;
+ #endif
++	}
+ 	if (!chip->pdata) {
+ 		dev_err(&client->dev, "pdata NULL!!\n");
+ 		kfree(chip);
+@@ -2169,20 +2174,24 @@ static int bq24192_probe(struct i2c_client *client,
+ 	 * register for an interrupt handler for servicing charger
+ 	 * interrupts
+ 	 */
++	if (client->irq) {
++		chip->irq = client->irq;
++	} else {
+ #ifdef CONFIG_ACPI
+-	gpio = devm_gpiod_get_index(dev, "bq24192_int", 0);
+-	if (IS_ERR(gpio)) {
+-		dev_err(dev, "acpi gpio get index failed\n");
+-		i2c_set_clientdata(client, NULL);
+-		kfree(chip);
+-		return PTR_ERR(gpio);
+-	}
++		gpio = devm_gpiod_get_index(dev, "bq24192_int", 0);
++		if (IS_ERR(gpio)) {
++			dev_err(dev, "acpi gpio get index failed\n");
++			i2c_set_clientdata(client, NULL);
++			kfree(chip);
++			return PTR_ERR(gpio);
++		}
+ 
+-	chip->irq = gpiod_to_irq(gpio);
++		chip->irq = gpiod_to_irq(gpio);
+ #else
+-	if (chip->pdata->get_irq_number)
+-		chip->irq = chip->pdata->get_irq_number();
++		if (chip->pdata->get_irq_number)
++			chip->irq = chip->pdata->get_irq_number();
+ #endif
++	}
+ 	if (chip->irq < 0) {
+ 		dev_err(&chip->client->dev,
+ 			"chgr_int_n GPIO is not available\n");
+@@ -2381,6 +2390,7 @@ struct bq24192_platform_data tbg24296_drvdata = {
+ static const struct i2c_device_id bq24192_id[] = {
+ 	{ "bq24192", },
+ 	{ "TBQ24296", (kernel_ulong_t)&tbg24296_drvdata},
++	{ "ext-charger", (kernel_ulong_t)&tbg24296_drvdata},
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(i2c, bq24192_id);
+diff --git a/include/linux/mfd/intel_soc_pmic_wcove.h b/include/linux/mfd/intel_soc_pmic_wcove.h
+index 80b9dca58dee..2046238b6006 100644
+--- a/include/linux/mfd/intel_soc_pmic_wcove.h
++++ b/include/linux/mfd/intel_soc_pmic_wcove.h
+@@ -18,6 +18,8 @@
+ #ifndef __INTEL_PMIC_WCOVE_H__
+ #define __INTEL_PMIC_WCOVE_H__
+ 
++extern struct i2c_adapter *wcove_pmic_i2c_adapter;
++
+ #define WC_IRQLVL1_ADDR		0x6E02
+ #define WC_IRQLVL1_MASK_ADDR	0x6E0E
+ #define WC_PWRSRC_ADDR		0x6E03
+-- 
+1.9.1
+

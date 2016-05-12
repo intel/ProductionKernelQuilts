@@ -1,0 +1,421 @@
+From 2d7ee97ad7a1fa6d1773f265694f6a10c9ef7e20 Mon Sep 17 00:00:00 2001
+Message-Id: <2d7ee97ad7a1fa6d1773f265694f6a10c9ef7e20.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: Kausal Malladi <Kausal.Malladi@intel.com>
+Date: Sun, 1 Feb 2015 13:38:02 +0530
+Subject: [PATCH 70/95] MUST_REBASE [VPG]: video/adf: Color Manager Framework
+ Actions
+
+This patch extends the Color Manager framework by adding functions for
+apply, set, get, disable and find color property.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-4163
+Change-Id: I13536ecf7954c7d74b1f038e08017cc332598f1a
+Signed-off-by: Kausal Malladi <Kausal.Malladi@intel.com>
+---
+ drivers/video/adf/intel/core/intel_color_manager.c |  247 ++++++++++++++++++++
+ .../adf/intel/include/core/intel_color_manager.h   |    7 +
+ drivers/video/adf/intel/include/intel_adf.h        |    6 +
+ drivers/video/adf/intel/intel_adf_interface.c      |   25 +-
+ drivers/video/adf/intel/intel_adf_overlay_engine.c |   38 ++-
+ 5 files changed, 315 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/intel_color_manager.c b/drivers/video/adf/intel/core/intel_color_manager.c
+index f6b90ec..61cfbb5 100644
+--- a/drivers/video/adf/intel/core/intel_color_manager.c
++++ b/drivers/video/adf/intel/core/intel_color_manager.c
+@@ -37,6 +37,253 @@ typedef bool (*get_color_capabilities)(void *props_data, int object_type);
+ get_color_capabilities platform_color_capabilities[] = {
+ };
+ 
++/*
++ * intel_color_manager_find
++ * Find a color property based on its id for an interface and overlay engine
++ * color_props = structure containing number of properties and
++ *     pointer to array of so many color properties,
++ *     set in interface or overlay engine
++ * prop_id = property id (csc/gamma etc)
++ */
++struct color_property *intel_color_manager_find(
++	struct color_capabilities *color_props, u8 prop_id)
++{
++	struct color_property *cp = NULL;
++	u32 index = 0;
++	u32 total_props = 0;
++
++	if (!color_props) {
++		pr_err("ADF: CM: This interface/overlay engine has no color capabilities\n");
++		return NULL;
++	}
++
++	total_props = color_props->no_of_props;
++	while (index < total_props) {
++		cp = color_props->props[index++];
++		if (cp && (cp->prop_id == prop_id)) {
++			pr_info("ADF: CM: Found property %s(index=%d)\n",
++				cp->name, index);
++			return cp;
++		}
++	}
++	pr_err("ADF: CM: Property Not Found: Cant find property with id=%d\n",
++			(int)prop_id);
++	return NULL;
++}
++
++/*
++ * Disable a color manager property
++ * This function assumes all the validation is done
++ * by the caller.
++ */
++static bool intel_color_manager_disable(
++	struct color_capabilities *color_props, u8 prop_id, u8 idx)
++{
++	struct color_property *cp;
++
++	/* Find the propery based on id */
++	cp = intel_color_manager_find(color_props, prop_id);
++	if (!cp) {
++		pr_err("ADF: CM: Could not find property with id=%d\n",
++			(int)prop_id);
++		return false;
++	}
++
++	if (!cp->validate || !cp->disable_property) {
++		pr_err("ADF: CM: No function for validate/disable color property\n");
++		return false;
++	}
++
++	if (!cp->validate(prop_id)) {
++		pr_err("ADF: CM: Invalid input for platform (prop=%d)\n",
++			(int)prop_id);
++		return false;
++	}
++
++	if (!cp->disable_property(cp, idx)) {
++		pr_err("ADF: CM: Disable property (%s) failed\n", cp->name);
++		return false;
++	}
++
++	pr_info("ADF: CM Successfully disabled color correction (%s)\n",
++								cp->name);
++	return true;
++}
++
++/* Set/Apply a color correction on a pipe */
++bool intel_color_manager_set(struct color_capabilities *color_props,
++		u8 prop_id, u64 *data, u8 idx)
++{
++	struct color_property *cp;
++
++	/* Find the propery based on id */
++	cp = intel_color_manager_find(color_props, prop_id);
++	if (!cp) {
++		pr_err("ADF: CM: Set: Could not find property with id=%d\n",
++			(int)prop_id);
++		return false;
++	}
++
++	if (!cp->validate || !cp->set_property) {
++		pr_err("ADF: CM: Set: No validation/set function for property %s\n",
++			cp->name);
++		return false;
++	}
++
++	pr_info("ADF: CM: Set: Found property %s\n", cp->name);
++
++	if (!cp->validate(prop_id)) {
++		pr_err("ADF: CM: Set: Invalid input for platform (prop=%d)\n",
++			(int)prop_id);
++		return false;
++	}
++
++	/* Apply color correction */
++	if (!cp->set_property(cp, data, idx)) {
++		pr_err("ADF: CM: Set: Set property (%s) failed\n", cp->name);
++		return false;
++	}
++
++	pr_info("ADF: CM: Set: Successfully applied color correction (%s)\n",
++			cp->name);
++	return true;
++}
++
++/* Get color correction data */
++bool intel_color_manager_get(struct color_capabilities *color_props,
++	struct color_cmd __user *ubuf, u8 idx)
++{
++	struct color_cmd cmd;
++	struct color_property *cp;
++
++	/* Clean command buf */
++	memset((void *)&cmd, 0, sizeof(cmd));
++
++	/* Extract the command */
++	if (copy_from_user((void *)&cmd, (const void *)ubuf,
++			sizeof(struct color_cmd))) {
++		pr_err("ADF: CM: Get: Copy failed\n");
++		return false;
++	}
++
++	/* Find the propery based on id */
++	cp = intel_color_manager_find(color_props, cmd.property);
++	if (!cp) {
++		pr_err("ADF: CM: Could not find property with id=%d\n",
++			(int)cmd.property);
++		return false;
++	}
++
++	/* Load status */
++	if (copy_to_user((void __user *)&(ubuf->action),
++			(const void *)&(cp->status), sizeof(ubuf->action))) {
++		pr_err("ADF: CM: Get status, copy status failed\n");
++		return false;
++	}
++
++	/* Load the current values */
++	if (copy_to_user((void __user *)to_user_ptr(ubuf->data_ptr),
++		(const void *)cp->lut, ubuf->size * sizeof(uint64_t))) {
++		pr_err("ADF: CM: Get status, copy data failed\n");
++		return false;
++	}
++
++	pr_info("ADF: CM: Successfully got color correction status(%s)\n",
++			cp->name);
++	return true;
++}
++
++/*
++ * intel_color_manager_apply:
++ * Parse, decode and Apply a change on an interface or overlay engine.
++ */
++bool intel_color_manager_apply(struct color_capabilities *color_props,
++	struct color_cmd *ubuf, u8 idx)
++{
++	bool ret = false;
++	struct color_cmd cmd;
++	u64 *raw_data = NULL;
++
++	if (!ubuf) {
++		pr_err("ADF: CM: Apply: insufficient data\n");
++		return false;
++	}
++
++	/* Clean command buf */
++	memset((void *)&cmd, 0, sizeof(cmd));
++
++	/* Extract the command */
++	if (copy_from_user((void *)&cmd, (const void *)ubuf,
++			sizeof(struct color_cmd))) {
++		pr_err("ADF: CM: Apply: Copy failed\n");
++		return false;
++	}
++
++	/* Validate command */
++	if ((int)cmd.action < color_set ||
++			(int)cmd.action > color_disable) {
++		pr_err("ADF: CM: Invalid action %d\n", (int)cmd.action);
++		return false;
++	}
++
++	if (cmd.action == color_set) {
++		pr_info("ADF: CM: Enabling property\n");
++
++		/* Validite size, min 1 block of data is required */
++		if (cmd.size < COLOR_MANAGER_SIZE_MIN) {
++			pr_err("ADF: CM: Invalid size=%d\n",
++					(int)cmd.size);
++			return false;
++		}
++
++		if (!cmd.data_ptr) {
++			pr_err("ADF: CM: Expecting %d coeff data but got NULL\n",
++					cmd.size);
++			return false;
++		}
++
++		raw_data = kzalloc(cmd.size * sizeof(uint64_t), GFP_KERNEL);
++		if (!raw_data) {
++			pr_err("ADF: CM: Out of memory\n");
++			return false;
++		}
++
++		/* Get the data */
++		if (copy_from_user((void *)raw_data,
++			(const void *)to_user_ptr(cmd.data_ptr),
++				cmd.size * sizeof(uint64_t))) {
++			pr_err("ADF: CM: copy from user data failed\n");
++			ret = false;
++			goto FREE_AND_RETURN;
++		}
++
++		/* Data loaded, now do changes in property */
++		if (!intel_color_manager_set(color_props, cmd.property,
++					raw_data, idx)) {
++			pr_err("ADF: CM: Color correction failed\n");
++			ret = false;
++			goto FREE_AND_RETURN;
++		}
++
++		ret = true;
++		pr_info("ADF: CM: Apply color correction success\n");
++	} else {
++		pr_info("ADF: CM: Disabling property\n");
++		if (!intel_color_manager_disable(color_props,
++						cmd.property, idx)) {
++			pr_err("ADF: CM: Disabling color property failed\n");
++			ret = false;
++			goto FREE_AND_RETURN;
++		}
++		ret = true;
++		pr_info("ADF: CM: Disable color correction success\n");
++	}
++
++FREE_AND_RETURN:
++	kfree(raw_data);
++	return ret;
++}
++
+ /* Allocate an LUT for any color property to copy data from userspace */
+ u64 *intel_color_manager_create_lut(int size)
+ {
+diff --git a/drivers/video/adf/intel/include/core/intel_color_manager.h b/drivers/video/adf/intel/include/core/intel_color_manager.h
+index 7addf00..34330fa 100644
+--- a/drivers/video/adf/intel/include/core/intel_color_manager.h
++++ b/drivers/video/adf/intel/include/core/intel_color_manager.h
+@@ -149,4 +149,11 @@ extern bool
+ vlv_get_color_correction(void *props_data, int object_type);
+ extern bool
+ chv_get_color_correction(void *props_data, int object_type);
++
++/* Inline function to convert u64 to void ptr */
++static inline void __user *to_user_ptr(u64 address)
++{
++	return (void __user *)(uintptr_t)address;
++}
++
+ #endif
+diff --git a/drivers/video/adf/intel/include/intel_adf.h b/drivers/video/adf/intel/include/intel_adf.h
+index 789adfe..0413f6c 100644
+--- a/drivers/video/adf/intel/include/intel_adf.h
++++ b/drivers/video/adf/intel/include/intel_adf.h
+@@ -62,4 +62,10 @@ extern int intel_adf_map_dma_to_flip(unsigned long args);
+ extern int intel_adf_unmap_dma_to_flip(unsigned long args);
+ extern void intel_adf_hotplug_work_function(struct work_struct *work);
+ extern void intel_adf_hpd_init(struct intel_adf_context *ctx);
++
++/* Color correction related */
++extern bool intel_color_manager_apply(struct color_capabilities *color_props,
++					struct color_cmd *ubuf, u8 idx);
++extern bool intel_color_manager_get(struct color_capabilities *color_props,
++					struct color_cmd *ubuf, u8 idx);
+ #endif /* INTEL_ADF_H_ */
+diff --git a/drivers/video/adf/intel/intel_adf_interface.c b/drivers/video/adf/intel/intel_adf_interface.c
+index 0ed06c4..198f532 100644
+--- a/drivers/video/adf/intel/intel_adf_interface.c
++++ b/drivers/video/adf/intel/intel_adf_interface.c
+@@ -23,6 +23,7 @@ static long intel_interface_obj_ioctl(struct adf_obj *obj,
+ 	struct adf_interface *intf = adf_obj_to_interface(obj);
+ 	struct intel_adf_interface *i_intf = to_intel_intf(intf);
+ 	struct intel_pipe *pipe = i_intf->pipe;
++	u8 pipe_id = pipe->base.idx;
+ 
+ 	/* Custom IOCTL commands */
+ 	switch (cmd) {
+@@ -33,13 +34,29 @@ static long intel_interface_obj_ioctl(struct adf_obj *obj,
+ 		return pipe->ops->dpst_context(pipe, arg);
+ 
+ 	case INTEL_ADF_COLOR_MANAGER_SET:
+-		pr_info("ADF: Calling apply to set Color Property on the Interface");
+-		/* Todo : Implement Logic for calling set IOCTL */
++		pr_info("ADF: Calling apply to set Color Property on the Interface\n");
++		if (!intel_color_manager_apply(pipe->color_ctx,
++				(struct color_cmd *) arg, pipe_id)) {
++			pr_err("ADF: %s Error: Set color correction failed\n",
++								__func__);
++			return -EFAULT;
++		}
++
++		pr_info("ADF: %s: Set color correction success\n", __func__);
++
+ 		return 0;
+ 
+ 	case INTEL_ADF_COLOR_MANAGER_GET:
+-		pr_info("ADF: Calling apply to get Color Property on the Interface");
+-		/* Todo : Implement Logic for calling get IOCTL */
++		pr_info("ADF: Calling apply to get Color Property on the Interface\n");
++		if (!intel_color_manager_get(pipe->color_ctx,
++				(struct color_cmd *) arg, pipe_id)) {
++			pr_err("ADF: %s Error: Get color correction failed\n",
++								__func__);
++			return -EFAULT;
++		}
++
++		pr_info("ADF: %s: Get color correction success\n", __func__);
++
+ 		return 0;
+ 
+ 	default:
+diff --git a/drivers/video/adf/intel/intel_adf_overlay_engine.c b/drivers/video/adf/intel/intel_adf_overlay_engine.c
+index 96dffb5..af060e4 100644
+--- a/drivers/video/adf/intel/intel_adf_overlay_engine.c
++++ b/drivers/video/adf/intel/intel_adf_overlay_engine.c
+@@ -18,17 +18,47 @@
+ long intel_overlay_engine_obj_ioctl(struct adf_obj *obj,
+ 	unsigned int cmd, unsigned long arg)
+ {
++	struct intel_adf_overlay_engine *overlay_engine;
++	struct intel_plane *plane;
++	struct adf_overlay_engine *adf_oe;
++	u8 plane_id;
++
+ 	long err = 0;
+ 
++	adf_oe = container_of(obj, struct adf_overlay_engine, base);
++	overlay_engine = container_of(adf_oe,
++		struct intel_adf_overlay_engine, base);
++
++	plane = overlay_engine->plane;
++	plane_id = plane->base.idx;
++
+ 	switch (cmd) {
+ 	case INTEL_ADF_COLOR_MANAGER_SET:
+-		pr_info("ADF: Calling apply to set Color Property on the Overlay Engine");
+-		/* Todo : Implement Logic for calling set IOCTL */
++		pr_info("ADF: Calling apply to set Color Property on the Overlay Engine\n");
++		if (!intel_color_manager_apply(plane->color_ctx,
++				(struct color_cmd *) arg, plane_id)) {
++			pr_err("%s Error: Set color correction failed\n",
++								__func__);
++			return -EFAULT;
++		}
++
++		pr_info("%s: Set color correction success\n", __func__);
++
++		err = 0;
+ 		break;
+ 
+ 	case INTEL_ADF_COLOR_MANAGER_GET:
+-		pr_info("ADF: Calling get Color Property on the Overlay Engine");
+-		/* Todo : Implement Logic for calling get IOCTL */
++		pr_info("ADF: Calling get Color Property on the Overlay Engine\n");
++		if (!intel_color_manager_get(plane->color_ctx,
++				(struct color_cmd *) arg, plane_id)) {
++			pr_err("%s Error: Get color correction failed\n",
++								__func__);
++			return -EFAULT;
++		}
++
++		pr_info("%s: Get color correction success\n", __func__);
++
++		err = 0;
+ 		break;
+ 
+ 	default:
+-- 
+1.7.9.5
+

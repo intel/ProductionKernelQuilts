@@ -1,0 +1,134 @@
+From 1de67ebcc8e5b08298c1523f0c55d2f79a29b0c2 Mon Sep 17 00:00:00 2001
+From: zhengq <qi.zheng@intel.com>
+Date: Tue, 5 May 2015 22:24:32 +0800
+Subject: [PATCH] Pinctrl: add new gpio acpi callback for Cherryview.
+
+There is a silicon bug in Cherryview. The SW w/a way is to
+make sure all the gpio registers operaions are serialized.
+Spin_lock is already added in the kernel driver for gpio
+registers read/write.
+In ASL code, instead of direct MMIO access of GPIO driver
+we should use Custom Op Region for all GPIO Community. To
+support this new Op Region, new gpio acpi callback is added
+in kernel driver.
+New ASL code is like below.
+   OperationRegion(GMM1, 0x92, 0, 0x8000)
+
+    0x91 - SW
+    0x92 - N
+    0x93 - E
+    0x94 - SE
+
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1610
+Change-Id: Ib2e9e53897dd07a9019dce3db9e60a35e6208bc8
+Signed-off-by: zhengq <qi.zheng@intel.com>
+---
+ drivers/pinctrl/pinctrl-cherryview.c | 71 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pinctrl/pinctrl-cherryview.c b/drivers/pinctrl/pinctrl-cherryview.c
+index 512728b2b31e..2edcf5a2b451 100644
+--- a/drivers/pinctrl/pinctrl-cherryview.c
++++ b/drivers/pinctrl/pinctrl-cherryview.c
+@@ -1357,6 +1357,68 @@ static const struct irq_domain_ops chv_gpio_irq_ops = {
+ 	.map = chv_gpio_irq_map,
+ };
+ 
++#ifdef CONFIG_ACPI
++#define GPIO_ACPI_MMIO_ACCESS_START		((acpi_adr_space_type) 0x91)
++
++struct chv_gpio_acpi_handler_data {
++	struct chv_gpio *cg;
++	int id;
++};
++
++static acpi_status
++chv_gpio_mmio_access_handler(u32 function, acpi_physical_address address,
++			    u32 bits, u64 *value, void *handler_context,
++			    void *region_context)
++{
++	struct chv_gpio_acpi_handler_data *data = region_context;
++	void __iomem *reg_addr;
++	struct device *dev = &data->cg->pdev->dev;
++
++	dev_dbg(dev, "%s: function %d, address 0x%x, value 0x%x\n",
++		__func__, function, (u32)address, (u32)(*value));
++
++	reg_addr = (void __iomem *) (data->cg->reg_base + (u32)address);
++
++	if (function == ACPI_WRITE)
++		chv_writel((u32)(*value), reg_addr);
++	else if (function == ACPI_READ)
++		*value = chv_readl(reg_addr);
++	else
++		return AE_BAD_PARAMETER;
++
++	return AE_OK;
++}
++
++
++static int chv_gpio_acpi_request_mmio_access(struct chv_gpio *cg, int id)
++{
++	struct acpi_device *adev = ACPI_COMPANION(&cg->pdev->dev);
++	struct chv_gpio_acpi_handler_data *data;
++	acpi_status status;
++
++	if (!adev)
++		return -ENODEV;
++
++	data = devm_kzalloc(&cg->pdev->dev,
++		sizeof(struct chv_gpio_acpi_handler_data), GFP_KERNEL);
++
++	if (!data)
++		return -ENOMEM;
++
++	data->cg = cg;
++	data->id = id;
++	status = acpi_install_address_space_handler(adev->handle,
++				GPIO_ACPI_MMIO_ACCESS_START + id,
++				&chv_gpio_mmio_access_handler,
++				NULL,
++				data);
++
++	if (ACPI_FAILURE(status))
++		return -EFAULT;
++	return 0;
++}
++#endif
++
+ static int
+ chv_gpio_pnp_probe(struct pnp_dev *pdev, const struct pnp_device_id *id)
+ {
+@@ -1367,7 +1429,8 @@ chv_gpio_pnp_probe(struct pnp_dev *pdev, const struct pnp_device_id *id)
+ 	struct device *dev = &pdev->dev;
+ 	struct gpio_bank_pnp *bank;
+ 	int ret = 0;
+-	int nbanks = sizeof(chv_banks_pnp) / sizeof(struct gpio_bank_pnp);
++	int nbanks = ARRAY_SIZE(chv_banks_pnp);
++	int bank_id = 0;
+ 
+ 	cg = devm_kzalloc(dev, sizeof(struct chv_gpio), GFP_KERNEL);
+ 	if (!cg) {
+@@ -1392,6 +1455,8 @@ chv_gpio_pnp_probe(struct pnp_dev *pdev, const struct pnp_device_id *id)
+ 		goto err;
+ 	}
+ 
++	bank_id = i;
++
+ 	mem_rc = pnp_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!mem_rc) {
+ 		dev_err(dev, "missing MEM resource\n");
+@@ -1454,6 +1519,10 @@ chv_gpio_pnp_probe(struct pnp_dev *pdev, const struct pnp_device_id *id)
+ 		irq_set_chained_handler(irq_rc->start, chv_gpio_irq_handler);
+ 	}
+ 
++#ifdef CONFIG_ACPI
++	chv_gpio_acpi_request_mmio_access(cg, bank_id);
++#endif
++
+ 	dev_info(dev, "Cherryview GPIO %s probed\n", pdev->name);
+ 
+ 	return 0;
+-- 
+1.9.1
+

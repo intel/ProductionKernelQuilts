@@ -1,0 +1,216 @@
+From 7685b4a15b5c165c07f2455b08082c6dadeb9a92 Mon Sep 17 00:00:00 2001
+Message-Id: <7685b4a15b5c165c07f2455b08082c6dadeb9a92.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 12 Nov 2014 16:28:16 +0000
+Subject: [PATCH 36/61] FOR_UPSTREAM [VPG]: drm/i915: Support for 'unflushed'
+ ring idle
+
+When the seqno wraps around zero, the entire GPU is forced to be idle for some
+reason (possibly only to work around issues with hardware semaphores but no-one
+seems too sure!). This causes a problem if the force idle occurs at an
+inopportune moment such as in the middle of submitting a batch buffer.
+
+Previously, the seqno was allocated at the time of the request structure. This
+is early enough that the idle is not a problem. However, the intention is to
+lazily allocate seqnos at the point of hardware submission. With a scheduler
+involved, the point of submission can be a long time after the request was
+initially created.
+
+This change adds a 'flush' parameter to the idle function call which specifies
+whether the outstanding_lazy_request and the scheduler queues should be flushed
+out. I.e. is the call intended to just idle the ring as it is right now (no
+flush) or is it intended to force all outstanding work out of the system (with
+flush).
+
+In the seqno wrap case, pending work is not an issue because it will not have a
+seqno assigned yet. Thus there is no need to flush it out at inopportune
+moments.
+
+Change-Id: I182e9a5853666c64ecc9e84d8a8b820a7f8e8836
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c         |    2 +-
+ drivers/gpu/drm/i915/i915_gem.c         |    4 +-
+ drivers/gpu/drm/i915/intel_lrc.c        |    2 +-
+ drivers/gpu/drm/i915/intel_pm.c         |    2 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   63 +++++++++++++++++++------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    2 +-
+ 6 files changed, 45 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 89d3eb6..c4e6b96 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -611,7 +611,7 @@ static int i915_dispatch_flip(struct drm_device * dev)
+ static int i915_quiescent(struct drm_device *dev)
+ {
+ 	i915_kernel_lost_context(dev);
+-	return intel_ring_idle(LP_RING(dev->dev_private));
++	return intel_ring_idle(LP_RING(dev->dev_private), true);
+ }
+ 
+ static int i915_flush_ioctl(struct drm_device *dev, void *data,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index bae1627..505ec06 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2434,7 +2434,7 @@ i915_gem_init_seqno(struct drm_device *dev, u32 seqno)
+ 
+ 	/* Carefully retire all requests without writing to the rings */
+ 	for_each_ring(ring, dev_priv, i) {
+-		ret = intel_ring_idle(ring);
++		ret = intel_ring_idle(ring, false);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -3342,7 +3342,7 @@ int i915_gpu_idle(struct drm_device *dev)
+ 				return ret;
+ 		}
+ 
+-		ret = intel_ring_idle(ring);
++		ret = intel_ring_idle(ring, true);
+ 		if (ret)
+ 			return ret;
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 2c39753..e8ea96b 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1584,7 +1584,7 @@ void intel_logical_ring_stop(struct intel_engine_cs *ring)
+ 	if (!intel_ring_initialized(ring))
+ 		return;
+ 
+-	ret = intel_ring_idle(ring);
++	ret = intel_ring_idle(ring, true);
+ 	if (ret && !i915_reset_in_progress(&to_i915(ring->dev)->gpu_error))
+ 		DRM_ERROR("failed to quiesce %s whilst cleaning up: %d\n",
+ 			  ring->name, ret);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 03ba75a..c2c99f9 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4952,7 +4952,7 @@ static void ironlake_enable_rc6(struct drm_device *dev)
+ 	 * does an implicit flush, combined with MI_FLUSH above, it should be
+ 	 * safe to assume that renderctx is valid
+ 	 */
+-	ret = intel_ring_idle(ring);
++	ret = intel_ring_idle(ring, true);
+ 	dev_priv->mm.interruptible = was_interruptible;
+ 	if (ret) {
+ 		DRM_ERROR("failed to enable ironlake power savings\n");
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index b13ff1c..53ff5c8 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2454,35 +2454,48 @@ static int intel_wrap_ring_buffer(struct intel_engine_cs *ring)
+ 	return 0;
+ }
+ 
+-int intel_ring_idle(struct intel_engine_cs *ring)
++int intel_ring_idle(struct intel_engine_cs *ring, bool flush)
+ {
+ 	struct drm_i915_gem_request *req;
+-	int ret;
++	int ret = 0;
+ 
+-	/* We need to add any requests required to flush the objects and ring */
+-	if (ring->outstanding_lazy_request) {
+-		ret = i915_add_request(ring);
+-		if (ret)
+-			return ret;
+-	}
++	if (flush) {
++		/* We need to add any requests required to flush the objects and ring */
++		if (ring->outstanding_lazy_request) {
++			ret = i915_add_request(ring);
++			if (ret)
++				return ret;
++		}
+ 
+-	/* If there is anything outstanding within the scheduler then give up
+-	 * now as the submission of such work requires the mutex lock. While
+-	 * the lock is definitely held at this point (i915_wait_seqno will BUG
+-	 * if called without), the driver is not necessarily at a safe point
+-	 * to start submitting ring work. */
+-	if (!i915_scheduler_is_ring_idle(ring))
+-		return -EAGAIN;
++		/* If there is anything outstanding within the scheduler then
++		 * give up now as the submission of such work requires the
++		 * mutex lock. While the lock is definitely held at this point
++		 * (i915_wait_request will BUG if called without), the driver
++		 * is not necessarily at a safe point to start submitting ring
++		 * work. */
++		if (!i915_scheduler_is_ring_idle(ring))
++			return -EAGAIN;
++	}
+ 
+-	/* Wait upon the last request to be completed */
+-	if (list_empty(&ring->request_list))
+-		return 0;
++	/* Wait upon the last request to be completed.
++	 *
++	 * NB: With a scheduler, requests might complete out of order (or
++	 * even be pre-empted and not complete at all). Thus the 'last'
++	 * request could change between it being the wait starting and the
++	 * wait completing. Hence a loop while not empty is required. */
++	while(!list_empty(&ring->request_list)) {
++		req = list_entry(ring->request_list.prev,
++				 struct drm_i915_gem_request,
++				 list);
++
++		ret = i915_wait_request(req);
++		if (ret)
++			return ret;
+ 
+-	req = list_entry(ring->request_list.prev,
+-			   struct drm_i915_gem_request,
+-			   list);
++		i915_gem_retire_requests_ring(ring);
++	}
+ 
+-	return i915_wait_request(req);
++	return 0;
+ }
+ 
+ int
+@@ -2587,7 +2600,9 @@ void intel_ring_init_seqno(struct intel_engine_cs *ring, u32 seqno)
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+-	BUG_ON(ring->outstanding_lazy_request);
++	/* It is safe to have work pending in the OLR but only if it has not
++	 * yet had a seqno assigned. */
++	BUG_ON(ring->outstanding_lazy_request && ring->outstanding_lazy_request->seqno);
+ 
+ 	if (INTEL_INFO(dev)->gen == 6 || INTEL_INFO(dev)->gen == 7) {
+ 		I915_WRITE(RING_SYNC_0(ring->mmio_base), 0);
+@@ -3550,7 +3565,7 @@ intel_stop_ring_buffer(struct intel_engine_cs *ring)
+ 	if (!intel_ring_initialized(ring))
+ 		return;
+ 
+-	ret = intel_ring_idle(ring);
++	ret = intel_ring_idle(ring, true);
+ 	if (ret && !i915_reset_in_progress(&to_i915(ring->dev)->gpu_error))
+ 		DRM_ERROR("failed to quiesce %s whilst cleaning up: %d\n",
+ 			  ring->name, ret);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 9a2bb15..25a0961 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -637,7 +637,7 @@ static inline int intel_ring_supports_watchdog(struct intel_engine_cs *ring)
+ int intel_ring_start_watchdog(struct intel_engine_cs *ring);
+ int intel_ring_stop_watchdog(struct intel_engine_cs *ring);
+ 
+-int __must_check intel_ring_idle(struct intel_engine_cs *ring);
++int __must_check intel_ring_idle(struct intel_engine_cs *ring, bool flush);
+ void intel_ring_init_seqno(struct intel_engine_cs *ring, u32 seqno);
+ int intel_ring_flush_all_caches(struct intel_engine_cs *ring);
+ int intel_ring_invalidate_all_caches(struct intel_engine_cs *ring);
+-- 
+1.7.9.5
+

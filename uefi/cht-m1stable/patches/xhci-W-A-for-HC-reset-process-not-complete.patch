@@ -1,0 +1,117 @@
+From 1bef209b2a72165f69999116d8f2c1a4f8485904 Mon Sep 17 00:00:00 2001
+From: Konrad Leszczynski <konrad.leszczynski@intel.com>
+Date: Mon, 4 Apr 2016 15:10:19 +0100
+Subject: [PATCH 2/2] xhci: W/A for HC reset process not complete.
+
+During warm reboot cycles, in some rare cases, xHCI reset
+process does not complete because HCRST bit was stuck.
+
+Bit EN_PIPE_4_1_SYNC_PHY_STATUS in DUAL_ROLE_CFG0 register
+will be set before performing the xHCI controller's
+reset (HC Reset) to W/A the problem with HC Reset completion.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-23957
+Change-Id: I5449265afafc4940f47f85cec025e2ea99320c7a
+Signed-off-by: Konrad Leszczynski <konrad.leszczynski@intel.com>
+Signed-off-by: Miroslaw Swiader <miroslaw.swiader@intel.com>
+Reviewed-on: https://android.intel.com:443/490556
+---
+ drivers/usb/host/xhci-intel-cap.c | 24 ++++++++++++++++++++++++
+ drivers/usb/host/xhci-intel-cap.h |  3 +++
+ drivers/usb/host/xhci-pci.c       |  1 +
+ drivers/usb/host/xhci.c           |  4 ++++
+ drivers/usb/host/xhci.h           |  1 +
+ 5 files changed, 33 insertions(+)
+
+diff --git a/drivers/usb/host/xhci-intel-cap.c b/drivers/usb/host/xhci-intel-cap.c
+index 608bd7f..fbc7d0a 100644
+--- a/drivers/usb/host/xhci-intel-cap.c
++++ b/drivers/usb/host/xhci-intel-cap.c
+@@ -294,3 +294,27 @@ void xhci_intel_ssic_port_unused(struct xhci_hcd *xhci, bool unused)
+ 
+ }
+ EXPORT_SYMBOL_GPL(xhci_intel_ssic_port_unused);
++
++/*
++ * This function enables/disables the PIPE 4.1 synchronous phystatus.
++ */
++void xhci_intel_pipe_sync_phystatus_quirk(struct xhci_hcd *xhci, bool enable)
++{
++	u32	data;
++
++	if (!xhci || !xhci->phy_mux_regs) {
++		xhci_err(xhci, "no xhci or phy_mux_regs\n");
++		return;
++	}
++
++	xhci_dbg(xhci, "pipe 4.1 phystatus: %s\n",
++		enable ? "enable" : "disable");
++
++	data = readl(xhci->phy_mux_regs + DUAL_ROLE_CFG0);
++	if (enable)
++		data |= EN_PIPE_4_1_SYNC_PHY_STATUS;
++	else
++		data &= ~EN_PIPE_4_1_SYNC_PHY_STATUS;
++	writel(data, xhci->phy_mux_regs + DUAL_ROLE_CFG0);
++}
++EXPORT_SYMBOL_GPL(xhci_intel_pipe_sync_phystatus_quirk);
+diff --git a/drivers/usb/host/xhci-intel-cap.h b/drivers/usb/host/xhci-intel-cap.h
+index d7becb7..b90caee 100644
+--- a/drivers/usb/host/xhci-intel-cap.h
++++ b/drivers/usb/host/xhci-intel-cap.h
+@@ -27,6 +27,7 @@
+ #define SW_VBUS_VALID		(1 << 24)
+ #define SW_IDPIN_EN		(1 << 21)
+ #define SW_IDPIN		(1 << 20)
++#define EN_PIPE_4_1_SYNC_PHY_STATUS	(1 << 23)
+ 
+ #define DUAL_ROLE_CFG1		0x6c
+ #define SW_MODE			(1 << 29)
+@@ -73,3 +74,5 @@ extern void xhci_intel_ssic_port_unused(struct xhci_hcd *xhci, bool unused);
+ extern void xhci_change_ssic_regs(struct xhci_hcd *xhci, bool enable);
+ extern bool xhci_intel_ssic_port_check(struct xhci_hcd *xhci, int port);
+ extern int xhci_intel_need_disable_stall(struct xhci_hcd *xhci);
++extern void xhci_intel_pipe_sync_phystatus_quirk(struct xhci_hcd *xhci,
++						 bool enable);
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index dcd2a8c..c40b10c 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -252,6 +252,7 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
+ 	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
+ 			pdev->device == PCI_DEVICE_ID_INTEL_CHT_XHCI) {
+ 		xhci->quirks |= XHCI_SPURIOUS_PME;
++		xhci->quirks |= XHCI_PIPE_4_1_SYNC_PHYSTAT_TOGGLE;
+ 
+ 		/* Initialize the Disable Stall quirk if necessary */
+ 		if (xhci_intel_need_disable_stall(xhci))
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index abd7dbc..89a6b9f 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -166,6 +166,10 @@ int xhci_reset(struct xhci_hcd *xhci)
+ 	u32 state;
+ 	int ret, i;
+ 
++	/* Disable PIPE 4.1 synchronous phystatus */
++	if (xhci->quirks & XHCI_PIPE_4_1_SYNC_PHYSTAT_TOGGLE)
++		xhci_intel_pipe_sync_phystatus_quirk(xhci, true);
++
+ 	state = readl(&xhci->op_regs->status);
+ 	if ((state & STS_HALT) == 0) {
+ 		xhci_warn(xhci, "Host controller not halted, aborting reset.\n");
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 2d1c1fc..2c5bcb8 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1565,6 +1565,7 @@ struct xhci_hcd {
+ #define XHCI_SPURIOUS_WAKEUP	(1 << 18)
+ #define XHCI_SPURIOUS_PME	(1 << 19)
+ #define XHCI_SSIC_DISABLE_STALL	(1 << 20)
++#define XHCI_PIPE_4_1_SYNC_PHYSTAT_TOGGLE	(1 << 21)
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;
+ 	/* There are two roothubs to keep track of bus suspend info for */
+-- 
+1.9.1
+

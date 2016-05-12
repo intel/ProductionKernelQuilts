@@ -1,0 +1,2177 @@
+From c8e3c8cf3c160d25abefd666c03038872b4523f0 Mon Sep 17 00:00:00 2001
+From: Fei Yang <fei.yang@intel.com>
+Date: Fri, 13 Jun 2014 14:31:28 -0700
+Subject: [PATCH 02/10] EXTCON: add drivers to suport Dc/Crc/Smsc3750
+
+These are the drivers for USB cable and charger detection.
+Depending on the PMIC and USB phy design, different driver is used.
+This patch includes drivers for DollarCove, CrystalCove and SMSC3750
+USB switch.
+
+Change-Id: Ic2285655ba3a4787e35bbe26100743a5bb231ce3
+Signed-off-by: Fei Yang <fei.yang@intel.com>
+---
+ drivers/extcon/Kconfig                   |    8 
+ drivers/extcon/Makefile                  |    3 
+ drivers/extcon/extcon-class.c            |   80 +++
+ drivers/extcon/extcon-crc-pwrsrc.c       |  433 ++++++++++++++++++
+ drivers/extcon/extcon-dc-pwrsrc.c        |  565 ++++++++++++++++++++++++
+ drivers/extcon/extcon-smsc375x.c         |  714 +++++++++++++++++++++++++++++++
+ include/linux/extcon.h                   |   45 +
+ include/linux/extcon/extcon-crc-pwrsrc.h |    8 
+ include/linux/extcon/extcon-dc-pwrsrc.h  |   18 
+ include/linux/extcon/extcon-smsc375x.h   |   30 +
+ include/linux/usb/phy.h                  |   37 +
+ 11 files changed, 1941 insertions(+)
+ create mode 100644 drivers/extcon/extcon-crc-pwrsrc.c
+ create mode 100644 drivers/extcon/extcon-dc-pwrsrc.c
+ create mode 100644 drivers/extcon/extcon-smsc375x.c
+ create mode 100644 include/linux/extcon/extcon-crc-pwrsrc.h
+ create mode 100644 include/linux/extcon/extcon-dc-pwrsrc.h
+ create mode 100644 include/linux/extcon/extcon-smsc375x.h
+
+Index: linux/drivers/extcon/Kconfig
+===================================================================
+--- linux.orig/drivers/extcon/Kconfig
++++ linux/drivers/extcon/Kconfig
+@@ -74,4 +74,12 @@ config EXTCON_PALMAS
+ 	  Say Y here to enable support for USB peripheral and USB host
+ 	  detection by palmas usb.
+ 
++config EXTCON_SMSC375X
++	tristate "SMSC375X EXTCON support"
++	depends on I2C
++	help
++	  Say Y here to enable support for external charger detection
++	  with SMSC375X. SMSC375X has BC1.2 charger detection support
++	  with USB mux switch.
++
+ endif # MULTISTATE_SWITCH
+Index: linux/drivers/extcon/Makefile
+===================================================================
+--- linux.orig/drivers/extcon/Makefile
++++ linux/drivers/extcon/Makefile
+@@ -12,3 +12,6 @@ obj-$(CONFIG_EXTCON_MAX77693)	+= extcon-
+ obj-$(CONFIG_EXTCON_MAX8997)	+= extcon-max8997.o
+ obj-$(CONFIG_EXTCON_ARIZONA)	+= extcon-arizona.o
+ obj-$(CONFIG_EXTCON_PALMAS)	+= extcon-palmas.o
++obj-$(CONFIG_EXTCON_SMSC375X)	+= extcon-smsc375x.o
++obj-$(CONFIG_INTEL_SOC_PMIC)	+= extcon-crc-pwrsrc.o
++obj-$(CONFIG_INTEL_SOC_PMIC)	+= extcon-dc-pwrsrc.o
+Index: linux/drivers/extcon/extcon-class.c
+===================================================================
+--- linux.orig/drivers/extcon/extcon-class.c
++++ linux/drivers/extcon/extcon-class.c
+@@ -48,6 +48,11 @@ const char extcon_cable_name[][CABLE_NAM
+ 	[EXTCON_FAST_CHARGER]	= "Fast-charger",
+ 	[EXTCON_SLOW_CHARGER]	= "Slow-charger",
+ 	[EXTCON_CHARGE_DOWNSTREAM]	= "Charge-downstream",
++	[EXTCON_SDP]		= "CHARGER_USB_SDP",
++	[EXTCON_DCP]		= "CHARGER_USB_DCP",
++	[EXTCON_CDP]		= "CHARGER_USB_CDP",
++	[EXTCON_ACA]		= "CHARGER_USB_ACA",
++	[EXTCON_AC]		= "CHARGER_AC",
+ 	[EXTCON_HDMI]		= "HDMI",
+ 	[EXTCON_MHL]		= "MHL",
+ 	[EXTCON_DVI]		= "DVI",
+@@ -72,6 +77,8 @@ static struct class_compat *switch_class
+ static LIST_HEAD(extcon_dev_list);
+ static DEFINE_MUTEX(extcon_dev_list_lock);
+ 
++static BLOCKING_NOTIFIER_HEAD(extcon_dev_notifier_list);
++
+ /**
+  * check_mutually_exclusive - Check if new_state violates mutually_exclusive
+  *			      condition.
+@@ -308,6 +315,30 @@ int extcon_find_cable_index(struct extco
+ EXPORT_SYMBOL_GPL(extcon_find_cable_index);
+ 
+ /**
++ * extcon_find_cable_type() - Get the cable type based on the cable index.
++ * @edev:	the extcon device that has the cable.
++ * @idx:	cable idx to be searched.
++ *
++ * This function is useful if the notifee want to know the cable type
++ * equivalent value defined in extcon_cable_name enum.
++ */
++int extcon_find_cable_type(struct extcon_dev *edev, int index)
++{
++	int i;
++
++	if (edev->supported_cable) {
++		for (i = 0; extcon_cable_name[i]; i++) {
++			if (!strncmp(edev->supported_cable[index],
++				extcon_cable_name[i], CABLE_NAME_MAX))
++				return i;
++		}
++	}
++
++	return -EINVAL;
++}
++EXPORT_SYMBOL_GPL(extcon_find_cable_type);
++
++/**
+  * extcon_get_cable_state_() - Get the status of a specific cable.
+  * @edev:	the extcon device that has the cable.
+  * @index:	cable index that can be retrieved by extcon_find_cable_index().
+@@ -393,6 +424,27 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(extcon_get_extcon_dev);
+ 
++/**
++ * extcon_num_of_extcon_devs() - number of extcon devices
++ * returns the total number of extcon registered devices.
++ */
++int extcon_num_of_cable_devs(const char *cable)
++{
++	struct extcon_dev *sd = NULL;
++	int i, j = 0;
++
++	mutex_lock(&extcon_dev_list_lock);
++	list_for_each_entry(sd, &extcon_dev_list, entry) {
++		for (i = 0; sd && i < sd->max_supported; i++) {
++			if (!strcmp(sd->supported_cable[i], cable))
++				j++;
++		}
++	}
++	mutex_unlock(&extcon_dev_list_lock);
++	return j;
++}
++EXPORT_SYMBOL_GPL(extcon_num_of_cable_devs);
++
+ static int _call_per_cable(struct notifier_block *nb, unsigned long val,
+ 			   void *ptr)
+ {
+@@ -564,6 +616,30 @@ static void dummy_sysfs_dev_release(stru
+ {
+ }
+ 
++void extcon_dev_register_notify(struct notifier_block *nb)
++{
++	blocking_notifier_chain_register(&extcon_dev_notifier_list, nb);
++}
++EXPORT_SYMBOL_GPL(extcon_dev_register_notify);
++
++void extcon_dev_unregister_notify(struct notifier_block *nb)
++{
++	blocking_notifier_chain_unregister(&extcon_dev_notifier_list, nb);
++}
++EXPORT_SYMBOL_GPL(extcon_dev_unregister_notify);
++
++void extcon_dev_notify_add_device(struct extcon_dev *edev)
++{
++	blocking_notifier_call_chain(&extcon_dev_notifier_list,
++				     EXTCON_DEVICE_ADD, edev);
++}
++
++void extcon_dev_notify_remove_device(struct extcon_dev *edev)
++{
++	blocking_notifier_call_chain(&extcon_dev_notifier_list,
++				     EXTCON_DEVICE_REMOVE, edev);
++}
++
+ /**
+  * extcon_dev_register() - Register a new extcon device
+  * @edev	: the new extcon device (should be allocated before calling)
+@@ -748,6 +824,8 @@ int extcon_dev_register(struct extcon_de
+ 	list_add(&edev->entry, &extcon_dev_list);
+ 	mutex_unlock(&extcon_dev_list_lock);
+ 
++	extcon_dev_notify_add_device(edev);
++
+ 	return 0;
+ 
+ err_dev:
+@@ -782,6 +860,8 @@ void extcon_dev_unregister(struct extcon
+ {
+ 	int index;
+ 
++	extcon_dev_notify_remove_device(edev);
++
+ 	mutex_lock(&extcon_dev_list_lock);
+ 	list_del(&edev->entry);
+ 	mutex_unlock(&extcon_dev_list_lock);
+Index: linux/drivers/extcon/extcon-crc-pwrsrc.c
+===================================================================
+--- /dev/null
++++ linux/drivers/extcon/extcon-crc-pwrsrc.c
+@@ -0,0 +1,433 @@
++/*
++ * intel_crystalcove_pwrsrc.c - Intel Crystal Cove Power Source Detect Driver
++ *
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the GNU
++ * General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ * Author: Kannappan R <r.kannappan@intel.com>
++ *	Ramakrishna Pallala <ramakrishna.pallala@intel.com>
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/io.h>
++#include <linux/slab.h>
++#include <linux/pm_runtime.h>
++#include <linux/interrupt.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/usb/phy.h>
++#include <linux/notifier.h>
++#include <linux/extcon.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/extcon/extcon-crc-pwrsrc.h>
++
++#define CRYSTALCOVE_PWRSRCIRQ_REG	0x03
++#define CRYSTALCOVE_MPWRSRCIRQS0_REG	0x0F
++#define CRYSTALCOVE_MPWRSRCIRQSX_REG	0x10
++#define CRYSTALCOVE_SPWRSRC_REG		0x1E
++#define CRYSTALCOVE_RESETSRC0_REG	0x20
++#define CRYSTALCOVE_RESETSRC1_REG	0x21
++#define CRYSTALCOVE_WAKESRC_REG		0x22
++
++#define PWRSRC_VBUS_DET			(1 << 0)
++#define PWRSRC_DCIN_DET			(1 << 1)
++#define PWRSRC_BAT_DET			(1 << 2)
++
++#define CRYSTALCOVE_VBUSCNTL_REG	0x6C
++#define VBUSCNTL_EN			(1 << 0)
++#define VBUSCNTL_SEL			(1 << 1)
++
++#define PWRSRC_EXTCON_CABLE_AC		"CHARGER_AC"
++#define PWRSRC_EXTCON_CABLE_USB		"USB"
++#define PWRSRC_DRV_NAME			"crystal_cove_pwrsrc"
++
++/*
++ * Crystal Cove PMIC can not do USB type detection.
++ * So if we find extcon USB_SDP cable then unregister
++ * the pwrsrc extcon device as BYT platform is not
++ * supporting AC and USB simultaneously.
++ */
++#define EXTCON_CABLE_SDP		"CHARGER_USB_SDP"
++
++static const char *byt_extcon_cable[] = {
++	PWRSRC_EXTCON_CABLE_AC,
++	PWRSRC_EXTCON_CABLE_USB,
++	NULL,
++};
++
++struct pwrsrc_info {
++	struct platform_device *pdev;
++	int irq;
++	struct usb_phy *otg;
++	struct extcon_dev *edev;
++	struct notifier_block	nb;
++};
++
++static char *pwrsrc_resetsrc0_info[] = {
++	/* bit 0 */ "Last shutdown caused by SOC reporting a thermal event",
++	/* bit 1 */ "Last shutdown caused by critical PMIC temperature",
++	/* bit 2 */ "Last shutdown caused by critical system temperature",
++	/* bit 3 */ "Last shutdown caused by critical battery temperature",
++	/* bit 4 */ "Last shutdown caused by VSYS under voltage",
++	/* bit 5 */ "Last shutdown caused by VSYS over voltage",
++	/* bit 6 */ "Last shutdown caused by battery removal",
++	NULL,
++};
++
++static char *pwrsrc_resetsrc1_info[] = {
++	/* bit 0 */ "Last shutdown caused by VCRIT threshold",
++	/* bit 1 */ "Last shutdown caused by BATID reporting battery removal",
++	/* bit 2 */ "Last shutdown caused by user pressing the power button",
++	NULL,
++};
++
++static char *pwrsrc_wakesrc_info[] = {
++	/* bit 0 */ "Last wake caused by user pressing the power button",
++	/* bit 1 */ "Last wake caused by a battery insertion",
++	/* bit 2 */ "Last wake caused by a USB charger insertion",
++	/* bit 3 */ "Last wake caused by an adapter insertion",
++	NULL,
++};
++
++/* Decode and log the given "reset source indicator" register, then clear it */
++static void crystalcove_pwrsrc_log_rsi(struct platform_device *pdev,
++					char **pwrsrc_rsi_info,
++					int reg_s)
++{
++	char *rsi_info = pwrsrc_rsi_info[0];
++	int val, i = 0;
++	int bit_select, clear_mask = 0x0;
++
++	val = intel_soc_pmic_readb(reg_s);
++	while (rsi_info) {
++		bit_select = (1 << i);
++		if (val & bit_select) {
++			dev_info(&pdev->dev, "%s\n", rsi_info);
++			clear_mask |= bit_select;
++		}
++		rsi_info = pwrsrc_rsi_info[++i];
++	}
++
++	/* Clear the register value for next reboot (write 1 to clear bit) */
++	intel_soc_pmic_writeb(reg_s, clear_mask);
++}
++
++/*
++ * D1 ensures SW control: D1[0]  = HW mode, D1[1] = SW mode
++ * D0 control the VBUS: D0[0] = disable VBUS, D0[1] = enable VBUS
++ */
++int crystal_cove_enable_vbus(void)
++{
++	int ret;
++
++	ret = intel_soc_pmic_writeb(CRYSTALCOVE_VBUSCNTL_REG, 0x03);
++	return ret;
++}
++EXPORT_SYMBOL(crystal_cove_enable_vbus);
++
++int crystal_cove_disable_vbus(void)
++{
++	int ret;
++
++	ret = intel_soc_pmic_writeb(CRYSTALCOVE_VBUSCNTL_REG, 0x02);
++	return ret;
++}
++EXPORT_SYMBOL(crystal_cove_disable_vbus);
++
++int crystal_cove_vbus_on_status(void)
++{
++	int ret;
++
++	ret = intel_soc_pmic_readb(CRYSTALCOVE_SPWRSRC_REG);
++	if (ret < 0)
++		return ret;
++
++	if (ret & PWRSRC_VBUS_DET)
++		return  1;
++
++	return 0;
++}
++EXPORT_SYMBOL(crystal_cove_vbus_on_status);
++
++static void handle_pwrsrc_event(struct pwrsrc_info *info, int pwrsrcirq)
++{
++	int spwrsrc, mask;
++
++	spwrsrc = intel_soc_pmic_readb(CRYSTALCOVE_SPWRSRC_REG);
++	if (spwrsrc < 0)
++		goto pmic_read_fail;
++
++	if (pwrsrcirq & PWRSRC_VBUS_DET) {
++		if (spwrsrc & PWRSRC_VBUS_DET) {
++			dev_dbg(&info->pdev->dev, "VBUS attach event\n");
++			mask = 1;
++			if (info->edev)
++				extcon_set_cable_state(info->edev,
++						PWRSRC_EXTCON_CABLE_USB, true);
++		} else {
++			dev_dbg(&info->pdev->dev, "VBUS detach event\n");
++			mask = 0;
++			if (info->edev)
++				extcon_set_cable_state(info->edev,
++						PWRSRC_EXTCON_CABLE_USB, false);
++		}
++		/* notify OTG driver */
++		if (info->otg)
++			atomic_notifier_call_chain(&info->otg->notifier,
++				USB_EVENT_VBUS, &mask);
++	} else if (pwrsrcirq & PWRSRC_DCIN_DET) {
++		if (spwrsrc & PWRSRC_DCIN_DET) {
++			dev_dbg(&info->pdev->dev, "ADP attach event\n");
++			if (info->edev)
++				extcon_set_cable_state(info->edev,
++						PWRSRC_EXTCON_CABLE_AC, true);
++		} else {
++			dev_dbg(&info->pdev->dev, "ADP detach event\n");
++			if (info->edev)
++				extcon_set_cable_state(info->edev,
++						PWRSRC_EXTCON_CABLE_AC, false);
++		}
++	} else if (pwrsrcirq & PWRSRC_BAT_DET) {
++		if (spwrsrc & PWRSRC_BAT_DET)
++			dev_dbg(&info->pdev->dev, "Battery attach event\n");
++		else
++			dev_dbg(&info->pdev->dev, "Battery detach event\n");
++	} else {
++		dev_dbg(&info->pdev->dev, "event none or spurious\n");
++	}
++
++	return;
++
++pmic_read_fail:
++	dev_err(&info->pdev->dev, "SPWRSRC read failed:%d\n", spwrsrc);
++	return;
++}
++
++static irqreturn_t crystalcove_pwrsrc_isr(int irq, void *data)
++{
++	struct pwrsrc_info *info = data;
++	int pwrsrcirq;
++
++	pwrsrcirq = intel_soc_pmic_readb(CRYSTALCOVE_PWRSRCIRQ_REG);
++	if (pwrsrcirq < 0) {
++		dev_err(&info->pdev->dev, "PWRSRCIRQ read failed\n");
++		goto pmic_irq_fail;
++	}
++
++	dev_dbg(&info->pdev->dev, "pwrsrcirq=%x\n", pwrsrcirq);
++	handle_pwrsrc_event(info, pwrsrcirq);
++
++pmic_irq_fail:
++	intel_soc_pmic_writeb(CRYSTALCOVE_PWRSRCIRQ_REG, pwrsrcirq);
++	return IRQ_HANDLED;
++}
++
++static int pwrsrc_extcon_dev_reg_callback(struct notifier_block *nb,
++					unsigned long event, void *data)
++{
++	struct pwrsrc_info *info = container_of(nb, struct pwrsrc_info, nb);
++	int mask = 0;
++
++	/* check if there is other extcon cables */
++	if (extcon_num_of_cable_devs(EXTCON_CABLE_SDP)) {
++		dev_info(&info->pdev->dev, "unregistering otg device\n");
++		/* Send VBUS disconnect as another cable detection
++		 * driver registered to extcon framework and notifies
++		 * OTG on cable connect */
++		if (info->otg)
++			atomic_notifier_call_chain(&info->otg->notifier,
++				USB_EVENT_VBUS, &mask);
++		/* Set VBUS supply mode to SW control mode */
++		intel_soc_pmic_writeb(CRYSTALCOVE_VBUSCNTL_REG, 0x02);
++		if (info->nb.notifier_call) {
++			extcon_dev_unregister_notify(&info->nb);
++			info->nb.notifier_call = NULL;
++		}
++		if (info->otg) {
++			usb_put_phy(info->otg);
++			info->otg = NULL;
++		}
++	}
++
++	return NOTIFY_OK;
++}
++
++static int pwrsrc_extcon_registration(struct pwrsrc_info *info)
++{
++	int ret = 0;
++
++	/* register with extcon */
++	info->edev = kzalloc(sizeof(struct extcon_dev), GFP_KERNEL);
++	if (!info->edev) {
++		dev_err(&info->pdev->dev, "mem alloc failed\n");
++		ret = -ENOMEM;
++		goto pwrsrc_extcon_fail;
++	}
++	info->edev->name = "BYT-Charger";
++	info->edev->supported_cable = byt_extcon_cable;
++	ret = extcon_dev_register(info->edev);
++	if (ret) {
++		dev_err(&info->pdev->dev, "extcon registration failed!!\n");
++		kfree(info->edev);
++		goto pwrsrc_extcon_fail;
++	}
++
++	if (extcon_num_of_cable_devs(EXTCON_CABLE_SDP)) {
++		dev_info(&info->pdev->dev,
++			"extcon device is already registered\n");
++		/* Set VBUS supply mode to SW control mode */
++		intel_soc_pmic_writeb(CRYSTALCOVE_VBUSCNTL_REG, 0x02);
++	} else {
++		/* Workaround: Set VBUS supply mode to HW control mode */
++		intel_soc_pmic_writeb(CRYSTALCOVE_VBUSCNTL_REG, 0x00);
++
++		/* OTG notification */
++		info->otg = usb_get_phy(USB_PHY_TYPE_USB2);
++		if (IS_ERR_OR_NULL(info->otg)) {
++			info->otg = NULL;
++			dev_warn(&info->pdev->dev, "Failed to get otg transceiver!!\n");
++			extcon_dev_unregister(info->edev);
++			kfree(info->edev);
++			ret = -ENODEV;
++			goto pwrsrc_extcon_fail;
++		}
++		info->nb.notifier_call = &pwrsrc_extcon_dev_reg_callback;
++		extcon_dev_register_notify(&info->nb);
++	}
++
++pwrsrc_extcon_fail:
++	return ret;
++}
++
++static int crystalcove_pwrsrc_probe(struct platform_device *pdev)
++{
++	struct pwrsrc_info *info;
++	int ret, pwrsrcirq = 0x0;
++
++	info = kzalloc(sizeof(*info), GFP_KERNEL);
++	if (!info) {
++		dev_err(&pdev->dev, "mem alloc failed\n");
++		return -ENOMEM;
++	}
++
++	info->pdev = pdev;
++	info->irq = platform_get_irq(pdev, 0);
++	platform_set_drvdata(pdev, info);
++
++	/* Log reason for last reset and wake events */
++	crystalcove_pwrsrc_log_rsi(pdev, pwrsrc_resetsrc0_info,
++				CRYSTALCOVE_RESETSRC0_REG);
++	crystalcove_pwrsrc_log_rsi(pdev, pwrsrc_resetsrc1_info,
++				CRYSTALCOVE_RESETSRC1_REG);
++	crystalcove_pwrsrc_log_rsi(pdev, pwrsrc_wakesrc_info,
++				CRYSTALCOVE_WAKESRC_REG);
++
++	ret = pwrsrc_extcon_registration(info);
++	if (ret)
++		goto extcon_reg_failed;
++
++	/* check if device is already connected */
++	if (info->otg)
++		pwrsrcirq |= PWRSRC_VBUS_DET;
++	if (info->edev)
++		pwrsrcirq |= PWRSRC_DCIN_DET;
++	if (pwrsrcirq)
++		handle_pwrsrc_event(info, pwrsrcirq);
++
++	ret = request_threaded_irq(info->irq, NULL, crystalcove_pwrsrc_isr,
++				IRQF_ONESHOT | IRQF_NO_SUSPEND,
++				PWRSRC_DRV_NAME, info);
++	if (ret) {
++		dev_err(&pdev->dev, "unable to register irq %d\n", info->irq);
++		goto intr_teg_failed;
++	}
++
++	/* unmask the PWRSRC interrupts */
++	intel_soc_pmic_writeb(CRYSTALCOVE_MPWRSRCIRQS0_REG, 0x00);
++	intel_soc_pmic_writeb(CRYSTALCOVE_MPWRSRCIRQSX_REG, 0x00);
++
++	return 0;
++
++intr_teg_failed:
++	if (info->otg)
++		usb_put_phy(info->otg);
++	if (info->edev) {
++		extcon_dev_unregister(info->edev);
++		kfree(info->edev);
++	}
++extcon_reg_failed:
++	kfree(info);
++	return ret;
++}
++
++static int crystalcove_pwrsrc_remove(struct platform_device *pdev)
++{
++	struct pwrsrc_info *info = platform_get_drvdata(pdev);
++
++	free_irq(info->irq, info);
++	if (info->otg)
++		usb_put_phy(info->otg);
++	if (info->edev) {
++		extcon_dev_unregister(info->edev);
++		kfree(info->edev);
++	}
++	kfree(info);
++	return 0;
++}
++
++#ifdef CONFIG_PM
++static int crystalcove_pwrsrc_suspend(struct device *dev)
++{
++	return 0;
++}
++
++static int crystalcove_pwrsrc_resume(struct device *dev)
++{
++	return 0;
++}
++#else
++#define crystalcove_pwrsrc_suspend		NULL
++#define crystalcove_pwrsrc_resume		NULL
++#endif
++
++static const struct dev_pm_ops crystalcove_pwrsrc_driver_pm_ops = {
++	.suspend	= crystalcove_pwrsrc_suspend,
++	.resume		= crystalcove_pwrsrc_resume,
++};
++
++static struct platform_driver crystalcove_pwrsrc_driver = {
++	.probe = crystalcove_pwrsrc_probe,
++	.remove = crystalcove_pwrsrc_remove,
++	.driver = {
++		.name = PWRSRC_DRV_NAME,
++		.pm = &crystalcove_pwrsrc_driver_pm_ops,
++	},
++};
++
++static int __init crystalcove_pwrsrc_init(void)
++{
++	return platform_driver_register(&crystalcove_pwrsrc_driver);
++}
++device_initcall(crystalcove_pwrsrc_init);
++
++static void __exit crystalcove_pwrsrc_exit(void)
++{
++	platform_driver_unregister(&crystalcove_pwrsrc_driver);
++}
++module_exit(crystalcove_pwrsrc_exit);
++
++MODULE_AUTHOR("Kannappan R <r.kannappan@intel.com>");
++MODULE_AUTHOR("Ramakrishna Pallala <ramakrishna.pallala@intel.com>");
++MODULE_DESCRIPTION("CrystalCove Power Source Detect Driver");
++MODULE_LICENSE("GPL");
+Index: linux/drivers/extcon/extcon-dc-pwrsrc.c
+===================================================================
+--- /dev/null
++++ linux/drivers/extcon/extcon-dc-pwrsrc.c
+@@ -0,0 +1,565 @@
++/*
++ * dc_xpwr_pwrsrc.c - Intel Dollar Cove(X-power) Power Source Detect Driver
++ *
++ * Copyright (C) 2014 Intel Corporation
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the GNU
++ * General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ * Author: Ramakrishna Pallala <ramakrishna.pallala@intel.com>
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/io.h>
++#include <linux/slab.h>
++#include <linux/pm_runtime.h>
++#include <linux/interrupt.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/usb/phy.h>
++#include <linux/usb/otg.h>
++#include <linux/notifier.h>
++#include <linux/extcon.h>
++#include <linux/power_supply.h>
++#include <linux/wakelock.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/extcon/extcon-dc-pwrsrc.h>
++
++#define DC_PS_STAT_REG			0x00
++#define PS_STAT_VBUS_TRIGGER		(1 << 0)
++#define PS_STAT_BAT_CHRG_DIR		(1 << 2)
++#define PS_STAT_VBUS_ABOVE_VHOLD	(1 << 3)
++#define PS_STAT_VBUS_VALID		(1 << 4)
++#define PS_STAT_VBUS_PRESENT		(1 << 5)
++
++#define DC_BC_GLOBAL_REG		0x2C
++#define BC_GLOBAL_RUN			(1 << 0)
++#define BC_GLOBAL_DET_STAT		(1 << 2)
++#define BC_GLOBAL_DBP_TOUT		(1 << 3)
++#define BC_GLOBAL_VLGC_COM_SEL		(1 << 4)
++#define BC_GLOBAL_DCD_TOUT_MASK		0x60
++#define DC_GLOBAL_DCD_TOUT_300MS	0x0
++#define DC_GLOBAL_DCD_TOUT_100MS	0x1
++#define DC_GLOBAL_DCD_TOUT_500MS	0x2
++#define DC_GLOBAL_DCD_TOUT_900MS	0x3
++#define BC_GLOBAL_DCD_DET_SEL		(1 << 7)
++
++#define DC_BC_VBUS_CNTL_REG		0x2D
++#define VBUS_CNTL_DPDM_PD_EN		(1 << 4)
++#define VBUS_CNTL_DPDM_FD_EN		(1 << 5)
++#define VBUS_CNTL_FIRST_PO_STAT		(1 << 6)
++
++#define DC_BC_USB_STAT_REG		0x2E
++#define USB_STAT_BUS_STAT_MASK		0xf
++#define USB_STAT_BUS_STAT_POS		0
++#define USB_STAT_BUS_STAT_ATHD		0x0
++#define USB_STAT_BUS_STAT_CONN		0x1
++#define USB_STAT_BUS_STAT_SUSP		0x2
++#define USB_STAT_BUS_STAT_CONF		0x3
++#define USB_STAT_USB_SS_MODE		(1 << 4)
++#define USB_STAT_DEAD_BAT_DET		(1 << 6)
++#define USB_STAT_DBP_UNCFG		(1 << 7)
++
++#define DC_BC_DET_STAT_REG		0x2F
++#define DET_STAT_MASK			0xE0
++#define DET_STAT_POS			5
++#define DET_STAT_SDP			0x1
++#define DET_STAT_CDP			0x2
++#define DET_STAT_DCP			0x2
++
++#define DC_PS_BOOT_REASON_REG		0x2
++
++#define DC_PWRSRC_IRQ_CFG_REG		0x40
++#define PWRSRC_IRQ_CFG_MASK		0x1C
++
++#define DC_BC12_IRQ_CFG_REG		0x45
++#define BC12_IRQ_CFG_MASK		0x3
++
++#define DC_XPWR_CHARGE_CUR_DCP		2000
++#define DC_XPWR_CHARGE_CUR_CDP		1500
++#define DC_XPWR_CHARGE_CUR_SDP		100
++
++#define DC_PWRSRC_INTR_NUM		4
++#define PWRSRC_DRV_NAME			"dollar_cove_pwrsrc"
++
++#define PWRSRC_EXTCON_CABLE_USB		"USB"
++
++enum {
++	VBUS_FALLING_IRQ = 0,
++	VBUS_RISING_IRQ,
++	MV_CHNG_IRQ,
++	BC_USB_CHNG_IRQ,
++};
++
++static const char *dc_extcon_cable[] = {
++	PWRSRC_EXTCON_CABLE_USB,
++	NULL,
++};
++
++struct dc_pwrsrc_info {
++	struct platform_device *pdev;
++	struct dc_xpwr_pwrsrc_pdata *pdata;
++	int irq[DC_PWRSRC_INTR_NUM];
++	struct extcon_dev *edev;
++	struct usb_phy		*otg;
++	struct notifier_block	id_nb;
++	struct wake_lock	wakelock;
++	bool is_sdp;
++	bool id_short;
++};
++
++static char *pwr_up_down_info[] = {
++	/* bit 0 */ "Last wake caused by user pressing the power button",
++	/* bit 2 */ "Last wake caused by a charger insertion",
++	/* bit 1 */ "Last wake caused by a battery insertion",
++	/* bit 3 */ "Last wake caused by SOC initiated global reset",
++	/* bit 4 */ "Last wake caused by cold reset",
++	/* bit 5 */ "Last shutdown caused by PMIC UVLO threshold",
++	/* bit 6 */ "Last shutdown caused by SOC initiated cold off",
++	/* bit 7 */ "Last shutdown caused by user pressing the power button",
++	NULL,
++};
++
++/* Decode and log the given "reset source indicator" register, then clear it */
++static void dc_xpwr_pwrsrc_log_rsi(struct platform_device *pdev,
++					char **pwrsrc_rsi_info,
++					int reg_s)
++{
++	char *rsi_info = pwrsrc_rsi_info[0];
++	int val, i = 0;
++	int bit_select, clear_mask = 0x0;
++
++	val = intel_soc_pmic_readb(reg_s);
++	while (rsi_info) {
++		bit_select = (1 << i);
++		if (val & bit_select) {
++			dev_dbg(&pdev->dev, "%s\n", rsi_info);
++			clear_mask |= bit_select;
++		}
++		rsi_info = pwrsrc_rsi_info[++i];
++	}
++
++	/* Clear the register value for next reboot (write 1 to clear bit) */
++	intel_soc_pmic_writeb(reg_s, clear_mask);
++}
++
++int dc_xpwr_vbus_on_status(void)
++{
++	int ret;
++
++	ret = intel_soc_pmic_readb(DC_PS_STAT_REG);
++	if (ret < 0)
++		return ret;
++
++	if (ret & PS_STAT_VBUS_PRESENT)
++		return  1;
++
++	return 0;
++}
++EXPORT_SYMBOL(dc_xpwr_vbus_on_status);
++
++static int handle_pwrsrc_event(struct dc_pwrsrc_info *info)
++{
++	if (dc_xpwr_vbus_on_status()) {
++		dev_info(&info->pdev->dev, "VBUS attach\n");
++		if (info->edev)
++			extcon_set_cable_state(info->edev,
++					PWRSRC_EXTCON_CABLE_USB, true);
++	} else {
++		dev_info(&info->pdev->dev, "VBUS dettach\n");
++		if (info->edev)
++			extcon_set_cable_state(info->edev,
++					PWRSRC_EXTCON_CABLE_USB, false);
++	}
++
++	return 0;
++}
++
++static int handle_chrg_det_event(struct dc_pwrsrc_info *info)
++{
++	static bool notify_otg, notify_charger;
++	static struct power_supply_cable_props cable_props;
++	int stat, cfg, ret, vbus_mask = 0;
++	u8 chrg_type;
++	bool vbus_attach = false;
++
++	ret = intel_soc_pmic_readb(DC_PS_STAT_REG);
++	if (ret < 0) {
++		dev_err(&info->pdev->dev, "get vbus stat error\n");
++		return ret;
++	}
++
++	if ((ret & PS_STAT_VBUS_PRESENT) && !info->id_short) {
++		dev_dbg(&info->pdev->dev, "VBUS present\n");
++		vbus_attach = true;
++	} else {
++		dev_dbg(&info->pdev->dev, "VBUS NOT present\n");
++		vbus_attach = false;
++		cable_props.ma = 0;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_DISCONNECT;
++		goto notify_otg_em;
++	}
++
++	/* check charger detection completion status */
++	ret = intel_soc_pmic_readb(DC_BC_GLOBAL_REG);
++	if (ret < 0)
++		goto dev_det_ret;
++	else
++		cfg = ret;
++	if (cfg & BC_GLOBAL_DET_STAT) {
++		dev_dbg(&info->pdev->dev, "charger detection not complete\n");
++		goto dev_det_ret;
++	}
++
++	ret = intel_soc_pmic_readb(DC_BC_DET_STAT_REG);
++	if (ret < 0)
++		goto dev_det_ret;
++	else
++		stat = ret;
++
++	dev_dbg(&info->pdev->dev, "Stat:%x, Cfg:%x\n", stat, cfg);
++
++	chrg_type = (stat & DET_STAT_MASK) >> DET_STAT_POS;
++	info->is_sdp = false;
++
++	if (chrg_type == DET_STAT_SDP) {
++		dev_dbg(&info->pdev->dev,
++				"SDP cable connecetd\n");
++		notify_otg = true;
++		vbus_mask = 1;
++		notify_charger = true;
++		info->is_sdp = true;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_CONNECT;
++		cable_props.chrg_type = POWER_SUPPLY_CHARGER_TYPE_USB_SDP;
++		cable_props.ma = DC_XPWR_CHARGE_CUR_SDP;
++	} else if (chrg_type == DET_STAT_CDP) {
++		dev_dbg(&info->pdev->dev,
++				"CDP cable connecetd\n");
++		notify_otg = true;
++		vbus_mask = 1;
++		notify_charger = true;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_CONNECT;
++		cable_props.chrg_type = POWER_SUPPLY_CHARGER_TYPE_USB_CDP;
++		cable_props.ma = DC_XPWR_CHARGE_CUR_CDP;
++	} else if (chrg_type == DET_STAT_DCP) {
++		dev_dbg(&info->pdev->dev,
++				"DCP cable connecetd\n");
++		notify_charger = true;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_CONNECT;
++		cable_props.chrg_type = POWER_SUPPLY_CHARGER_TYPE_USB_DCP;
++		cable_props.ma = DC_XPWR_CHARGE_CUR_DCP;
++		if (!wake_lock_active(&info->wakelock))
++			wake_lock(&info->wakelock);
++	} else {
++		dev_warn(&info->pdev->dev,
++			"disconnect or unknown or ID event\n");
++		cable_props.ma = 0;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_DISCONNECT;
++	}
++
++notify_otg_em:
++	if (!vbus_attach) {	/* disconnevt event */
++		if (notify_otg) {
++			atomic_notifier_call_chain(&info->otg->notifier,
++						USB_EVENT_VBUS, &vbus_mask);
++			notify_otg = false;
++		}
++		if (notify_charger) {
++			atomic_notifier_call_chain(&power_supply_notifier,
++					PSY_CABLE_EVENT, &cable_props);
++			notify_charger = false;
++		}
++		if (wake_lock_active(&info->wakelock))
++			wake_unlock(&info->wakelock);
++	} else {
++		if (notify_otg) {
++			/*
++			 * TODO:close mux path to switch
++			 * b/w device mode and host mode.
++			 */
++			atomic_notifier_call_chain(&info->otg->notifier,
++						USB_EVENT_VBUS, &vbus_mask);
++		}
++
++		if (notify_charger)
++			atomic_notifier_call_chain(&power_supply_notifier,
++					PSY_CABLE_EVENT, &cable_props);
++	}
++
++	return 0;
++
++dev_det_ret:
++	if (ret < 0)
++		dev_err(&info->pdev->dev, "BC Mod detection error\n");
++	return ret;
++}
++
++static irqreturn_t dc_xpwr_pwrsrc_isr(int irq, void *data)
++{
++	struct dc_pwrsrc_info *info = data;
++	int i, ret;
++
++	for (i = 0; i < DC_PWRSRC_INTR_NUM; i++) {
++		if (info->irq[i] == irq)
++			break;
++	}
++
++	if (i >= DC_PWRSRC_INTR_NUM) {
++		dev_warn(&info->pdev->dev, "spurious interrupt!!\n");
++		return IRQ_NONE;
++	}
++
++	if (info->pdata->en_chrg_det)
++		ret = handle_chrg_det_event(info);
++	else
++		ret = handle_pwrsrc_event(info);
++	if (ret < 0)
++		dev_warn(&info->pdev->dev, "error in PWRSRC INT handling\n");
++
++	return IRQ_HANDLED;
++}
++
++static int dc_pwrsrc_handle_otg_notification(struct notifier_block *nb,
++				   unsigned long event, void *param)
++{
++	struct dc_pwrsrc_info *info =
++	    container_of(nb, struct dc_pwrsrc_info, id_nb);
++	struct power_supply_cable_props cable_props;
++	int *val = (int *)param;
++
++	if (!val || ((event != USB_EVENT_ID) &&
++			(event != USB_EVENT_ENUMERATED)))
++		return NOTIFY_DONE;
++
++	dev_info(&info->pdev->dev,
++		"[OTG notification]evt:%lu val:%d\n", event, *val);
++
++	switch (event) {
++	case USB_EVENT_ID:
++		/*
++		 * in case of ID short(*id = 0)
++		 * enable vbus else disable vbus.
++		 */
++		if (*val)
++			info->id_short = false;
++		else
++			info->id_short = true;
++		break;
++	case USB_EVENT_ENUMERATED:
++		/*
++		 * ignore cable plug/unplug events as SMSC
++		 * had already send those event notifications.
++		 * Also only handle notifications for SDP case.
++		 */
++		if (!*val || !info->is_sdp ||
++			(*val == DC_XPWR_CHARGE_CUR_SDP))
++			break;
++		/*
++		 * if current limit is < 100mA
++		 * treat it as suspend event.
++		 */
++		if (*val < DC_XPWR_CHARGE_CUR_SDP)
++			cable_props.chrg_evt =
++					POWER_SUPPLY_CHARGER_EVENT_SUSPEND;
++		else
++			cable_props.chrg_evt =
++					POWER_SUPPLY_CHARGER_EVENT_CONNECT;
++		cable_props.chrg_type = POWER_SUPPLY_CHARGER_TYPE_USB_SDP;
++		cable_props.ma = *val;
++		atomic_notifier_call_chain(&power_supply_notifier,
++					PSY_CABLE_EVENT, &cable_props);
++		break;
++	default:
++		dev_warn(&info->pdev->dev, "invalid OTG event\n");
++	}
++
++	return NOTIFY_OK;
++}
++
++static int pwrsrc_otg_registration(struct dc_pwrsrc_info *info)
++{
++	int ret;
++
++	/* OTG notification */
++	info->otg = usb_get_phy(USB_PHY_TYPE_USB2);
++	if (IS_ERR(info->otg)) {
++		dev_warn(&info->pdev->dev, "Failed to get otg transceiver!!\n");
++		return PTR_ERR(info->otg);
++	}
++
++	info->id_nb.notifier_call = dc_pwrsrc_handle_otg_notification;
++	ret = usb_register_notifier(info->otg, &info->id_nb);
++	if (ret) {
++		dev_err(&info->pdev->dev,
++			"failed to register otg notifier\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static int pwrsrc_extcon_registration(struct dc_pwrsrc_info *info)
++{
++	int ret = 0;
++
++	/* register with extcon */
++	info->edev = kzalloc(sizeof(struct extcon_dev), GFP_KERNEL);
++	if (!info->edev) {
++		dev_err(&info->pdev->dev, "mem alloc failed\n");
++		return -ENOMEM;
++	}
++	info->edev->name = "dc_pwrsrc";
++	info->edev->supported_cable = dc_extcon_cable;
++	ret = extcon_dev_register(info->edev);
++	if (ret) {
++		dev_err(&info->pdev->dev, "extcon registration failed!!\n");
++		kfree(info->edev);
++	} else {
++		dev_dbg(&info->pdev->dev, "extcon registration success!!\n");
++	}
++
++	return ret;
++}
++
++static int dc_xpwr_pwrsrc_probe(struct platform_device *pdev)
++{
++	struct dc_pwrsrc_info *info;
++	int ret, i;
++
++	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
++	if (!info) {
++		dev_err(&pdev->dev, "mem alloc failed\n");
++		return -ENOMEM;
++	}
++
++	info->pdev = pdev;
++	info->pdata = pdev->dev.platform_data;
++	if (!info->pdata)
++		return -ENODEV;
++
++	platform_set_drvdata(pdev, info);
++
++	dc_xpwr_pwrsrc_log_rsi(pdev, pwr_up_down_info,
++				DC_PS_BOOT_REASON_REG);
++
++	if (info->pdata->en_chrg_det) {
++		wake_lock_init(&info->wakelock, WAKE_LOCK_SUSPEND,
++						"pwrsrc_wakelock");
++		ret = pwrsrc_otg_registration(info);
++	} else {
++		ret = pwrsrc_extcon_registration(info);
++	}
++	if (ret < 0)
++		return ret;
++
++	for (i = 0; i < DC_PWRSRC_INTR_NUM; i++) {
++		info->irq[i] = platform_get_irq(pdev, i);
++		ret = request_threaded_irq(info->irq[i],
++				NULL, dc_xpwr_pwrsrc_isr,
++				IRQF_ONESHOT, PWRSRC_DRV_NAME, info);
++		if (ret) {
++			dev_err(&pdev->dev, "request_irq fail :%d err:%d\n",
++							info->irq[i], ret);
++			goto intr_reg_failed;
++		}
++	}
++
++	/* Unmask VBUS interrupt */
++	intel_soc_pmic_writeb(DC_PWRSRC_IRQ_CFG_REG, PWRSRC_IRQ_CFG_MASK);
++	if (info->pdata->en_chrg_det) {
++		/* unmask the BC1.2 complte interrupts */
++		intel_soc_pmic_writeb(DC_BC12_IRQ_CFG_REG, BC12_IRQ_CFG_MASK);
++		/* enable the charger detection logic */
++		intel_soc_pmic_setb(DC_BC_GLOBAL_REG, BC_GLOBAL_RUN);
++	}
++
++	if (info->pdata->en_chrg_det)
++		ret = handle_chrg_det_event(info);
++	else
++		ret = handle_pwrsrc_event(info);
++	if (ret < 0)
++		dev_warn(&info->pdev->dev, "error in PWRSRC evt handling\n");
++
++	return 0;
++
++intr_reg_failed:
++	for (; i > 0; i--)
++		free_irq(info->irq[i - 1], info);
++	if (info->pdata->en_chrg_det) {
++		usb_put_phy(info->otg);
++	} else {
++		extcon_dev_unregister(info->edev);
++		kfree(info->edev);
++	}
++	return ret;
++}
++
++static int dc_xpwr_pwrsrc_remove(struct platform_device *pdev)
++{
++	struct dc_pwrsrc_info *info = platform_get_drvdata(pdev);
++	int i;
++
++	for (i = 0; i < DC_PWRSRC_INTR_NUM; i++)
++		free_irq(info->irq[i], info);
++	if (info->pdata->en_chrg_det) {
++		usb_put_phy(info->otg);
++	} else {
++		extcon_dev_unregister(info->edev);
++		kfree(info->edev);
++	}
++	return 0;
++}
++
++#ifdef CONFIG_PM
++static int dc_xpwr_pwrsrc_suspend(struct device *dev)
++{
++	return 0;
++}
++
++static int dc_xpwr_pwrsrc_resume(struct device *dev)
++{
++	return 0;
++}
++#else
++#define dc_xpwr_pwrsrc_suspend		NULL
++#define dc_xpwr_pwrsrc_resume		NULL
++#endif
++
++static const struct dev_pm_ops dc_xpwr_pwrsrc_driver_pm_ops = {
++	.suspend	= dc_xpwr_pwrsrc_suspend,
++	.resume		= dc_xpwr_pwrsrc_resume,
++};
++
++static struct platform_driver dc_xpwr_pwrsrc_driver = {
++	.probe = dc_xpwr_pwrsrc_probe,
++	.remove = dc_xpwr_pwrsrc_remove,
++	.driver = {
++		.name = PWRSRC_DRV_NAME,
++		.pm = &dc_xpwr_pwrsrc_driver_pm_ops,
++	},
++};
++
++static int __init dc_xpwr_pwrsrc_init(void)
++{
++	return platform_driver_register(&dc_xpwr_pwrsrc_driver);
++}
++device_initcall(dc_xpwr_pwrsrc_init);
++
++static void __exit dc_xpwr_pwrsrc_exit(void)
++{
++	platform_driver_unregister(&dc_xpwr_pwrsrc_driver);
++}
++module_exit(dc_xpwr_pwrsrc_exit);
++
++MODULE_AUTHOR("Ramakrishna Pallala <ramakrishna.pallala@intel.com>");
++MODULE_DESCRIPTION("DollarCove(X-power) Power Source Detect Driver");
++MODULE_LICENSE("GPL");
+Index: linux/drivers/extcon/extcon-smsc375x.c
+===================================================================
+--- /dev/null
++++ linux/drivers/extcon/extcon-smsc375x.c
+@@ -0,0 +1,714 @@
++/*
++ * extcon-smsc375x.c - SMSC375x extcon driver
++ *
++ * Copyright (C) 2013 Intel Corporation
++ * Ramakrishna Pallala <ramakrishna.pallala@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the GNU
++ * General Public License for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/gpio.h>
++#include <linux/interrupt.h>
++#include <linux/err.h>
++#include <linux/device.h>
++#include <linux/workqueue.h>
++#include <linux/usb/otg.h>
++#include <linux/notifier.h>
++#include <linux/extcon.h>
++#include <linux/pm_runtime.h>
++#include <linux/acpi.h>
++#include <linux/power_supply.h>
++#include <linux/wakelock.h>
++#include <linux/extcon/extcon-smsc375x.h>
++
++/* SMSC375x I2C registers */
++#define SMSC375X_REG_STAT		0x00
++#define SMSC375X_REG_CFG		0x01
++#define SMSC375X_REG_CHRG_CFG		0x02
++#define SMSC375X_REG_CHRG_STAT		0x03
++
++/* Status */
++#define STAT_OVLO_STAT		(1 << 0)
++#define STAT_OVLO_LATCH		(1 << 1)
++#define STAT_OVP_SWTCH_STAT	(1 << 2)
++#define STAT_CUR_LMT_STAT	(1 << 3)
++#define STAT_CHRG_DET_DONE	(1 << 4)
++#define STAT_CHRG_TYPE_MASK	(7 << 5)
++#define STAT_CHRG_TYPE_DCP	(1 << 5)
++#define STAT_CHRG_TYPE_CDP	(2 << 5)
++#define STAT_CHRG_TYPE_SDP	(3 << 5)
++#define STAT_CHRG_TYPE_SE1L	(4 << 5)
++#define STAT_CHRG_TYPE_SE1H	(5 << 5)
++
++/* Config */
++#define CFG_EN_OVP_SWITCH	(1 << 0)
++#define CFG_EN_CUR_LMT		(1 << 1)
++#define CFG_OVERRIDE_VBUS	(1 << 2)
++#define CFG_OVERRIDE_CUR_LMT	(1 << 3)
++#define CFG_EN_MUX1		(1 << 5)
++#define CFG_EN_MUX2		(1 << 6)
++#define CFG_SOFT_POR		(1 << 7)
++
++/* Charger Config */
++#define CHRG_CFG_EN_SNG_RX	(1 << 0)
++#define CHRG_CFG_EN_CON_DET	(1 << 1)
++#define CHRG_CFG_EN_VDAT_SRC	(1 << 2)
++#define CHRG_CFG_EN_HOST_CHRG	(1 << 3)
++#define CHRG_CFG_EN_IDAT_SINK	(1 << 4)
++#define CHRG_CFG_EN_DP_PDOWN	(1 << 5)
++#define CHRG_CFG_EN_DM_PDOWN	(1 << 6)
++#define CHRG_CFG_I2C_CNTL	(1 << 7)
++
++
++/* Charger Config */
++#define CHRG_STAT_VDAT_DET	(1 << 0)
++#define CHRG_STAT_DP_SNG_RX	(1 << 1)
++#define CHRG_STAT_DM_SNG_RX	(1 << 2)
++#define CHRG_STAT_RX_HIGH_CUR	(1 << 3)
++
++
++#define SMSC_CHARGE_CUR_DCP		2000
++#define SMSC_CHARGE_CUR_CDP		1500
++#define SMSC_CHARGE_CUR_SDP_100		100
++#define SMSC_CHARGE_CUR_SDP_500		500
++
++#define SMSC375X_EXTCON_USB		"USB"
++#define SMSC375X_EXTCON_SDP		"CHARGER_USB_SDP"
++#define SMSC375X_EXTCON_DCP		"CHARGER_USB_DCP"
++#define SMSC375X_EXTCON_CDP		"CHARGER_USB_CDP"
++
++static const char *smsc375x_extcon_cable[] = {
++	SMSC375X_EXTCON_SDP,
++	SMSC375X_EXTCON_DCP,
++	SMSC375X_EXTCON_CDP,
++	NULL,
++};
++
++struct smsc375x_chip {
++	struct i2c_client	*client;
++	struct smsc375x_pdata	*pdata;
++	struct usb_phy		*otg;
++	struct work_struct	otg_work;
++	struct notifier_block	id_nb;
++	bool			id_short;
++	struct extcon_specific_cable_nb cable_obj;
++	struct notifier_block	vbus_nb;
++	struct work_struct	vbus_work;
++	struct extcon_dev	*edev;
++	struct wake_lock	wakelock;
++	bool			is_sdp;
++};
++
++static struct smsc375x_chip *chip_ptr;
++
++static int smsc375x_write_reg(struct i2c_client *client,
++		int reg, int value)
++{
++	int ret;
++
++	ret = i2c_smbus_write_byte_data(client, reg, value);
++
++	if (ret < 0)
++		dev_err(&client->dev, "%s: err %d\n", __func__, ret);
++
++	return ret;
++}
++
++static int smsc375x_read_reg(struct i2c_client *client, int reg)
++{
++	int ret;
++
++	ret = i2c_smbus_read_byte_data(client, reg);
++
++	if (ret < 0)
++		dev_err(&client->dev, "%s: err %d\n", __func__, ret);
++
++	return ret;
++}
++
++static int smsc375x_detect_dev(struct smsc375x_chip *chip)
++{
++	struct i2c_client *client = chip->client;
++	static bool notify_otg, notify_charger;
++	static char *cable;
++	static struct power_supply_cable_props cable_props;
++	int stat, cfg, ret, vbus_mask = 0;
++	u8 chrg_type;
++	bool vbus_attach = false;
++
++	dev_info(&chip->client->dev, "%s\n", __func__);
++	/*
++	 * get VBUS status from external IC like
++	 * PMIC or Charger as SMSC375x chip can not
++	 * be accessed with out VBUS.
++	 */
++	ret = chip->pdata->is_vbus_online();
++	if (ret < 0) {
++		dev_info(&chip->client->dev, "get vbus stat error\n");
++		return ret;
++	}
++
++	if (ret) {
++		dev_info(&chip->client->dev, "VBUS present\n");
++		vbus_attach = true;
++	} else {
++		dev_info(&chip->client->dev, "VBUS NOT present\n");
++		vbus_attach = false;
++		cable_props.ma = 0;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_DISCONNECT;
++		goto notify_otg_em;
++	}
++
++	/* dont proceed with charger detection in host mode */
++	if (chip->id_short) {
++		/*
++		 * only after reading the status register
++		 * MUX path is being closed. And by default
++		 * MUX is to connected Host mode path.
++		 */
++		ret = smsc375x_read_reg(client, SMSC375X_REG_STAT);
++		return ret;
++	}
++	/* check charger detection completion status */
++	ret = smsc375x_read_reg(client, SMSC375X_REG_STAT);
++	if (ret < 0)
++		goto dev_det_i2c_failed;
++	else
++		stat = ret;
++
++	if (!(stat & STAT_CHRG_DET_DONE)) {
++		dev_info(&chip->client->dev, "DET failed");
++		return -EOPNOTSUPP;
++	}
++
++	ret = smsc375x_read_reg(client, SMSC375X_REG_CFG);
++	if (ret < 0)
++		goto dev_det_i2c_failed;
++	else
++		cfg = ret;
++
++	dev_info(&client->dev, "Stat:%x, Cfg:%x\n", stat, cfg);
++
++	chrg_type = stat & STAT_CHRG_TYPE_MASK;
++	chip->is_sdp = false;
++
++	if (chrg_type == STAT_CHRG_TYPE_SDP) {
++		dev_info(&chip->client->dev,
++				"SDP cable connecetd\n");
++		notify_otg = true;
++		vbus_mask = 1;
++		notify_charger = true;
++		chip->is_sdp = true;
++		cable = SMSC375X_EXTCON_SDP;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_CONNECT;
++		cable_props.chrg_type = POWER_SUPPLY_CHARGER_TYPE_USB_SDP;
++		if (chip->pdata->charging_compliance_override)
++			cable_props.ma = SMSC_CHARGE_CUR_SDP_500;
++		else
++			cable_props.ma = SMSC_CHARGE_CUR_SDP_100;
++	} else if (chrg_type == STAT_CHRG_TYPE_CDP) {
++		dev_info(&chip->client->dev,
++				"CDP cable connecetd\n");
++		notify_otg = true;
++		vbus_mask = 1;
++		notify_charger = true;
++		cable = SMSC375X_EXTCON_CDP;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_CONNECT;
++		cable_props.chrg_type = POWER_SUPPLY_CHARGER_TYPE_USB_CDP;
++		cable_props.ma = SMSC_CHARGE_CUR_CDP;
++	} else if ((chrg_type == STAT_CHRG_TYPE_DCP) ||
++			(chrg_type == STAT_CHRG_TYPE_SE1L) ||
++			(chrg_type == STAT_CHRG_TYPE_SE1H)) {
++		dev_info(&chip->client->dev,
++				"DCP/SE1 cable connecetd\n");
++		notify_charger = true;
++		cable = SMSC375X_EXTCON_DCP;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_CONNECT;
++		cable_props.chrg_type = POWER_SUPPLY_CHARGER_TYPE_USB_DCP;
++		cable_props.ma = SMSC_CHARGE_CUR_DCP;
++		if (!wake_lock_active(&chip->wakelock))
++			wake_lock(&chip->wakelock);
++	} else {
++		dev_warn(&chip->client->dev,
++			"disconnect or unknown or ID event\n");
++		cable_props.ma = 0;
++		cable_props.chrg_evt = POWER_SUPPLY_CHARGER_EVENT_DISCONNECT;
++	}
++
++notify_otg_em:
++	if (!vbus_attach) {	/* disconnevt event */
++		if (notify_otg) {
++			atomic_notifier_call_chain(&chip->otg->notifier,
++						USB_EVENT_VBUS, &vbus_mask);
++			notify_otg = false;
++		}
++		if (notify_charger) {
++			/*
++			 * not supporting extcon events currently.
++			 * extcon_set_cable_state(chip->edev, cable, false);
++			 */
++			atomic_notifier_call_chain(&power_supply_notifier,
++					PSY_CABLE_EVENT, &cable_props);
++			notify_charger = false;
++			cable = NULL;
++		}
++		if (wake_lock_active(&chip->wakelock))
++			wake_unlock(&chip->wakelock);
++	} else {
++		if (notify_otg) {
++			/* close mux path to enable device mode */
++			ret = smsc375x_write_reg(client, SMSC375X_REG_CFG,
++					(cfg & ~CFG_EN_MUX1) | CFG_EN_MUX2);
++			if (ret < 0)
++				goto dev_det_i2c_failed;
++			atomic_notifier_call_chain(&chip->otg->notifier,
++						USB_EVENT_VBUS, &vbus_mask);
++		}
++
++		if (notify_charger) {
++			/*
++			 * not supporting extcon events currently.
++			 * extcon_set_cable_state(chip->edev, cable, true);
++			 */
++			atomic_notifier_call_chain(&power_supply_notifier,
++					PSY_CABLE_EVENT, &cable_props);
++		}
++	}
++
++	return 0;
++
++dev_det_i2c_failed:
++	if (chip->pdata->is_vbus_online())
++		dev_err(&chip->client->dev,
++				"vbus present: i2c read failed:%d\n", ret);
++	else
++		dev_info(&chip->client->dev,
++				"vbus removed: i2c read failed:%d\n", ret);
++	return ret;
++}
++
++static irqreturn_t smsc375x_irq_handler(int irq, void *data)
++{
++	struct smsc375x_chip *chip = data;
++
++	pm_runtime_get_sync(&chip->client->dev);
++
++	dev_info(&chip->client->dev, "SMSC USB INT!\n");
++
++	smsc375x_detect_dev(chip);
++
++	pm_runtime_put_sync(&chip->client->dev);
++	return IRQ_HANDLED;
++}
++
++static void smsc375x_otg_event_worker(struct work_struct *work)
++{
++	struct smsc375x_chip *chip =
++	    container_of(work, struct smsc375x_chip, otg_work);
++	int ret;
++
++	pm_runtime_get_sync(&chip->client->dev);
++
++	if (chip->id_short)
++		ret = chip->pdata->enable_vbus();
++	else
++		ret = chip->pdata->disable_vbus();
++	if (ret < 0)
++		dev_warn(&chip->client->dev, "id vbus control failed\n");
++
++	/*
++	 * As we are not getting SMSC INT in case
++	 * 5V boost enablement.
++	 * Follwoing WA is added to enable Host mode
++	 * on CR V2.1 by invoking the VBUS worker.
++	 */
++	msleep(5000);
++	schedule_work(&chip->vbus_work);
++
++	pm_runtime_put_sync(&chip->client->dev);
++}
++
++static int smsc375x_handle_otg_notification(struct notifier_block *nb,
++				   unsigned long event, void *param)
++{
++	struct smsc375x_chip *chip =
++	    container_of(nb, struct smsc375x_chip, id_nb);
++	struct power_supply_cable_props cable_props;
++	int *val = (int *)param;
++
++	if (!val || ((event != USB_EVENT_ID) &&
++			(event != USB_EVENT_ENUMERATED)))
++		return NOTIFY_DONE;
++
++	dev_info(&chip->client->dev,
++		"[OTG notification]evt:%lu val:%d\n", event, *val);
++
++	switch (event) {
++	case USB_EVENT_ID:
++		/*
++		 * in case of ID short(*id = 0)
++		 * enable vbus else disable vbus.
++		 */
++		if (*val)
++			chip->id_short = false;
++		else
++			chip->id_short = true;
++		schedule_work(&chip->otg_work);
++		break;
++	case USB_EVENT_ENUMERATED:
++		/*
++		 * ignore cable plug/unplug events as SMSC
++		 * had already send those event notifications.
++		 * Also only handle notifications for SDP case.
++		 */
++		/* No need to change SDP inlimit based on enumeration status
++		 * if platform can voilate charging_compliance.
++		 */
++		if (chip->pdata->charging_compliance_override ||
++			 !chip->is_sdp ||
++			(*val == SMSC_CHARGE_CUR_SDP_100))
++			break;
++		/*
++		 * if current limit is < 100mA
++		 * treat it as suspend event.
++		 */
++		if (*val < SMSC_CHARGE_CUR_SDP_100)
++			cable_props.chrg_evt =
++					POWER_SUPPLY_CHARGER_EVENT_SUSPEND;
++		else
++			cable_props.chrg_evt =
++					POWER_SUPPLY_CHARGER_EVENT_CONNECT;
++		cable_props.chrg_type = POWER_SUPPLY_CHARGER_TYPE_USB_SDP;
++		cable_props.ma = *val;
++		atomic_notifier_call_chain(&power_supply_notifier,
++					PSY_CABLE_EVENT, &cable_props);
++		break;
++	default:
++		dev_warn(&chip->client->dev, "invalid OTG event\n");
++	}
++
++	return NOTIFY_OK;
++}
++
++static void smsc375x_pwrsrc_event_worker(struct work_struct *work)
++{
++	struct smsc375x_chip *chip =
++	    container_of(work, struct smsc375x_chip, vbus_work);
++	int ret;
++
++	pm_runtime_get_sync(&chip->client->dev);
++
++	/*
++	 * Sometimes SMSC INT triggering is only
++	 * happening after reading the status bits.
++	 * So we are reading the status register as WA
++	 * to invoke teh MUX INT in case of connect events.
++	 */
++	if (!chip->pdata->is_vbus_online()) {
++		ret = smsc375x_detect_dev(chip);
++	} else {
++		/**
++		 * To guarantee SDP detection in SMSC, need 75mSec delay before
++		 * sending an I2C command. So added 50mSec delay here.
++		 */
++		mdelay(50);
++		ret = smsc375x_read_reg(chip->client, SMSC375X_REG_STAT);
++	}
++	if (ret < 0)
++		dev_warn(&chip->client->dev, "pwrsrc evt error\n");
++
++	pm_runtime_put_sync(&chip->client->dev);
++}
++
++static int smsc375x_handle_pwrsrc_notification(struct notifier_block *nb,
++				   unsigned long event, void *param)
++{
++	struct smsc375x_chip *chip =
++	    container_of(nb, struct smsc375x_chip, vbus_nb);
++
++	dev_info(&chip->client->dev, "[PWRSRC notification]: %lu\n", event);
++
++	schedule_work(&chip->vbus_work);
++
++	return NOTIFY_OK;
++}
++
++static int smsc375x_irq_init(struct smsc375x_chip *chip)
++{
++	const struct acpi_device_id *id;
++	struct i2c_client *client = chip->client;
++	struct device *dev;
++	struct gpio_desc *gpio;
++	int ret;
++
++	if (!client)
++		return -EINVAL;
++	dev = &client->dev;
++	if (!ACPI_HANDLE(dev))
++		return -ENODEV;
++
++	id = acpi_match_device(dev->driver->acpi_match_table, dev);
++	if (!id)
++		return -ENODEV;
++	gpio = devm_gpiod_get_index(dev, "smsc3750_int", 0);
++	if (IS_ERR(gpio)) {
++		dev_err(dev, "acpi gpio get index failed\n");
++		return PTR_ERR(gpio);
++	}
++	ret = gpiod_to_irq(gpio);
++	if (ret < 0)
++		return ret;
++
++	/* get irq number */
++	chip->client->irq = ret;
++	if (client->irq) {
++		ret = request_threaded_irq(client->irq, NULL,
++				smsc375x_irq_handler,
++				IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++				"smsc375x", chip);
++		if (ret) {
++			dev_err(&client->dev, "failed to reqeust IRQ\n");
++			return ret;
++		}
++		enable_irq_wake(client->irq);
++	} else {
++		dev_err(&client->dev, "IRQ not set\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int smsc375x_probe(struct i2c_client *client,
++			 const struct i2c_device_id *id)
++{
++	struct smsc375x_chip *chip;
++	int ret = 0, id_val = -1;
++
++	chip = kzalloc(sizeof(struct smsc375x_chip), GFP_KERNEL);
++	if (!chip) {
++		dev_err(&client->dev, "failed to allocate driver data\n");
++		return -ENOMEM;
++	}
++
++	chip->client = client;
++#ifdef CONFIG_ACPI
++	chip->pdata = (struct smsc375x_pdata *)id->driver_data;
++#else
++	chip->pdata = dev->platform_data;
++#endif
++	i2c_set_clientdata(client, chip);
++	wake_lock_init(&chip->wakelock, WAKE_LOCK_SUSPEND,
++						"smsc375x_wakelock");
++
++	/* register with extcon */
++	chip->edev = kzalloc(sizeof(struct extcon_dev), GFP_KERNEL);
++	if (!chip->edev) {
++		dev_err(&client->dev, "mem alloc failed\n");
++		ret = -ENOMEM;
++		goto extcon_mem_failed;
++	}
++	chip->edev->name = "smsc375x";
++	chip->edev->supported_cable = smsc375x_extcon_cable;
++	ret = extcon_dev_register(chip->edev);
++	if (ret) {
++		dev_err(&client->dev, "extcon registration failed!!\n");
++		goto extcon_reg_failed;
++	}
++
++	/* register for EXTCON USB notification */
++	INIT_WORK(&chip->vbus_work, smsc375x_pwrsrc_event_worker);
++	chip->vbus_nb.notifier_call = smsc375x_handle_pwrsrc_notification;
++	ret = extcon_register_interest(&chip->cable_obj, NULL,
++			SMSC375X_EXTCON_USB, &chip->vbus_nb);
++
++	/* OTG notification */
++	chip->otg = usb_get_phy(USB_PHY_TYPE_USB2);
++	if (!chip->otg) {
++		dev_warn(&client->dev, "Failed to get otg transceiver!!\n");
++		goto otg_reg_failed;
++	}
++
++	INIT_WORK(&chip->otg_work, smsc375x_otg_event_worker);
++	chip->id_nb.notifier_call = smsc375x_handle_otg_notification;
++	ret = usb_register_notifier(chip->otg, &chip->id_nb);
++	if (ret) {
++		dev_err(&chip->client->dev,
++			"failed to register otg notifier\n");
++		goto id_reg_failed;
++	}
++
++	ret = smsc375x_irq_init(chip);
++	if (ret)
++		goto intr_reg_failed;
++
++	chip_ptr = chip;
++
++	if (chip->otg->get_id_status) {
++		ret = chip->otg->get_id_status(chip->otg, &id_val);
++		if (ret < 0) {
++			dev_warn(&client->dev,
++				"otg get ID status failed:%d\n", ret);
++			ret = 0;
++		}
++	}
++
++	if (!id_val && !chip->id_short)
++		atomic_notifier_call_chain(&chip->otg->notifier,
++						USB_EVENT_ID, &id_val);
++	else
++		smsc375x_detect_dev(chip);
++
++	/* Init Runtime PM State */
++	pm_runtime_put_noidle(&chip->client->dev);
++	pm_schedule_suspend(&chip->client->dev, MSEC_PER_SEC);
++
++	return 0;
++
++intr_reg_failed:
++	usb_unregister_notifier(chip->otg, &chip->id_nb);
++id_reg_failed:
++	usb_put_phy(chip->otg);
++otg_reg_failed:
++	extcon_dev_unregister(chip->edev);
++extcon_reg_failed:
++	kfree(chip->edev);
++extcon_mem_failed:
++	kfree(chip);
++	return ret;
++}
++
++static int smsc375x_remove(struct i2c_client *client)
++{
++	struct smsc375x_chip *chip = i2c_get_clientdata(client);
++
++	free_irq(client->irq, chip);
++	usb_put_phy(chip->otg);
++	extcon_dev_unregister(chip->edev);
++	kfree(chip->edev);
++	pm_runtime_get_noresume(&chip->client->dev);
++	kfree(chip);
++	return 0;
++}
++
++static void smsc375x_shutdown(struct i2c_client *client)
++{
++	dev_dbg(&client->dev, "smsc375x shutdown\n");
++
++	if (client->irq > 0)
++		disable_irq(client->irq);
++	return;
++}
++
++static int smsc375x_suspend(struct device *dev)
++{
++	struct smsc375x_chip *chip = dev_get_drvdata(dev);
++
++	if (chip->client->irq > 0)
++		disable_irq(chip->client->irq);
++
++	dev_dbg(dev, "%s called\n", __func__);
++	return 0;
++}
++
++static int smsc375x_resume(struct device *dev)
++{
++	struct smsc375x_chip *chip = dev_get_drvdata(dev);
++
++	if (chip->client->irq > 0)
++		enable_irq(chip->client->irq);
++
++	dev_dbg(dev, "%s called\n", __func__);
++	return 0;
++}
++
++static int smsc375x_runtime_suspend(struct device *dev)
++{
++	dev_dbg(dev, "%s called\n", __func__);
++	return 0;
++}
++
++static int smsc375x_runtime_resume(struct device *dev)
++{
++	dev_dbg(dev, "%s called\n", __func__);
++	return 0;
++}
++
++static int smsc375x_runtime_idle(struct device *dev)
++{
++	dev_dbg(dev, "%s called\n", __func__);
++	return 0;
++}
++
++static const struct dev_pm_ops smsc375x_pm_ops = {
++		SET_SYSTEM_SLEEP_PM_OPS(smsc375x_suspend,
++				smsc375x_resume)
++		SET_RUNTIME_PM_OPS(smsc375x_runtime_suspend,
++				smsc375x_runtime_resume,
++				smsc375x_runtime_idle)
++};
++
++static struct smsc375x_pdata smsc_drvdata = {
++	.enable_vbus = NULL,
++	.disable_vbus = NULL,
++	.is_vbus_online = NULL,
++	.charging_compliance_override = false,
++};
++
++static const struct i2c_device_id smsc375x_id[] = {
++	{"smsc375x", (kernel_ulong_t)&smsc_drvdata},
++	{"SMSC3750", (kernel_ulong_t)&smsc_drvdata},
++	{}
++};
++MODULE_DEVICE_TABLE(i2c, smsc375x_id);
++
++static const struct acpi_device_id acpi_smsc375x_id[] = {
++	{"SMSC3750", (kernel_ulong_t)&smsc_drvdata},
++	{}
++};
++MODULE_DEVICE_TABLE(acpi, acpi_smsc375x_id);
++
++static struct i2c_driver smsc375x_i2c_driver = {
++	.driver = {
++		.name = "smsc375x",
++		.owner	= THIS_MODULE,
++		.pm	= &smsc375x_pm_ops,
++		.acpi_match_table = ACPI_PTR(acpi_smsc375x_id),
++	},
++	.probe = smsc375x_probe,
++	.remove = smsc375x_remove,
++	.id_table = smsc375x_id,
++	.shutdown = smsc375x_shutdown,
++};
++
++/*
++ * Module stuff
++ */
++
++static int __init smsc375x_extcon_init(void)
++{
++	int ret = i2c_add_driver(&smsc375x_i2c_driver);
++	return ret;
++}
++late_initcall(smsc375x_extcon_init);
++
++static void __exit smsc375x_extcon_exit(void)
++{
++	i2c_del_driver(&smsc375x_i2c_driver);
++}
++module_exit(smsc375x_extcon_exit);
++
++MODULE_AUTHOR("Ramakrishna Pallala <ramakrishna.pallala@intel.com>");
++MODULE_DESCRIPTION("SMSC375x extcon driver");
++MODULE_LICENSE("GPL");
+Index: linux/include/linux/extcon.h
+===================================================================
+--- linux.orig/include/linux/extcon.h
++++ linux/include/linux/extcon.h
+@@ -26,6 +26,7 @@
+ #include <linux/device.h>
+ #include <linux/notifier.h>
+ #include <linux/sysfs.h>
++#include <linux/kconfig.h>
+ 
+ #define SUPPORTED_CABLE_MAX	32
+ #define CABLE_NAME_MAX		30
+@@ -55,6 +56,11 @@ enum extcon_cable_name {
+ 	EXTCON_FAST_CHARGER,
+ 	EXTCON_SLOW_CHARGER,
+ 	EXTCON_CHARGE_DOWNSTREAM,	/* Charging an external device */
++	EXTCON_SDP,
++	EXTCON_DCP,
++	EXTCON_CDP,
++	EXTCON_ACA,
++	EXTCON_AC,
+ 	EXTCON_HDMI,
+ 	EXTCON_MHL,
+ 	EXTCON_DVI,
+@@ -119,6 +125,7 @@ struct extcon_dev {
+ 	/* Optional callbacks to override class functions */
+ 	ssize_t	(*print_name)(struct extcon_dev *edev, char *buf);
+ 	ssize_t	(*print_state)(struct extcon_dev *edev, char *buf);
++	int (*get_cable_properties)(const char *cable_name, void *cable_props);
+ 
+ 	/* Internal data. Please do not set. */
+ 	struct device dev;
+@@ -177,6 +184,23 @@ struct extcon_specific_cable_nb {
+ 	unsigned long previous_value;
+ };
+ 
++enum extcon_chrgr_cbl_stat {
++	EXTCON_CHRGR_CABLE_CONNECTED,
++	EXTCON_CHRGR_CABLE_DISCONNECTED,
++	EXTCON_CHRGR_CABLE_SUSPENDED,
++	EXTCON_CHRGR_CABLE_RESUMED,
++	EXTCON_CHRGR_CABLE_UPDATED,
++};
++
++struct extcon_chrgr_cbl_props {
++	enum extcon_chrgr_cbl_stat cable_stat;
++	unsigned long ma;
++};
++
++/* extcon device register notify events */
++#define EXTCON_DEVICE_ADD		0x0001
++#define EXTCON_DEVICE_REMOVE		0x0002
++
+ #if IS_ENABLED(CONFIG_EXTCON)
+ 
+ /*
+@@ -186,6 +210,9 @@ struct extcon_specific_cable_nb {
+ extern int extcon_dev_register(struct extcon_dev *edev);
+ extern void extcon_dev_unregister(struct extcon_dev *edev);
+ extern struct extcon_dev *extcon_get_extcon_dev(const char *extcon_name);
++extern int extcon_num_of_cable_devs(const char *cable);
++extern void extcon_dev_register_notify(struct notifier_block *nb);
++extern void extcon_dev_unregister_notify(struct notifier_block *nb);
+ 
+ /*
+  * get/set/update_state access the 32b encoded state value, which represents
+@@ -208,6 +235,7 @@ extern int extcon_update_state(struct ex
+  */
+ extern int extcon_find_cable_index(struct extcon_dev *sdev,
+ 				   const char *cable_name);
++extern int extcon_find_cable_type(struct extcon_dev *edev, int index);
+ extern int extcon_get_cable_state_(struct extcon_dev *edev, int cable_index);
+ extern int extcon_set_cable_state_(struct extcon_dev *edev, int cable_index,
+ 				   bool cable_state);
+@@ -247,6 +275,8 @@ static inline int extcon_dev_register(st
+ }
+ 
+ static inline void extcon_dev_unregister(struct extcon_dev *edev) { }
++static void extcon_dev_register_notify(struct notifier_block *nb) { }
++static void extcon_dev_unregister_notify(struct notifier_block *nb) { }
+ 
+ static inline u32 extcon_get_state(struct extcon_dev *edev)
+ {
+@@ -270,6 +300,16 @@ static inline int extcon_find_cable_inde
+ 	return 0;
+ }
+ 
++static int extcon_find_cable_type(struct extcon_dev *edev, int index)
++{
++	return 0;
++}
++
++static int extcon_find_cable_type(struct extcon_dev *edev, int index)
++{
++	return 0;
++}
++
+ static inline int extcon_get_cable_state_(struct extcon_dev *edev,
+ 					  int cable_index)
+ {
+@@ -299,6 +339,11 @@ static inline struct extcon_dev *extcon_
+ 	return NULL;
+ }
+ 
++static inline int extcon_num_of_cable_devs(const char *cable)
++{
++	return 0;
++}
++
+ static inline int extcon_register_notifier(struct extcon_dev *edev,
+ 					   struct notifier_block *nb)
+ {
+Index: linux/include/linux/extcon/extcon-crc-pwrsrc.h
+===================================================================
+--- /dev/null
++++ linux/include/linux/extcon/extcon-crc-pwrsrc.h
+@@ -0,0 +1,8 @@
++
++#ifndef __INTEL_CRYSTALCOVE_PWRSRC_H_
++#define __INTEL_CRYSTALCOVE_PWRSRC_H_
++
++int crystal_cove_enable_vbus(void);
++int crystal_cove_disable_vbus(void);
++int crystal_cove_vbus_on_status(void);
++#endif
+Index: linux/include/linux/extcon/extcon-dc-pwrsrc.h
+===================================================================
+--- /dev/null
++++ linux/include/linux/extcon/extcon-dc-pwrsrc.h
+@@ -0,0 +1,18 @@
++
++#ifndef __DC_XPWR_PWRSRC_H_
++#define __DC_XPWR_PWRSRC_H_
++
++struct dc_xpwr_pwrsrc_pdata {
++	bool	en_chrg_det;
++};
++
++#ifdef CONFIG_INTEL_SOC_PMIC
++int dc_xpwr_vbus_on_status(void);
++#else
++static int dc_xpwr_vbus_on_status(void)
++{
++	return 0;
++}
++#endif
++
++#endif
+Index: linux/include/linux/extcon/extcon-smsc375x.h
+===================================================================
+--- /dev/null
++++ linux/include/linux/extcon/extcon-smsc375x.h
+@@ -0,0 +1,30 @@
++/*
++ * include/linux/extcon/extcon-smsc375x.h
++ *
++ * Copyright (C) 2013 Intel Corporation
++ * Ramakrishna Pallala <ramakrishna.pallala@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifndef _EXTCON_SMSC375X_H_
++#define _EXTCON_SMSC375X_H_
++
++#include <linux/module.h>
++#include <linux/extcon.h>
++
++/**
++ * struct smsc375x_pdata - platform data for SMSC 375x device.
++ * @is_vbus_online  - call back to get VBUS present state
++ */
++struct smsc375x_pdata {
++	int (*enable_vbus)(void);
++	int (*disable_vbus)(void);
++	int (*is_vbus_online)(void);
++	bool charging_compliance_override;
++};
++
++#endif /* _EXTCON_SMSC375X_H_ */
+Index: linux/include/linux/usb/phy.h
+===================================================================
+--- linux.orig/include/linux/usb/phy.h
++++ linux/include/linux/usb/phy.h
+@@ -27,6 +27,7 @@ enum usb_phy_events {
+ 	USB_EVENT_ID,           /* id was grounded */
+ 	USB_EVENT_CHARGER,      /* usb dedicated charger */
+ 	USB_EVENT_ENUMERATED,   /* gadget driver enumerated */
++	USB_EVENT_DRIVE_VBUS,	/* drive vbus request */
+ };
+ 
+ /* associate a type with PHY */
+@@ -60,6 +61,12 @@ enum usb_otg_state {
+ 	OTG_STATE_A_VBUS_ERR,
+ };
+ 
++enum vbus_state {
++	UNKNOW_STATE,
++	VBUS_ENABLED,			/* vbus at normal state */
++	VBUS_DISABLED,			/* vbus disabled by a_bus_drop */
++};
++
+ struct usb_phy;
+ struct usb_otg;
+ 
+@@ -93,6 +100,8 @@ struct usb_phy {
+ 	u16			port_status;
+ 	u16			port_change;
+ 
++	int vbus_state;
++
+ 	/* to support controllers that have multiple transceivers */
+ 	struct list_head	head;
+ 
+@@ -116,6 +125,14 @@ struct usb_phy {
+ 			enum usb_device_speed speed);
+ 	int	(*notify_disconnect)(struct usb_phy *x,
+ 			enum usb_device_speed speed);
++
++	/* check charger status */
++	int	(*get_chrg_status)(struct usb_phy *x, void *data);
++	/* check ID status */
++	int	(*get_id_status)(struct usb_phy *x, void *data);
++
++	/* for a_bus_drop handler fromed user space */
++	void (*a_bus_drop)(struct usb_phy *phy);
+ };
+ 
+ /**
+@@ -306,4 +323,24 @@ static inline const char *usb_phy_type_s
+ 		return "UNKNOWN PHY TYPE";
+ 	}
+ }
++
++static inline int
++otg_get_chrg_status(struct usb_phy *x, void *data)
++{
++	if (x && x->get_chrg_status)
++		return x->get_chrg_status(x, data);
++
++	return -ENOTSUPP;
++}
++
++static inline int
++otg_get_id_status(struct usb_phy *x, void *data)
++{
++	if (x && x->get_id_status)
++		return x->get_id_status(x, data);
++
++	return -ENOTSUPP;
++}
++
++void otg_uevent_trigger(struct usb_phy *phy);
+ #endif /* __LINUX_USB_PHY_H */

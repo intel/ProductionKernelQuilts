@@ -1,0 +1,217 @@
+From 37e48d96b4fefcbd483272cec2eb0471b2399e4c Mon Sep 17 00:00:00 2001
+Message-Id: <37e48d96b4fefcbd483272cec2eb0471b2399e4c.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 24 Jul 2014 17:04:28 +0100
+Subject: [PATCH 25/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: GEN-specific
+ logical ring emit flush
+
+Same as the legacy-style ring->flush.
+
+v2: The BSD invalidate bit still exists in GEN8! Add it for the VCS
+rings (but still consolidate the blt and bsd ring flushes into one).
+This was noticed by Brad Volkin.
+
+v3: The command for BSD and for other rings is slightly different:
+get it exactly the same as in gen6_ring_flush + gen6_bsd_ring_flush
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+[danvet: Checkpatch.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 4712274c362b7730a1c6e01c9a51a6d46f5b7f43)
+
+Change-Id: Ic7ad7ba0fece90bcb2b58f0693866175863a5592
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 4712274c362b7730a1c6e01c9a51a6d46f5b7f43
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/intel_lrc.c        |   85 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    7 ---
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   10 ++++
+ 3 files changed, 95 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index ba87312..b372549 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -338,6 +338,86 @@ static int gen8_init_render_ring(struct intel_engine_cs *ring)
+ 	return ret;
+ }
+ 
++static int gen8_emit_flush(struct intel_ringbuffer *ringbuf,
++			   u32 invalidate_domains,
++			   u32 unused)
++{
++	struct intel_engine_cs *ring = ringbuf->ring;
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	uint32_t cmd;
++	int ret;
++
++	ret = intel_logical_ring_begin(ringbuf, 4);
++	if (ret)
++		return ret;
++
++	cmd = MI_FLUSH_DW + 1;
++
++	if (ring == &dev_priv->ring[VCS]) {
++		if (invalidate_domains & I915_GEM_GPU_DOMAINS)
++			cmd |= MI_INVALIDATE_TLB | MI_INVALIDATE_BSD |
++				MI_FLUSH_DW_STORE_INDEX |
++				MI_FLUSH_DW_OP_STOREDW;
++	} else {
++		if (invalidate_domains & I915_GEM_DOMAIN_RENDER)
++			cmd |= MI_INVALIDATE_TLB | MI_FLUSH_DW_STORE_INDEX |
++				MI_FLUSH_DW_OP_STOREDW;
++	}
++
++	intel_logical_ring_emit(ringbuf, cmd);
++	intel_logical_ring_emit(ringbuf,
++				I915_GEM_HWS_SCRATCH_ADDR |
++				MI_FLUSH_DW_USE_GTT);
++	intel_logical_ring_emit(ringbuf, 0); /* upper addr */
++	intel_logical_ring_emit(ringbuf, 0); /* value */
++	intel_logical_ring_advance(ringbuf);
++
++	return 0;
++}
++
++static int gen8_emit_flush_render(struct intel_ringbuffer *ringbuf,
++				  u32 invalidate_domains,
++				  u32 flush_domains)
++{
++	struct intel_engine_cs *ring = ringbuf->ring;
++	u32 scratch_addr = ring->scratch.gtt_offset + 2 * CACHELINE_BYTES;
++	u32 flags = 0;
++	int ret;
++
++	flags |= PIPE_CONTROL_CS_STALL;
++
++	if (flush_domains) {
++		flags |= PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH;
++		flags |= PIPE_CONTROL_DEPTH_CACHE_FLUSH;
++	}
++
++	if (invalidate_domains) {
++		flags |= PIPE_CONTROL_TLB_INVALIDATE;
++		flags |= PIPE_CONTROL_INSTRUCTION_CACHE_INVALIDATE;
++		flags |= PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE;
++		flags |= PIPE_CONTROL_VF_CACHE_INVALIDATE;
++		flags |= PIPE_CONTROL_CONST_CACHE_INVALIDATE;
++		flags |= PIPE_CONTROL_STATE_CACHE_INVALIDATE;
++		flags |= PIPE_CONTROL_QW_WRITE;
++		flags |= PIPE_CONTROL_GLOBAL_GTT_IVB;
++	}
++
++	ret = intel_logical_ring_begin(ringbuf, 6);
++	if (ret)
++		return ret;
++
++	intel_logical_ring_emit(ringbuf, GFX_OP_PIPE_CONTROL(6));
++	intel_logical_ring_emit(ringbuf, flags);
++	intel_logical_ring_emit(ringbuf, scratch_addr);
++	intel_logical_ring_emit(ringbuf, 0);
++	intel_logical_ring_emit(ringbuf, 0);
++	intel_logical_ring_emit(ringbuf, 0);
++	intel_logical_ring_advance(ringbuf);
++
++	return 0;
++}
++
+ static u32 gen8_get_seqno(struct intel_engine_cs *ring, bool lazy_coherency)
+ {
+ 	return intel_read_status_page(ring, I915_GEM_HWS_INDEX);
+@@ -449,6 +529,7 @@ static int logical_render_ring_init(struct drm_device *dev)
+ 	ring->get_seqno = gen8_get_seqno;
+ 	ring->set_seqno = gen8_set_seqno;
+ 	ring->emit_request = gen8_emit_request;
++	ring->emit_flush = gen8_emit_flush_render;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+@@ -468,6 +549,7 @@ static int logical_bsd_ring_init(struct drm_device *dev)
+ 	ring->get_seqno = gen8_get_seqno;
+ 	ring->set_seqno = gen8_set_seqno;
+ 	ring->emit_request = gen8_emit_request;
++	ring->emit_flush = gen8_emit_flush;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+@@ -487,6 +569,7 @@ static int logical_bsd2_ring_init(struct drm_device *dev)
+ 	ring->get_seqno = gen8_get_seqno;
+ 	ring->set_seqno = gen8_set_seqno;
+ 	ring->emit_request = gen8_emit_request;
++	ring->emit_flush = gen8_emit_flush;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+@@ -506,6 +589,7 @@ static int logical_blt_ring_init(struct drm_device *dev)
+ 	ring->get_seqno = gen8_get_seqno;
+ 	ring->set_seqno = gen8_set_seqno;
+ 	ring->emit_request = gen8_emit_request;
++	ring->emit_flush = gen8_emit_flush;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+@@ -525,6 +609,7 @@ static int logical_vebox_ring_init(struct drm_device *dev)
+ 	ring->get_seqno = gen8_get_seqno;
+ 	ring->set_seqno = gen8_set_seqno;
+ 	ring->emit_request = gen8_emit_request;
++	ring->emit_flush = gen8_emit_flush;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 455f78a..9a65f6b 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -33,13 +33,6 @@
+ #include "i915_trace.h"
+ #include "intel_drv.h"
+ 
+-/* Early gen2 devices have a cacheline of just 32 bytes, using 64 is overkill,
+- * but keeps the logic simple. Indeed, the whole purpose of this macro is just
+- * to give some inclination as to some of the magic values used in the various
+- * workarounds!
+- */
+-#define CACHELINE_BYTES 64
+-
+ bool
+ intel_ring_initialized(struct intel_engine_cs *ring)
+ {
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 3b02075..dc3d7db 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -5,6 +5,13 @@
+ 
+ #define I915_CMD_HASH_ORDER 9
+ 
++/* Early gen2 devices have a cacheline of just 32 bytes, using 64 is overkill,
++ * but keeps the logic simple. Indeed, the whole purpose of this macro is just
++ * to give some inclination as to some of the magic values used in the various
++ * workarounds!
++ */
++#define CACHELINE_BYTES 64
++
+ /*
+  * Gen2 BSpec "1. Programming Environment" / 1.4.4.6 "Ring Buffer Use"
+  * Gen3 BSpec "vol1c Memory Interface Functions" / 2.3.4.5 "Ring Buffer Use"
+@@ -152,6 +159,9 @@ struct  intel_engine_cs {
+ 
+ 	/* Execlists */
+ 	int		(*emit_request)(struct intel_ringbuffer *ringbuf);
++	int		(*emit_flush)(struct intel_ringbuffer *ringbuf,
++				      u32 invalidate_domains,
++				      u32 flush_domains);
+ 
+ 	/**
+ 	 * List of objects currently involved in rendering from the
+-- 
+1.7.9.5
+

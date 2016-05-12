@@ -1,0 +1,517 @@
+From c54c3f2d743dd330ef53bfe1965642659174484e Mon Sep 17 00:00:00 2001
+Message-Id: <c54c3f2d743dd330ef53bfe1965642659174484e.1423172493.git.feitong.yi@intel.com>
+In-Reply-To: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+References: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+From: rtshiva <sivakumar.thulasimani@intel.com>
+Date: Tue, 20 Jan 2015 18:24:07 +0530
+Subject: [PATCH 15/29] MUST_REBASE [VPG]: adf/intel/vlv: Adding the vlv_pll
+ structure
+
+This patch adds new files which contains vlv pll related
+functions, which will be used by all encoders.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+For: GMINL-5213
+Change-Id: I0c667d07878e5079653f9e98f36228c8f9b61042
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Signed-off-by: Deepak M <m.deepak@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/Makefile          |    4 +-
+ drivers/video/adf/intel/core/vlv/vlv_dsi_pll.c     |  299 ++++++++++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_pll.c         |   59 ++++
+ .../adf/intel/include/core/common/dsi/dsi_pipe.h   |    5 -
+ .../video/adf/intel/include/core/intel_dc_config.h |   13 +
+ drivers/video/adf/intel/include/core/vlv/vlv_pll.h |   54 ++++
+ 6 files changed, 428 insertions(+), 6 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/vlv/vlv_dsi_pll.c
+ create mode 100644 drivers/video/adf/intel/core/vlv/vlv_pll.c
+ create mode 100644 drivers/video/adf/intel/include/core/vlv/vlv_pll.h
+
+diff --git a/drivers/video/adf/intel/core/vlv/Makefile b/drivers/video/adf/intel/core/vlv/Makefile
+index aae8c3c..7fa28b8 100644
+--- a/drivers/video/adf/intel/core/vlv/Makefile
++++ b/drivers/video/adf/intel/core/vlv/Makefile
+@@ -8,4 +8,6 @@ obj-y := vlv_dc_config.o \
+ 	vlv_mode_set.o \
+ 	vlv_dpst.o \
+ 	vlv_debugfs.o \
+-	vlv_pipe.o
++	vlv_pipe.o \
++	vlv_pll.o \
++	vlv_dsi_pll.o
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dsi_pll.c b/drivers/video/adf/intel/core/vlv/vlv_dsi_pll.c
+new file mode 100644
+index 0000000..a3dc575
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/vlv_dsi_pll.c
+@@ -0,0 +1,299 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <drm/drmP.h>
++#include <intel_adf_device.h>
++#include <core/intel_dc_config.h>
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_pll.h>
++
++
++#define DSI_HSS_PACKET_SIZE		4
++#define DSI_HSE_PACKET_SIZE		4
++#define DSI_HSA_PACKET_EXTRA_SIZE	6
++#define DSI_HBP_PACKET_EXTRA_SIZE	6
++#define DSI_HACTIVE_PACKET_EXTRA_SIZE	6
++#define DSI_HFP_PACKET_EXTRA_SIZE	6
++#define DSI_EOTP_PACKET_SIZE		4
++
++
++
++static const u32 lfsr_converts[] = {
++	426, 469, 234, 373, 442, 221, 110, 311, 411,		/* 62 - 70 */
++	461, 486, 243, 377, 188, 350, 175, 343, 427, 213,	/* 71 - 80 */
++	106, 53, 282, 397, 454, 227, 113, 56, 284, 142,		/* 81 - 90 */
++	71, 35, 273, 136, 324, 418, 465, 488, 500, 506		/* 91 - 100 */
++};
++
++/* Get DSI clock from pixel clock */
++static u32 vlv_dsi_pll_clk_from_pclk(u32 pclk, int pixel_format, int lane_count)
++{
++	u32 dsi_clk_khz;
++	u32 bpp;
++
++	switch (pixel_format) {
++	default:
++	case VID_MODE_FORMAT_RGB888:
++	case VID_MODE_FORMAT_RGB666_LOOSE:
++		bpp = 24;
++		break;
++	case VID_MODE_FORMAT_RGB666:
++		bpp = 18;
++		break;
++	case VID_MODE_FORMAT_RGB565:
++		bpp = 16;
++		break;
++	}
++
++	/*
++	 * DSI data rate = pixel clock * bits per pixel / lane count
++	 * pixel clock is converted from KHz to Hz
++	 */
++	dsi_clk_khz = DIV_ROUND_CLOSEST(pclk * bpp, lane_count);
++
++	return dsi_clk_khz;
++}
++
++u32 vlv_dsi_pll_calc_mnp(struct vlv_pll *pll, u32 dsi_clk,
++		struct dsi_mnp *dsi_mnp)
++{
++	u32 m, n, p;
++	u32 ref_clk;
++	u32 error;
++	u32 tmp_error;
++	int target_dsi_clk;
++	int calc_dsi_clk;
++	u32 calc_m;
++	u32 calc_p;
++	u32 m_seed;
++	u32 m_start;
++	u32 m_limit;
++	u32 n_limit;
++	u32 p_limit;
++
++	/* dsi_clk is expected in KHZ */
++	if (dsi_clk < 300000 || dsi_clk > 1150000) {
++		pr_err("DSI CLK Out of Range\n");
++		return -ECHRNG;
++	}
++
++	ref_clk = 25000;
++	m_start = 62;
++	m_limit = 92;
++	n_limit = 1;
++	p_limit = 6;
++
++	target_dsi_clk = dsi_clk;
++	error = 0xFFFFFFFF;
++	tmp_error = 0xFFFFFFFF;
++	calc_m = m_start;
++	calc_p = 0;
++
++	for (m = m_start; m <= m_limit; m++) {
++		for (p = 2; p <= p_limit; p++) {
++			/*
++			 * Find the optimal m and p divisors
++			 * with minimal error +/- the required clock
++			 */
++			calc_dsi_clk = (m * ref_clk) / (p * n_limit);
++			if (calc_dsi_clk == target_dsi_clk) {
++				calc_m = m;
++				calc_p = p;
++				error = 0;
++				break;
++			} else
++				tmp_error = abs(target_dsi_clk - calc_dsi_clk);
++
++			if (tmp_error < error) {
++				error = tmp_error;
++				calc_m = m;
++				calc_p = p;
++			}
++		}
++
++		if (error == 0)
++			break;
++	}
++
++	m_seed = lfsr_converts[calc_m - 62];
++	n = n_limit;
++	dsi_mnp->dsi_pll_ctrl = 1 << (DSI_PLL_P1_POST_DIV_SHIFT + calc_p - 2);
++
++	dsi_mnp->dsi_pll_div = (n - 1) << DSI_PLL_N1_DIV_SHIFT |
++			m_seed << DSI_PLL_M1_DIV_SHIFT;
++
++	return 0;
++}
++
++u32 chv_dsi_pll_calc_mnp(struct vlv_pll *pll, u32 dsi_clk,
++		struct dsi_mnp *dsi_mnp)
++{
++	u32 m, n, p;
++	u32 ref_clk;
++	u32 error;
++	u32 tmp_error;
++	int target_dsi_clk;
++	int calc_dsi_clk;
++	u32 calc_m;
++	u32 calc_p;
++	u32 m_seed;
++	u32 m_start;
++	u32 m_limit;
++	u32 n_limit;
++	u32 p_limit;
++
++	/* dsi_clk is expected in KHZ */
++	if (dsi_clk < 300000 || dsi_clk > 1150000) {
++		pr_err("DSI CLK Out of Range\n");
++		return -ECHRNG;
++	}
++
++	ref_clk = 100000;
++	m_start = 70;
++	m_limit = 96;
++	n_limit = 4;
++	p_limit = 6;
++
++	target_dsi_clk = dsi_clk;
++	error = 0xFFFFFFFF;
++	tmp_error = 0xFFFFFFFF;
++	calc_m = m_start;
++	calc_p = 0;
++
++	for (m = m_start; m <= m_limit; m++) {
++		for (p = 2; p <= p_limit; p++) {
++			/*
++			 * Find the optimal m and p divisors
++			 * with minimal error +/- the required clock
++			 */
++			calc_dsi_clk = (m * ref_clk) / (p * n_limit);
++			if (calc_dsi_clk == target_dsi_clk) {
++				calc_m = m;
++				calc_p = p;
++				error = 0;
++				break;
++			} else
++				tmp_error = abs(target_dsi_clk - calc_dsi_clk);
++
++			if (tmp_error < error) {
++				error = tmp_error;
++				calc_m = m;
++				calc_p = p;
++			}
++		}
++
++		if (error == 0)
++			break;
++	}
++
++	m_seed = lfsr_converts[calc_m - 62];
++	n = n_limit;
++	dsi_mnp->dsi_pll_ctrl = 1 << (DSI_PLL_P1_POST_DIV_SHIFT + calc_p - 2);
++
++	dsi_mnp->dsi_pll_div = (n/2) << DSI_PLL_N1_DIV_SHIFT |
++			m_seed << DSI_PLL_M1_DIV_SHIFT;
++
++	return 0;
++}
++
++/*
++ * XXX: The muxing and gating is hard coded for now. Need to add support for
++ * sharing PLLs with two DSI outputs.
++ */
++static void vlv_dsi_pll_configure(struct vlv_pll *pll)
++{
++	u32 ret;
++	struct dsi_config *intel_dsi = pll->config;
++	struct dsi_mnp dsi_mnp;
++	u32 dsi_clk;
++
++	dsi_clk = vlv_dsi_pll_clk_from_pclk(intel_dsi->ctx.pclk,
++		intel_dsi->ctx.pixel_format, intel_dsi->ctx.lane_count);
++
++	if (IS_CHERRYVIEW())
++		ret = chv_dsi_pll_calc_mnp(pll, dsi_clk, &dsi_mnp);
++	else
++		ret = vlv_dsi_pll_calc_mnp(pll, dsi_clk, &dsi_mnp);
++
++	if (ret) {
++		pr_info("dsi_calc_mnp failed\n");
++		return;
++	}
++
++	dsi_mnp.dsi_pll_ctrl |= DSI_PLL_CLK_GATE_DSI0_DSIPLL;
++
++	pr_info("dsi pll div %08x, ctrl %08x\n",
++			dsi_mnp.dsi_pll_div, dsi_mnp.dsi_pll_ctrl);
++
++	vlv_cck_write(CCK_REG_DSI_PLL_CONTROL, 0);
++	vlv_cck_write(CCK_REG_DSI_PLL_DIVIDER, dsi_mnp.dsi_pll_div);
++	vlv_cck_write(CCK_REG_DSI_PLL_CONTROL, dsi_mnp.dsi_pll_ctrl);
++
++	return;
++}
++
++u32 vlv_dsi_pll_enable(struct vlv_pll *pll,
++		struct drm_mode_modeinfo *mode)
++{
++	u32 val;
++
++	/* Disable DPOunit clock gating, can stall pipe */
++	val = REG_READ(pll->offset);
++	val |= DPLL_RESERVED_BIT;
++	REG_WRITE(pll->offset, val);
++
++	val = REG_READ(DSPCLK_GATE_D);
++	val |= VSUNIT_CLOCK_GATE_DISABLE;
++	REG_WRITE(DSPCLK_GATE_D, val);
++
++	vlv_dsi_pll_configure(pll);
++
++	/* wait at least 0.5 us after ungating before enabling VCO */
++	usleep_range(1, 10);
++
++	val = vlv_cck_read(CCK_REG_DSI_PLL_CONTROL);
++	val |= DSI_PLL_VCO_EN;
++	vlv_cck_write(CCK_REG_DSI_PLL_CONTROL, val);
++
++	pr_info("DSI PLL locked\n");
++	return 0;
++
++}
++
++u32 vlv_dsi_pll_disable(struct vlv_pll *pll)
++{
++	u32 val;
++
++	/* program the register values */
++	val = vlv_cck_read(CCK_REG_DSI_PLL_CONTROL);
++	val &= ~DSI_PLL_VCO_EN;
++	val |= DSI_PLL_LDO_GATE;
++	vlv_cck_write(CCK_REG_DSI_PLL_CONTROL, val);
++
++	val = REG_READ(DSPCLK_GATE_D);
++	val &= ~DPOUNIT_CLOCK_GATE_DISABLE;
++	REG_WRITE(DSPCLK_GATE_D, val);
++	return 0;
++
++}
++
++bool vlv_dsi_pll_init(struct vlv_pll *pll, enum pipe pipe_id, enum port port_id)
++{
++	/* init dsi clock */
++	pll->assigned = true;
++
++	pll->offset = DPLL(pipe_id);
++	pll->port_id = port_id;
++	pll->pll_id = (enum pll) pipe_id;
++	return true;
++}
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pll.c b/drivers/video/adf/intel/core/vlv/vlv_pll.c
+new file mode 100644
+index 0000000..b45356c
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/vlv_pll.c
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <intel_adf_device.h>
++#include <core/intel_dc_config.h>
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_pll.h>
++
++
++u32 vlv_pll_enable(struct vlv_pll *pll,
++		struct drm_mode_modeinfo *mode)
++{
++	/* program the register values */
++	return 0;
++}
++
++u32 vlv_pll_disable(struct vlv_pll *pll)
++{
++	/* program the register values */
++	u32 val = 0;
++
++	val = REG_READ(pll->offset);
++	val &= ~DPLL_VCO_ENABLE;
++	if (pll->pll_id == _DPLL_A)
++		val &= ~DPLL_INTEGRATED_CRI_CLK_VLV;
++
++	REG_WRITE(pll->offset, val);
++	return 0;
++}
++
++bool vlv_pll_init(struct vlv_pll *pll, enum intel_pipe_type type,
++		enum pipe pipe_id, enum port port_id)
++{
++	/* do any init needed for each pll */
++	if (type == INTEL_PIPE_DSI)
++		return vlv_dsi_pll_init(pll, pipe_id, port_id);
++
++	/* FIXME: convert to proper pll */
++	pll->pll_id = (enum pll) pipe_id;
++	pll->offset = DPLL(pipe_id);
++	pll->port_id = port_id;
++
++	return false;
++}
++
++bool vlv_pll_destroy(struct vlv_pll *pll)
++{
++	return false;
++}
+diff --git a/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h b/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
+index 797d19a..66a6a33 100644
+--- a/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
++++ b/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
+@@ -29,11 +29,6 @@
+ #include "core/common/backlight_dev.h"
+ #endif
+ 
+-enum enum_ports {
+-	PORT_A = 0,
+-	PORT_C = 1
+-};
+-
+ struct dsi_pipe;
+ 
+ /**
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 9bc1b14..04d49f7 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -48,6 +48,19 @@ enum gen_id {
+ #define IS_CHERRYVIEW() (intel_adf_get_platform_id() == gen_cherryview)
+ #define IS_VALLEYVIEW() (intel_adf_get_platform_id() == gen_valleyview)
+ 
++enum port {
++	PORT_A = 0,
++	PORT_B,
++	PORT_C,
++	PORT_D,
++};
++
++enum pll {
++	PLL_A = 0,
++	PLL_B,
++	PLL_C,
++};
++
+ enum intel_plane_blending {
+ 	INTEL_PLANE_BLENDING_NONE,
+ 	INTEL_PLANE_BLENDING_PREMULT,
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pll.h b/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
+new file mode 100644
+index 0000000..1ae9570
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
+@@ -0,0 +1,54 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef _VLV_PLL_H_
++#define _VLV_PLL_H_
++
++#include <core/intel_dc_config.h>
++#include <core/vlv/vlv_dc_regs.h>
++
++struct dsi_mnp {
++	u32 dsi_pll_ctrl;
++	u32 dsi_pll_div;
++};
++
++struct vlv_pll {
++	bool assigned;
++	enum port port_id;
++	enum pll pll_id;
++	u32 offset;
++	u32 multiplier_offset;
++	u32 dpio_stat_offset;
++	u32 phy_ctrl_offset;
++	u32 phy_stat_offset;
++	u32 clock_type;
++	struct dsi_config *config;
++};
++
++u32 vlv_dsi_pll_enable(struct vlv_pll *pll,
++		struct drm_mode_modeinfo *mode);
++u32 vlv_dsi_pll_disable(struct vlv_pll *pll);
++u32 vlv_dsi_pll_calc_mnp(struct vlv_pll *pll, u32 dsi_clk,
++		struct dsi_mnp *dsi_mnp);
++u32 vlv_pll_enable(struct vlv_pll *pll,
++		struct drm_mode_modeinfo *mode);
++u32 vlv_pll_disable(struct vlv_pll *pll);
++
++u32 chv_dsi_pll_calc_mnp(struct vlv_pll *pll, u32 dsi_clk,
++		struct dsi_mnp *dsi_mnp);
++bool vlv_dsi_pll_init(struct vlv_pll *pll, enum pipe epipe, enum port port);
++bool vlv_pll_init(struct vlv_pll *pll, enum intel_pipe_type type,
++		enum pipe epipe, enum port eport);
++bool vlv_pll_destroy(struct vlv_pll *pll);
++
++#endif /*_VLV_PLL_H_*/
+-- 
+1.7.9.5
+

@@ -1,0 +1,149 @@
+From c034057604b3eba8d452bdeb01330910d403270e Mon Sep 17 00:00:00 2001
+From: Alexander Usyskin <alexander.usyskin@intel.com>
+Date: Sun, 29 Mar 2015 09:33:54 +0300
+Subject: [PATCH] mei: enforce limit of write buffer allocated
+
+This resolves case where application constantly writes
+to firmware client, causing too many request buffers to
+be allocated before the device has a chance to process
+the writes and then have the write buffers freed.
+
+In this case driver will consume all kernel memory.
+
+Limit size of simultaneously allocated write buffers
+to 128K multiplied on number of hw clients.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-7494
+Change-Id: I623e98019883d8d8ac2119a47564101b5efc5d32
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+---
+ drivers/misc/mei/client.c  | 9 +++++++++
+ drivers/misc/mei/hbm.c     | 2 ++
+ drivers/misc/mei/init.c    | 2 ++
+ drivers/misc/mei/main.c    | 5 ++++-
+ drivers/misc/mei/mei_dev.h | 7 +++++++
+ 5 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/mei/client.c b/drivers/misc/mei/client.c
+index 36c0296..cc95750 100644
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -144,6 +144,8 @@ void mei_io_cb_free(struct mei_cl_cb *cb)
+ 	if (cb == NULL)
+ 		return;
+ 
++	if (cb->fop_type == MEI_FOP_WRITE)
++		cb->cl->dev->write_mem_limit += cb->request_buffer.size;
+ 	kfree(cb->request_buffer.data);
+ 	kfree(cb->response_buffer.data);
+ 	kfree(cb);
+@@ -182,6 +184,7 @@ struct mei_cl_cb *mei_io_cb_init(struct mei_cl *cl, struct file *fp)
+  * returns 0 on success
+  *         -EINVAL if cb is NULL
+  *         -ENOMEM if allocation failed
++ *         -EBUSY  if write memory limit reached
+  */
+ int mei_io_cb_alloc_req_buf(struct mei_cl_cb *cb, size_t length)
+ {
+@@ -191,10 +194,16 @@ int mei_io_cb_alloc_req_buf(struct mei_cl_cb *cb, size_t length)
+ 	if (length == 0)
+ 		return 0;
+ 
++	if (length > cb->cl->dev->write_mem_limit)
++		return -EBUSY;
++
+ 	cb->request_buffer.data = kmalloc(length, GFP_KERNEL);
+ 	if (!cb->request_buffer.data)
+ 		return -ENOMEM;
+ 	cb->request_buffer.size = length;
++
++	/* register that we use length memory in this call */
++	cb->cl->dev->write_mem_limit -= length;
+ 	return 0;
+ }
+ /**
+diff --git a/drivers/misc/mei/hbm.c b/drivers/misc/mei/hbm.c
+index b9a4bb5..d0fc857 100644
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -79,6 +79,8 @@ static int mei_hbm_me_cl_allocate(struct mei_device *dev)
+ 	for_each_set_bit(b, dev->me_clients_map, MEI_CLIENTS_MAX)
+ 		dev->me_clients_num++;
+ 
++	dev->write_mem_limit = dev->me_clients_num * MEI_WRITE_BUF_LIMIT;
++
+ 	if (dev->me_clients_num == 0)
+ 		return 0;
+ 
+diff --git a/drivers/misc/mei/init.c b/drivers/misc/mei/init.c
+index 04fd306..8fc4e50 100644
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -382,6 +382,8 @@ void mei_device_init(struct mei_device *dev, const struct mei_cfg *cfg)
+ 	bitmap_zero(dev->host_clients_map, MEI_CLIENTS_MAX);
+ 	dev->open_handle_count = 0;
+ 
++	dev->write_mem_limit = 0;
++
+ 	/*
+ 	 * Reserving the first client ID
+ 	 * 0: Reserved for MEI Bus Message communications
+diff --git a/drivers/misc/mei/main.c b/drivers/misc/mei/main.c
+index 66f0a1a..e39d1f1 100644
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@ -390,8 +390,11 @@ static ssize_t mei_write(struct file *file, const char __user *ubuf,
+ 		goto out;
+ 	}
+ 	rets = mei_io_cb_alloc_req_buf(write_cb, length);
+-	if (rets)
++	if (rets) {
++		dev_warn(&dev->pdev->dev,
++			"failed to allocate req buffer, err = %d\n", rets);
+ 		goto out;
++	}
+ 
+ 	rets = copy_from_user(write_cb->request_buffer.data, ubuf, length);
+ 	if (rets) {
+diff --git a/drivers/misc/mei/mei_dev.h b/drivers/misc/mei/mei_dev.h
+index 5c7e990..dfddbdb 100644
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -22,6 +22,7 @@
+ #include <linux/poll.h>
+ #include <linux/mei.h>
+ #include <linux/mei_cl_bus.h>
++#include <linux/sizes.h>
+ 
+ #include "hw.h"
+ #include "hbm.h"
+@@ -43,6 +44,8 @@
+ 
+ #define MEI_RD_MSG_BUF_SIZE           (128 * sizeof(u32))
+ 
++/* write buffer limit multiplier (per hw client) in bytes */
++#define MEI_WRITE_BUF_LIMIT      SZ_128K
+ 
+ /*
+  * AMTHI Client UUID
+@@ -407,6 +410,7 @@ struct mei_cfg {
+ 
+  * @hbuf_depth - depth of hardware host/write buffer is slots
+  * @hbuf_is_ready - query if the host host/write buffer is ready
++ * @write_mem_limit - limit write buffers, counted in bytes
+  * @wr_msg - the buffer for hbm control messages
+  * @cfg - per device generation config and ops
+  */
+@@ -466,6 +470,9 @@ struct mei_device {
+ 	u8 hbuf_depth;
+ 	bool hbuf_is_ready;
+ 
++	/* limit write buffers*/
++	size_t write_mem_limit;
++
+ 	/* used for control messages */
+ 	struct {
+ 		struct mei_msg_hdr hdr;
+-- 
+1.9.1
+

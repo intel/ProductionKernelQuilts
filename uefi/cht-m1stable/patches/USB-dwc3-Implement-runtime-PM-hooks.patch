@@ -1,0 +1,576 @@
+From 40e4c2f5b99bceb4ee9e7f667f20c1f218cb4dbe Mon Sep 17 00:00:00 2001
+From: Hetian Fang <hetian.fang@intel.com>
+Date: Mon, 18 Aug 2014 17:01:56 +0800
+Subject: [PATCH] USB: dwc3: Implement runtime PM hooks
+
+Re-use system suspend/resume hooks
+
+Note: We must disable the USB PHY for power saving,
+before shutdown USB PHY, dwc3_suspend_phy() must be called
+to avoid USB hang
+
+Change-Id: Ib3768df35a3850cb2132b7354f55b3e909cd2b91
+---
+ drivers/usb/dwc3/core.c          |  183 ++++++++++++++++++++++++++++-----------
+ drivers/usb/dwc3/core.h          |    4 
+ drivers/usb/dwc3/dwc3-pci.c      |   65 +++++++++++++
+ drivers/usb/dwc3/gadget.c        |   25 +++++
+ drivers/usb/dwc3/platform_data.h |    1 
+ 5 files changed, 229 insertions(+), 49 deletions(-)
+
+--- linux.orig/drivers/usb/dwc3/core.c
++++ linux/drivers/usb/dwc3/core.c
+@@ -62,6 +62,8 @@ void dwc3_set_mode(struct dwc3 *dwc, u32
+ #define GUSB2PHYCFG_SUS_PHY                     0x40
+ #define GUSB2PHYCFG_PHYSOFTRST (1 << 31)
+ #define GUSB2PHYCFG_ULPI_AUTO_RESUME (1 << 15)
++#define GUSB3PIPECTL0                           0xc2c0
++#define GUSB3PIPECTL_SUS_EN                     0x20000
+ 
+ #define EXTEND_ULPI_REGISTER_ACCESS_MASK        0xC0
+ #define GUSB2PHYACC0    0xc280
+@@ -430,6 +432,60 @@ static void dwc3_core_exit(struct dwc3 *
+ 	usb_phy_shutdown(dwc->usb3_phy);
+ }
+ 
++static void dwc3_suspend_phy(struct dwc3 *dwc, bool suspend)
++{
++	u32 data = 0;
++
++	data = dwc3_readl(dwc->regs, GUSB2PHYCFG0);
++	if (suspend)
++		data |= GUSB2PHYCFG_SUS_PHY;
++	else
++		data &= ~GUSB2PHYCFG_SUS_PHY;
++
++	dwc3_writel(dwc->regs, GUSB2PHYCFG0, data);
++
++	data = dwc3_readl(dwc->regs, GUSB3PIPECTL0);
++	if (suspend)
++		data |= GUSB3PIPECTL_SUS_EN;
++	else
++		data &= ~GUSB3PIPECTL_SUS_EN;
++
++	dwc3_writel(dwc->regs, GUSB3PIPECTL0, data);
++}
++
++static int dwc3_handle_otg_notification(struct notifier_block *nb,
++		unsigned long event, void *data)
++{
++	struct dwc3* dwc = container_of(nb, struct dwc3, nb);
++	unsigned long flags;
++	int state = NOTIFY_DONE;
++	static int last_value = -1;
++	int val;
++
++	val = *(int *)data;
++
++	if (last_value == val)
++		goto out;
++
++	last_value = val;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	switch (event) {
++	case USB_EVENT_VBUS:
++		dev_info(dwc->dev, "DWC3 OTG Notify USB_EVENT_VBUS, val = %d\n", val);
++		if (val)
++			pm_runtime_get(dwc->dev);
++		state = NOTIFY_OK;
++		break;
++	default:
++		dev_dbg(dwc->dev, "DWC3 OTG Notify unknow notify message\n");
++	}
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++out:
++	return state;
++}
++
+ #define DWC3_ALIGN_MASK		(16 - 1)
+ 
+ static int dwc3_probe(struct platform_device *pdev)
+@@ -485,6 +541,7 @@ static int dwc3_probe(struct platform_de
+ 
+ 		dwc->needs_fifo_resize = pdata->tx_fifo_resize;
+ 		dwc->dr_mode = pdata->dr_mode;
++		dwc->runtime_suspend = pdata->runtime_suspend;
+ 	} else {
+ 		dwc->usb2_phy = devm_usb_get_phy(dev, USB_PHY_TYPE_USB2);
+ 		dwc->usb3_phy = devm_usb_get_phy(dev, USB_PHY_TYPE_USB3);
+@@ -551,6 +608,7 @@ static int dwc3_probe(struct platform_de
+ 	dev->dma_parms	= dev->parent->dma_parms;
+ 	dma_set_coherent_mask(dev, dev->parent->coherent_dma_mask);
+ 
++	pm_runtime_set_active(dev);
+ 	pm_runtime_enable(dev);
+ 	pm_runtime_get_sync(dev);
+ 	pm_runtime_forbid(dev);
+@@ -629,10 +687,31 @@ static int dwc3_probe(struct platform_de
+ 		goto err3;
+ 	}
+ 
++	atomic_set(&dwc->suspend_depth, 0);
++
++	if (dwc->runtime_suspend) {
++		pm_runtime_set_autosuspend_delay(dev, 500);
++		pm_runtime_use_autosuspend(dev);
++		pm_runtime_mark_last_busy(dev);
++		pm_runtime_put_autosuspend(dev);
++
++		/* Register otg notifier to monitor VBus change events */
++		// FIXME: usb3_phy notification
++		dwc->nb.notifier_call = dwc3_handle_otg_notification;
++		ret = usb_register_notifier(dwc->usb2_phy, &dwc->nb);
++		if (ret) {
++			dev_err(dev, "failed to register otg notifier\n");
++			goto err4;
++		}
++	}
++
+ 	pm_runtime_allow(dev);
+ 
+ 	return 0;
+ 
++err4:
++	dwc3_debugfs_exit(dwc);
++
+ err3:
+ 	switch (dwc->dr_mode) {
+ 	case USB_DR_MODE_PERIPHERAL:
+@@ -694,68 +773,80 @@ static int dwc3_remove(struct platform_d
+ 
+ 	dwc3_core_exit(dwc);
+ 
+-	pm_runtime_put_sync(&pdev->dev);
++	if (dwc->runtime_suspend) {
++		usb_unregister_notifier(dwc->usb2_phy, &dwc->nb);
++	} else {
++		pm_runtime_put_sync(&pdev->dev);
++	}
++
+ 	pm_runtime_disable(&pdev->dev);
+ 
+ 	return 0;
+ }
+ 
++
+ #ifdef CONFIG_PM_SLEEP
+-static int dwc3_prepare(struct device *dev)
++
++static int dwc3_suspend_common(struct device *dev)
+ {
+ 	struct dwc3	*dwc = dev_get_drvdata(dev);
+ 	unsigned long	flags;
+ 
++	if (atomic_inc_return(&dwc->suspend_depth) > 1)
++		return 0;
++
+ 	spin_lock_irqsave(&dwc->lock, flags);
+ 
+ 	switch (dwc->dr_mode) {
+ 	case USB_DR_MODE_PERIPHERAL:
+ 	case USB_DR_MODE_OTG:
+ 		dwc3_gadget_prepare(dwc);
++		dwc3_gadget_suspend(dwc);
+ 		/* FALLTHROUGH */
+ 	case USB_DR_MODE_HOST:
+ 	default:
+-		dwc3_event_buffers_cleanup(dwc);
++		/* do nothing */
+ 		break;
+ 	}
+ 
++	dwc3_event_buffers_cleanup(dwc);
++
++	dwc->gctl = dwc3_readl(dwc->regs, DWC3_GCTL);
++
++	dwc3_suspend_phy(dwc, true);
++
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++	usb_phy_shutdown(dwc->usb3_phy);
++	usb_phy_shutdown(dwc->usb2_phy);
++
+ 	return 0;
+ }
+ 
+-static void dwc3_complete(struct device *dev)
++static int dwc3_resume_common(struct device *dev)
+ {
+ 	struct dwc3	*dwc = dev_get_drvdata(dev);
+ 	unsigned long	flags;
+ 
+-	spin_lock_irqsave(&dwc->lock, flags);
++	if (atomic_dec_return(&dwc->suspend_depth) > 0)
++		return 0;
+ 
+-	switch (dwc->dr_mode) {
+-	case USB_DR_MODE_PERIPHERAL:
+-	case USB_DR_MODE_OTG:
+-		dwc3_gadget_complete(dwc);
+-		/* FALLTHROUGH */
+-	case USB_DR_MODE_HOST:
+-	default:
+-		dwc3_event_buffers_setup(dwc);
+-		break;
+-	}
++	usb_phy_init(dwc->usb3_phy);
++	usb_phy_init(dwc->usb2_phy);
+ 
+-	spin_unlock_irqrestore(&dwc->lock, flags);
+-}
++	spin_lock_irqsave(&dwc->lock, flags);
+ 
+-static int dwc3_suspend(struct device *dev)
+-{
+-	struct dwc3	*dwc = dev_get_drvdata(dev);
+-	unsigned long	flags;
++	dwc3_suspend_phy(dwc, false);
+ 
+-	spin_lock_irqsave(&dwc->lock, flags);
++	dwc3_writel(dwc->regs, DWC3_GCTL, dwc->gctl);
++
++	dwc3_event_buffers_setup(dwc);
+ 
+ 	switch (dwc->dr_mode) {
+ 	case USB_DR_MODE_PERIPHERAL:
+ 	case USB_DR_MODE_OTG:
+-		dwc3_gadget_suspend(dwc);
++		dwc3_gadget_resume(dwc);
++		dwc3_gadget_complete(dwc);
+ 		/* FALLTHROUGH */
+ 	case USB_DR_MODE_HOST:
+ 	default:
+@@ -763,46 +854,44 @@ static int dwc3_suspend(struct device *d
+ 		break;
+ 	}
+ 
+-	dwc->gctl = dwc3_readl(dwc->regs, DWC3_GCTL);
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
+ 	return 0;
+ }
+ 
+-static int dwc3_resume(struct device *dev)
++
++#ifdef CONFIG_PM_RUNTIME
++
++static int dwc3_runtime_suspend(struct device *dev)
+ {
+-	struct dwc3	*dwc = dev_get_drvdata(dev);
+-	unsigned long	flags;
++	return dwc3_suspend_common(dev);
++}
+ 
+-	spin_lock_irqsave(&dwc->lock, flags);
++static int dwc3_runtime_resume(struct device *dev)
++{
++	return dwc3_resume_common(dev);
++}
+ 
+-	dwc3_writel(dwc->regs, DWC3_GCTL, dwc->gctl);
++#else
+ 
+-	switch (dwc->dr_mode) {
+-	case USB_DR_MODE_PERIPHERAL:
+-	case USB_DR_MODE_OTG:
+-		dwc3_gadget_resume(dwc);
+-		/* FALLTHROUGH */
+-	case USB_DR_MODE_HOST:
+-	default:
+-		/* do nothing */
+-		break;
+-	}
++#define dwc3_runtime_suspend NULL
++#define dwc3_runtime_resume NULL
+ 
+-	spin_unlock_irqrestore(&dwc->lock, flags);
++#endif
+ 
+-	pm_runtime_disable(dev);
+-	pm_runtime_set_active(dev);
+-	pm_runtime_enable(dev);
++static int dwc3_suspend(struct device *dev)
++{
++	return dwc3_suspend_common(dev);
++}
+ 
+-	return 0;
++static int dwc3_resume(struct device *dev)
++{
++	return dwc3_resume_common(dev);
+ }
+ 
+ static const struct dev_pm_ops dwc3_dev_pm_ops = {
+-	.prepare	= dwc3_prepare,
+-	.complete	= dwc3_complete,
+-
+ 	SET_SYSTEM_SLEEP_PM_OPS(dwc3_suspend, dwc3_resume)
++	SET_RUNTIME_PM_OPS(dwc3_runtime_suspend, dwc3_runtime_resume, NULL)
+ };
+ 
+ #define DWC3_PM_OPS	&(dwc3_dev_pm_ops)
+--- linux.orig/drivers/usb/dwc3/core.h
++++ linux/drivers/usb/dwc3/core.h
+@@ -732,6 +732,10 @@ struct dwc3 {
+ 
+ 	u8			test_mode;
+ 	u8			test_mode_nr;
++
++	bool			runtime_suspend;
++	struct notifier_block	nb;
++	atomic_t		suspend_depth;
+ };
+ 
+ /* -------------------------------------------------------------------------- */
+--- linux.orig/drivers/usb/dwc3/dwc3-pci.c
++++ linux/drivers/usb/dwc3/dwc3-pci.c
+@@ -25,6 +25,8 @@
+ #include <linux/usb/otg.h>
+ #include <linux/usb/usb_phy_gen_xceiv.h>
+ 
++#include "platform_data.h"
++
+ /* FIXME define these in <linux/pci_ids.h> */
+ #define PCI_VENDOR_ID_SYNOPSYS		0x16c3
+ #define PCI_DEVICE_ID_SYNOPSYS_HAPSUSB3	0xabcd
+@@ -36,6 +38,7 @@ struct dwc3_pci {
+ 	struct platform_device	*dwc3;
+ 	struct platform_device	*usb2_phy;
+ 	struct platform_device	*usb3_phy;
++	atomic_t		suspend_depth;
+ };
+ 
+ static int dwc3_pci_register_phys(struct dwc3_pci *glue)
+@@ -132,6 +135,9 @@ static int dwc3_pci_probe(struct pci_dev
+ 	struct dwc3_pci		*glue;
+ 	int			ret = -ENOMEM;
+ 	struct device		*dev = &pci->dev;
++	struct dwc3_platform_data	pdata;
++
++	memset(&pdata, 0x00, sizeof(pdata));
+ 
+ 	glue = devm_kzalloc(dev, sizeof(*glue), GFP_KERNEL);
+ 	if (!glue) {
+@@ -162,6 +168,11 @@ static int dwc3_pci_probe(struct pci_dev
+ 		goto err1;
+ 	}
+ 
++	pdata.runtime_suspend = true;
++	ret = platform_device_add_data(dwc3, &pdata, sizeof(pdata));
++	if (ret)
++		goto err1;
++
+ 	memset(res, 0x00, sizeof(struct resource) * ARRAY_SIZE(res));
+ 
+ 	res[0].start	= pci_resource_start(pci, 0);
+@@ -201,6 +212,14 @@ static int dwc3_pci_probe(struct pci_dev
+ 		goto err3;
+ 	}
+ 
++	atomic_set(&glue->suspend_depth, 0);
++
++	pm_runtime_set_autosuspend_delay(dev, 100);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_allow(dev);
++	pm_runtime_mark_last_busy(dev);
++	pm_runtime_put_autosuspend(dev);
++
+ 	return 0;
+ 
+ err3:
+@@ -215,6 +234,9 @@ static void dwc3_pci_remove(struct pci_d
+ {
+ 	struct dwc3_pci	*glue = pci_get_drvdata(pci);
+ 
++	pm_runtime_forbid(glue->dev);
++	pm_runtime_set_suspended(glue->dev);
++
+ 	platform_device_unregister(glue->dwc3);
+ 	platform_device_unregister(glue->usb2_phy);
+ 	platform_device_unregister(glue->usb3_phy);
+@@ -233,20 +255,28 @@ static const struct pci_device_id dwc3_p
+ MODULE_DEVICE_TABLE(pci, dwc3_pci_id_table);
+ 
+ #ifdef CONFIG_PM_SLEEP
+-static int dwc3_pci_suspend(struct device *dev)
++static int dwc3_pci_suspend_common(struct device *dev)
+ {
+ 	struct pci_dev	*pci = to_pci_dev(dev);
++	struct dwc3_pci	*glue = pci_get_drvdata(pci);
++
++	if (atomic_inc_return(&glue->suspend_depth) > 1)
++		return 0;
+ 
+ 	pci_disable_device(pci);
+ 
+ 	return 0;
+ }
+ 
+-static int dwc3_pci_resume(struct device *dev)
++static int dwc3_pci_resume_common(struct device *dev)
+ {
+ 	struct pci_dev	*pci = to_pci_dev(dev);
++	struct dwc3_pci	*glue = pci_get_drvdata(pci);
+ 	int		ret;
+ 
++	if (atomic_dec_return(&glue->suspend_depth) > 0)
++		return 0;
++
+ 	ret = pci_enable_device(pci);
+ 	if (ret) {
+ 		dev_err(dev, "can't re-enable device --> %d\n", ret);
+@@ -257,10 +287,41 @@ static int dwc3_pci_resume(struct device
+ 
+ 	return 0;
+ }
++
++static int dwc3_pci_suspend(struct device *dev)
++{
++	return dwc3_pci_suspend_common(dev);
++}
++
++static int dwc3_pci_resume(struct device *dev)
++{
++	return dwc3_pci_resume_common(dev);
++}
++
++#ifdef CONFIG_PM_RUNTIME
++
++static int dwc3_pci_runtime_suspend(struct device *dev)
++{
++	return dwc3_pci_suspend_common(dev);
++}
++
++static int dwc3_pci_runtime_resume(struct device *dev)
++{
++	return dwc3_pci_resume_common(dev);
++}
++
++#else
++
++#define dwc3_pci_runtime_suspend NULL
++#define dwc3_pci_runtime_resume NULL
++
++#endif
++
+ #endif /* CONFIG_PM_SLEEP */
+ 
+ static const struct dev_pm_ops dwc3_pci_dev_pm_ops = {
+ 	SET_SYSTEM_SLEEP_PM_OPS(dwc3_pci_suspend, dwc3_pci_resume)
++	SET_RUNTIME_PM_OPS(dwc3_pci_runtime_suspend, dwc3_pci_runtime_resume, NULL)
+ };
+ 
+ static struct pci_driver dwc3_pci_driver = {
+--- linux.orig/drivers/usb/dwc3/gadget.c
++++ linux/drivers/usb/dwc3/gadget.c
+@@ -1359,6 +1359,8 @@ static int dwc3_gadget_wakeup(struct usb
+ 	u8			link_state;
+ 	u8			speed;
+ 
++	pm_runtime_get_sync(dwc->dev);
++
+ 	spin_lock_irqsave(&dwc->lock, flags);
+ 
+ 	/*
+@@ -1422,6 +1424,8 @@ static int dwc3_gadget_wakeup(struct usb
+ out:
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++	pm_runtime_put_autosuspend(dwc->dev);
++
+ 	return ret;
+ }
+ 
+@@ -1492,10 +1496,14 @@ static int dwc3_gadget_pullup(struct usb
+ 
+ 	is_on = !!is_on;
+ 
++	pm_runtime_get_sync(dwc->dev);
++
+ 	spin_lock_irqsave(&dwc->lock, flags);
+ 	ret = dwc3_gadget_run_stop(dwc, is_on);
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++	pm_runtime_put_autosuspend(dwc->dev);
++
+ 	return ret;
+ }
+ 
+@@ -1536,6 +1544,8 @@ static int dwc3_gadget_start(struct usb_
+ 	int			irq;
+ 	u32			reg;
+ 
++	pm_runtime_get_sync(dwc->dev);
++
+ 	irq = platform_get_irq(to_platform_device(dwc->dev), 0);
+ 	ret = request_threaded_irq(irq, dwc3_interrupt, dwc3_thread_interrupt,
+ 			IRQF_SHARED, "dwc3", dwc);
+@@ -1545,6 +1555,7 @@ static int dwc3_gadget_start(struct usb_
+ 		goto err0;
+ 	}
+ 
++
+ 	spin_lock_irqsave(&dwc->lock, flags);
+ 
+ 	if (dwc->gadget_driver) {
+@@ -1619,8 +1630,11 @@ static int dwc3_gadget_start(struct usb_
+ 
+ 	dwc3_gadget_enable_irq(dwc);
+ 
++
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++	pm_runtime_put_autosuspend(dwc->dev);
++
+ 	return 0;
+ 
+ err3:
+@@ -1635,6 +1649,8 @@ err1:
+ 	free_irq(irq, dwc);
+ 
+ err0:
++	pm_runtime_put_autosuspend(dwc->dev);
++
+ 	return ret;
+ }
+ 
+@@ -1645,6 +1661,8 @@ static int dwc3_gadget_stop(struct usb_g
+ 	unsigned long		flags;
+ 	int			irq;
+ 
++	pm_runtime_get_sync(dwc->dev);
++
+ 	spin_lock_irqsave(&dwc->lock, flags);
+ 
+ 	dwc3_gadget_disable_irq(dwc);
+@@ -1655,6 +1673,8 @@ static int dwc3_gadget_stop(struct usb_g
+ 
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++	pm_runtime_put_autosuspend(dwc->dev);
++
+ 	irq = platform_get_irq(to_platform_device(dwc->dev), 0);
+ 	free_irq(irq, dwc);
+ 
+@@ -2152,6 +2172,11 @@ static void dwc3_gadget_disconnect_inter
+ 
+ 	dwc->gadget.speed = USB_SPEED_UNKNOWN;
+ 	dwc->setup_packet_pending = false;
++
++	if (dwc->runtime_suspend) {
++		pm_runtime_mark_last_busy(dwc->dev);
++		pm_runtime_put_autosuspend(dwc->dev);
++	}
+ }
+ 
+ static void dwc3_gadget_reset_interrupt(struct dwc3 *dwc)
+--- linux.orig/drivers/usb/dwc3/platform_data.h
++++ linux/drivers/usb/dwc3/platform_data.h
+@@ -24,4 +24,5 @@ struct dwc3_platform_data {
+ 	enum usb_device_speed maximum_speed;
+ 	enum usb_dr_mode dr_mode;
+ 	bool tx_fifo_resize;
++	bool runtime_suspend;
+ };

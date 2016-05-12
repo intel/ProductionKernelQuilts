@@ -1,0 +1,210 @@
+From 944cd2086fc6ae385ef02c1c2fc40f3410a424c4 Mon Sep 17 00:00:00 2001
+Message-Id: <944cd2086fc6ae385ef02c1c2fc40f3410a424c4.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 5 Sep 2013 14:19:24 +0530
+Subject: [PATCH 014/312] FROM_UPSTREAM [VPG]: drm/i915/sprite: Make plane
+ switching asynchronous
+
+Issue: AXIA-4190
+
+Queue the unpinning of the current plane object to after the next vblank.
+For special case benchmarks and others apps that may call set_plane at a
+high frequency, we can unpin their objects directly unless they are "live".
+
+v2: (vandana.kannan@intel.com) Rework commit message
+Requirement:- On enabling sprite, it was found that the sprite fps was too
+low. Making use of this patch as it gives a performance boost.
+To be reverted:- This patch is not the final solution. The final solution
+will have to be worked upon later.
+
+Change-Id: I7297031fd9f3a2a2a545b1dc4df77f42cdffc5be
+Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+
+Conflicts:
+
+	drivers/gpu/drm/i915/intel_drv.h
+	drivers/gpu/drm/i915/intel_sprite.c
+(cherry picked from commit 5993a16595b33abcc62f8639c063b2738e1c351d)
+---
+ drivers/gpu/drm/i915/i915_reg.h      |    2 +
+ drivers/gpu/drm/i915/intel_display.c |    2 +-
+ drivers/gpu/drm/i915/intel_drv.h     |    3 ++
+ drivers/gpu/drm/i915/intel_sprite.c  |   67 +++++++++++++++++++++++-----------
+ 4 files changed, 52 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index eb17a6a..d9aaec9 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -4173,6 +4173,7 @@ enum punit_power_well {
+ #define DVSSTRIDE(pipe) _PIPE(pipe, _DVSASTRIDE, _DVSBSTRIDE)
+ #define DVSPOS(pipe) _PIPE(pipe, _DVSAPOS, _DVSBPOS)
+ #define DVSSURF(pipe) _PIPE(pipe, _DVSASURF, _DVSBSURF)
++#define DVSSURFLIVE(pipe) _PIPE(pipe, _DVSASURFLIVE, _DVSBSURFLIVE)
+ #define DVSKEYMAX(pipe) _PIPE(pipe, _DVSAKEYMAXVAL, _DVSBKEYMAXVAL)
+ #define DVSSIZE(pipe) _PIPE(pipe, _DVSASIZE, _DVSBSIZE)
+ #define DVSSCALE(pipe) _PIPE(pipe, _DVSASCALE, _DVSBSCALE)
+@@ -4249,6 +4250,7 @@ enum punit_power_well {
+ #define SPRKEYVAL(pipe) _PIPE(pipe, _SPRA_KEYVAL, _SPRB_KEYVAL)
+ #define SPRKEYMSK(pipe) _PIPE(pipe, _SPRA_KEYMSK, _SPRB_KEYMSK)
+ #define SPRSURF(pipe) _PIPE(pipe, _SPRA_SURF, _SPRB_SURF)
++#define SPRSURFLIVE(pipe) _PIPE(pipe, _SPRA_SURFLIVE, _SPRB_SURFLIVE)
+ #define SPRKEYMAX(pipe) _PIPE(pipe, _SPRA_KEYMAX, _SPRB_KEYMAX)
+ #define SPRTILEOFF(pipe) _PIPE(pipe, _SPRA_TILEOFF, _SPRB_TILEOFF)
+ #define SPROFFSET(pipe) _PIPE(pipe, _SPRA_OFFSET, _SPRB_OFFSET)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index b65f560..92f8112 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2719,7 +2719,7 @@ static void intel_crtc_unpin_work_fn(struct intel_crtc *crtc, void *obj)
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
+-static void
++void
+ intel_crtc_queue_unpin(struct intel_crtc *crtc,
+ 		       struct drm_i915_gem_object *obj)
+ {
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index c9b2ad7..a116fc9 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -461,6 +461,7 @@ struct intel_plane {
+ 			       struct drm_intel_sprite_colorkey *key);
+ 	void (*get_colorkey)(struct drm_plane *plane,
+ 			     struct drm_intel_sprite_colorkey *key);
++	u32 (*current_surface)(struct drm_plane *plane);
+ };
+ 
+ struct intel_watermark_params {
+@@ -731,6 +732,8 @@ void intel_mark_fb_busy(struct drm_i915_gem_object *obj,
+ 			struct intel_engine_cs *ring);
+ void intel_mark_idle(struct drm_device *dev);
+ void intel_crtc_restore_mode(struct drm_crtc *crtc);
++void intel_crtc_queue_unpin(struct intel_crtc *crtc,
++			    struct drm_i915_gem_object *obj);
+ void intel_crtc_update_dpms(struct drm_crtc *crtc);
+ void intel_encoder_destroy(struct drm_encoder *encoder);
+ void intel_connector_dpms(struct drm_connector *, int mode);
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 9a17b4e..863e29c 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -543,6 +543,16 @@ ivb_get_colorkey(struct drm_plane *plane, struct drm_intel_sprite_colorkey *key)
+ 		key->flags = I915_SET_COLORKEY_NONE;
+ }
+ 
++static u32
++ivb_current_surface(struct drm_plane *plane)
++{
++	struct intel_plane *intel_plane;
++
++	intel_plane = to_intel_plane(plane);
++
++	return SPRSURFLIVE(intel_plane->pipe);
++}
++
+ static void
+ ilk_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 		 struct drm_framebuffer *fb,
+@@ -809,6 +819,35 @@ static bool colorkey_enabled(struct intel_plane *intel_plane)
+ 	return key.flags != I915_SET_COLORKEY_NONE;
+ }
+ 
++static u32
++ilk_current_surface(struct drm_plane *plane)
++{
++	struct intel_plane *intel_plane;
++
++	intel_plane = to_intel_plane(plane);
++
++	return DVSSURFLIVE(intel_plane->pipe);
++}
++
++static void
++intel_plane_queue_unpin(struct intel_plane *plane,
++			struct drm_i915_gem_object *obj)
++{
++	/*
++	 * If the surface is currently being scanned out, we need to
++	 * wait until the next vblank event latches in the new base address
++	 * before we unpin it, or we may end up displaying the wrong data.
++	 * However, if the old object isn't currently 'live', we can just
++	 * unpin right away.
++	 */
++	if (plane->current_surface(&plane->base) != i915_gem_obj_ggtt_offset(obj)) {
++		intel_unpin_fb_obj(obj);
++		return;
++	}
++
++	intel_crtc_queue_unpin(to_intel_crtc(plane->base.crtc), obj);
++}
++
+ static int
+ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 		   struct drm_framebuffer *fb, int crtc_x, int crtc_y,
+@@ -1044,20 +1083,8 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	}
+ 
+ 	/* Unpin old obj after new one is active to avoid ugliness */
+-	if (old_obj) {
+-		/*
+-		 * It's fairly common to simply update the position of
+-		 * an existing object.  In that case, we don't need to
+-		 * wait for vblank to avoid ugliness, we only need to
+-		 * do the pin & ref bookkeeping.
+-		 */
+-		if (old_obj != obj && intel_crtc->active)
+-			intel_wait_for_vblank(dev, intel_crtc->pipe);
+-
+-		mutex_lock(&dev->struct_mutex);
+-		intel_unpin_fb_obj(old_obj);
+-		mutex_unlock(&dev->struct_mutex);
+-	}
++	if (old_obj)
++		intel_plane_queue_unpin(intel_plane, old_obj);
+ 
+ 	return 0;
+ }
+@@ -1088,16 +1115,12 @@ intel_disable_plane(struct drm_plane *plane)
+ 			intel_post_enable_primary(plane->crtc);
+ 	}
+ 
++	mutex_lock(&dev->struct_mutex);
+ 	if (intel_plane->obj) {
+-		if (intel_crtc->active)
+-			intel_wait_for_vblank(dev, intel_plane->pipe);
+-
+-		mutex_lock(&dev->struct_mutex);
+-		intel_unpin_fb_obj(intel_plane->obj);
+-		mutex_unlock(&dev->struct_mutex);
+-
++		intel_plane_queue_unpin(intel_plane, intel_plane->obj);
+ 		intel_plane->obj = NULL;
+ 	}
++	mutex_unlock(&dev->struct_mutex);
+ 
+ 	return 0;
+ }
+@@ -1256,6 +1279,7 @@ intel_plane_init(struct drm_device *dev, enum pipe pipe, int plane)
+ 		intel_plane->disable_plane = ilk_disable_plane;
+ 		intel_plane->update_colorkey = ilk_update_colorkey;
+ 		intel_plane->get_colorkey = ilk_get_colorkey;
++		intel_plane->current_surface = ilk_current_surface;
+ 
+ 		if (IS_GEN6(dev)) {
+ 			plane_formats = snb_plane_formats;
+@@ -1289,6 +1313,7 @@ intel_plane_init(struct drm_device *dev, enum pipe pipe, int plane)
+ 			intel_plane->disable_plane = ivb_disable_plane;
+ 			intel_plane->update_colorkey = ivb_update_colorkey;
+ 			intel_plane->get_colorkey = ivb_get_colorkey;
++			intel_plane->current_surface = ivb_current_surface;
+ 
+ 			plane_formats = snb_plane_formats;
+ 			num_plane_formats = ARRAY_SIZE(snb_plane_formats);
+-- 
+1.7.9.5
+

@@ -1,0 +1,178 @@
+From c73794697428abb03e8d2ae06d3d7763e38fee1c Mon Sep 17 00:00:00 2001
+From: Ecco park <eccopark@broadcom.com>
+Date: Tue, 22 Jul 2014 16:34:11 -0700
+Subject: [PATCH 33/77] net: wireless: bcmdhd fixed mismatched PCIe status
+
+16300859 pcieh 0000:01:00.0: Refused to change power state, currently in D3
+
+Signed-off-by: Ecco park <eccopark@broadcom.com>
+---
+ drivers/net/wireless/bcmdhd/dhd.h            |  1 +
+ drivers/net/wireless/bcmdhd/dhd_linux.c      | 27 +++++++++++++++++++++
+ drivers/net/wireless/bcmdhd/dhd_pcie.c       | 35 +++++++++++++++++++++-------
+ drivers/net/wireless/bcmdhd/dhd_pcie_linux.c |  6 +++--
+ drivers/net/wireless/bcmdhd/dhd_proto.h      |  8 ++++++-
+ 5 files changed, 65 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/wireless/bcmdhd/dhd.h b/drivers/net/wireless/bcmdhd/dhd.h
+index 65a5d5992505..7ed592e62ba3 100644
+--- a/drivers/net/wireless/bcmdhd/dhd.h
++++ b/drivers/net/wireless/bcmdhd/dhd.h
+@@ -659,6 +659,7 @@ extern int dhd_os_send_hang_message(dhd_pub_t *dhdp);
+ extern void dhd_set_version_info(dhd_pub_t *pub, char *fw);
+ extern bool dhd_os_check_if_up(dhd_pub_t *pub);
+ extern int dhd_os_check_wakelock(dhd_pub_t *pub);
++extern int dhd_os_check_wakelock_all(dhd_pub_t *pub);
+ extern int dhd_get_instance(dhd_pub_t *pub);
+ #ifdef CUSTOM_SET_CPUCORE
+ extern void dhd_set_cpucore(dhd_pub_t *dhd, int set);
+diff --git a/drivers/net/wireless/bcmdhd/dhd_linux.c b/drivers/net/wireless/bcmdhd/dhd_linux.c
+index 6491ff71d343..cf8a06395790 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_linux.c
++++ b/drivers/net/wireless/bcmdhd/dhd_linux.c
+@@ -8043,6 +8043,33 @@ int dhd_os_check_wakelock(dhd_pub_t *pub)
+ #endif
+ 	return 0;
+ }
++
++int dhd_os_check_wakelock_all(dhd_pub_t *pub)
++{
++#if defined(CONFIG_HAS_WAKELOCK) || \
++	(defined(BCMSDIO) && (LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 36)))
++	dhd_info_t *dhd;
++
++	if (!pub)
++		return 0;
++	dhd = (dhd_info_t *)(pub->info);
++#endif /* CONFIG_HAS_WAKELOCK || BCMSDIO */
++
++#ifdef CONFIG_HAS_WAKELOCK
++	/* Indicate to the SD Host to avoid going to suspend if internal locks are up */
++	if (dhd && (wake_lock_active(&dhd->wl_wifi) ||
++		wake_lock_active(&dhd->wl_wdwake) ||
++		wake_lock_active(&dhd->wl_rxwake) ||
++		wake_lock_active(&dhd->wl_ctrlwake))) {
++		return 1;
++	}
++#elif defined(BCMSDIO) && (LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 36))
++	if (dhd && (dhd->wakelock_counter > 0) && dhd_bus_dev_pm_enabled(pub))
++		return 1;
++#endif
++	return 0;
++}
++
+ int net_os_wake_unlock(struct net_device *dev)
+ {
+ 	dhd_info_t *dhd = DHD_DEV_INFO(dev);
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie.c b/drivers/net/wireless/bcmdhd/dhd_pcie.c
+index 6752db5bc075..b04a46e6d79b 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie.c
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie.c
+@@ -2692,36 +2692,53 @@ dhdpcie_bus_suspend(struct  dhd_bus *bus, bool state)
+ 	if (bus->dhd->dongle_reset)
+ 		return -EIO;
+ 
+-	if (state == (bus->dhd->busstate == DHD_BUS_SUSPEND)) /* Set to same state */
+-		return BCME_OK;
+ 
+ 	if (bus->suspended == state) /* Set to same state */
+ 		return BCME_OK;
+ 
+ 	if (state) {
+ 		bus->wait_for_d3_ack = 0;
++		bus->suspended = TRUE;
++		bus->dhd->busstate = DHD_BUS_SUSPEND;
+ 		DHD_OS_WAKE_LOCK_WAIVE(bus->dhd);
++		dhd_os_set_ioctl_resp_timeout(DEFAULT_IOCTL_RESP_TIMEOUT);
+ 		dhdpcie_send_mb_data(bus, H2D_HOST_D3_INFORM);
+ 		timeleft = dhd_os_ioctl_resp_wait(bus->dhd, &bus->wait_for_d3_ack, &pending);
++		dhd_os_set_ioctl_resp_timeout(IOCTL_RESP_TIMEOUT);
+ 		DHD_OS_WAKE_LOCK_RESTORE(bus->dhd);
+ 		if (bus->wait_for_d3_ack) {
+ 			/* Got D3 Ack. Suspend the bus */
+-			DHD_ERROR(("dhdpcie_send_mb_data ack received\n"));
+-			rc = dhdpcie_pci_suspend_resume(bus->dev, state);
+-			bus->suspended = TRUE;
+-			bus->dhd->busstate = DHD_BUS_SUSPEND;
++			if (dhd_os_check_wakelock_all(bus->dhd)) {
++				DHD_ERROR(("Suspend failed because of wakelock\n"));
++				bus->dev->current_state = PCI_D3hot;
++				pci_set_master(bus->dev);
++				rc = pci_set_power_state(bus->dev, PCI_D0);
++				if (rc) {
++					DHD_ERROR(("%s: pci_set_power_state failed:"
++						" current_state[%d], ret[%d]\n",
++						__FUNCTION__, bus->dev->current_state, rc));
++				}
++				bus->suspended = FALSE;
++				bus->dhd->busstate = DHD_BUS_DATA;
++				rc = BCME_ERROR;
++			} else {
++				dhdpcie_bus_intr_disable(bus);
++				rc = dhdpcie_pci_suspend_resume(bus->dev, state);
++			}
+ 		} else if (timeleft == 0) {
+ 			DHD_ERROR(("%s: resumed on timeout\n", __FUNCTION__));
+-			return -ETIMEDOUT;
++			bus->suspended = FALSE;
++			bus->dhd->busstate = DHD_BUS_DATA;
++			rc = -ETIMEDOUT;
+ 		}
+ 		bus->wait_for_d3_ack = 1;
+-	}
+-	else {
++	} else {
+ 		/* Resume */
+ 		DHD_ERROR(("dhdpcie_bus_suspend resume\n"));
+ 		rc = dhdpcie_pci_suspend_resume(bus->dev, state);
+ 		bus->suspended = FALSE;
+ 		bus->dhd->busstate = DHD_BUS_DATA;
++		dhdpcie_bus_intr_enable(bus);
+ 	}
+ 	return rc;
+ }
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c b/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c
+index c1a03f3635fb..a13fe40e120a 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c
+@@ -173,13 +173,15 @@ static int dhdpcie_set_suspend_resume(struct pci_dev *pdev, bool state)
+ 
+ 	/* When firmware is not loaded do the PCI bus */
+ 	/* suspend/resume only */
+-	if (bus && (bus->dhd->busstate == DHD_BUS_DOWN)) {
++	if (bus && (bus->dhd->busstate == DHD_BUS_DOWN) &&
++		!bus->dhd->dongle_reset) {
+ 		ret = dhdpcie_pci_suspend_resume(bus->dev, state);
+ 		return ret;
+ 	}
+ 
+ 	if (bus && ((bus->dhd->busstate == DHD_BUS_SUSPEND)||
+-		(bus->dhd->busstate == DHD_BUS_DATA))) {
++		(bus->dhd->busstate == DHD_BUS_DATA)) &&
++		(bus->suspended != state)) {
+ 
+ 		ret = dhdpcie_bus_suspend(bus, state);
+ 	}
+diff --git a/drivers/net/wireless/bcmdhd/dhd_proto.h b/drivers/net/wireless/bcmdhd/dhd_proto.h
+index e8f043e9ed6d..87e0c83626f7 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_proto.h
++++ b/drivers/net/wireless/bcmdhd/dhd_proto.h
+@@ -36,8 +36,14 @@
+ #include <dhd_flowring.h>
+ #endif
+ 
++#define DEFAULT_IOCTL_RESP_TIMEOUT	2000
+ #ifndef IOCTL_RESP_TIMEOUT
+-#define IOCTL_RESP_TIMEOUT  2000  /* In milli second default value for Production FW */
++#ifdef BCMQT
++#define IOCTL_RESP_TIMEOUT  30000 /* In milli second */
++#else
++/* In milli second default value for Production FW */
++#define IOCTL_RESP_TIMEOUT  DEFAULT_IOCTL_RESP_TIMEOUT
++#endif /* BCMQT */
+ #endif /* IOCTL_RESP_TIMEOUT */
+ 
+ #ifndef MFG_IOCTL_RESP_TIMEOUT
+-- 
+2.0.3
+

@@ -1,0 +1,144 @@
+From 480e74e63d46edfd71d0884daac8c1b7506ad542 Mon Sep 17 00:00:00 2001
+From: Xiang Wang <xiang.a.wang@intel.com>
+Date: Tue, 31 Mar 2015 16:44:27 +0800
+Subject: [PATCH] i2c: designware: prevent accessing i2c after i2c suspend
+
+Currently dw_i2c_suspend/resume may have race condition
+with i2c_dw_xfer. Someone may be doing i2c_dw_xfer during
+the period of dw_i2c_suspend/resume.
+
+Fix this by:
+1. Adding lock on dw_i2c_suspend/resume;
+2. Return error on illegal access.
+
+Change-Id: I7b32e16fbd27b6e7bec1d2f2113672430878a5de
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-26433
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1557
+Signed-off-by: Xiang Wang <xiang.a.wang@intel.com>
+---
+ drivers/i2c/busses/i2c-designware-core.c    |  7 +++++
+ drivers/i2c/busses/i2c-designware-core.h    |  7 +++++
+ drivers/i2c/busses/i2c-designware-platdrv.c | 48 +++++++++++++++++++++++++++--
+ 3 files changed, 59 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-designware-core.c b/drivers/i2c/busses/i2c-designware-core.c
+index b588656ae84e..49fdf86cb21e 100644
+--- a/drivers/i2c/busses/i2c-designware-core.c
++++ b/drivers/i2c/busses/i2c-designware-core.c
+@@ -703,6 +703,13 @@ i2c_dw_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
+ 	dev_dbg(dev->dev, "%s: msgs: %d\n", __func__, num);
+ 
+ 	mutex_lock(&dev->lock);
++
++	if (dev->status & STATUS_SUSPENDED) {
++		mutex_unlock(&dev->lock);
++		dev_WARN(dev->dev, "i2c xfer after suspend!\n");
++		return -EIO;
++	}
++
+ 	pm_runtime_get_sync(dev->dev);
+ 
+ 	reinit_completion(&dev->cmd_complete);
+diff --git a/drivers/i2c/busses/i2c-designware-core.h b/drivers/i2c/busses/i2c-designware-core.h
+index ad55ca8f4d94..91e23cae4f7d 100644
+--- a/drivers/i2c/busses/i2c-designware-core.h
++++ b/drivers/i2c/busses/i2c-designware-core.h
+@@ -34,6 +34,13 @@
+ #define DW_IC_CON_RESTART_EN		0x20
+ #define DW_IC_CON_SLAVE_DISABLE		0x40
+ 
++/*
++ * status codes
++ */
++#define STATUS_IDLE			0x0
++#define STATUS_WRITE_IN_PROGRESS	0x1
++#define STATUS_READ_IN_PROGRESS		0x2
++#define STATUS_SUSPENDED		0x4
+ 
+ /**
+  * struct dw_i2c_dev - private i2c-designware data
+diff --git a/drivers/i2c/busses/i2c-designware-platdrv.c b/drivers/i2c/busses/i2c-designware-platdrv.c
+index 0eb83531dc7a..6f9f92405b7a 100644
+--- a/drivers/i2c/busses/i2c-designware-platdrv.c
++++ b/drivers/i2c/busses/i2c-designware-platdrv.c
+@@ -439,12 +439,18 @@ static int dw_i2c_suspend(struct device *dev)
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct dw_i2c_dev *i_dev = platform_get_drvdata(pdev);
+ 
++	dev_dbg(dev, "%s\n", __func__);
++
+ 	if (i_dev->polling)
+ 		return 0;
+ 
++	mutex_lock(&i_dev->lock);
+ 	i2c_dw_disable(i_dev);
+ 	clk_disable_unprepare(i_dev->clk);
+ 
++	i_dev->status |= STATUS_SUSPENDED;
++	mutex_unlock(&i_dev->lock);
++
+ 	return 0;
+ }
+ 
+@@ -453,19 +459,55 @@ static int dw_i2c_resume(struct device *dev)
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct dw_i2c_dev *i_dev = platform_get_drvdata(pdev);
+ 
++
++	dev_dbg(dev, "%s\n", __func__);
++
+ 	if (i_dev->polling)
+ 		return 0;
+ 
++	mutex_lock(&i_dev->lock);
+ 	clk_prepare_enable(i_dev->clk);
+ 	i2c_dw_init(i_dev);
+ 
++	i_dev->status &= ~STATUS_SUSPENDED;
++	mutex_unlock(&i_dev->lock);
++
+ 	return 0;
+ }
+-#endif
+ 
+-static UNIVERSAL_DEV_PM_OPS(dw_i2c_dev_pm_ops, dw_i2c_suspend,
+-			    dw_i2c_resume, NULL);
++static int dw_i2c_runtime_suspend(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct dw_i2c_dev *i_dev = platform_get_drvdata(pdev);
+ 
++	if (i_dev->polling)
++		return 0;
++
++	i2c_dw_disable(i_dev);
++	clk_disable_unprepare(i_dev->clk);
++
++	return 0;
++}
++
++static int dw_i2c_runtime_resume(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct dw_i2c_dev *i_dev = platform_get_drvdata(pdev);
++
++	if (i_dev->polling)
++		return 0;
++
++	clk_prepare_enable(i_dev->clk);
++	i2c_dw_init(i_dev);
++
++	return 0;
++}
++#endif
++
++static const struct dev_pm_ops dw_i2c_dev_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(dw_i2c_suspend, dw_i2c_resume)
++	SET_RUNTIME_PM_OPS(dw_i2c_runtime_suspend, dw_i2c_runtime_resume, NULL)
++};
+ /* work with hotplug and coldplug */
+ MODULE_ALIAS("platform:i2c_designware");
+ 
+-- 
+1.9.1
+

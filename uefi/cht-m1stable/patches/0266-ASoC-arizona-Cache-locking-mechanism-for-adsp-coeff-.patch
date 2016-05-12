@@ -1,0 +1,95 @@
+From 06f1499fc04ab87ccc1a263f484051db1217d10a Mon Sep 17 00:00:00 2001
+From: bsapthagiri <sapthagiri.baratam@incubesol.com>
+Date: Tue, 8 Jul 2014 19:32:16 +0530
+Subject: [PATCH 266/351] ASoC: arizona: Cache locking mechanism for adsp
+ coeff controls updation
+
+There can be a inconsistent behaviour when we try to read and write the
+adsp coeffs simultaniously. Added locking mechanism on cache to avoid
+this overwriting.
+
+Change-Id: If21f052c6487b53d5da9da4317272a8ee145b007
+Signed-off-by: bsapthagiri <sapthagiri.baratam@incubesol.com>
+---
+ sound/soc/codecs/wm_adsp.c |   15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/sound/soc/codecs/wm_adsp.c b/sound/soc/codecs/wm_adsp.c
+index 947b39b1..ee6dd5e 100644
+--- a/sound/soc/codecs/wm_adsp.c
++++ b/sound/soc/codecs/wm_adsp.c
+@@ -420,6 +420,7 @@ struct wm_coeff_ctl {
+ 	size_t len;
+ 	unsigned int set:1;
+ 	struct snd_kcontrol *kcontrol;
++	struct mutex lock;
+ };
+ 
+ static int wm_adsp_create_grouped_control(struct wm_adsp *dsp,
+@@ -603,15 +604,20 @@ static int wm_coeff_put(struct snd_kcontrol *kcontrol,
+ {
+ 	struct wm_coeff_ctl *ctl = (struct wm_coeff_ctl *)kcontrol->private_value;
+ 	char *p = ucontrol->value.bytes.data;
++	int ret;
+ 
++	mutex_lock(&ctl->lock);
+ 	memcpy(ctl->cache, p, ctl->len);
+ 
+ 	if (!ctl->enabled) {
+ 		ctl->set = 1;
++		mutex_unlock(&ctl->lock);
+ 		return 0;
+ 	}
+ 
+-	return wm_coeff_write_control(kcontrol, p, ctl->len);
++	ret = wm_coeff_write_control(kcontrol, p, ctl->len);
++	mutex_unlock(&ctl->lock);
++	return ret;
+ }
+ 
+ static int wm_coeff_read_control(struct snd_kcontrol *kcontrol,
+@@ -661,7 +667,9 @@ static int wm_coeff_get(struct snd_kcontrol *kcontrol,
+ 	struct wm_coeff_ctl *ctl = (struct wm_coeff_ctl *)kcontrol->private_value;
+ 	char *p = ucontrol->value.bytes.data;
+ 
++	mutex_lock(&ctl->lock);
+ 	memcpy(p, ctl->cache, ctl->len);
++	mutex_unlock(&ctl->lock);
+ 	return 0;
+ }
+ 
+@@ -1058,9 +1066,11 @@ static int wm_coeff_init_control_caches(struct wm_adsp *adsp)
+ 	list_for_each_entry(ctl, &adsp->ctl_list, list) {
+ 		if (!ctl->enabled || ctl->set)
+ 			continue;
++		mutex_lock(&ctl->lock);
+ 		ret = wm_coeff_read_control(ctl->kcontrol,
+ 					    ctl->cache,
+ 					    ctl->len);
++		mutex_unlock(&ctl->lock);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+@@ -1077,9 +1087,11 @@ static int wm_coeff_sync_controls(struct wm_adsp *adsp)
+ 		if (!ctl->enabled)
+ 			continue;
+ 		if (ctl->set) {
++			mutex_lock(&ctl->lock);
+ 			ret = wm_coeff_write_control(ctl->kcontrol,
+ 						     ctl->cache,
+ 						     ctl->len);
++			mutex_unlock(&ctl->lock);
+ 			if (ret < 0)
+ 				return ret;
+ 		}
+@@ -1167,6 +1179,7 @@ static int wm_adsp_create_control(struct wm_adsp *dsp,
+ 		ret = -ENOMEM;
+ 		goto err_ctl_name;
+ 	}
++	mutex_init(&ctl->lock);
+ 
+ 	ctl_work = kzalloc(sizeof(*ctl_work), GFP_KERNEL);
+ 	if (!ctl_work) {
+-- 
+1.7.9.5
+

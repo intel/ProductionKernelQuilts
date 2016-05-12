@@ -1,0 +1,558 @@
+From 396fc7e829d174181d159e5388080ce415aeeed3 Mon Sep 17 00:00:00 2001
+From: Zaikuo Wang <zaikuo.wang@intel.com>
+Date: Mon, 15 Jun 2015 11:30:25 +0800
+Subject: [PATCH 438/462] atomisp2: implement wdt on each pipe instead of on
+ stream
+
+Originally, atomisp wdt run on stream level, this could cause
+that no isp timeout/recover happen as long as one pipe in this
+stream is alive, but other pipe has already timeout and could not
+be recovered
+
+this patch implement one wdt for each pipe, so there are totally
+(stream_number * 4) wdt in driver
+
+Change-Id: I3387e0a2226c2b9093f2ddac747992fc088bbf38
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-38301
+Signed-off-by: Zaikuo Wang <zaikuo.wang@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/60527
+Build: IMIN (SC)
+Approver: Jing Tao <jing.tao@intel.com>
+Integrator: WeiX Meng <weix.meng@intel.com>
+Build: WeiX Meng <weix.meng@intel.com>
+Reviewed-by: WeiX Meng <weix.meng@intel.com>
+Maintainer: WeiX Meng <weix.meng@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.c      | 160 +++++++++++++++------
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.h      |   4 +-
+ .../atomisp2/atomisp_driver/atomisp_compat_css20.c |  22 +--
+ .../pci/atomisp2/atomisp_driver/atomisp_internal.h |   6 +-
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.c    |  29 ++--
+ .../pci/atomisp2/atomisp_driver/atomisp_subdev.h   |  12 +-
+ .../pci/atomisp2/atomisp_driver/atomisp_v4l2.c     |  10 +-
+ 7 files changed, 163 insertions(+), 80 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index 72337be..5fa5ed8 100755
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -662,8 +662,8 @@ irqreturn_t atomisp_isr(int irq, void *dev)
+ 			}
+ 
+ 			atomisp_eof_event(asd, eof_event.event.exp_id);
+-			dev_dbg(isp->dev, "%s EOF exp_id %d\n", __func__,
+-				eof_event.event.exp_id);
++			dev_dbg(isp->dev, "%s EOF exp_id %d, asd %d\n",
++				__func__, eof_event.event.exp_id, asd->index);
+ 		}
+ 
+ 		irq_infos &= ~IA_CSS_IRQ_INFO_ISYS_EVENTS_READY;
+@@ -695,13 +695,9 @@ void atomisp_clear_css_buffer_counters(struct atomisp_sub_device *asd)
+ 	asd->video_out_video_capture.buffers_in_css = 0;
+ }
+ 
+-bool atomisp_buffers_queued(struct atomisp_sub_device *asd)
++bool atomisp_buffers_queued_pipe(struct atomisp_video_pipe *pipe)
+ {
+-	return asd->video_out_capture.buffers_in_css ||
+-		asd->video_out_vf.buffers_in_css ||
+-		asd->video_out_preview.buffers_in_css ||
+-		asd->video_out_video_capture.buffers_in_css ?
+-		    true : false;
++	return pipe->buffers_in_css ? true : false;
+ }
+ 
+ /* 0x100000 is the start of dmem inside SP */
+@@ -957,6 +953,7 @@ void atomisp_buf_done(struct atomisp_sub_device *asd, int error,
+ 	enum atomisp_metadata_type md_type;
+ 	struct atomisp_device *isp = asd->isp;
+ 	struct v4l2_control ctrl;
++	bool reset_wdt_timer = false;
+ 
+ 	if (
+ 	    buf_type != CSS_BUFFER_TYPE_METADATA &&
+@@ -1048,6 +1045,7 @@ void atomisp_buf_done(struct atomisp_sub_device *asd, int error,
+ 		break;
+ 	case CSS_BUFFER_TYPE_VF_OUTPUT_FRAME:
+ 	case CSS_BUFFER_TYPE_SEC_VF_OUTPUT_FRAME:
++		reset_wdt_timer = true;
+ 		pipe->buffers_in_css--;
+ 		frame = buffer.css_buffer.data.frame;
+ 		if (!frame) {
+@@ -1098,6 +1096,7 @@ void atomisp_buf_done(struct atomisp_sub_device *asd, int error,
+ 		break;
+ 	case CSS_BUFFER_TYPE_OUTPUT_FRAME:
+ 	case CSS_BUFFER_TYPE_SEC_OUTPUT_FRAME:
++		reset_wdt_timer = true;
+ 		pipe->buffers_in_css--;
+ 		frame = buffer.css_buffer.data.frame;
+ 		if (!frame) {
+@@ -1262,7 +1261,7 @@ void atomisp_buf_done(struct atomisp_sub_device *asd, int error,
+ 		 */
+ 		wake_up(&vb->done);
+ 	}
+-
++	atomic_set(&pipe->wdt_count, 0);
+ 	/*
+ 	 * Requeue should only be done for 3a and dis buffers.
+ 	 * Queue/dequeue order will change if driver recycles image buffers.
+@@ -1278,6 +1277,17 @@ void atomisp_buf_done(struct atomisp_sub_device *asd, int error,
+ 	}
+ 	if (!error && q_buffers)
+ 		atomisp_qbuffers_to_css(asd);
++
++	/* If there are no buffers queued then
++	 * delete wdt timer. */
++	if (asd->streaming != ATOMISP_DEVICE_STREAMING_ENABLED)
++		return;
++	if (!atomisp_buffers_queued_pipe(pipe))
++		atomisp_wdt_stop_pipe(pipe, false);
++	else if (reset_wdt_timer)
++		/* SOF irq should not reset wdt timer. */
++		atomisp_wdt_refresh_pipe(pipe,
++				ATOMISP_WDT_KEEP_CURRENT_DELAY);
+ }
+ 
+ void atomisp_delayed_init_work(struct work_struct *work)
+@@ -1489,6 +1499,8 @@ void atomisp_wdt_work(struct work_struct *work)
+ 	struct atomisp_device *isp = container_of(work, struct atomisp_device,
+ 						  wdt_work);
+ 	int i;
++	unsigned int pipe_wdt_cnt[MAX_STREAM_NUM][4] = { {0} };
++	bool css_recover = true;
+ 
+ 	rt_mutex_lock(&isp->mutex);
+ 	if (!atomisp_streaming_count(isp)) {
+@@ -1497,12 +1509,29 @@ void atomisp_wdt_work(struct work_struct *work)
+ 		return;
+ 	}
+ 
+-	dev_err(isp->dev, "timeout %d of %d\n",
+-		atomic_read(&isp->wdt_count) + 1,
+-		ATOMISP_ISP_MAX_TIMEOUT_COUNT);
+-
+-	if (atomic_inc_return(&isp->wdt_count) <
+-			ATOMISP_ISP_MAX_TIMEOUT_COUNT) {
++	for (i = 0; i < isp->num_of_streams; i++) {
++		struct atomisp_sub_device *asd = &isp->asd[i];
++		pipe_wdt_cnt[i][0] +=
++			atomic_read(&asd->video_out_capture.wdt_count);
++		pipe_wdt_cnt[i][1] +=
++			atomic_read(&asd->video_out_vf.wdt_count);
++		pipe_wdt_cnt[i][2] +=
++			atomic_read(&asd->video_out_preview.wdt_count);
++		pipe_wdt_cnt[i][3] +=
++			atomic_read(&asd->video_out_video_capture.wdt_count);
++		css_recover =
++			(pipe_wdt_cnt[i][0] <= ATOMISP_ISP_MAX_TIMEOUT_COUNT &&
++			pipe_wdt_cnt[i][1] <= ATOMISP_ISP_MAX_TIMEOUT_COUNT &&
++			pipe_wdt_cnt[i][2] <= ATOMISP_ISP_MAX_TIMEOUT_COUNT &&
++			pipe_wdt_cnt[i][3] <= ATOMISP_ISP_MAX_TIMEOUT_COUNT)
++			? true : false;
++		dev_err(isp->dev, "pipe on asd%d timeout cnt: (%d, %d, %d, %d) of %d, recover = %d\n",
++			asd->index, pipe_wdt_cnt[i][0], pipe_wdt_cnt[i][1],
++			pipe_wdt_cnt[i][2], pipe_wdt_cnt[i][3],
++			ATOMISP_ISP_MAX_TIMEOUT_COUNT, css_recover);
++	}
++
++	if (css_recover) {
+ 		unsigned int old_dbglevel = dbg_level;
+ 		atomisp_css_debug_dump_sp_sw_debug_info();
+ 		atomisp_css_debug_dump_debug_info(__func__);
+@@ -1591,9 +1620,9 @@ void atomisp_wdt_work(struct work_struct *work)
+ 				atomisp_flush_bufs_and_wakeup(asd);
+ 				complete(&asd->init_done);
+ 			}
++			atomisp_wdt_stop(asd, false);
+ 		}
+ 
+-		atomic_set(&isp->wdt_count, 0);
+ 		isp->isp_fatal_error = true;
+ 		atomic_set(&isp->wdt_work_queued, 0);
+ 
+@@ -1608,6 +1637,16 @@ void atomisp_wdt_work(struct work_struct *work)
+ #endif
+ 
+ 	__atomisp_css_recover(isp, true);
++	for (i = 0; i < isp->num_of_streams; i++) {
++		struct atomisp_sub_device *asd = &isp->asd[i];
++		if (asd->streaming ==
++			ATOMISP_DEVICE_STREAMING_ENABLED) {
++			atomisp_wdt_refresh(asd,
++				isp->sw_contex.file_input ?
++				ATOMISP_ISP_FILE_TIMEOUT_DURATION :
++				ATOMISP_ISP_TIMEOUT_DURATION);
++		}
++	}
+ 	atomisp_set_stop_timeout(ATOMISP_CSS_STOP_TIMEOUT_US);
+ 	dev_err(isp->dev, "timeout recovery handling done\n");
+ 	atomic_set(&isp->wdt_work_queued, 0);
+@@ -1646,10 +1685,18 @@ void atomisp_css_flush(struct atomisp_device *isp)
+ 	dev_dbg(isp->dev, "atomisp css flush done\n");
+ }
+ 
+-void atomisp_wdt(unsigned long isp_addr)
++void atomisp_wdt(unsigned long pipe_addr)
+ {
+-	struct atomisp_device *isp = (struct atomisp_device *)isp_addr;
++	struct atomisp_video_pipe *pipe =
++		(struct atomisp_video_pipe *)pipe_addr;
++	struct atomisp_sub_device *asd = pipe->asd;
++	struct atomisp_device *isp = asd->isp;
+ 
++	atomic_inc(&pipe->wdt_count);
++	dev_warn(isp->dev,
++		"[WARNING]asd %d pipe %s ISP timeout %d!\n",
++			asd->index, pipe->vdev.name,
++			atomic_read(&pipe->wdt_count));
+ 	if (atomic_read(&isp->wdt_work_queued)) {
+ 		dev_dbg(isp->dev, "ISP watchdog was put into workqueue\n");
+ 		return;
+@@ -1658,46 +1705,74 @@ void atomisp_wdt(unsigned long isp_addr)
+ 	queue_work(isp->wdt_work_queue, &isp->wdt_work);
+ }
+ 
+-void atomisp_wdt_refresh(struct atomisp_sub_device *asd, unsigned int delay)
++void atomisp_wdt_refresh_pipe(struct atomisp_video_pipe *pipe,
++				unsigned int delay)
+ {
+ 	unsigned long next;
+ 
+ 	if (delay != ATOMISP_WDT_KEEP_CURRENT_DELAY)
+-		asd->wdt_duration = delay;
++		pipe->wdt_duration = delay;
+ 
+-	next = jiffies + asd->wdt_duration;
++	next = jiffies + pipe->wdt_duration;
+ 
+ 	/* Override next if it has been pushed beyon the "next" time */
+-	if (atomisp_is_wdt_running(asd) && time_after(asd->wdt_expires, next))
+-		next = asd->wdt_expires;
++	if (atomisp_is_wdt_running(pipe) && time_after(pipe->wdt_expires, next))
++		next = pipe->wdt_expires;
+ 
+-	asd->wdt_expires = next;
++	pipe->wdt_expires = next;
+ 
+-	if (atomisp_is_wdt_running(asd))
+-		dev_dbg(asd->isp->dev, "WDT will hit after %d ms\n",
+-			((int)(next - jiffies) * 1000 / HZ));
++	if (atomisp_is_wdt_running(pipe))
++		dev_dbg(pipe->asd->isp->dev, "WDT will hit after %d ms (%s)\n",
++			((int)(next - jiffies) * 1000 / HZ), pipe->vdev.name);
+ 	else
+-		dev_dbg(asd->isp->dev, "WDT starts with %d ms period\n",
+-			((int)(next - jiffies) * 1000 / HZ));
++		dev_dbg(pipe->asd->isp->dev, "WDT starts with %d ms period (%s)\n",
++			((int)(next - jiffies) * 1000 / HZ), pipe->vdev.name);
+ 
+-	mod_timer(&asd->wdt, next);
+-	atomic_set(&asd->isp->wdt_count, 0);
++	mod_timer(&pipe->wdt, next);
+ }
+ 
+-void atomisp_wdt_stop(struct atomisp_sub_device *asd, bool sync)
++void atomisp_wdt_refresh(struct atomisp_sub_device *asd, unsigned int delay)
++{
++	dev_dbg(asd->isp->dev, "WDT refresh all:\n");
++	if (atomisp_is_wdt_running(&asd->video_out_capture))
++		atomisp_wdt_refresh_pipe(&asd->video_out_capture, delay);
++	if (atomisp_is_wdt_running(&asd->video_out_preview))
++		atomisp_wdt_refresh_pipe(&asd->video_out_preview, delay);
++	if (atomisp_is_wdt_running(&asd->video_out_vf))
++		atomisp_wdt_refresh_pipe(&asd->video_out_vf, delay);
++	if (atomisp_is_wdt_running(&asd->video_out_video_capture))
++		atomisp_wdt_refresh_pipe(&asd->video_out_video_capture, delay);
++}
++
++
++void atomisp_wdt_stop_pipe(struct atomisp_video_pipe *pipe, bool sync)
+ {
+-	dev_dbg(asd->isp->dev, "WDT stop\n");
++	if (!atomisp_is_wdt_running(pipe))
++		return;
++
++	dev_dbg(pipe->asd->isp->dev,
++		"WDT stop asd %d (%s)\n", pipe->asd->index, pipe->vdev.name);
++
+ 	if (sync) {
+-		del_timer_sync(&asd->wdt);
+-		cancel_work_sync(&asd->isp->wdt_work);
++		del_timer_sync(&pipe->wdt);
++		cancel_work_sync(&pipe->asd->isp->wdt_work);
+ 	} else {
+-		del_timer(&asd->wdt);
++		del_timer(&pipe->wdt);
+ 	}
+ }
+ 
+-void atomisp_wdt_start(struct atomisp_sub_device *asd)
++void atomisp_wdt_stop(struct atomisp_sub_device *asd, bool sync)
+ {
+-	atomisp_wdt_refresh(asd, ATOMISP_ISP_TIMEOUT_DURATION);
++	dev_dbg(asd->isp->dev, "WDT stop all:\n");
++	atomisp_wdt_stop_pipe(&asd->video_out_capture, sync);
++	atomisp_wdt_stop_pipe(&asd->video_out_preview, sync);
++	atomisp_wdt_stop_pipe(&asd->video_out_vf, sync);
++	atomisp_wdt_stop_pipe(&asd->video_out_video_capture, sync);
++}
++
++void atomisp_wdt_start(struct atomisp_video_pipe *pipe)
++{
++	atomisp_wdt_refresh_pipe(pipe, ATOMISP_ISP_TIMEOUT_DURATION);
+ }
+ 
+ void atomisp_setup_flash(struct atomisp_sub_device *asd)
+@@ -3848,8 +3923,13 @@ void atomisp_handle_parameter_and_buffer(struct atomisp_video_pipe *pipe)
+ 
+ 	if (need_to_enqueue_buffer) {
+ 		atomisp_qbuffers_to_css(asd);
+-		if (!atomisp_is_wdt_running(asd) && atomisp_buffers_queued(asd))
+-			atomisp_wdt_start(asd);
++		if (atomisp_buffers_queued_pipe(pipe)) {
++			if (!atomisp_is_wdt_running(pipe))
++				atomisp_wdt_start(pipe);
++			else
++				atomisp_wdt_refresh_pipe(pipe,
++					ATOMISP_WDT_KEEP_CURRENT_DELAY);
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.h
+index 2218e7b..35a9d2b 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.h
+@@ -60,7 +60,7 @@ struct atomisp_acc_pipe *atomisp_to_acc_pipe(struct video_device *dev);
+ int atomisp_reset(struct atomisp_device *isp);
+ void atomisp_flush_bufs_and_wakeup(struct atomisp_sub_device *asd);
+ void atomisp_clear_css_buffer_counters(struct atomisp_sub_device *asd);
+-bool atomisp_buffers_queued(struct atomisp_sub_device *asd);
++bool atomisp_buffers_queued_pipe(struct atomisp_video_pipe *pipe);
+ 
+ /* TODO:should be here instead of atomisp_helper.h
+ extern void __iomem *atomisp_io_base;
+@@ -81,7 +81,7 @@ void atomisp_kernel_free(void *ptr);
+ void atomisp_msi_irq_init(struct atomisp_device *isp, struct pci_dev *dev);
+ void atomisp_msi_irq_uninit(struct atomisp_device *isp, struct pci_dev *dev);
+ void atomisp_wdt_work(struct work_struct *work);
+-void atomisp_wdt(unsigned long isp_addr);
++void atomisp_wdt(unsigned long pipe_addr);
+ void atomisp_setup_flash(struct atomisp_sub_device *asd);
+ irqreturn_t atomisp_isr(int irq, void *dev);
+ irqreturn_t atomisp_isr_thread(int irq, void *isp_ptr);
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+index 46561cf..72aca14 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+@@ -4566,7 +4566,6 @@ int atomisp_css_isr_thread(struct atomisp_device *isp,
+ 	enum atomisp_input_stream_id stream_id = 0;
+ 	struct atomisp_css_event current_event;
+ 	struct atomisp_sub_device *asd = &isp->asd[0];
+-	bool reset_wdt_timer[MAX_STREAM_NUM] = {false};
+ 	int i;
+ 
+ 	while (!atomisp_css_dequeue_event(&current_event)) {
+@@ -4582,7 +4581,7 @@ int atomisp_css_isr_thread(struct atomisp_device *isp,
+ 				current_event.event.fw_assert_line_no);
+ 			for (i = 0; i < isp->num_of_streams; i++)
+ 				atomisp_wdt_stop(&isp->asd[i], 0);
+-			atomisp_wdt((unsigned long)isp);
++			queue_work(isp->wdt_work_queue, &isp->wdt_work);
+ 			return -EINVAL;
+ 		} else if (current_event.event.type == IA_CSS_EVENT_TYPE_FW_WARNING) {
+ 			dev_warn(isp->dev, "%s: ISP reports warning, code is %d, exp_id %d\n",
+@@ -4610,13 +4609,11 @@ int atomisp_css_isr_thread(struct atomisp_device *isp,
+ 			frame_done_found[asd->index] = true;
+ 			atomisp_buf_done(asd, 0, CSS_BUFFER_TYPE_OUTPUT_FRAME,
+ 					 current_event.pipe, true, stream_id);
+-			reset_wdt_timer[asd->index] = true; /* ISP running */
+ 			break;
+ 		case CSS_EVENT_SEC_OUTPUT_FRAME_DONE:
+ 			frame_done_found[asd->index] = true;
+ 			atomisp_buf_done(asd, 0, CSS_BUFFER_TYPE_SEC_OUTPUT_FRAME,
+ 					 current_event.pipe, true, stream_id);
+-			reset_wdt_timer[asd->index] = true; /* ISP running */
+ 			break;
+ 		case CSS_EVENT_3A_STATISTICS_DONE:
+ 			atomisp_buf_done(asd, 0,
+@@ -4634,13 +4631,11 @@ int atomisp_css_isr_thread(struct atomisp_device *isp,
+ 			atomisp_buf_done(asd, 0,
+ 					 CSS_BUFFER_TYPE_VF_OUTPUT_FRAME,
+ 					 current_event.pipe, true, stream_id);
+-			reset_wdt_timer[asd->index] = true; /* ISP running */
+ 			break;
+ 		case CSS_EVENT_SEC_VF_OUTPUT_FRAME_DONE:
+ 			atomisp_buf_done(asd, 0,
+ 					 CSS_BUFFER_TYPE_SEC_VF_OUTPUT_FRAME,
+ 					 current_event.pipe, true, stream_id);
+-			reset_wdt_timer[asd->index] = true; /* ISP running */
+ 			break;
+ 		case CSS_EVENT_DIS_STATISTICS_DONE:
+ 			atomisp_buf_done(asd, 0,
+@@ -4660,21 +4655,6 @@ int atomisp_css_isr_thread(struct atomisp_device *isp,
+ 			break;
+ 		}
+ 	}
+-	/* If there are no buffers queued then
+-	 * delete wdt timer. */
+-	for (i = 0; i < isp->num_of_streams; i++) {
+-		asd = &isp->asd[i];
+-		if (!asd)
+-			continue;
+-		if (asd->streaming != ATOMISP_DEVICE_STREAMING_ENABLED)
+-			continue;
+-		if (!atomisp_buffers_queued(asd))
+-			atomisp_wdt_stop(asd, false);
+-		else if (reset_wdt_timer[i])
+-		/* SOF irq should not reset wdt timer. */
+-			atomisp_wdt_refresh(asd,
+-					ATOMISP_WDT_KEEP_CURRENT_DELAY);
+-	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h
+index 944b035..4cac5da 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h
+@@ -293,7 +293,6 @@ struct atomisp_device {
+ 	bool isp_fatal_error;
+ 	struct workqueue_struct *wdt_work_queue;
+ 	struct work_struct wdt_work;
+-	atomic_t wdt_count;
+ 	atomic_t wdt_work_queued;
+ 
+ 	spinlock_t lock; /* Just for streaming below */
+@@ -319,8 +318,11 @@ extern void *atomisp_kernel_malloc(size_t bytes);
+ extern void atomisp_kernel_free(void *ptr);
+ 
+ #define atomisp_is_wdt_running(a) timer_pending(&(a)->wdt)
++extern void atomisp_wdt_refresh_pipe(struct atomisp_video_pipe *pipe,
++					unsigned int delay);
+ extern void atomisp_wdt_refresh(struct atomisp_sub_device *asd, unsigned int delay);
+-extern void atomisp_wdt_start(struct atomisp_sub_device *asd);
++extern void atomisp_wdt_start(struct atomisp_video_pipe *pipe);
++extern void atomisp_wdt_stop_pipe(struct atomisp_video_pipe *pipe, bool sync);
+ extern void atomisp_wdt_stop(struct atomisp_sub_device *asd, bool sync);
+ 
+ #endif /* __ATOMISP_INTERNAL_H__ */
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index 0ec893f..d345a40 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -1353,8 +1353,9 @@ done:
+ 		} else {
+ 			atomisp_qbuffers_to_css(asd);
+ 
+-			if (!atomisp_is_wdt_running(asd) && atomisp_buffers_queued(asd))
+-				atomisp_wdt_start(asd);
++			if (!atomisp_is_wdt_running(pipe) &&
++				atomisp_buffers_queued_pipe(pipe))
++				atomisp_wdt_start(pipe);
+ 		}
+ 	}
+ 
+@@ -1624,12 +1625,19 @@ int atomisp_stream_on_master_slave_sensor(struct atomisp_device *isp, bool isp_t
+ }
+ 
+ /* FIXME! */
+-void __wdt_on_master_slave_sensor(struct atomisp_device *isp, unsigned int wdt_duration)
++void __wdt_on_master_slave_sensor(struct atomisp_video_pipe *pipe,
++				unsigned int wdt_duration, bool enable)
+ {
+-	if (atomisp_buffers_queued(&isp->asd[0]))
+-		atomisp_wdt_refresh(&isp->asd[0], wdt_duration);
+-	if (atomisp_buffers_queued(&isp->asd[1]))
+-		atomisp_wdt_refresh(&isp->asd[1], wdt_duration);
++	static struct atomisp_video_pipe *pipe0;
++
++	if (enable) {
++		if (atomisp_buffers_queued_pipe(pipe0))
++			atomisp_wdt_refresh_pipe(pipe0, wdt_duration);
++		if (atomisp_buffers_queued_pipe(pipe))
++			atomisp_wdt_refresh_pipe(pipe, wdt_duration);
++	} else {
++		pipe0 = pipe;
++	}
+ }
+ 
+ static void atomisp_pause_buffer_event(struct atomisp_device *isp)
+@@ -1869,10 +1877,11 @@ start_sensor:
+ 			dev_err(isp->dev, "master slave sensor stream on failed!\n");
+ 			goto out;
+ 		}
+-		__wdt_on_master_slave_sensor(isp, wdt_duration);
++		__wdt_on_master_slave_sensor(pipe, wdt_duration, true);
+ 		goto start_delay_wq;
+ 	} else if (asd->depth_mode->val && (atomisp_streaming_count(isp) <
+ 		   ATOMISP_DEPTH_SENSOR_STREAMON_COUNT)) {
++		__wdt_on_master_slave_sensor(pipe, wdt_duration, false);
+ 		goto start_delay_wq;
+ 	}
+ 
+@@ -1893,8 +1902,8 @@ start_sensor:
+ 		goto out;
+ 	}
+ 
+-	if (atomisp_buffers_queued(asd))
+-		atomisp_wdt_refresh(asd, wdt_duration);
++	if (atomisp_buffers_queued_pipe(pipe))
++		atomisp_wdt_refresh_pipe(pipe, wdt_duration);
+ 
+ start_delay_wq:
+ 	if (asd->continuous_mode->val) {
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+index 6b5718c..9b2911e 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+@@ -110,6 +110,14 @@ struct atomisp_video_pipe {
+ 	 */
+ 	unsigned int frame_request_config_id[VIDEO_MAX_FRAME];
+ 	struct atomisp_css_params_with_list *frame_params[VIDEO_MAX_FRAME];
++
++	/*
++	* move wdt from asd struct to create wdt for each pipe
++	*/
++	struct timer_list wdt;
++	unsigned int wdt_duration;	/* in jiffies */
++	unsigned long wdt_expires;
++	atomic_t wdt_count;
+ };
+ 
+ struct atomisp_acc_pipe {
+@@ -387,10 +395,6 @@ struct atomisp_sub_device {
+ 	int raw_buffer_locked_count;
+ 	spinlock_t raw_buffer_bitmap_lock;
+ 
+-	struct timer_list wdt;
+-	unsigned int wdt_duration;	/* in jiffies */
+-	unsigned long wdt_expires;
+-
+ 	struct atomisp_resolution sensor_array_res;
+ 	bool high_speed_mode; /* Indicate whether now is a high speed mode */
+ 	int pending_capture_request; /* Indicates the number of pending capture requests. */
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_v4l2.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_v4l2.c
+index 93af334..d6ea0b9 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_v4l2.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_v4l2.c
+@@ -1239,7 +1239,15 @@ static int init_atomisp_wdts(struct atomisp_device *isp)
+ 	for (i = 0; i < isp->num_of_streams; i++) {
+ 		struct atomisp_sub_device *asd = &isp->asd[i];
+ 		asd = &isp->asd[i];
+-		setup_timer(&asd->wdt, atomisp_wdt, (unsigned long)isp);
++		setup_timer(&asd->video_out_capture.wdt,
++			atomisp_wdt, (unsigned long)&asd->video_out_capture);
++		setup_timer(&asd->video_out_preview.wdt,
++			atomisp_wdt, (unsigned long)&asd->video_out_preview);
++		setup_timer(&asd->video_out_vf.wdt,
++			atomisp_wdt, (unsigned long)&asd->video_out_vf);
++		setup_timer(&asd->video_out_video_capture.wdt,
++			atomisp_wdt,
++			(unsigned long)&asd->video_out_video_capture);
+ 	}
+ 	return 0;
+ alloc_fail:
+-- 
+1.9.1
+

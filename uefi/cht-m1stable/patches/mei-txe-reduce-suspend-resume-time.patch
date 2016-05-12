@@ -1,0 +1,82 @@
+From 7f1794d4becc9eb3fa99eb8a7f07d4102715b45b Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Sun, 29 Mar 2015 14:51:42 +0300
+Subject: [PATCH] mei: txe: reduce suspend/resume time
+
+HW has to be in known state before the initialisation
+sequence is started. The polling step for settling aliveness
+was set to 200ms while in practise this can be done in up to 30msecs.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-36272
+Change-Id: I549c39cb398f1a80dbce02f90b977091d7c3ef9f
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Barak Yoresh <barak.yoresh@intel.com>
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+---
+ drivers/misc/mei/hw-txe.c | 25 ++++++++++++++++---------
+ 1 file changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/misc/mei/hw-txe.c b/drivers/misc/mei/hw-txe.c
+index 93273783dec5..0c0679628b0d 100644
+--- a/drivers/misc/mei/hw-txe.c
++++ b/drivers/misc/mei/hw-txe.c
+@@ -16,6 +16,7 @@
+ 
+ #include <linux/pci.h>
+ #include <linux/jiffies.h>
++#include <linux/ktime.h>
+ #include <linux/delay.h>
+ #include <linux/kthread.h>
+ #include <linux/irqreturn.h>
+@@ -196,6 +197,11 @@ static u32 mei_txe_aliveness_get(struct mei_device *dev)
+ 	return reg & HICR_HOST_ALIVENESS_RESP_ACK;
+ }
+ 
++static inline bool ktime_before(const ktime_t cmp1, const ktime_t cmp2)
++{
++	return ktime_compare(cmp1, cmp2) < 0;
++}
++
+ /**
+  * mei_txe_aliveness_poll - waits for aliveness to settle
+  *
+@@ -203,26 +209,27 @@ static u32 mei_txe_aliveness_get(struct mei_device *dev)
+  * @expected: expected aliveness value
+  *
+  * Polls for HICR_HOST_ALIVENESS_RESP.ALIVENESS_RESP to be set
+- * returns > 0 if the expected value was received, -ETIME otherwise
++ *
++ * Return: 0 if the expected value was received, -ETIME otherwise
+  */
+ static int mei_txe_aliveness_poll(struct mei_device *dev, u32 expected)
+ {
+ 	struct mei_txe_hw *hw = to_txe_hw(dev);
+-	int t = 0;
++	ktime_t stop, start;
+ 
++	start = ktime_get();
++	stop = ktime_add(start, ms_to_ktime(SEC_ALIVENESS_WAIT_TIMEOUT));
+ 	do {
+ 		hw->aliveness = mei_txe_aliveness_get(dev);
+ 		if (hw->aliveness == expected) {
+ 			dev->pg_event = MEI_PG_EVENT_IDLE;
+ 			dev_dbg(&dev->pdev->dev,
+-				"aliveness settled after %d msecs\n", t);
+-			return t;
++				"aliveness settled after %lld usecs\n",
++				ktime_to_us(ktime_sub(ktime_get(), start)));
++			return 0;
+ 		}
+-		mutex_unlock(&dev->device_lock);
+-		msleep(MSEC_PER_SEC / 5);
+-		mutex_lock(&dev->device_lock);
+-		t += MSEC_PER_SEC / 5;
+-	} while (t < SEC_ALIVENESS_WAIT_TIMEOUT);
++		usleep_range(20, 50);
++	} while (ktime_before(ktime_get(), stop));
+ 
+ 	dev->pg_event = MEI_PG_EVENT_IDLE;
+ 	dev_err(&dev->pdev->dev, "aliveness timed out\n");
+-- 
+1.9.1
+

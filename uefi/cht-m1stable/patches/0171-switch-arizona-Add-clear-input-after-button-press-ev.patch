@@ -1,0 +1,336 @@
+From c33e1eb9f797eb149d96834bc3f85c315b2e47c0 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Date: Fri, 7 Mar 2014 13:58:04 +0000
+Subject: [PATCH 171/351] switch: arizona: Add clear input after button press
+ events
+
+Change-Id: I87c29cc83f0e67427a6b116af44e70f15e72aeae
+Signed-off-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Signed-off-by: Nikesh Oswal <Nikesh.Oswal@wolfsonmicro.com>
+---
+ drivers/mfd/arizona-core.c            |  128 +++++++++++++++++++++++++++++++++
+ drivers/mfd/florida-tables.c          |   12 ++++
+ drivers/switch/switch-arizona.c       |   34 +++++++++
+ include/linux/mfd/arizona/core.h      |    2 +
+ include/linux/mfd/arizona/registers.h |   48 +++++++++++++
+ 5 files changed, 224 insertions(+)
+
+diff --git a/drivers/mfd/arizona-core.c b/drivers/mfd/arizona-core.c
+index 317c433..89a3bc1 100644
+--- a/drivers/mfd/arizona-core.c
++++ b/drivers/mfd/arizona-core.c
+@@ -945,6 +945,134 @@ static const struct mfd_cell wm8997_devs[] = {
+ 	},
+ };
+ 
++static const struct {
++	unsigned int enable;
++	unsigned int conf_reg;
++	unsigned int vol_reg;
++	unsigned int adc_reg;
++} arizona_florida_channel_defs[] = {
++	{
++		ARIZONA_IN1R_ENA, ARIZONA_IN1L_CONTROL,
++		ARIZONA_ADC_DIGITAL_VOLUME_1R, ARIZONA_ADC_VCO_CAL_5
++	},
++	{
++		ARIZONA_IN1L_ENA, ARIZONA_IN1L_CONTROL,
++		ARIZONA_ADC_DIGITAL_VOLUME_1L, ARIZONA_ADC_VCO_CAL_4
++	},
++	{
++		ARIZONA_IN2R_ENA, ARIZONA_IN2L_CONTROL,
++		ARIZONA_ADC_DIGITAL_VOLUME_2R, ARIZONA_ADC_VCO_CAL_7
++	},
++	{
++		ARIZONA_IN2L_ENA, ARIZONA_IN2L_CONTROL,
++		ARIZONA_ADC_DIGITAL_VOLUME_2L, ARIZONA_ADC_VCO_CAL_6
++	},
++	{
++		ARIZONA_IN3R_ENA, ARIZONA_IN3L_CONTROL,
++		ARIZONA_ADC_DIGITAL_VOLUME_3R, ARIZONA_ADC_VCO_CAL_9
++	},
++	{
++		ARIZONA_IN3L_ENA, ARIZONA_IN3L_CONTROL,
++		ARIZONA_ADC_DIGITAL_VOLUME_3L, ARIZONA_ADC_VCO_CAL_8
++	},
++};
++
++static void arizona_florida_mute_analog(struct arizona* arizona,
++					unsigned int mute)
++{
++	unsigned int val, chans;
++	int i;
++
++	regmap_read(arizona->regmap, ARIZONA_INPUT_ENABLES_STATUS, &chans);
++
++	for (i = 0; i < ARRAY_SIZE(arizona_florida_channel_defs); ++i) {
++		if (!(chans & arizona_florida_channel_defs[i].enable))
++			continue;
++
++		/* Check for analogue input */
++		regmap_read(arizona->regmap,
++			    arizona_florida_channel_defs[i].conf_reg,
++			    &val);
++		if (val & 0x0400)
++			continue;
++
++		regmap_update_bits(arizona->regmap,
++				   arizona_florida_channel_defs[i].vol_reg,
++				   ARIZONA_IN1L_MUTE,
++				   mute);
++	}
++}
++
++static bool arizona_florida_get_input_state(struct arizona* arizona)
++{
++	unsigned int val, chans;
++	int count, i, j;
++
++	regmap_read(arizona->regmap, ARIZONA_INPUT_ENABLES_STATUS, &chans);
++
++	for (i = 0; i < ARRAY_SIZE(arizona_florida_channel_defs); ++i) {
++		if (!(chans & arizona_florida_channel_defs[i].enable))
++			continue;
++
++		/* Check for analogue input */
++		regmap_read(arizona->regmap,
++			    arizona_florida_channel_defs[i].conf_reg,
++			    &val);
++		if (val & 0x0400)
++			continue;
++
++		count = 0;
++
++		for (j = 0; j < 4; ++j) {
++			regmap_read(arizona->regmap,
++				    arizona_florida_channel_defs[i].adc_reg,
++				    &val);
++			val &= ARIZONA_ADC1L_COUNT_RD_MASK;
++			val >>= ARIZONA_ADC1L_COUNT_RD_SHIFT;
++
++			dev_dbg(arizona->dev, "ADC Count: %d\n", val);
++
++			if (val > 78 || val < 54)
++				count++;
++		}
++
++		if (count == j)
++			return true;
++	}
++
++	return false;
++}
++
++void arizona_florida_clear_input(struct arizona *arizona)
++{
++	regmap_write(arizona->regmap, 0x80, 0x3);
++
++	if (arizona_florida_get_input_state(arizona)) {
++		arizona_florida_mute_analog(arizona, ARIZONA_IN1L_MUTE);
++
++		regmap_write(arizona->regmap, 0x3A6, 0x5555);
++		regmap_write(arizona->regmap, 0x3A5, 0x3);
++		msleep(10);
++		regmap_write(arizona->regmap, 0x3A5, 0x0);
++
++		if (arizona_florida_get_input_state(arizona)) {
++			regmap_write(arizona->regmap, 0x3A6, 0xAAAA);
++			regmap_write(arizona->regmap, 0x3A5, 0x5);
++			msleep(10);
++			regmap_write(arizona->regmap, 0x3A5, 0x0);
++		}
++
++		regmap_write(arizona->regmap, 0x3A6, 0x0);
++
++		msleep(5);
++
++		arizona_florida_mute_analog(arizona, 0);
++	}
++
++	regmap_write(arizona->regmap, 0x80, 0x0);
++}
++EXPORT_SYMBOL_GPL(arizona_florida_clear_input);
++
+ int arizona_dev_init(struct arizona *arizona)
+ {
+ 	struct device *dev = arizona->dev;
+diff --git a/drivers/mfd/florida-tables.c b/drivers/mfd/florida-tables.c
+index 9195e51..6f47c48 100644
+--- a/drivers/mfd/florida-tables.c
++++ b/drivers/mfd/florida-tables.c
+@@ -1651,6 +1651,12 @@ static bool florida_readable_register(struct device *dev, unsigned int reg)
+ 	case ARIZONA_IN4R_CONTROL:
+ 	case ARIZONA_ADC_DIGITAL_VOLUME_4R:
+ 	case ARIZONA_DMIC4R_CONTROL:
++	case ARIZONA_ADC_VCO_CAL_4:
++	case ARIZONA_ADC_VCO_CAL_5:
++	case ARIZONA_ADC_VCO_CAL_6:
++	case ARIZONA_ADC_VCO_CAL_7:
++	case ARIZONA_ADC_VCO_CAL_8:
++	case ARIZONA_ADC_VCO_CAL_9:
+ 	case ARIZONA_OUTPUT_ENABLES_1:
+ 	case ARIZONA_OUTPUT_STATUS_1:
+ 	case ARIZONA_OUTPUT_STANDBY_1:
+@@ -2642,6 +2648,12 @@ static bool florida_volatile_register(struct device *dev, unsigned int reg)
+ 	case ARIZONA_INPUT_ENABLES_STATUS:
+ 	case ARIZONA_OUTPUT_STATUS_1:
+ 	case ARIZONA_RAW_OUTPUT_STATUS_1:
++	case ARIZONA_ADC_VCO_CAL_4:
++	case ARIZONA_ADC_VCO_CAL_5:
++	case ARIZONA_ADC_VCO_CAL_6:
++	case ARIZONA_ADC_VCO_CAL_7:
++	case ARIZONA_ADC_VCO_CAL_8:
++	case ARIZONA_ADC_VCO_CAL_9:
+ 	case ARIZONA_SLIMBUS_RX_PORT_STATUS:
+ 	case ARIZONA_SLIMBUS_TX_PORT_STATUS:
+ 	case ARIZONA_INTERRUPT_STATUS_1:
+diff --git a/drivers/switch/switch-arizona.c b/drivers/switch/switch-arizona.c
+index 91678e7..4c789ae 100644
+--- a/drivers/switch/switch-arizona.c
++++ b/drivers/switch/switch-arizona.c
+@@ -92,6 +92,8 @@ struct arizona_extcon_info {
+ 	struct delayed_work hpdet_work;
+ 	struct delayed_work micd_detect_work;
+ 	struct delayed_work micd_timeout_work;
++	struct delayed_work micd_clear_work;
++	bool first_clear;
+ 
+ 	bool hpdet_active;
+ 	bool hpdet_done;
+@@ -1124,6 +1126,24 @@ handled:
+ 	mutex_unlock(&info->lock);
+ }
+ 
++static void arizona_micd_input_clear(struct work_struct *work)
++{
++	struct arizona_extcon_info *info = container_of(work,
++							struct arizona_extcon_info,
++							micd_clear_work.work);
++	struct arizona *arizona = info->arizona;
++
++	arizona_florida_clear_input(arizona);
++
++	mutex_lock(&info->lock);
++	if (info->first_clear) {
++		schedule_delayed_work(&info->micd_clear_work,
++				      msecs_to_jiffies(900));
++		info->first_clear = false;
++	}
++	mutex_unlock(&info->lock);
++}
++
+ static irqreturn_t arizona_micdet(int irq, void *data)
+ {
+ 	struct arizona_extcon_info *info = data;
+@@ -1132,10 +1152,23 @@ static irqreturn_t arizona_micdet(int irq, void *data)
+ 
+ 	cancel_delayed_work_sync(&info->micd_detect_work);
+ 	cancel_delayed_work_sync(&info->micd_timeout_work);
++	cancel_delayed_work_sync(&info->micd_clear_work);
+ 
+ 	mutex_lock(&info->lock);
++
+ 	if (!info->detecting)
+ 		debounce = 0;
++
++	switch (arizona->type) {
++	case WM5110:
++		info->first_clear = true;
++		schedule_delayed_work(&info->micd_clear_work,
++				      msecs_to_jiffies(80));
++		break;
++	default:
++		break;
++	}
++
+ 	mutex_unlock(&info->lock);
+ 
+ 	if (debounce)
+@@ -1405,6 +1438,7 @@ static int arizona_extcon_probe(struct platform_device *pdev)
+ 	info->last_jackdet = ~(ARIZONA_MICD_CLAMP_STS | ARIZONA_JD1_STS);
+ 	INIT_DELAYED_WORK(&info->hpdet_work, arizona_hpdet_work);
+ 	INIT_DELAYED_WORK(&info->micd_detect_work, arizona_micd_detect);
++	INIT_DELAYED_WORK(&info->micd_clear_work, arizona_micd_input_clear);
+ 	INIT_DELAYED_WORK(&info->micd_timeout_work, arizona_micd_timeout_work);
+ 	platform_set_drvdata(pdev, info);
+ 
+diff --git a/include/linux/mfd/arizona/core.h b/include/linux/mfd/arizona/core.h
+index 5d3d12b..3e2499f 100644
+--- a/include/linux/mfd/arizona/core.h
++++ b/include/linux/mfd/arizona/core.h
+@@ -136,4 +136,6 @@ extern int arizona_of_read_u32_array(struct arizona *arizona, const char *prop,
+ extern int arizona_of_read_u32(struct arizona *arizona, const char* prop,
+ 			       bool mandatory, u32 *data);
+ 
++extern void arizona_florida_clear_input(struct arizona *arizona);
++
+ #endif
+diff --git a/include/linux/mfd/arizona/registers.h b/include/linux/mfd/arizona/registers.h
+index a3323bb..351b979 100644
+--- a/include/linux/mfd/arizona/registers.h
++++ b/include/linux/mfd/arizona/registers.h
+@@ -171,6 +171,12 @@
+ #define ARIZONA_IN4R_CONTROL                     0x32C
+ #define ARIZONA_ADC_DIGITAL_VOLUME_4R            0x32D
+ #define ARIZONA_DMIC4R_CONTROL                   0x32E
++#define ARIZONA_ADC_VCO_CAL_4                    0x393
++#define ARIZONA_ADC_VCO_CAL_5                    0x394
++#define ARIZONA_ADC_VCO_CAL_6                    0x395
++#define ARIZONA_ADC_VCO_CAL_7                    0x396
++#define ARIZONA_ADC_VCO_CAL_8                    0x397
++#define ARIZONA_ADC_VCO_CAL_9                    0x398
+ #define ARIZONA_OUTPUT_ENABLES_1                 0x400
+ #define ARIZONA_OUTPUT_STATUS_1                  0x401
+ #define ARIZONA_OUTPUT_STANDBY_1                 0x405
+@@ -2732,6 +2738,48 @@
+ #define ARIZONA_IN4R_DMIC_DLY_WIDTH                   6  /* IN4R_DMIC_DLY - [5:0] */
+ 
+ /*
++ * R915 (0x393) -  ADC VCO Cal 4
++ */
++#define ARIZONA_ADC1L_COUNT_RD_MASK              0x1FC0  /* ADC1L_COUNT_RD - [12:6] */
++#define ARIZONA_ADC1L_COUNT_RD_SHIFT                  6  /* ADC1L_COUNT_RD - [12:6] */
++#define ARIZONA_ADC1L_COUNT_RD_WIDTH                  7  /* ADC1L_COUNT_RD - [12:6] */
++
++/*
++ * R916 (0x394) -  ADC VCO Cal 5
++ */
++#define ARIZONA_ADC1R_COUNT_RD_MASK              0x1FC0  /* ADC1R_COUNT_RD - [12:6] */
++#define ARIZONA_ADC1R_COUNT_RD_SHIFT                  6  /* ADC1R_COUNT_RD - [12:6] */
++#define ARIZONA_ADC1R_COUNT_RD_WIDTH                  7  /* ADC1R_COUNT_RD - [12:6] */
++
++/*
++ * R917 (0x395) -  ADC VCO Cal 6
++ */
++#define ARIZONA_ADC2L_COUNT_RD_MASK              0x1FC0  /* ADC2L_COUNT_RD - [12:6] */
++#define ARIZONA_ADC2L_COUNT_RD_SHIFT                  6  /* ADC2L_COUNT_RD - [12:6] */
++#define ARIZONA_ADC2L_COUNT_RD_WIDTH                  7  /* ADC2L_COUNT_RD - [12:6] */
++
++/*
++ * R918 (0x396) -  ADC VCO Cal 7
++ */
++#define ARIZONA_ADC2R_COUNT_RD_MASK              0x1FC0  /* ADC2R_COUNT_RD - [12:6] */
++#define ARIZONA_ADC2R_COUNT_RD_SHIFT                  6  /* ADC2R_COUNT_RD - [12:6] */
++#define ARIZONA_ADC2R_COUNT_RD_WIDTH                  7  /* ADC2R_COUNT_RD - [12:6] */
++
++/*
++ * R919 (0x397) -  ADC VCO Cal 8
++ */
++#define ARIZONA_ADC3L_COUNT_RD_MASK              0x1FC0  /* ADC3L_COUNT_RD - [12:6] */
++#define ARIZONA_ADC3L_COUNT_RD_SHIFT                  6  /* ADC3L_COUNT_RD - [12:6] */
++#define ARIZONA_ADC3L_COUNT_RD_WIDTH                  7  /* ADC3L_COUNT_RD - [12:6] */
++
++/*
++ * R920 (0x398) -  ADC VCO Cal 9
++ */
++#define ARIZONA_ADC3R_COUNT_RD_MASK              0x1FC0  /* ADC3R_COUNT_RD - [12:6] */
++#define ARIZONA_ADC3R_COUNT_RD_SHIFT                  6  /* ADC3R_COUNT_RD - [12:6] */
++#define ARIZONA_ADC3R_COUNT_RD_WIDTH                  7  /* ADC3R_COUNT_RD - [12:6] */
++
++/*
+  * R1024 (0x400) - Output Enables 1
+  */
+ #define ARIZONA_OUT6L_ENA                        0x0800  /* OUT6L_ENA */
+-- 
+1.7.9.5
+

@@ -1,0 +1,143 @@
+From 95836f3fd0ea57c17a86c4e4130f6a526ad7a0a9 Mon Sep 17 00:00:00 2001
+From: Tianshu Qiu <tian.shu.qiu@intel.com>
+Date: Thu, 30 Apr 2015 17:25:23 +0800
+Subject: [PATCH 387/462] atomisp2: Fix video zoom flicker
+
+This patch fixes video digital zoom flicker issue by
+syncing global and per-frame parameters for dvs
+6axis config.
+If a per-frame setting is on the way, new global
+settings with dvs 6axis config will not be updated
+until the previous per-frame setting is applied
+with buffer output.
+
+Change-Id: Ia72d46b33c5d9be5aee932041d0b4ff4143dcdfc
+Fixes-Issue: #JIMINAN-33915
+Signed-off-by: Tianshu Qiu <tian.shu.qiu@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/53725
+Approver: Jing Tao <jing.tao@intel.com>
+Build: IMIN (SC)
+Integrator: WeiX Meng <weix.meng@intel.com>
+Build: WeiX Meng <weix.meng@intel.com>
+Reviewed-by: WeiX Meng <weix.meng@intel.com>
+Maintainer: WeiX Meng <weix.meng@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.c      | 48 ++++++++++++++++------
+ .../pci/atomisp2/atomisp_driver/atomisp_fops.c     |  2 +
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.c    |  1 +
+ .../pci/atomisp2/atomisp_driver/atomisp_subdev.h   |  1 +
+ 4 files changed, 39 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index 23a18d3..55596b1 100755
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -1118,6 +1118,9 @@ void atomisp_buf_done(struct atomisp_sub_device *asd, int error,
+ 
+ 		/* free the parameters */
+ 		if (pipe->frame_params[vb->i]) {
++			if (asd->params.dvs_6axis ==
++			    pipe->frame_params[vb->i]->params.dvs_6axis)
++				asd->params.dvs_6axis = NULL;
+ 			atomisp_free_css_parameters(
+ 				&pipe->frame_params[vb->i]->params);
+ 			atomisp_kernel_free(pipe->frame_params[vb->i]);
+@@ -1199,6 +1202,38 @@ void atomisp_buf_done(struct atomisp_sub_device *asd, int error,
+ 			WARN_ON(frame->exp_id > ATOMISP_MAX_EXP_ID);
+ 		}
+ 
++		if (asd->params.css_update_params_needed) {
++			atomisp_apply_css_parameters(asd,
++				&asd->params.css_param);
++			if (asd->params.css_param.update_flag.dz_config)
++				atomisp_css_set_dz_config(asd,
++					&asd->params.css_param.dz_config);
++			/* New global dvs 6axis config should be blocked
++			 * here if there's a buffer with per-frame parameters
++			 * pending in CSS frame buffer queue.
++			 * This is to aviod zooming vibration since global
++			 * parameters take effect immediately while
++			 * per-frame parameters are taken after previous
++			 * buffers in CSS got processed.
++			 */
++			if (asd->params.dvs_6axis)
++				atomisp_css_set_dvs_6axis(asd,
++					asd->params.dvs_6axis);
++			else
++				asd->params.css_update_params_needed = false;
++			/* The update flag should not be cleaned here
++			 * since it is still going to be used to make up
++			 * following per-frame parameters.
++			 * This will introduce more copy work since each
++			 * time when updating global parameters, the whole
++			 * parameter set are applied.
++			 * FIXME: A new set of parameter copy functions can
++			 * be added to make up per-frame parameters based on
++			 * solid structures stored in asd->params.css_param
++			 * instead of using shadow pointers in update flag.
++			 */
++			atomisp_css_update_isp_params(asd);
++		}
+ 		break;
+ 	default:
+ 		break;
+@@ -1733,19 +1768,6 @@ irqreturn_t atomisp_isr_thread(int irq, void *isp_ptr)
+ 		asd = &isp->asd[i];
+ 		if (asd->streaming != ATOMISP_DEVICE_STREAMING_ENABLED)
+ 			continue;
+-		if (frame_done_found[asd->index] &&
+-		    asd->params.css_update_params_needed) {
+-			atomisp_apply_css_parameters(asd,
+-				&asd->params.css_param);
+-			if (asd->params.css_param.update_flag.dz_config)
+-				atomisp_css_set_dz_config(asd,
+-					&asd->params.css_param.dz_config);
+-			atomisp_css_update_isp_params(asd);
+-			asd->params.css_update_params_needed = false;
+-			memset(&asd->params.css_param.update_flag, 0,
+-			       sizeof(struct atomisp_parameters));
+-			frame_done_found[asd->index] = false;
+-		}
+ 		atomisp_setup_flash(asd);
+ 
+ 	}
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
+index 5da32bb..6a5265a 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
+@@ -266,6 +266,8 @@ int atomisp_q_video_buffers_to_css(struct atomisp_sub_device *asd,
+ 						vm_mem->vaddr);
+ 			atomisp_css_update_isp_params_on_pipe(asd,
+ 				asd->stream_env[stream_id].pipes[css_pipe_id]);
++			asd->params.dvs_6axis = (struct atomisp_css_dvs_6axis *)
++				param->params.dvs_6axis;
+ 
+ 			/*
+ 			 * WORKAROUND:
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index bcfd8f4..6366b0e 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -1806,6 +1806,7 @@ static int atomisp_streamon(struct file *file, void *fh,
+ 		memset(&asd->params.css_param.update_flag, 0,
+ 		       sizeof(struct atomisp_parameters));
+ 	}
++	asd->params.dvs_6axis = NULL;
+ 
+ 	ret = atomisp_css_start(asd, css_pipe_id, false);
+ 	if (ret)
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+index d37acef..6b5718c 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+@@ -235,6 +235,7 @@ struct atomisp_subdev_params {
+ 	uint32_t metadata_width_size;
+ 
+ 	struct ia_css_dvs2_statistics *dvs_stat;
++	struct atomisp_css_dvs_6axis *dvs_6axis;
+ 	uint32_t exp_id;
+ 	int  dvs_hor_coef_bytes;
+ 	int  dvs_ver_coef_bytes;
+-- 
+1.9.1
+

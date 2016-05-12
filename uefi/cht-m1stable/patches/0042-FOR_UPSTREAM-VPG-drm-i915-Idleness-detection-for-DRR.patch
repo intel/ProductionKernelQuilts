@@ -1,0 +1,418 @@
+From d2304947bc5b2236b0e9391e6050f87074ef07e5 Mon Sep 17 00:00:00 2001
+Message-Id: <d2304947bc5b2236b0e9391e6050f87074ef07e5.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Vandana Kannan <vandana.kannan@intel.com>
+Date: Fri, 14 Mar 2014 11:01:01 +0530
+Subject: [PATCH 042/312] FOR_UPSTREAM [VPG]: drm/i915: Idleness detection for
+ DRRS
+
+Adding support to detect display idleness by tracking page flip from
+user space. Switch to low refresh rate is triggered after 2 seconds of
+idleness. The delay is configurable. If there is a page flip or call to
+update the plane, then high refresh rate is applied.
+The feature is not used in dual-display mode.
+
+v2: Chris Wilson's review comments incorporated.
+Modify idleness detection implementation to make it similar to the
+implementation of intel_update_fbc/intel_disable_fbc
+
+v3: Internal review comments incorporated
+Add NULL pointer check in intel_disable_drrs.
+Add drrs calls in i9xx_crtc_enable/disable and valleyview_crtc_enable.
+
+v4: Jani's review comments incorporated.
+Change in sequence in intel_update_drrs. Comment modified to remove details
+of update param. Modified DRRS idleness interval to a module parameter.
+
+v5: Chris's review comments incorporated.
+Initialize connector in idleness detection init. Modifications made to
+use only intel_connector in i915_drrs and derive intel_dp when required.
+Added a function drrs_fini to cleanup DRRS work.
+
+v6: Internal review comments. Removed check for primary enabled, which is
+a redundant check, in the case of clone mode. Added a flag to track
+dual-display configuration. Remove print statement for "cancel DRR work"
+and print "DRRS not supported" only once.
+
+v7: Remove drrs calls from update_primary(). DRRS calls for sprite related
+flips will be handled via crtc_page_flip. This will have to be revisited
+after sprite flip notification patch is merged.
+
+Issue: APDEV-1101
+Change-Id: I350c2b365028f23b59964e98f2abff7118875d3c
+Signed-off-by: Vandana Kannan <vandana.kannan@intel.com>
+Signed-off-by: Pradeep Bhat <pradeep.bhat@intel.com>
+Reviewed-on: https://android.intel.com/167764
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    7 ++
+ drivers/gpu/drm/i915/i915_params.c   |    8 ++
+ drivers/gpu/drm/i915/intel_display.c |   15 ++++
+ drivers/gpu/drm/i915/intel_dp.c      |   23 +++++-
+ drivers/gpu/drm/i915/intel_drv.h     |    4 +
+ drivers/gpu/drm/i915/intel_pm.c      |  138 ++++++++++++++++++++++++++++++++++
+ 6 files changed, 194 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 8a007cc5..6142cd4 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -640,6 +640,12 @@ struct i915_fbc {
+ 
+ struct i915_drrs {
+ 	struct intel_connector *connector;
++	bool is_clone;
++	struct intel_drrs_work {
++		struct delayed_work work;
++		struct drm_crtc *crtc;
++		int interval;
++	} *drrs_work;
+ };
+ 
+ struct i915_psr {
+@@ -2050,6 +2056,7 @@ struct i915_params {
+ 	bool reset;
+ 	bool disable_display;
+ 	bool disable_vtd_wa;
++	int drrs_interval;
+ };
+ extern struct i915_params i915 __read_mostly;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_params.c b/drivers/gpu/drm/i915/i915_params.c
+index aba1f83..2ebb5fc 100644
+--- a/drivers/gpu/drm/i915/i915_params.c
++++ b/drivers/gpu/drm/i915/i915_params.c
+@@ -48,6 +48,7 @@ struct i915_params i915 __read_mostly = {
+ 	.disable_display = 0,
+ 	.enable_cmd_parser = 0,
+ 	.disable_vtd_wa = 0,
++	.drrs_interval = 2000,
+ };
+ 
+ module_param_named(modeset, i915.modeset, int, 0400);
+@@ -156,3 +157,10 @@ MODULE_PARM_DESC(disable_vtd_wa, "Disable all VT-d workarounds (default: false)"
+ module_param_named(enable_cmd_parser, i915.enable_cmd_parser, int, 0600);
+ MODULE_PARM_DESC(enable_cmd_parser,
+ 		 "Enable command parsing (1=enabled [default], 0=disabled)");
++
++module_param_named(drrs_interval, i915.drrs_interval, int, 0600);
++MODULE_PARM_DESC(drrs_interval,
++	"DRRS idleness detection interval  (default: 2000 ms)."
++	"If this field is set to 0, then seamless DRRS feature "
++	"based on idleness detection is disabled."
++	"The interval is to be set in milliseconds.");
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 0a3c6ee..777a117 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -3135,6 +3135,7 @@ intel_pipe_set_base(struct drm_crtc *crtc, int x, int y,
+ 
+ 	mutex_lock(&dev->struct_mutex);
+ 	intel_update_fbc(dev);
++	intel_update_drrs(dev);
+ 	intel_edp_psr_update(dev);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+@@ -4316,6 +4317,7 @@ static void intel_crtc_enable_planes(struct drm_crtc *crtc)
+ 	mutex_lock(&dev->struct_mutex);
+ 	intel_update_fbc(dev);
+ 	intel_edp_psr_update(dev);
++	intel_update_drrs(dev);
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
+@@ -4612,6 +4614,7 @@ static void ironlake_crtc_disable(struct drm_crtc *crtc)
+ 	mutex_lock(&dev->struct_mutex);
+ 	intel_update_fbc(dev);
+ 	intel_edp_psr_update(dev);
++	intel_update_drrs(dev);
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
+@@ -4660,6 +4663,7 @@ static void haswell_crtc_disable(struct drm_crtc *crtc)
+ 	mutex_lock(&dev->struct_mutex);
+ 	intel_update_fbc(dev);
+ 	intel_edp_psr_update(dev);
++	intel_update_drrs(dev);
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
+@@ -5043,6 +5047,7 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
+ 		encoder->enable(encoder);
+ 
+ 	intel_crtc_enable_planes(crtc);
++	intel_update_drrs(dev);
+ 
+ 	drm_crtc_vblank_on(crtc);
+ 
+@@ -5120,6 +5125,7 @@ static void i9xx_crtc_enable(struct drm_crtc *crtc)
+ 
+ 	intel_crtc_load_lut(crtc);
+ 
++	intel_update_drrs(dev);
+ 	intel_update_watermarks(crtc);
+ 	intel_enable_pipe(intel_crtc);
+ 
+@@ -5225,6 +5231,7 @@ static void i9xx_crtc_disable(struct drm_crtc *crtc)
+ 	mutex_lock(&dev->struct_mutex);
+ 	intel_update_fbc(dev);
+ 	intel_edp_psr_update(dev);
++	intel_update_drrs(dev);
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
+@@ -9578,6 +9585,10 @@ static void intel_unpin_work_fn(struct work_struct *__work)
+ 	drm_gem_object_unreference(&work->pending_flip_obj->base);
+ 	drm_gem_object_unreference(&work->old_fb_obj->base);
+ 
++	/* disable current DRRS work scheduled and restart
++	 * to push work by another x seconds
++	 */
++	intel_update_drrs(dev);
+ 	intel_update_fbc(dev);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+@@ -10098,6 +10109,7 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 		goto cleanup_unpin;
+ 
+ 	intel_disable_fbc(dev);
++	intel_disable_drrs(dev);
+ 	intel_mark_fb_busy(obj, NULL);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+@@ -12610,6 +12622,7 @@ void intel_modeset_init(struct drm_device *dev)
+ 
+ 	/* Just in case the BIOS is doing something questionable. */
+ 	intel_disable_fbc(dev);
++	intel_disable_drrs(dev);
+ 
+ 	drm_modeset_lock_all(dev);
+ 	intel_modeset_setup_hw_state(dev, false);
+@@ -13118,6 +13131,8 @@ void intel_modeset_cleanup(struct drm_device *dev)
+ 
+ 	intel_disable_fbc(dev);
+ 
++	intel_disable_drrs(dev);
++
+ 	intel_disable_gt_powersave(dev);
+ 
+ 	ironlake_teardown_rc6(dev);
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 6dbaa21..23fddcc 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -3729,16 +3729,37 @@ intel_dp_connector_destroy(struct drm_connector *connector)
+ 	kfree(connector);
+ }
+ 
++static void
++intel_dp_drrs_fini(struct drm_i915_private *dev_priv,
++			struct intel_dp *intel_dp)
++{
++	if (intel_dp->drrs_state.type == SEAMLESS_DRRS_SUPPORT) {
++		if (cancel_delayed_work_sync
++			(&dev_priv->drrs.drrs_work->work)) {
++			kfree(dev_priv->drrs.drrs_work);
++			dev_priv->drrs.drrs_work = NULL;
++			dev_priv->drrs.connector = NULL;
++		}
++	}
++}
++
+ void intel_dp_encoder_destroy(struct drm_encoder *encoder)
+ {
+ 	struct intel_digital_port *intel_dig_port = enc_to_dig_port(encoder);
+ 	struct intel_dp *intel_dp = &intel_dig_port->dp;
+ 	struct drm_device *dev = intel_dp_to_dev(intel_dp);
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	drm_dp_aux_unregister(&intel_dp->aux);
+ 	drm_encoder_cleanup(encoder);
+ 	if (is_edp(intel_dp)) {
+ 		cancel_delayed_work_sync(&intel_dp->panel_vdd_work);
++
++		if (dev_priv->drrs.connector &&
++			intel_dp == enc_to_intel_dp(
++				&dev_priv->drrs.connector->encoder->base))
++			intel_dp_drrs_fini(dev_priv, intel_dp);
++
+ 		drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
+ 		edp_panel_vdd_off_sync(intel_dp);
+ 		drm_modeset_unlock(&dev->mode_config.connection_mutex);
+@@ -4132,7 +4153,7 @@ intel_dp_drrs_init(struct intel_digital_port *intel_dig_port,
+ 		return NULL;
+ 	}
+ 
+-	dev_priv->drrs.connector = intel_connector;
++	intel_init_drrs_idleness_detection(dev, intel_connector);
+ 
+ 	mutex_init(&intel_dp->drrs_state.mutex);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index f2d1b8d..c454bef 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1008,6 +1008,10 @@ void intel_fini_runtime_pm(struct drm_i915_private *dev_priv);
+ void ilk_wm_get_hw_state(struct drm_device *dev);
+ void __vlv_set_power_well(struct drm_i915_private *dev_priv,
+ 			  enum punit_power_well power_well_id, bool enable);
++void intel_init_drrs_idleness_detection(struct drm_device *dev,
++		struct intel_connector *connector);
++void intel_update_drrs(struct drm_device *dev);
++void intel_disable_drrs(struct drm_device *dev);
+ 
+ /* intel_sdvo.c */
+ bool intel_sdvo_init(struct drm_device *dev, uint32_t sdvo_reg, bool is_sdvob);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 3d58ba7..4e7e78a 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -620,6 +620,144 @@ out_disable:
+ 	i915_gem_stolen_cleanup_compression(dev);
+ }
+ 
++static void intel_drrs_work_fn(struct work_struct *__work)
++{
++	struct intel_drrs_work *work =
++		container_of(to_delayed_work(__work),
++			     struct intel_drrs_work, work);
++	struct drm_device *dev = work->crtc->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* Double check if the dual-display mode is active. */
++	if (dev_priv->drrs.is_clone)
++		return;
++
++	intel_dp_set_drrs_state(work->crtc->dev,
++		dev_priv->drrs.connector->panel.downclock_mode->vrefresh);
++}
++
++static void intel_cancel_drrs_work(struct drm_i915_private *dev_priv)
++{
++	if (dev_priv->drrs.drrs_work == NULL)
++		return;
++
++	cancel_delayed_work_sync(&dev_priv->drrs.drrs_work->work);
++}
++
++static void intel_enable_drrs(struct drm_crtc *crtc)
++{
++	struct drm_device *dev = crtc->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_dp *intel_dp = NULL;
++
++	intel_dp = enc_to_intel_dp(&dev_priv->drrs.connector->encoder->base);
++
++	if (intel_dp == NULL)
++		return;
++
++	intel_cancel_drrs_work(dev_priv);
++
++	if (intel_dp->drrs_state.refresh_rate_type != DRRS_LOW_RR) {
++		dev_priv->drrs.drrs_work->crtc = crtc;
++
++		/* Delay the actual enabling to let pageflipping cease and the
++		 * display to settle before starting DRRS
++		 */
++		schedule_delayed_work(&dev_priv->drrs.drrs_work->work,
++			msecs_to_jiffies(dev_priv->drrs.drrs_work->interval));
++	}
++}
++
++void intel_disable_drrs(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_dp *intel_dp = NULL;
++
++	if (dev_priv->drrs.connector == NULL)
++		return;
++
++	intel_dp = enc_to_intel_dp(&dev_priv->drrs.connector->encoder->base);
++
++	if (intel_dp == NULL)
++		return;
++
++	/* as part of disable DRRS, reset refresh rate to HIGH_RR */
++	if (intel_dp->drrs_state.refresh_rate_type == DRRS_LOW_RR) {
++		intel_cancel_drrs_work(dev_priv);
++		intel_dp_set_drrs_state(dev,
++			dev_priv->drrs.connector->panel.fixed_mode->vrefresh);
++	}
++}
++
++/**
++ * intel_update_drrs - enable/disable DRRS as needed
++ * @dev: the drm_device
++*/
++void intel_update_drrs(struct drm_device *dev)
++{
++	struct drm_crtc *crtc = NULL, *tmp_crtc;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* if drrs.connector is NULL, then drrs_init did not get called.
++	 * which means DRRS is not supported.
++	 */
++	if (dev_priv->drrs.connector == NULL)
++		return;
++
++	if (dev_priv->drrs.connector->panel.downclock_mode == NULL)
++		return;
++
++	list_for_each_entry(tmp_crtc, &dev->mode_config.crtc_list, head) {
++		if (tmp_crtc != NULL && intel_crtc_active(tmp_crtc)) {
++			if (crtc) {
++				DRM_DEBUG_KMS(
++				"more than one pipe active, disabling DRRS\n");
++				dev_priv->drrs.is_clone = true;
++				intel_disable_drrs(dev);
++				return;
++			}
++			crtc = tmp_crtc;
++		}
++	}
++
++	if (crtc == NULL) {
++		DRM_DEBUG_KMS("DRRS: crtc not initialized\n");
++		return;
++	}
++
++	dev_priv->drrs.is_clone = false;
++	intel_disable_drrs(dev);
++
++	/* re-enable idleness detection */
++	intel_enable_drrs(crtc);
++}
++
++void intel_init_drrs_idleness_detection(struct drm_device *dev,
++					struct intel_connector *connector)
++{
++	struct intel_drrs_work *work;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (i915.drrs_interval == 0) {
++		DRM_INFO("DRRS disable by flag\n");
++		return;
++	}
++
++	work = kzalloc(sizeof(struct intel_drrs_work), GFP_KERNEL);
++	if (!work) {
++		DRM_ERROR("Failed to allocate DRRS work structure\n");
++		return;
++	}
++
++	dev_priv->drrs.connector = connector;
++	dev_priv->drrs.is_clone = false;
++
++	work->interval = i915.drrs_interval;
++	INIT_DELAYED_WORK(&work->work, intel_drrs_work_fn);
++
++	dev_priv->drrs.drrs_work = work;
++}
++
+ static void i915_pineview_get_mem_freq(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-- 
+1.7.9.5
+

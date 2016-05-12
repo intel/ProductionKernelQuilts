@@ -1,0 +1,298 @@
+From 8fad1d57208d271533e0149afb59d4a867afb5dc Mon Sep 17 00:00:00 2001
+From: Fei Yang <fei.yang@intel.com>
+Date: Fri, 13 Jun 2014 14:44:26 -0700
+Subject: [PATCH 03/10] EM: Intel's Energy Manager configuration code
+
+Forklift EM configuration code from MCG's tree. Needed for charging
+to work.
+Also add platform data for pwrsrc driver which is needed for
+DollarCove to do charger detection
+
+Change-Id: I7c197c67d43f5fb560d6177b004cbbb5e272c52a
+Signed-off-by: David Cohen <david.a.cohen@intel.com>
+Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@intel.com>
+---
+ arch/x86/include/asm/intel_em_config.h | 102 ++++++++++++++++++++++++++++++
+ drivers/mfd/intel_soc_pmic_dc.c        |  19 ++++++
+ drivers/platform/x86/Makefile          |   1 +
+ drivers/platform/x86/intel_em_config.c | 110 +++++++++++++++++++++++++++++++++
+ 4 files changed, 232 insertions(+)
+ create mode 100644 arch/x86/include/asm/intel_em_config.h
+ create mode 100644 drivers/platform/x86/intel_em_config.c
+
+diff --git a/arch/x86/include/asm/intel_em_config.h b/arch/x86/include/asm/intel_em_config.h
+new file mode 100644
+index 0000000..02d0e3e
+--- /dev/null
++++ b/arch/x86/include/asm/intel_em_config.h
+@@ -0,0 +1,102 @@
++/*
++ * intel_em_config.h : Intel EM configuration setup code
++ *
++ * (C) Copyright 2014 Intel Corporation
++ * Author: Kotakonda, Venkataramana <venkataramana.kotakonda@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++#ifndef _INTEL_EM_CONFIG_H
++#define _INTEL_EM_CONFIG_H
++
++#include <linux/types.h>
++#include <linux/acpi.h>
++#include <linux/power/battery_id.h>
++
++
++struct em_config_oem0_data {
++	char batt_id[BATTID_STR_LEN];
++	 u8 turbo;
++	 u8 batt_type;
++	u16 capacity;
++	u16 volt_max;
++	u16 chrg_term_ma;
++	u16 low_batt_thr;
++	u8  safe_dischrg_ul;
++	u8  safe_dischrg_ll;
++	u16 temp_mon_ranges;
++	struct ps_temp_chg_table temp_mon_range[BATT_TEMP_NR_RNG];
++	/* Temperature lower limit */
++	u16 temp_low_lim;
++} __packed;
++
++
++/********* OEM1 Table Structures ****************/
++struct em_config_oem1_data {
++	u8 fpo_0;
++	u8 fpo_1;
++	u8 dbiin_gpio;
++	u8 dbiout_gpio;
++	u8 batchptyp;
++	u16 ia_apps_run_volt;
++	u8 batid_dbibase;
++	u8 batid_anlgbase;
++	u8 ia_apps_cap;
++	u16 vbatt_freq_lmt;
++	u8 cap_freq_idx;
++	u8 rsvd_1; /* reserved bit*/
++	u8 batidx;
++	u8 ia_apps_to_use;
++	u8 turbo_chrg;
++} __packed;
++
++#ifdef CONFIG_ACPI
++/*
++ * em_config_get_oem0_data - This function fetches OEM0 table .
++ * @data : Pointer to OEM0 data structure in which data should be filled.
++ *
++ * Returns number bytes fetched (+ve) on success or 0 on error.
++ *
++ */
++int em_config_get_oem0_data(struct em_config_oem0_data *data);
++
++/*
++ * em_config_get_oem1_data - This function fetches OEM1 table .
++ * @data : Pointer to OEM1 data structure in which data should be filled.
++ *
++ * Returns number bytes fetched (+ve) on success or 0 on error.
++ *
++ */
++int em_config_get_oem1_data(struct em_config_oem1_data *data);
++
++/*
++ * em_config_get_charge_profile - This function fetches
++ *				charger profile for connected battery.
++ * @chrg_prof : Pointer to charger profile structure in
++ *				which profile should be filled.
++ *
++ * Returns number bytes fetched (+ve) on success or 0 on error.
++ *
++ */
++int em_config_get_charge_profile(struct ps_pse_mod_prof *chrg_prof);
++
++#else
++
++static int em_config_get_oem0_data(struct em_config_oem0_data *data)
++{
++	return 0;
++}
++static int em_config_get_oem1_data(struct em_config_oem1_data *data)
++{
++	return 0;
++}
++static int em_config_get_charge_profile(struct ps_pse_mod_prof *chrg_prof)
++{
++	return 0;
++}
++#endif /* CONFIG_ACPI */
++
++#endif /*_INTEL_EM_CONFIG_H */
+diff --git a/drivers/mfd/intel_soc_pmic_dc.c b/drivers/mfd/intel_soc_pmic_dc.c
+index d5d6350..18f9e9f 100644
+--- a/drivers/mfd/intel_soc_pmic_dc.c
++++ b/drivers/mfd/intel_soc_pmic_dc.c
+@@ -26,6 +26,9 @@
+ #include <linux/power/dc_xpwr_battery.h>
+ #include <linux/power/dc_xpwr_charger.h>
+ 
++#include <asm/intel_em_config.h>
++#include <linux/extcon/extcon-dc-pwrsrc.h>
++
+ #include "intel_soc_pmic_core.h"
+ 
+ enum {
+@@ -411,9 +414,25 @@ static void dc_xpwr_fg_pdata(void)
+ 				(void *)&pdata, sizeof(pdata));
+ }
+ 
++static void dc_xpwr_pwrsrc_pdata(void)
++{
++	static struct dc_xpwr_pwrsrc_pdata pdata;
++
++	/*
++	 * set en_chrg_det to true if the
++	 * D+/D- lines are connected to
++	 * PMIC itself.
++	 */
++	pdata.en_chrg_det = true;
++
++	intel_soc_pmic_set_pdata("dollar_cove_pwrsrc",
++				 (void *)&pdata, sizeof(pdata));
++}
++
+ static int dollar_cove_init(void)
+ {
+ 	pr_info("Dollar Cove: IC_TYPE 0x%02X\n", intel_soc_pmic_readb(0x03));
++	dc_xpwr_pwrsrc_pdata();
+ 	dc_xpwr_fg_pdata();
+ 	dc_xpwr_chrg_pdata();
+ 
+diff --git a/drivers/platform/x86/Makefile b/drivers/platform/x86/Makefile
+index 9b87cfc..ad49c65 100644
+--- a/drivers/platform/x86/Makefile
++++ b/drivers/platform/x86/Makefile
+@@ -56,3 +56,4 @@ obj-$(CONFIG_INTEL_SMARTCONNECT)	+= intel-smartconnect.o
+ 
+ obj-$(CONFIG_PVPANIC)           += pvpanic.o
+ obj-$(CONFIG_INTEL_BAYTRAIL_MBI)	+= intel_baytrail.o
++obj-$(CONFIG_ACPI) += intel_em_config.o
+diff --git a/drivers/platform/x86/intel_em_config.c b/drivers/platform/x86/intel_em_config.c
+new file mode 100644
+index 0000000..92e857c
+--- /dev/null
++++ b/drivers/platform/x86/intel_em_config.c
+@@ -0,0 +1,110 @@
++/*
++ * intel_em_config.c : Intel EM configuration setup code
++ *
++ * (C) Copyright 2014 Intel Corporation
++ * Author: Kotakonda, Venkataramana <venkataramana.kotakonda@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++
++#include <asm/intel_em_config.h>
++
++#define EM_CONFIG_OEM0_NAME "OEM0"
++#define EM_CONFIG_OEM1_NAME "OEM1"
++
++static void dump_chrg_profile(const struct ps_pse_mod_prof *chrg_prof);
++
++static int em_config_get_acpi_table(char *name, void *data, int data_size)
++{
++	struct acpi_table_header *acpi_tbl = NULL;
++	acpi_size tbl_size;
++	acpi_status status;
++	int ret = 0;
++	int hdr_size = sizeof(struct acpi_table_header);
++
++	status = acpi_get_table_with_size(name , 0,
++					&acpi_tbl, &tbl_size);
++	if (ACPI_SUCCESS(status)) {
++		pr_info("EM:%s  table found, size=%d\n", name, tbl_size);
++		if (tbl_size < (data_size + hdr_size)) {
++			pr_err("EM:%s table incomplete!!\n", name);
++		} else {
++			memcpy(data, ((char *)acpi_tbl) + hdr_size, data_size);
++			ret = data_size;
++		}
++	} else {
++		pr_err("EM:%s table not found!!\n", name);
++	}
++
++	return ret;
++}
++
++int em_config_get_oem0_data(struct em_config_oem0_data *data)
++{
++	return em_config_get_acpi_table(EM_CONFIG_OEM0_NAME,
++				data, sizeof(struct em_config_oem0_data));
++}
++EXPORT_SYMBOL(em_config_get_oem0_data);
++
++int em_config_get_oem1_data(struct em_config_oem1_data *data)
++{
++	return em_config_get_acpi_table(EM_CONFIG_OEM1_NAME,
++				data, sizeof(struct em_config_oem1_data));
++}
++EXPORT_SYMBOL(em_config_get_oem1_data);
++
++int em_config_get_charge_profile(struct ps_pse_mod_prof *chrg_prof)
++{
++	struct em_config_oem0_data oem0_data;
++	int ret = 0;
++
++	if (chrg_prof == NULL)
++		return 0;
++	ret = em_config_get_oem0_data((struct em_config_oem0_data *)chrg_prof);
++	if (ret > 0) {
++		/* battery_type field contains 2 bytes, and upper byte
++		 * contains battery_type & lower byte used for turbo,
++		 * which is discarded */
++		chrg_prof->battery_type = chrg_prof->battery_type >> 8;
++#ifdef DEBUG
++		dump_chrg_profile(chrg_prof);
++#endif
++	}
++	return ret;
++}
++EXPORT_SYMBOL(em_config_get_charge_profile);
++
++
++
++static void dump_chrg_profile(const struct ps_pse_mod_prof *chrg_prof)
++{
++	u16 i = 0;
++
++	pr_info("OEM0:batt_id = %s\n", chrg_prof->batt_id);
++	pr_info("OEM0:battery_type = %d\n", chrg_prof->battery_type);
++	pr_info("OEM0:capacity = %d\n", chrg_prof->capacity);
++	pr_info("OEM0:voltage_max = %d\n", chrg_prof->voltage_max);
++	pr_info("OEM0:chrg_term_ma = %d\n", chrg_prof->chrg_term_ma);
++	pr_info("OEM0:low_batt_mV = %d\n", chrg_prof->low_batt_mV);
++	pr_info("OEM0:disch_tmp_ul = %d\n", chrg_prof->disch_tmp_ul);
++	pr_info("OEM0:disch_tmp_ll = %d\n", chrg_prof->disch_tmp_ll);
++	pr_info("OEM0:temp_mon_ranges = %d\n", chrg_prof->temp_mon_ranges);
++	for (i = 0; i < chrg_prof->temp_mon_ranges; i++) {
++		pr_info("OEM0:temp_mon_range[%d].up_lim = %d\n",
++			i, chrg_prof->temp_mon_range[i].temp_up_lim);
++		pr_info("OEM0:temp_mon_range[%d].full_chrg_vol = %d\n",
++			i, chrg_prof->temp_mon_range[i].full_chrg_vol);
++		pr_info("OEM0:temp_mon_range[%d].full_chrg_cur = %d\n",
++			i, chrg_prof->temp_mon_range[i].full_chrg_cur);
++		pr_info("OEM0:temp_mon_range[%d].maint_chrg_vol_ll = %d\n",
++			i, chrg_prof->temp_mon_range[i].maint_chrg_vol_ll);
++		pr_info("OEM0:temp_mon_range[%d].main_chrg_vol_ul = %d\n",
++			i, chrg_prof->temp_mon_range[i].maint_chrg_vol_ul);
++		pr_info("OEM0:temp_mon_range[%d].main_chrg_cur = %d\n",
++			i, chrg_prof->temp_mon_range[i].maint_chrg_cur);
++	}
++	pr_info("OEM0:temp_low_lim = %d\n", chrg_prof->temp_low_lim);
++}
+-- 
+2.0.0
+

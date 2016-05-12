@@ -1,0 +1,117 @@
+From b8848c7493503aa6b643a9d774de8beed24769f1 Mon Sep 17 00:00:00 2001
+From: Zhang Yanmin <yanmin.zhang@intel.com>
+Date: Fri, 8 Apr 2016 06:35:39 +0800
+Subject: [PATCH 1/5] sst: keep fw cache memory to avoid further kmalloc
+ failure
+
+Current sst driver might allocate 1MB (order-8) to cache
+firmware data. AFter loading the firmware, sst driver kfrees
+it. At next firmware uploading, sst driver kmalloc the memory
+again. If Android installs lots of app and memory is fragmented
+dramatically after a long run, sst couldn't get the big block
+of continuous memory. sst driver fails to start voice.
+
+In addition, some paths on sst firmware uploading don't kfree
+memory pointed by fw_in_mem at some failure cases and doesn't
+check it at next time when uploading firmware. That causes memory
+leak.
+
+The patch fixes it by keeping the memory pointed by fw_in_mem
+as long as sst driver is enabled.
+
+Change-Id: I68a9cc4321ca3d5cdbf1a395276277980518b41b
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-28338
+Signed-off-by: Zhang Yanmin <yanmin.zhang@intel.com>
+Reviewed-on: https://android.intel.com:443/492256
+---
+ sound/soc/intel/sst/sst.h     |  1 +
+ sound/soc/intel/sst/sst_dsp.c | 32 +++++++++++++++++++-------------
+ sound/soc/intel/sst/sst_pvt.c |  2 --
+ 3 files changed, 20 insertions(+), 15 deletions(-)
+
+diff --git a/sound/soc/intel/sst/sst.h b/sound/soc/intel/sst/sst.h
+index 72b378f..f9aacb5 100644
+--- a/sound/soc/intel/sst/sst.h
++++ b/sound/soc/intel/sst/sst.h
+@@ -541,6 +541,7 @@ struct intel_sst_drv {
+ 	unsigned int		csr_value;
+ 	struct sst_dma		dma;
+ 	void			*fw_in_mem;
++	size_t			fw_in_mem_size;
+ 	struct sst_runtime_param runtime_param;
+ 	unsigned int		device_input_mixer;
+ 	struct mutex		mixer_ctrl_lock;
+diff --git a/sound/soc/intel/sst/sst_dsp.c b/sound/soc/intel/sst/sst_dsp.c
+index 34800de5..aaf6ed4 100644
+--- a/sound/soc/intel/sst/sst_dsp.c
++++ b/sound/soc/intel/sst/sst_dsp.c
+@@ -1204,10 +1204,14 @@ void sst_firmware_load_cb(const struct firmware *fw, void *context)
+ 		goto out;
+ 	}
+ 
+-	ctx->fw_in_mem = kzalloc(fw->size, GFP_KERNEL);
+-	if (!ctx->fw_in_mem) {
+-		pr_err("%s unable to allocate memory\n", __func__);
+-		goto out;
++	if (!ctx->fw_in_mem || (ctx->fw_in_mem_size < fw->size)) {
++		kfree(ctx->fw_in_mem);
++		ctx->fw_in_mem = kzalloc(fw->size, GFP_KERNEL);
++		if (!ctx->fw_in_mem) {
++			pr_err("%s unable to allocate memory\n", __func__);
++			goto out;
++		}
++		ctx->fw_in_mem_size = fw->size;
+ 	}
+ 
+ 	pr_debug("copied fw to %p", ctx->fw_in_mem);
+@@ -1231,11 +1235,9 @@ void sst_firmware_load_cb(const struct firmware *fw, void *context)
+ 							&ctx->memcpy_list);
+ 	}
+ 	trace_sst_fw_download("End FW parsing", ctx->sst_state);
+-	if (ret) {
+-		kfree(ctx->fw_in_mem);
+-		ctx->fw_in_mem = NULL;
++	if (ret)
+ 		goto out;
+-	}
++
+ 	/* If static module download(download at boot time) is supported,
+ 	 * set the flag to indicate lib download is to be done
+ 	 */
+@@ -1278,11 +1280,15 @@ static int sst_request_fw(struct intel_sst_drv *sst)
+ 		pr_err("FW image invalid...\n");
+ 		goto end_release;
+ 	}
+-	sst->fw_in_mem = kzalloc(fw->size, GFP_KERNEL);
+-	if (!sst->fw_in_mem) {
+-		pr_err("%s unable to allocate memory\n", __func__);
+-		retval = -ENOMEM;
+-		goto end_release;
++	if (!sst->fw_in_mem || (sst->fw_in_mem_size < fw->size)) {
++		kfree(sst->fw_in_mem);
++		sst->fw_in_mem = kzalloc(fw->size, GFP_KERNEL);
++		if (!sst->fw_in_mem) {
++			pr_err("%s unable to allocate memory\n", __func__);
++			retval = -ENOMEM;
++			goto end_release;
++		}
++		sst->fw_in_mem_size = fw->size;
+ 	}
+ 	pr_debug("copied fw to %p", sst->fw_in_mem);
+ 	pr_debug("phys: %lx", (unsigned long)virt_to_phys(sst->fw_in_mem));
+diff --git a/sound/soc/intel/sst/sst_pvt.c b/sound/soc/intel/sst/sst_pvt.c
+index fab4f35..f321d8b 100644
+--- a/sound/soc/intel/sst/sst_pvt.c
++++ b/sound/soc/intel/sst/sst_pvt.c
+@@ -421,8 +421,6 @@ void sst_do_recovery_mrfld(struct intel_sst_drv *sst)
+ 
+ 	if (sst_drv_ctx->fw_in_mem) {
+ 		pr_err("Clearing the cached FW copy...\n");
+-		kfree(sst_drv_ctx->fw_in_mem);
+-		sst_drv_ctx->fw_in_mem = NULL;
+ 		sst_memcpy_free_resources();
+ 		kfree(sst_drv_ctx->fw_sg_list.src);
+ 		kfree(sst_drv_ctx->fw_sg_list.dst);
+-- 
+1.9.1
+

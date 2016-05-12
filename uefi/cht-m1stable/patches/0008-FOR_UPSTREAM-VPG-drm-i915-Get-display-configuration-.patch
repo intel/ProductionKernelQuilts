@@ -1,0 +1,151 @@
+From b50eda28d17dff53aaa2ca5e263226e21c6f7bcd Mon Sep 17 00:00:00 2001
+Message-Id: <b50eda28d17dff53aaa2ca5e263226e21c6f7bcd.1421886431.git.chang-joon.lee@intel.com>
+In-Reply-To: <2a59efb195329ac28200fa6e68e1170a4cf8d03c.1421886431.git.chang-joon.lee@intel.com>
+References: <2a59efb195329ac28200fa6e68e1170a4cf8d03c.1421886431.git.chang-joon.lee@intel.com>
+From: Alok Pandey <alok.pandey@intel.com>
+Date: Wed, 12 Nov 2014 18:29:55 -0500
+Subject: [PATCH 08/11] FOR_UPSTREAM [VPG]: drm/i915: Get display
+ configuration from VBT
+
+Get the list of connectors from VBT instead of hardcoding in the
+setup_outputs() function.
+
+Issue: GMINL-4330
+Change-Id: Ie339bebe18be46fddf17fd41cc9769012e321742
+Signed-off-by: Alok Pandey <alok.pandey@intel.com>
+Signed-off-by: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+
+Conflicts:
+
+	drivers/gpu/drm/i915/intel_bios.h
+---
+ drivers/gpu/drm/i915/i915_reg.h      |    7 ++--
+ drivers/gpu/drm/i915/intel_bios.h    |    1 +
+ drivers/gpu/drm/i915/intel_display.c |   66 ++++++++++++++++++++++++++++------
+ 3 files changed, 61 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index acf502d..c5cf846 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -2856,7 +2856,9 @@ enum punit_power_well {
+ #define PCH_HDMIC	0xe1150
+ #define PCH_HDMID	0xe1160
+ #define PORT_ENABLE	(1 << 31)
+-
++#define _PORTADDR(dvo_port, b, c, d)	((dvo_port == b) ? GEN4_HDMIB : \
++					((dvo_port == c) ? GEN4_HDMIC : \
++					CHV_HDMID))
+ #define PORT_DFT_I9XX				0x61150
+ #define   DC_BALANCE_RESET			(1 << 25)
+ #define PORT_DFT2_G4X				0x61154
+@@ -2864,7 +2866,8 @@ enum punit_power_well {
+ #define   PIPE_SCRAMBLE_RESET_MASK		(0x3 << 0)
+ #define   PIPE_B_SCRAMBLE_RESET			(1 << 1)
+ #define   PIPE_A_SCRAMBLE_RESET			(1 << 0)
+-
++#define PORT_ADDR(dvo_port)		_PORTADDR(dvo_port, DVO_PORT_HDMIB,\
++					DVO_PORT_HDMIC, DVO_PORT_HDMID)
+ /* Gen 3 SDVO bits: */
+ #define   SDVO_ENABLE				(1 << 31)
+ #define   SDVO_PIPE_SEL(pipe)			((pipe) << 30)
+diff --git a/drivers/gpu/drm/i915/intel_bios.h b/drivers/gpu/drm/i915/intel_bios.h
+index 25b7532..ce1d928 100644
+--- a/drivers/gpu/drm/i915/intel_bios.h
++++ b/drivers/gpu/drm/i915/intel_bios.h
+@@ -694,6 +694,7 @@ int intel_parse_bios(struct drm_device *dev);
+ #define	 DEVICE_TYPE_DP		0x68C6
+ #define	 DEVICE_TYPE_eDP	0x78C6
+ #define	 DEVICE_TYPE_DP_HDMI_DVI	0x60D6
++#define	 DEVICE_TYPE_MIPI	0x7CC2
+ 
+ #define  DEVICE_TYPE_CLASS_EXTENSION	(1 << 15)
+ #define  DEVICE_TYPE_POWER_MANAGEMENT	(1 << 14)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 1653774..111cb57 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -12985,6 +12985,60 @@ static bool intel_crt_present(struct drm_device *dev)
+ 	return true;
+ }
+ 
++static void intel_setup_outputs_vbt(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int i;
++
++	for (i = 0; i < dev_priv->vbt.child_dev_num; i++) {
++		int dvo_port =
++			dev_priv->vbt.child_dev[i].common.dvo_port;
++		int devtype =
++			dev_priv->vbt.child_dev[i].common.device_type;
++
++		switch (dvo_port) {
++		case DVO_PORT_MIPIA:
++		case DVO_PORT_MIPIB:
++		case DVO_PORT_MIPIC:
++			if (devtype & DEVICE_TYPE_MIPI_OUTPUT)
++				intel_dsi_init(dev);
++			break;
++		case DVO_PORT_DPB:
++		case DVO_PORT_DPC:
++		case DVO_PORT_DPD:
++			if (devtype & DEVICE_TYPE_eDP_BITS) {
++				int port = dvo_port - DVO_PORT_CRT;
++				intel_dp_init(dev, VLV_DISPLAY_BASE
++					+ DDI_BUF_CTL(port), port);
++			}
++			break;
++		case DVO_PORT_HDMIB:
++		case DVO_PORT_HDMIC:
++		case DVO_PORT_HDMID:
++			if (devtype == DEVICE_TYPE_DP_HDMI_DVI ||
++						devtype == DEVICE_TYPE_HDMI) {
++				int hdmi_reg = VLV_DISPLAY_BASE
++						+ PORT_ADDR(dvo_port);
++				if (I915_READ(hdmi_reg) & SDVO_DETECTED)
++					intel_hdmi_init(dev, hdmi_reg,
++							dvo_port);
++			}
++
++			if (devtype == DEVICE_TYPE_DP_HDMI_DVI ||
++						devtype == DEVICE_TYPE_DP) {
++				intel_dp_init(dev, VLV_DISPLAY_BASE
++						+ DDI_BUF_CTL(dvo_port),
++							dvo_port);
++			break;
++			}
++		default:
++			DRM_DEBUG_KMS("Unknown port\n");
++			break;
++
++		}
++	}
++}
++
+ static void intel_setup_outputs(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -13044,18 +13098,8 @@ static void intel_setup_outputs(struct drm_device *dev)
+ 		if (I915_READ(PCH_DP_D) & DP_DETECTED)
+ 			intel_dp_init(dev, PCH_DP_D, PORT_D);
+ 	} else if (IS_CHERRYVIEW(dev)) {
++		intel_setup_outputs_vbt(dev);
+ 
+-		/* Strap bits not working consistently with all BIOS versions.
+-		 * For now initialize all displays and enable them only if
+-		 * actual display is present.
+-		 */
+-
+-		intel_dp_init(dev, VLV_DISPLAY_BASE + DP_C, PORT_C);
+-
+-		intel_hdmi_init(dev, VLV_DISPLAY_BASE + CHV_HDMID, PORT_D);
+-
+-		if (dev_priv->vbt.has_mipi)
+-			intel_dsi_init(dev);
+ 	} else if (IS_VALLEYVIEW(dev)) {
+ 		/* There is no detection method for MIPI so rely on VBT */
+ 		if (dev_priv->vbt.has_mipi)
+-- 
+1.7.9.5
+

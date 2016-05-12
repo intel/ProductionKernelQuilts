@@ -1,0 +1,80 @@
+From 298f2ef0cdcc82373f1002ab89c548c71a8e6afb Mon Sep 17 00:00:00 2001
+Message-Id: <298f2ef0cdcc82373f1002ab89c548c71a8e6afb.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 10 Jun 2014 12:14:40 +0100
+Subject: [PATCH 132/312] FROM_UPSTREAM [VPG]: drm/i915: Prefault the entire
+ object on first page fault
+
+Inserting additional PTEs has no side-effect for us as the pfn are fixed
+for the entire time the object is resident in the global GTT. The
+downside is that we pay the entire cost of faulting the object upon the
+first hit, for which we in return receive the benefit of removing the
+per-page faulting overhead.
+
+On an Ivybridge i7-3720qm with 1600MHz DDR3, with 32 fences,
+Upload rate for 2 linear surfaces:	8127MiB/s -> 8134MiB/s
+Upload rate for 2 tiled surfaces:	8607MiB/s -> 8625MiB/s
+Upload rate for 4 linear surfaces:	8127MiB/s -> 8127MiB/s
+Upload rate for 4 tiled surfaces:	8611MiB/s -> 8602MiB/s
+Upload rate for 8 linear surfaces:	8114MiB/s -> 8124MiB/s
+Upload rate for 8 tiled surfaces:	8601MiB/s -> 8603MiB/s
+Upload rate for 16 linear surfaces:	8110MiB/s -> 8123MiB/s
+Upload rate for 16 tiled surfaces:	8595MiB/s -> 8606MiB/s
+Upload rate for 32 linear surfaces:	8104MiB/s -> 8121MiB/s
+Upload rate for 32 tiled surfaces:	8589MiB/s -> 8605MiB/s
+Upload rate for 64 linear surfaces:	8107MiB/s -> 8121MiB/s
+Upload rate for 64 tiled surfaces:	2013MiB/s -> 3017MiB/s
+
+For: GMIN-1669
+Upstream-repo: http://lists.freedesktop.org/archives/intel-gfx/2014-June/046993.html
+Change-Id: Idff358bbef28cfd9e8b3afff1504ba284947024c
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: "Goel, Akash" <akash.goel@intel.com>
+Testcasee: igt/gem_fence_upload/performance
+Reviewed-by: Brad Volkin <bradley.d.volkin@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_gem.c |   22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 06b735a..4e72669 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1573,14 +1573,26 @@ int i915_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 	if (ret)
+ 		goto unpin;
+ 
+-	obj->fault_mappable = true;
+-
++	/* Finally, remap it using the new GTT offset */
+ 	pfn = dev_priv->gtt.mappable_base + i915_gem_obj_ggtt_offset(obj);
+ 	pfn >>= PAGE_SHIFT;
+-	pfn += page_offset;
+ 
+-	/* Finally, remap it using the new GTT offset */
+-	ret = vm_insert_pfn(vma, (unsigned long)vmf->virtual_address, pfn);
++	if (!obj->fault_mappable) {
++		int i;
++
++		for (i = 0; i < obj->base.size >> PAGE_SHIFT; i++) {
++			ret = vm_insert_pfn(vma,
++				(unsigned long)vma->vm_start + i * PAGE_SIZE,
++				pfn + i);
++			if (ret)
++				break;
++		}
++
++		obj->fault_mappable = true;
++	} else
++		ret = vm_insert_pfn(vma,
++			    (unsigned long)vmf->virtual_address,
++			    pfn + page_offset);
+ unpin:
+ 	i915_gem_object_ggtt_unpin(obj);
+ unlock:
+-- 
+1.7.9.5
+

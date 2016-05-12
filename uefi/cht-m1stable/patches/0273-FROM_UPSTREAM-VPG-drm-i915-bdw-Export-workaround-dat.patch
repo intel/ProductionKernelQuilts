@@ -1,0 +1,168 @@
+From 63740c112c91c6d6bca989ae2b3c5912f767f67a Mon Sep 17 00:00:00 2001
+Message-Id: <63740c112c91c6d6bca989ae2b3c5912f767f67a.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Arun Siluvery <arun.siluvery@linux.intel.com>
+Date: Tue, 26 Aug 2014 14:44:51 +0100
+Subject: [PATCH 273/312] FROM_UPSTREAM [VPG]: drm/i915/bdw: Export workaround
+ data to debugfs
+
+The workarounds that are applied are exported to a debugfs file;
+this is used to verify their state after the test case (reset or
+suspend/resume etc). This patch is only required to support i-g-t.
+
+Issue: VIZ-4092
+Issue: GMIN-3475
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 888b59951ed5ac450fe3ddd7b3937d905b9bafbc
+Change-Id: I267ead17426704a5997040e6388cc238f6d89f88
+Signed-off-by: Arun Siluvery <arun.siluvery@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |   40 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h         |   14 +++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   23 ++++++++++++++++++
+ 3 files changed, 77 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 8965c6d..241f1a9 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -3080,6 +3080,45 @@ static int i915_runtime_pm_info(struct seq_file *m, void *unused)
+ 	return 0;
+ }
+ 
++static int intel_wa_registers(struct seq_file *m, void *unused)
++{
++	int i;
++	int ret;
++	struct drm_info_node *node = (struct drm_info_node *) m->private;
++	struct drm_device *dev = node->minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (!IS_BROADWELL(dev)) {
++		DRM_DEBUG_DRIVER("Workaround table not available !!\n");
++		return -EINVAL;
++	}
++
++	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	if (ret)
++		return ret;
++
++	intel_runtime_pm_get(dev_priv);
++
++	seq_printf(m, "Workarounds applied: %d\n", dev_priv->num_wa_regs);
++	for (i = 0; i < dev_priv->num_wa_regs; ++i) {
++		u32 addr, mask;
++
++		addr = dev_priv->intel_wa_regs[i].addr;
++		mask = dev_priv->intel_wa_regs[i].mask;
++		dev_priv->intel_wa_regs[i].value = I915_READ(addr) | mask;
++		if (dev_priv->intel_wa_regs[i].addr)
++			seq_printf(m, "0x%X: 0x%08X, mask: 0x%08X\n",
++				   dev_priv->intel_wa_regs[i].addr,
++				   dev_priv->intel_wa_regs[i].value,
++				   dev_priv->intel_wa_regs[i].mask);
++	}
++
++	intel_runtime_pm_put(dev_priv);
++	mutex_unlock(&dev->struct_mutex);
++
++	return 0;
++}
++
+ struct pipe_crc_info {
+ 	const char *name;
+ 	struct drm_device *dev;
+@@ -4948,6 +4987,7 @@ static const struct drm_info_list i915_debugfs_list[] = {
+ 	{"i915_power_domain_info", i915_power_domain_info, 0},
+ 	{"i915_runtime_pm_info", i915_runtime_pm_info, 0},
+ 	{"i915_display_info", i915_display_info, 0},
++	{"intel_wa_registers", intel_wa_registers, 0},
+ };
+ #define I915_DEBUGFS_ENTRIES ARRAY_SIZE(i915_debugfs_list)
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 018b3b8..843045c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1626,6 +1626,20 @@ struct drm_i915_private {
+ 	wait_queue_head_t perfmon_buffer_queue;
+ 	atomic_t perfmon_buffer_interrupts;
+ 
++	/*
++	 * workarounds are currently applied at different places and
++	 * changes are being done to consolidate them so exact count is
++	 * not clear at this point, use a max value for now.
++	 */
++#define I915_MAX_WA_REGS  16
++	struct {
++		u32 addr;
++		u32 value;
++		/* bitmask representing WA bits */
++		u32 mask;
++	} intel_wa_regs[I915_MAX_WA_REGS];
++	u32 num_wa_regs;
++
+ 	/* Reclocking support */
+ 	bool render_reclock_avail;
+ 	bool lvds_downclock_avail;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index ef99893..35751cc 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -611,20 +611,40 @@ get_pipe_control_scratch_addr(struct intel_engine_cs *ring)
+ static inline void intel_ring_emit_wa(struct intel_engine_cs *ring,
+ 				       u32 addr, u32 value)
+ {
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (dev_priv->num_wa_regs > I915_MAX_WA_REGS)
++		return;
++
+ 	intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
+ 	intel_ring_emit(ring, addr);
+ 	intel_ring_emit(ring, value);
++
++	dev_priv->intel_wa_regs[dev_priv->num_wa_regs].addr = addr;
++	dev_priv->intel_wa_regs[dev_priv->num_wa_regs].mask = (value) & 0xFFFF;
++	/* value is updated with the status of remaining bits of this
++	 * register when it is read from debugfs file
++	 */
++	dev_priv->intel_wa_regs[dev_priv->num_wa_regs].value = value;
++	dev_priv->num_wa_regs++;
++
++	return;
+ }
+ 
+ static int gen8_init_workarounds(struct intel_engine_cs *ring)
+ {
+ 	int ret;
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	/*
+ 	 * workarounds applied in this fn are part of register state context,
+ 	 * they need to be re-initialized followed by gpu reset, suspend/resume,
+ 	 * module reload.
+ 	 */
++	dev_priv->num_wa_regs = 0;
++	memset(dev_priv->intel_wa_regs, 0, sizeof(dev_priv->intel_wa_regs));
+ 
+ 	/*
+ 	 * update the number of dwords required based on the
+@@ -683,6 +703,9 @@ static int gen8_init_workarounds(struct intel_engine_cs *ring)
+ 
+ 	intel_ring_advance(ring);
+ 
++	DRM_DEBUG_DRIVER("Number of Workarounds applied: %d\n",
++			 dev_priv->num_wa_regs);
++
+ 	return 0;
+ }
+ 
+-- 
+1.7.9.5
+

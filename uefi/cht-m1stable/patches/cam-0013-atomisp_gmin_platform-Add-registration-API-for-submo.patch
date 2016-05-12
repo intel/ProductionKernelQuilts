@@ -1,0 +1,166 @@
+From 0b7630367eada8b175c595551714438383fee135 Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Thu, 1 May 2014 09:29:59 -0700
+Subject: [PATCH 013/117] atomisp_gmin_platform: Add registration API for
+ submodules
+
+The original design of the atomisp platform layer had a per-board,
+hard-configured array of configuration structs.  Replace this with a
+runtime-accumulated list built out of the ACPI-probed I2C submodule
+drivers.
+
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ .../x86/platform/intel-mid/atomisp_gmin_platform.c | 74 ++++++++++++++++------
+ .../camera/drivers/media/i2c/imx/imx.c             | 12 ++++
+ include/linux/atomisp_platform.h                   |  5 ++
+ 3 files changed, 73 insertions(+), 18 deletions(-)
+
+diff --git a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+index 1338635..9d4bcd4 100644
+--- a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
++++ b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+@@ -1,6 +1,25 @@
+ #include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/atomisp_platform.h>
+ #include <asm/spid.h>
+ 
++#define MAX_SUBDEVS 8
++
++/* This needs to be initialized at runtime so the various
++ * platform-checking macros in spid.h return the correct results.
++ * Either that, or we need to fix up the usage of those macros so that
++ * it's checking more appropriate runtime-detectable data. */
++struct soft_platform_id spid;
++EXPORT_SYMBOL(spid);
++
++/* Submodules use type==0 for the end-of-list marker */
++static struct intel_v4l2_subdev_table pdata_subdevs[MAX_SUBDEVS+1];
++
++static const struct atomisp_platform_data pdata = {
++    .subdevs = pdata_subdevs,
++    .spid = &spid,
++};
++
+ /*
+  *   struct atomisp_sensor_caps {
+  *       int stream_num;
+@@ -36,22 +55,14 @@ EXPORT_SYMBOL_GPL(atomisp_get_default_camera_caps);
+  */
+ const struct atomisp_platform_data *atomisp_get_platform_data(void)
+ {
+-    /* This gets enumerated in
+-     * atomisp_pci_probe->atomisp_register_entites->atomisp_subdev_probe,
+-     * which means that it's going to be needed before it's available.
+-     * I think that's the only spot it's needed though.
+-     *
+-     * Note that it also talks about stuff like flash and motor
+-     * devices, which are not going to be uniquely identifiable
+-     * electronically (i.e. which flash goes with which camera?)  May
+-     * really need the firmware intervention, or else duplicate with
+-     * e.g.  module parameters on the subdevices... */
+-    return NULL;
++    return &pdata;
+ }
+ EXPORT_SYMBOL_GPL(atomisp_get_platform_data);
+ 
+ /*
+- * Used in a handful of modules.  Focus motor maybe?
++ * Used in a handful of modules.  Focus motor control, I think.  Note
++ * that there is no configurability in the API, so this needs to be
++ * fixed where it is used.
+  *
+  * struct camera_af_platform_data {
+  *     int (*power_ctrl)(struct v4l2_subdev *subdev, int flag);
+@@ -63,9 +74,36 @@ const struct camera_af_platform_data *camera_get_af_platform_data(void)
+ }
+ EXPORT_SYMBOL_GPL(camera_get_af_platform_data);
+ 
+-/* This needs to be initialized at runtime so the various
+- * platform-checking macros in spid.h return the correct results.
+- * Either that, or we need to fix up the usage of those macros so that
+- * it's checking more appropriate runtime-detectable data. */
+-struct soft_platform_id spid;
+-EXPORT_SYMBOL(spid);
++int atomisp_register_i2c_module(struct i2c_client *client,
++                                enum intel_v4l2_subdev_type type,
++                                enum atomisp_camera_port port)
++{
++    int i;
++    struct i2c_board_info *bi;
++
++    dev_info(&client->dev, "register atomisp i2c module type %d on port %d\n", type, port);
++
++    for (i=0; i < MAX_SUBDEVS; i++)
++        if (!pdata.subdevs[i].type)
++            break;
++
++    if (pdata.subdevs[i].type)
++        return -ENOMEM;
++
++    pdata.subdevs[i].type = type;
++    pdata.subdevs[i].port = port;
++    pdata.subdevs[i].v4l2_subdev.i2c_adapter_id = client->adapter->nr;
++
++    /* Convert i2c_client to i2c_board_info */
++    bi = &pdata.subdevs[i].v4l2_subdev.board_info;
++    memcpy(bi->type, client->name, I2C_NAME_SIZE);
++    bi->flags = client->flags;
++    bi->addr = client->addr;
++    bi->irq = client->irq;
++    bi->comp_addr_count = client->comp_addr_count;
++    bi->comp_addrs = client->comp_addrs;
++    bi->irq_flags = client->irq_flags;
++
++    return 0;
++}
++EXPORT_SYMBOL_GPL(atomisp_register_i2c_module);
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+index 772479b..312d5784 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+@@ -2307,6 +2307,7 @@ static int imx_probe(struct i2c_client *client,
+ 	}
+ 
+ 	/* Load the Noise reduction, Dead pixel registers from cpf file*/
++	/* FIXME: msr_file_name needs to come from ACPI/EFI config too */
+ 	if (dev->platform_data->msr_file_name != NULL)
+ 		msr_file_name = dev->platform_data->msr_file_name();
+ 	if (msr_file_name) {
+@@ -2319,6 +2320,17 @@ static int imx_probe(struct i2c_client *client,
+ 		dev_warn(&client->dev, "Drvb file not present");
+ 	}
+ 
++	/* Register the atomisp platform data prior to the ISP module
++	 * load.  Ideally this would be stored as data on the
++	 * subdevices, but this API matches upstream better. */
++	/* FIXME: type and port need to come from ACPI/EFI config,
++	 * this is hard coded to FFRD8 */
++	ret = atomisp_register_i2c_module(client, RAW_CAMERA, ATOMISP_CAMERA_PORT_PRIMARY);
++	if (ret) {
++		imx_remove(client);
++		return ret;
++	}
++
+ 	return ret;
+ 
+ out_ctrl_handler_free:
+diff --git a/include/linux/atomisp_platform.h b/include/linux/atomisp_platform.h
+index 3c34d29..5e29ced 100644
+--- a/include/linux/atomisp_platform.h
++++ b/include/linux/atomisp_platform.h
+@@ -220,5 +220,10 @@ struct camera_mipi_info {
+ extern const struct atomisp_platform_data *atomisp_get_platform_data(void);
+ extern const struct atomisp_camera_caps *atomisp_get_default_camera_caps(void);
+ 
++/* G-Min API */
++extern int atomisp_register_i2c_module(struct i2c_client *client,
++				       enum intel_v4l2_subdev_type type,
++				       enum atomisp_camera_port port);
++
+ #endif /* ATOMISP_PLATFORM_H_ */
+ #endif
+-- 
+1.9.3
+

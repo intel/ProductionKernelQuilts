@@ -1,0 +1,281 @@
+From e503db0a946ca332b4044447fdf3438c19ef1ae2 Mon Sep 17 00:00:00 2001
+Message-Id: <e503db0a946ca332b4044447fdf3438c19ef1ae2.1440106296.git.chang-joon.lee@intel.com>
+In-Reply-To: <1f426693c14c79e65ad8e62ef6bb4b07d6484040.1440106296.git.chang-joon.lee@intel.com>
+References: <1f426693c14c79e65ad8e62ef6bb4b07d6484040.1440106296.git.chang-joon.lee@intel.com>
+From: Tim Gore <tim.gore@intel.com>
+Date: Mon, 20 Jul 2015 14:37:04 +0100
+Subject: [PATCH 06/11] FOR_UPSTREAM [VPG]: drm/i915: fix pending count with
+ scheduler
+
+When an individual ring is reset and there are batch
+buffers waiting in the scheduler, these batch buffers
+are not included in the batch_pending counts in the reset
+stats for each context. This patch adds a function to
+the scheduler that returns the number of batch buffers
+it has queued for a given context, and uses it to add
+these batch buffers to the batch_pending counts.
+
+v2: Added code to count these scheduler queued batches
+when doing a full gpu reset, so the batch_pending count
+is the same for full gpu reset as for ring reset, as
+suggested by Tomas Elf.
+
+v3: Extensive comment added to make clear how these
+counts are derived and to make clear certain pathalogical
+cases. Also tidied up the way the ring->request_lists are
+handled and extended this to include all rings, not just
+the one currently hanging. This brings it in to line with
+the full GPU reset case.
+
+v4: Following another comment from Tomas, and further
+discussions with Reuven who is doing the OGL robustness
+testing, I have made yet further changes! Code to account
+for batches waiting in the scheduler has been moved into
+i915_gem_reset_ring_status, so that all the code to update
+the reset stats is now in one place. This function is per
+engine so I have modified the new scheduler function
+i915_scheduler_count_queued_by_context to count only
+batches for the specified engine.
+handle_hung_ring calls i915_gem_reset_ring_status only for
+the hanging ring so that only batches for this ring are
+included in the batch pending counts, rather than counting
+for all rings as I was doing previously. This makes more
+sense as batches for other rings should be unaffected by a
+single engine reset and the OGL Robustness code is now
+using its knowledge of OGL share groups to work out which
+contexts are dependent on the hanging context(s) and may
+need to be recreated.
+
+Change-Id: I78e63dc7953c4700403df1f88ce3f68c98fa5b3a
+Tracked-On: https://jira01.devtools.intel.com/browse/VIZ-6087
+Depends-On: Ib5d50c8456239b1b63e90838eab0509ea1379174
+Signed-off-by: Tim Gore <tim.gore@intel.com>
+
+## Don't forget to add a JIRA URL to the Tracked-On metadata!
+## https://wiki.ith.intel.com/display/CACTUS/Patch+requirements+check
+## url should be in the form:
+## Tracked-On: https://jira01.devtools.intel.com/browse/<PROJ>-<NUMB>
+## Several Tracked-On lines are allowed
+## you can fully prefill your Tracked-On commits using environment variable:
+## export CURRENT_TRACKED_ON=https://jira01.devtools.intel.com/browse/<PROJ>-<NUMB>
+##
+## Don't forget to add a JIRA URL to the Tracked-On metadata!
+## https://wiki.ith.intel.com/display/CACTUS/Patch+requirements+check
+## url should be in the form:
+## Tracked-On: https://jira01.devtools.intel.com/browse/<PROJ>-<NUMB>
+## Several Tracked-On lines are allowed
+## you can fully prefill your Tracked-On commits using environment variable:
+## export CURRENT_TRACKED_ON=https://jira01.devtools.intel.com/browse/<PROJ>-<NUMB>
+##
+---
+ drivers/gpu/drm/i915/i915_drv.c       | 63 +++++++++++++++++++++++++++++------
+ drivers/gpu/drm/i915/i915_drv.h       |  3 ++
+ drivers/gpu/drm/i915/i915_gem.c       | 21 ++++++++++--
+ drivers/gpu/drm/i915/i915_scheduler.c | 24 +++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.h |  3 ++
+ 5 files changed, 101 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index a94e4aa..2148636 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -903,12 +903,10 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 	uint32_t completed_seqno;
+ 	struct drm_crtc *crtc;
+ 	struct intel_crtc *intel_crtc;
+-	struct drm_i915_gem_request *request;
+ 	struct intel_unpin_work *unpin_work;
+ 	struct intel_context *current_context = NULL;
+ 	uint32_t hw_context_id1 = ~0u;
+ 	uint32_t hw_context_id2 = ~0u;
+-	int guilty = 1;
+ 
+ 	acthd = intel_ring_get_active_head(ring);
+ 	completed_seqno = ring->get_seqno(ring, false);
+@@ -918,14 +916,59 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 	/* Take wake lock to prevent power saving mode */
+ 	gen6_gt_force_wake_get(dev_priv, FORCEWAKE_ALL);
+ 
+-	/* Search the request list to see which batch buffer caused
+-	* the hang. Only checks requests that haven't yet completed.*/
+-	list_for_each_entry(request, &ring->request_list, list) {
+-		if (request && (request->seqno > completed_seqno)) {
+-			i915_set_reset_status(dev_priv, request->ctx, guilty);
+-			guilty = 0;
+-		}
+-	}
++
++	/*
++	 * The driver keeps some counters for each context, called batch_active
++	 * and batch_pending. These are used to track how many batch buffers
++	 * have been impacted by a reset. There does not seem to be a precise
++	 * requirement for what these mean, so for the moment they are:
++	 *
++	 * batch_active for a context is incremented if it owns
++	 * the batch buffer that is active on the hung ring.
++	 *
++	 * batch_pending for a context is incremented for each batch
++	 * that it owns that is not marked complete when its ring is
++	 * reset.
++	 *
++	 * If a context has batch_active > 0 then it has submitted work that
++	 * has hung one of the engines - bad boy! If also batch_pending > 0
++	 * then it has other work submitted behind the hanging batch. When
++	 * TDR is enabled the ring reset does not cause these batch buffers
++	 * to be discarded and they may well execute fine after the hang is
++	 * cleared, but they should probably be considered suspect. If TDR is
++	 * not enabled (or in the case of certain signals or if a ring hangs
++	 * to frequently) then the hang will cause a full GPU reset, meaning
++	 * all rings will be reset and ALL pending batch buffers discarded and
++	 * added to the batch_pending count for their respective contexts.
++	 *
++	 * If a context has batch_active=0 but batch_pending>0 then it had
++	 * batch buffers for a ring that was reset and the batch buffers were
++	 * not marked complete (the batch buffer could have been active at
++	 * time of reset, but was not active on the hung ring). When TDR is
++	 * enabled these pending batches are just those, for this context,
++	 * that are queued up behind the hanging batch. When a full GPU
++	 * reset occurs (no TDR or a signal or hanging too frequently) then
++	 * these pending batches are from all rings and may have been active
++	 * at the time of the reset, but not on the hung ring.
++	 *
++	 * Roughly:
++	 *   batch_active > 0 means your context has hung an engine.
++	 *   batch_pending> 0 means your context has affected batches.
++	 *
++	 * NOTE: in the case of multiple hangs/resets by TDR then multiple
++	 * counting of batches can happen. So you can really only use the
++	 * fact that these counts are zero or non-zero.
++	 *
++	 * Also note that these counts do not get cleared, they just keep
++	 * accumulating. If you keep the context and continue using it you
++	 * need to be aware of this.
++	*/
++	/*
++	 *  Search the request lists and update context reset stats.
++	 *  i915_gem.c has a fn to do this.
++	*/
++	i915_gem_reset_ring_status(dev_priv, ring);
++
+ 
+ 	if (i915.enable_execlists) {
+ 		enum context_submission_status status =
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 66f2311..4d5ad34 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2807,6 +2807,9 @@ void i915_gem_object_unpin_fence(struct drm_i915_gem_object *obj);
+ struct drm_i915_gem_request *
+ i915_gem_find_active_request(struct intel_engine_cs *ring);
+ 
++void i915_gem_reset_ring_status(struct drm_i915_private *dev_priv,
++					struct intel_engine_cs *ring);
++
+ bool i915_gem_retire_requests(struct drm_device *dev);
+ void i915_gem_retire_requests_ring(struct intel_engine_cs *ring);
+ int __must_check i915_gem_check_wedge(struct i915_gpu_error *error,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index a93bffb..4a54a29 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2881,7 +2881,7 @@ i915_gem_find_active_request(struct intel_engine_cs *ring)
+ 	return NULL;
+ }
+ 
+-static void i915_gem_reset_ring_status(struct drm_i915_private *dev_priv,
++void i915_gem_reset_ring_status(struct drm_i915_private *dev_priv,
+ 				       struct intel_engine_cs *ring)
+ {
+ 	struct drm_i915_gem_request *request;
+@@ -2899,6 +2899,21 @@ static void i915_gem_reset_ring_status(struct drm_i915_private *dev_priv,
+ 
+ 	list_for_each_entry_continue(request, &ring->request_list, list)
+ 		i915_set_reset_status(dev_priv, request->ctx, false);
++
++	/*
++	 * If there is a gpu scheduler enabled, check each context to
++	 * see if it has any requests for this ring wating in the
++	 * scheduler
++	 */
++	if (i915_scheduler_is_enabled(dev_priv->dev)) {
++		struct intel_context *ctx;
++		uint32_t count;
++		list_for_each_entry(ctx, &dev_priv->context_list, link) {
++			count = i915_scheduler_count_queued_by_context
++							(dev_priv->dev, ctx, ring);
++			ctx->hang_stats.batch_pending += count;
++		}
++	}
+ }
+ 
+ static void i915_gem_reset_ring_cleanup(struct drm_i915_private *dev_priv,
+@@ -2979,8 +2994,6 @@ void i915_gem_reset(struct drm_device *dev)
+ 	struct intel_engine_cs *ring;
+ 	int i;
+ 
+-	i915_scheduler_kill_all(dev);
+-
+ 	/*
+ 	 * Before we free the objects from the requests, we need to inspect
+ 	 * them for finding the guilty party. As the requests only borrow
+@@ -2989,6 +3002,8 @@ void i915_gem_reset(struct drm_device *dev)
+ 	for_each_ring(ring, dev_priv, i)
+ 		i915_gem_reset_ring_status(dev_priv, ring);
+ 
++	i915_scheduler_kill_all(dev);
++
+ 	for_each_ring(ring, dev_priv, i)
+ 		i915_gem_reset_ring_cleanup(dev_priv, ring);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index b3bfb60..e2bcd98 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -1023,6 +1023,30 @@ int i915_scheduler_query_stats(struct intel_engine_cs *ring,
+ 	return 0;
+ }
+ 
++uint32_t i915_scheduler_count_queued_by_context(struct drm_device *dev,
++						struct intel_context *target,
++						struct intel_engine_cs *ring) {
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct i915_scheduler *scheduler = dev_priv->scheduler;
++	struct i915_scheduler_queue_entry *node;
++	unsigned long flags;
++	uint32_t count = 0;
++
++	spin_lock_irqsave(&scheduler->lock, flags);
++	list_for_each_entry(node, &scheduler->node_queue[ring->id], link) {
++		if (!I915_SQS_IS_QUEUED(node))
++			continue;
++
++		if (node->params.ctx != target)
++			continue;
++
++		count++;
++	}
++
++	spin_unlock_irqrestore(&scheduler->lock, flags);
++	return count;
++}
++
+ int i915_scheduler_flush_request(struct drm_i915_gem_request *req,
+ 				 bool is_locked)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 61df49d..70ac5bd 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -174,6 +174,9 @@ bool        i915_scheduler_is_request_tracked(struct drm_i915_gem_request *req,
+ 					      bool *completed, bool *busy);
+ int         i915_scheduler_query_stats(struct intel_engine_cs *ring,
+ 				       struct i915_scheduler_stats_nodes *stats);
++uint32_t    i915_scheduler_count_queued_by_context(struct drm_device *dev,
++						   struct intel_context *target,
++						   struct intel_engine_cs *ring);
+ bool        i915_scheduler_file_queue_is_full(struct drm_file *file);
+ 
+ #endif  /* _I915_SCHEDULER_H_ */
+-- 
+1.9.1
+

@@ -1,0 +1,175 @@
+From 492c1b6903687d43d07c971c62b89b93c4e32dae Mon Sep 17 00:00:00 2001
+From: "xinhui.pan" <xinhuix.pan@intel.com>
+Date: Wed, 27 May 2015 13:57:25 +0800
+Subject: [PATCH] [PORT TO CHT]tty/n_gsm.c: keep dlci's lifetime same with mux
+
+Panic happens in scenarios below:
+
+1) Process A opens gsmttyXX.
+2) gsmld_config -> gsm_cleanup_mux and __gsm_activate_mux.
+3) Proces A closes gsmttyXX.
+We will get panic in gsmtty_remove. __gsm_activate_mux
+alloc new dlci[0], but gsmtty_remove put the new dlci[0]
+instead of the old. We need reuse the dlci[0] instead of
+allocing new one.
+
+1) Process A opens gsmttyXX.
+2) gsmld_config -> gsm_cleanup_mux and __gsm_activate_mux.
+3) gsmld_close --> gsm_cleanup_mux.
+We will get panic in gsmtty_remove. We put the dlci[XX] twice
+in cleanup. So when gsmtty_remove calls in,
+dlci = tty-> driver_data points to a bad memory.
+That causes random panic.
+So put dlci[XX] only when gsm close.
+
+Also use a lock in gsmtty_remove, otherwise we will hit panic:
+
+1) Process A opens gsmttyXX
+2) gsmld_close --> gsm_cleanup_mux -> gsm_dlci_release (race with 3)
+3) gsmld_remove
+4) gsmld_close --> gsm_cleanup_mux -> gsm_dlci_release
+5) tty ref is zero, list corruption when call tty_kref_put.
+tty_hangup schedule tty->hangup_work.
+If tty ref is zero, tty_kref_put will schedule tty->hangup_work,too
+That cause the list panic. So use lock in gsmtty_remove.
+
+Change-Id: Ic7092af1c3b9f51c7e7ea3f31e2a0bc34f30cb35
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1778
+Signed-off-by: xinhui.pan <xinhuiX.pan@intel.com>
+Reviewed-on: https://android.intel.com:443/247591
+---
+ drivers/tty/n_gsm.c | 60 +++++++++++++++++++++++++++++++++++------------------
+ 1 file changed, 40 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/tty/n_gsm.c b/drivers/tty/n_gsm.c
+index a90662976baa..9c6e9090cc77 100644
+--- a/drivers/tty/n_gsm.c
++++ b/drivers/tty/n_gsm.c
+@@ -2186,6 +2186,7 @@ void gsm_cleanup_mux(struct gsm_mux *gsm)
+ 	int i;
+ 	struct gsm_msg *txq, *ntxq;
+ 	unsigned long flags;
++	struct gsm_dlci *dlci;
+ 
+ 	gsm->dead = 1;
+ 
+@@ -2196,9 +2197,14 @@ void gsm_cleanup_mux(struct gsm_mux *gsm)
+ 		gsm_closeall_dlci(gsm);
+ 
+ 	mutex_lock(&gsm->mutex);
+-	for (i = NUM_DLCI-1; i >= 0; i--)
+-		if (gsm->dlci[i])
+-			gsm_dlci_release(gsm->dlci[i]);
++	for (i = NUM_DLCI-1; i >= 0; i--) {
++		dlci = gsm->dlci[i];
++		if (dlci) {
++			if (!gsm->tty_dead) /*only put it when gsm close*/
++				dlci_get(dlci);
++			gsm_dlci_release(dlci);
++		}
++	}
+ 	activated--;
+ 	mutex_unlock(&gsm->mutex);
+ 
+@@ -2210,33 +2216,38 @@ void gsm_cleanup_mux(struct gsm_mux *gsm)
+ 	spin_unlock_irqrestore(&gsm->tx_lock, flags);
+ }
+ 
+-static int __gsm_activate_mux(struct gsm_mux *gsm, bool assign_new_mux_entry)
++static inline int __gsm_init_mux(struct gsm_mux *gsm)
+ {
+-	struct gsm_dlci *dlci;
+-	int ret;
+-
+-	init_timer(&gsm->t2_timer);
+-	gsm->t2_timer.function = gsm_control_retransmit;
+-	gsm->t2_timer.data = (unsigned long)gsm;
++	setup_timer(&gsm->t2_timer, gsm_control_retransmit, (unsigned long)gsm);
+ 	init_waitqueue_head(&gsm->event);
+ 	spin_lock_init(&gsm->control_lock);
+ 	spin_lock_init(&gsm->tx_lock);
+ 
++	return gsm_add_one_mux_entry(gsm);
++}
++
++static int __gsm_activate_mux(struct gsm_mux *gsm)
++{
++	struct gsm_dlci *dlci;
++
+ 	if (gsm->encoding == 0)
+ 		gsm->receive = gsm0_receive;
+ 	else
+ 		gsm->receive = gsm1_receive;
+ 	gsm->error = gsm_error;
+ 
+-	if (assign_new_mux_entry) {
+-		ret = gsm_add_one_mux_entry(gsm);
+-		if (ret != 0)
+-			return ret;
++	mutex_lock(&gsm->mutex);
++	dlci = gsm->dlci[0];
++	if (dlci == NULL) {
++		dlci = gsm_dlci_alloc(gsm, 0);
++		if (dlci == NULL) {
++			mutex_unlock(&gsm->mutex);
++			return -ENOMEM;
++		}
+ 	}
++	dlci->dead = 0;
++	mutex_unlock(&gsm->mutex);
+ 
+-	dlci = gsm_dlci_alloc(gsm, 0);
+-	if (dlci == NULL)
+-		return -ENOMEM;
+ 	activated++;
+ 	gsm->dead = 0;		/* Tty opens are now permissible */
+ 	return 0;
+@@ -2252,7 +2263,12 @@ static int __gsm_activate_mux(struct gsm_mux *gsm, bool assign_new_mux_entry)
+  */
+ static int gsm_activate_mux(struct gsm_mux *gsm)
+ {
+-	return __gsm_activate_mux(gsm, 1);
++	int ret;
++
++	ret = __gsm_init_mux(gsm);
++	if (ret != 0)
++		return ret;
++	return __gsm_activate_mux(gsm);
+ }
+ 
+ /**
+@@ -2792,8 +2808,10 @@ static int gsmld_config(struct tty_struct *tty, struct gsm_mux *gsm,
+ 		if (signal_pending(current))
+ 			return -EINTR;
+ 	}
+-	if (need_restart)
++	if (need_restart) {
+ 		gsm_cleanup_mux(gsm);
++		wake_up(&gsm->event);
++	}
+ 
+ 	gsm->initiator = c->initiator;
+ 	gsm->mru = c->mru;
+@@ -2815,7 +2833,7 @@ static int gsmld_config(struct tty_struct *tty, struct gsm_mux *gsm,
+ 		gsm->t2 = c->t2;
+ 
+ 	if (need_restart)
+-		__gsm_activate_mux(gsm, 0);
++		__gsm_activate_mux(gsm);
+ 	if (gsm->initiator && need_close)
+ 		gsm_dlci_begin_open(gsm->dlci[0]);
+ 	return 0;
+@@ -3554,8 +3572,10 @@ static void gsmtty_remove(struct tty_driver *driver, struct tty_struct *tty)
+ 	struct gsm_dlci *dlci = tty->driver_data;
+ 	struct gsm_mux *gsm = dlci->gsm;
+ 
++	mutex_lock(&gsm->mutex);
+ 	dlci_put(dlci);
+ 	dlci_put(gsm->dlci[0]);
++	mutex_unlock(&gsm->mutex);
+ 	mux_put(gsm);
+ 	tty->driver_data = NULL;
+ 	tty->port = NULL;
+-- 
+1.9.1
+

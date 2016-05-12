@@ -1,0 +1,173 @@
+From 922ade404b1825b27621557fe0f5018b3155dc46 Mon Sep 17 00:00:00 2001
+Message-Id: <922ade404b1825b27621557fe0f5018b3155dc46.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 7 Aug 2014 13:23:20 +0100
+Subject: [PATCH 41/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Display execlists
+ info in debugfs
+
+v2: Warn and return if LRCs are not enabled.
+
+v3: Grab the Execlists spinlock (noticed by Daniel Vetter).
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+
+v4: Lock the struct mutex for atomic state capture
+
+Signed-off-by: Thomas Daniel <thomas.daniel@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+[danvet: Checkpatch.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 4ba70e448be91f52032595678c306e4aee2fae5c)
+
+Change-Id: I122a11690e53e7c1adb9d3ed77f6ccbe5f99801f
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 4ba70e448be91f52032595678c306e4aee2fae5c
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   81 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_lrc.c    |    6 ---
+ drivers/gpu/drm/i915/intel_lrc.h    |    7 +++
+ 3 files changed, 88 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 5cb93ab..2fd73bf 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -2447,6 +2447,86 @@ static int i915_context_status(struct seq_file *m, void *unused)
+ 	return 0;
+ }
+ 
++static int i915_execlists(struct seq_file *m, void *data)
++{
++	struct drm_info_node *node = (struct drm_info_node *)m->private;
++	struct drm_device *dev = node->minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_engine_cs *ring;
++	u32 status_pointer;
++	u8 read_pointer;
++	u8 write_pointer;
++	u32 status;
++	u32 ctx_id;
++	struct list_head *cursor;
++	int ring_id, i;
++	int ret;
++
++	if (!i915.enable_execlists) {
++		seq_puts(m, "Logical Ring Contexts are disabled\n");
++		return 0;
++	}
++
++	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	if (ret)
++		return ret;
++
++	for_each_ring(ring, dev_priv, ring_id) {
++		struct intel_ctx_submit_request *head_req = NULL;
++		int count = 0;
++		unsigned long flags;
++
++		seq_printf(m, "%s\n", ring->name);
++
++		status = I915_READ(RING_EXECLIST_STATUS(ring));
++		ctx_id = I915_READ(RING_EXECLIST_STATUS(ring) + 4);
++		seq_printf(m, "\tExeclist status: 0x%08X, context: %u\n",
++			   status, ctx_id);
++
++		status_pointer = I915_READ(RING_CONTEXT_STATUS_PTR(ring));
++		seq_printf(m, "\tStatus pointer: 0x%08X\n", status_pointer);
++
++		read_pointer = ring->next_context_status_buffer;
++		write_pointer = status_pointer & 0x07;
++		if (read_pointer > write_pointer)
++			write_pointer += 6;
++		seq_printf(m, "\tRead pointer: 0x%08X, write pointer 0x%08X\n",
++			   read_pointer, write_pointer);
++
++		for (i = 0; i < 6; i++) {
++			status = I915_READ(RING_CONTEXT_STATUS_BUF(ring) + 8*i);
++			ctx_id = I915_READ(RING_CONTEXT_STATUS_BUF(ring) + 8*i + 4);
++
++			seq_printf(m, "\tStatus buffer %d: 0x%08X, context: %u\n",
++				   i, status, ctx_id);
++		}
++
++		spin_lock_irqsave(&ring->execlist_lock, flags);
++		list_for_each(cursor, &ring->execlist_queue)
++			count++;
++		head_req = list_first_entry_or_null(&ring->execlist_queue,
++				struct intel_ctx_submit_request, execlist_link);
++		spin_unlock_irqrestore(&ring->execlist_lock, flags);
++
++		seq_printf(m, "\t%d requests in queue\n", count);
++		if (head_req) {
++			struct drm_i915_gem_object *ctx_obj;
++
++			ctx_obj = head_req->ctx->engine[ring_id].state;
++			seq_printf(m, "\tHead request id: %u\n",
++				   intel_execlists_ctx_id(ctx_obj));
++			seq_printf(m, "\tHead request tail: %u\n",
++				   head_req->tail);
++		}
++
++		seq_putc(m, '\n');
++	}
++
++	mutex_unlock(&dev->struct_mutex);
++
++	return 0;
++}
++
+ static int i915_gen6_forcewake_count_info(struct seq_file *m, void *data)
+ {
+ 	struct drm_info_node *node = m->private;
+@@ -4971,6 +5051,7 @@ static const struct drm_info_list i915_debugfs_list[] = {
+ 	{"i915_opregion", i915_opregion, 0},
+ 	{"i915_gem_framebuffer", i915_gem_framebuffer_info, 0},
+ 	{"i915_context_status", i915_context_status, 0},
++	{"i915_execlists", i915_execlists, 0},
+ 	{"i915_gen6_forcewake_count", i915_gen6_forcewake_count_info, 0},
+ 	{"i915_swizzle_info", i915_swizzle_info, 0},
+ 	{"i915_ppgtt_info", i915_ppgtt_info, 0},
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 89f04b4..51e1b78 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -46,12 +46,6 @@
+ 
+ #define GEN8_LR_CONTEXT_ALIGN 4096
+ 
+-#define RING_ELSP(ring)			((ring)->mmio_base+0x230)
+-#define RING_EXECLIST_STATUS(ring)	((ring)->mmio_base+0x234)
+-#define RING_CONTEXT_CONTROL(ring)	((ring)->mmio_base+0x244)
+-#define RING_CONTEXT_STATUS_BUF(ring)	((ring)->mmio_base+0x370)
+-#define RING_CONTEXT_STATUS_PTR(ring)	((ring)->mmio_base+0x3a0)
+-
+ #define RING_EXECLIST_QFULL		(1 << 0x2)
+ #define RING_EXECLIST1_VALID		(1 << 0x3)
+ #define RING_EXECLIST0_VALID		(1 << 0x4)
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index 331c6c2..117d1a4 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -24,6 +24,13 @@
+ #ifndef _INTEL_LRC_H_
+ #define _INTEL_LRC_H_
+ 
++/* Execlists regs */
++#define RING_ELSP(ring)			((ring)->mmio_base+0x230)
++#define RING_EXECLIST_STATUS(ring)	((ring)->mmio_base+0x234)
++#define RING_CONTEXT_CONTROL(ring)	((ring)->mmio_base+0x244)
++#define RING_CONTEXT_STATUS_BUF(ring)	((ring)->mmio_base+0x370)
++#define RING_CONTEXT_STATUS_PTR(ring)	((ring)->mmio_base+0x3a0)
++
+ /* Logical Rings */
+ void intel_logical_ring_stop(struct intel_engine_cs *ring);
+ void intel_logical_ring_cleanup(struct intel_engine_cs *ring);
+-- 
+1.7.9.5
+

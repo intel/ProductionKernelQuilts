@@ -1,0 +1,93 @@
+From bcfe933b9c88e40b4015bfa8f56871d52295cc16 Mon Sep 17 00:00:00 2001
+From: Yuyang Du <yuyang.du@intel.com>
+Date: Mon, 17 Nov 2014 20:23:53 -0500
+Subject: [PATCH] sched: Implement workload consolidation in periodic load
+ balance
+
+(1) Skip pulling task to the non-consolidated CPUs.
+
+(2) On consolidated Idle CPU, we aggressively pull tasks from
+    non-consolidated CPUs.
+
+Change-Id: I94fcd382bbbda59e25073959cdf83c112929aade
+Orig-Change-Id: I3e1401d1b0fb53aeaac87656d455722c070596a5
+Orig-Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-20603
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9774
+Signed-off-by: Yuyang Du <yuyang.du@intel.com>
+Signed-off-by: Srinidhi Kasagar <srinidhi.kasagar@intel.com>
+---
+ kernel/sched/fair.c | 53 ++++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 46 insertions(+), 7 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 04c6252..f3223e4 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6915,18 +6915,57 @@ static void nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle, struc
+  */
+ static void run_rebalance_domains(struct softirq_action *h)
+ {
++	int this_cpu = smp_processor_id();
+ 	struct rq *this_rq = this_rq();
++	struct sched_domain *sd;
+ 	enum cpu_idle_type idle = this_rq->idle_balance ?
+ 						CPU_IDLE : CPU_NOT_IDLE;
+ 
+-	rebalance_domains(this_rq, idle);
++	rcu_read_lock();
++	sd = rcu_dereference(per_cpu(sd_wc, this_cpu));
++	if (sd) {
++		struct cpumask *nonshielded_cpus =
++			__get_cpu_var(load_balance_mask);
+ 
+-	/*
+-	 * If this cpu has a pending nohz_balance_kick, then do the
+-	 * balancing on behalf of the other idle cpus whose ticks are
+-	 * stopped.
+-	 */
+-	nohz_idle_balance(this_rq, idle, nohz.idle_cpus_mask);
++		/*
++		 * If we encounter shielded cpus here, don't do balance on them
++		 */
++		cpumask_copy(nonshielded_cpus, cpu_active_mask);
++
++		wc_nonshielded_mask(sd, nonshielded_cpus);
++		rcu_read_unlock();
++
++		/*
++		 * Aggressively unload the shielded cpus to unshielded cpus
++		 */
++		wc_unload(nonshielded_cpus, sd);
++
++		if (cpumask_test_cpu(this_cpu, nonshielded_cpus)) {
++			struct cpumask *idle_cpus =
++				__get_cpu_var(local_cpu_mask);
++			cpumask_and(idle_cpus, nonshielded_cpus,
++				    nohz.idle_cpus_mask);
++
++			rebalance_domains(this_rq, idle);
++
++			/*
++			 * If this cpu has a pending nohz_balance_kick, then do the
++			 * balancing on behalf of the other idle cpus whose ticks are
++			 * stopped.
++			 */
++			nohz_idle_balance(this_rq, idle, idle_cpus);
++		}
++	} else {
++		rcu_read_unlock();
++		rebalance_domains(this_rq, idle);
++
++		/*
++		 * If this cpu has a pending nohz_balance_kick, then do the
++		 * balancing on behalf of the other idle cpus whose ticks are
++		 * stopped.
++		 */
++		nohz_idle_balance(this_rq, idle, nohz.idle_cpus_mask);
++	}
+ }
+ 
+ static inline int on_null_domain(struct rq *rq)
+-- 
+1.9.1
+

@@ -1,0 +1,429 @@
+From b5c41c027e3d6a373b5e98b57e72b567b12e25a4 Mon Sep 17 00:00:00 2001
+Message-Id: <b5c41c027e3d6a373b5e98b57e72b567b12e25a4.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:26 +0000
+Subject: [PATCH 18/63] FROM_UPSTREAM [VPG]: drm/i915: Replace
+ last_[rwf]_seqno with last_[rwf]_req
+
+The object structure contains the last read, write and fenced seqno values for
+use in syncrhonisation operations. These have now been replaced with their
+request structure counterparts.
+
+Note that to ensure that objects do not end up with dangling pointers, the
+assignments of last_*_req include reference count updates. Thus a request cannot
+be freed if an object is still hanging on to it for any reason.
+
+v2: Corrected 'last_rendering_' to 'last_read_' in a number of comments that did
+not get updated when 'last_rendering_seqno' became 'last_read|write_seqno'
+several millenia ago.
+
+Change-Id: I820251aa459fe4d816058c5dbef9f50227bec739
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 97b2a6a10a1aef6f32832fcbc9d6a27650354904
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_debugfs.c        |    6 +--
+ drivers/gpu/drm/i915/i915_drv.h            |   13 ++---
+ drivers/gpu/drm/i915/i915_gem.c            |   73 ++++++++++++++++------------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    3 +-
+ drivers/gpu/drm/i915/i915_gem_gtt.h        |    4 +-
+ drivers/gpu/drm/i915/i915_gem_stolen.c     |    6 +--
+ drivers/gpu/drm/i915/i915_gpu_error.c      |    4 +-
+ drivers/gpu/drm/i915/intel_display.c       |    9 ++--
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    2 +-
+ 9 files changed, 67 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 966f1d9..7861b73 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -134,9 +134,9 @@ describe_obj(struct seq_file *m, struct drm_i915_gem_object *obj)
+ 		   obj->base.size / 1024,
+ 		   obj->base.read_domains,
+ 		   obj->base.write_domain,
+-		   obj->last_read_seqno,
+-		   obj->last_write_seqno,
+-		   obj->last_fenced_seqno,
++		   i915_gem_request_get_seqno(obj->last_read_req),
++		   i915_gem_request_get_seqno(obj->last_write_req),
++		   i915_gem_request_get_seqno(obj->last_fenced_req),
+ 		   i915_cache_level_str(obj->cache_level),
+ 		   obj->dirty ? " dirty" : "",
+ 		   obj->madv == I915_MADV_DONTNEED ? " purgeable" : "");
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index d3b7c3c..d539bf9 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2016,10 +2016,10 @@ struct drm_i915_gem_object {
+ 	struct intel_engine_cs *ring;
+ 
+ 	/** Breadcrumb of last rendering to the buffer. */
+-	uint32_t last_read_seqno;
+-	uint32_t last_write_seqno;
++	struct drm_i915_gem_request *last_read_req;
++	struct drm_i915_gem_request *last_write_req;
+ 	/** Breadcrumb of last fenced GPU access to the buffer. */
+-	uint32_t last_fenced_seqno;
++	struct drm_i915_gem_request *last_fenced_req;
+ 
+ 	/** Current tiling stride for the object, if it's tiled. */
+ 	uint32_t stride;
+@@ -2071,9 +2071,10 @@ struct drm_i915_gem_object {
+  * The request queue allows us to note sequence numbers that have been emitted
+  * and may be associated with active buffers to be retired.
+  *
+- * By keeping this list, we can avoid having to do questionable
+- * sequence-number comparisons on buffer last_rendering_seqnos, and associate
+- * an emission time with seqnos for tracking how far ahead of the GPU we are.
++ * By keeping this list, we can avoid having to do questionable sequence
++ * number comparisons on buffer last_read|write_seqno. It also allows an
++ * emission time to be associated with the request for tracking how far ahead
++ * of the GPU the submission is.
+  */
+ struct drm_i915_gem_request {
+ 	struct kref ref;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 6d4d35e..7a71d65 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1361,11 +1361,11 @@ i915_gem_object_wait_rendering__tail(struct drm_i915_gem_object *obj)
+ 	/* Manually manage the write flush as we may have not yet
+ 	 * retired the buffer.
+ 	 *
+-	 * Note that the last_write_seqno is always the earlier of
+-	 * the two (read/write) seqno, so if we haved successfully waited,
++	 * Note that the last_write_req is always the earlier of
++	 * the two (read/write) requests, so if we haved successfully waited,
+ 	 * we know we have passed the last write.
+ 	 */
+-	obj->last_write_seqno = 0;
++	i915_gem_request_assign(&obj->last_write_req, NULL);
+ 
+ 	return 0;
+ }
+@@ -1378,14 +1378,18 @@ static __must_check int
+ i915_gem_object_wait_rendering(struct drm_i915_gem_object *obj,
+ 			       bool readonly)
+ {
++	struct drm_i915_gem_request *req;
+ 	struct intel_engine_cs *ring = obj->ring;
+ 	u32 seqno;
+ 	int ret;
+ 
+-	seqno = readonly ? obj->last_write_seqno : obj->last_read_seqno;
+-	if (seqno == 0)
++	req = readonly ? obj->last_write_req : obj->last_read_req;
++	if (!req)
+ 		return 0;
+ 
++	seqno = i915_gem_request_get_seqno(req);
++	WARN_ON(seqno == 0);
++
+ 	ret = i915_wait_seqno(ring, seqno);
+ 	if (ret)
+ 		return ret;
+@@ -1401,6 +1405,7 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
+ 					    struct drm_i915_file_private *file_priv,
+ 					    bool readonly)
+ {
++	struct drm_i915_gem_request *req;
+ 	struct drm_device *dev = obj->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_engine_cs *ring = obj->ring;
+@@ -1411,10 +1416,13 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
+ 	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
+ 	BUG_ON(!dev_priv->mm.interruptible);
+ 
+-	seqno = readonly ? obj->last_write_seqno : obj->last_read_seqno;
+-	if (seqno == 0)
++	req = readonly ? obj->last_write_req : obj->last_read_req;
++	if (!req)
+ 		return 0;
+ 
++	seqno = i915_gem_request_get_seqno(req);
++	WARN_ON(seqno == 0);
++
+ 	ret = i915_gem_check_wedge(&dev_priv->gpu_error, true, ring);
+ 	if (ret)
+ 		return ret;
+@@ -2290,12 +2298,12 @@ i915_gem_object_move_to_active(struct drm_i915_gem_object *obj,
+ {
+ 	struct drm_device *dev = obj->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	u32 seqno = intel_ring_get_seqno(ring);
++	struct drm_i915_gem_request *req = intel_ring_get_request(ring);
+ 
+ 	BUG_ON(ring == NULL);
+-	if (obj->ring != ring && obj->last_write_seqno) {
+-		/* Keep the seqno relative to the current ring */
+-		obj->last_write_seqno = seqno;
++	if (obj->ring != ring && obj->last_write_req) {
++		/* Keep the request relative to the current ring */
++		i915_gem_request_assign(&obj->last_write_req, req);
+ 	}
+ 	obj->ring = ring;
+ 
+@@ -2307,10 +2315,10 @@ i915_gem_object_move_to_active(struct drm_i915_gem_object *obj,
+ 
+ 	list_move_tail(&obj->ring_list, &ring->active_list);
+ 
+-	obj->last_read_seqno = seqno;
++	i915_gem_request_assign(&obj->last_read_req, req);
+ 
+ 	if (obj->fenced_gpu_access) {
+-		obj->last_fenced_seqno = seqno;
++		i915_gem_request_assign(&obj->last_fenced_req, req);
+ 
+ 		/* Bump MRU to take account of the delayed flush */
+ 		if (obj->fence_reg != I915_FENCE_REG_NONE) {
+@@ -2349,11 +2357,11 @@ i915_gem_object_move_to_inactive(struct drm_i915_gem_object *obj)
+ 	list_del_init(&obj->ring_list);
+ 	obj->ring = NULL;
+ 
+-	obj->last_read_seqno = 0;
+-	obj->last_write_seqno = 0;
++	i915_gem_request_assign(&obj->last_read_req, NULL);
++	i915_gem_request_assign(&obj->last_write_req, NULL);
+ 	obj->base.write_domain = 0;
+ 
+-	obj->last_fenced_seqno = 0;
++	i915_gem_request_assign(&obj->last_fenced_req, NULL);
+ 	obj->fenced_gpu_access = false;
+ 
+ 	obj->active = 0;
+@@ -2371,7 +2379,7 @@ i915_gem_object_retire(struct drm_i915_gem_object *obj)
+ 		return;
+ 
+ 	if (i915_seqno_passed(ring->get_seqno(ring, true),
+-			      obj->last_read_seqno))
++			      i915_gem_request_get_seqno(obj->last_read_req)))
+ 		i915_gem_object_move_to_inactive(obj);
+ }
+ 
+@@ -2808,7 +2816,8 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ 				      struct drm_i915_gem_object,
+ 				      ring_list);
+ 
+-		if (!i915_seqno_passed(seqno, obj->last_read_seqno))
++		if (!i915_seqno_passed(seqno,
++			     i915_gem_request_get_seqno(obj->last_read_req)))
+ 			break;
+ 
+ 		i915_gem_object_move_to_inactive(obj);
+@@ -2927,7 +2936,8 @@ i915_gem_object_flush_active(struct drm_i915_gem_object *obj)
+ 	int ret;
+ 
+ 	if (obj->active) {
+-		ret = i915_gem_check_olr(obj->ring, obj->last_read_seqno);
++		ret = i915_gem_check_olr(obj->ring,
++			     i915_gem_request_get_seqno(obj->last_read_req));
+ 		if (ret)
+ 			return ret;
+ 
+@@ -2991,13 +3001,12 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ 	if (ret)
+ 		goto out;
+ 
+-	if (obj->active) {
+-		seqno = obj->last_read_seqno;
+-		ring = obj->ring;
+-	}
++	if (!obj->active || !obj->last_read_req)
++		goto out;
+ 
+-	if (seqno == 0)
+-		 goto out;
++	seqno = i915_gem_request_get_seqno(obj->last_read_req);
++	WARN_ON(seqno == 0);
++	ring = obj->ring;
+ 
+ 	/* Do this after OLR check to make sure we make forward progress polling
+ 	 * on this IOCTL with a 0 timeout (like busy ioctl)
+@@ -3050,7 +3059,7 @@ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 
+ 	idx = intel_ring_sync_index(from, to);
+ 
+-	seqno = obj->last_read_seqno;
++	seqno = i915_gem_request_get_seqno(obj->last_read_req);
+ 	if (seqno <= from->semaphore.sync_seqno[idx])
+ 		return 0;
+ 
+@@ -3061,11 +3070,12 @@ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 	trace_i915_gem_ring_sync_to(from, to, seqno);
+ 	ret = to->semaphore.sync_to(to, from, seqno);
+ 	if (!ret)
+-		/* We use last_read_seqno because sync_to()
++		/* We use last_read_req because sync_to()
+ 		 * might have just caused seqno wrap under
+ 		 * the radar.
+ 		 */
+-		from->semaphore.sync_seqno[idx] = obj->last_read_seqno;
++		from->semaphore.sync_seqno[idx] =
++				i915_gem_request_get_seqno(obj->last_read_req);
+ 
+ 	return ret;
+ }
+@@ -3375,12 +3385,13 @@ static void i915_gem_object_update_fence(struct drm_i915_gem_object *obj,
+ static int
+ i915_gem_object_wait_fence(struct drm_i915_gem_object *obj)
+ {
+-	if (obj->last_fenced_seqno) {
+-		int ret = i915_wait_seqno(obj->ring, obj->last_fenced_seqno);
++	if (obj->last_fenced_req) {
++		int ret = i915_wait_seqno(obj->ring,
++			   i915_gem_request_get_seqno(obj->last_fenced_req));
+ 		if (ret)
+ 			return ret;
+ 
+-		obj->last_fenced_seqno = 0;
++		i915_gem_request_assign(&obj->last_fenced_req, NULL);
+ 	}
+ 
+ 	obj->fenced_gpu_access = false;
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 936ac1a..4c3c99b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -960,6 +960,7 @@ void
+ i915_gem_execbuffer_move_to_active(struct list_head *vmas,
+ 				   struct intel_engine_cs *ring)
+ {
++	struct drm_i915_gem_request *req = intel_ring_get_request(ring);
+ 	struct i915_vma *vma;
+ 
+ 	list_for_each_entry(vma, vmas, exec_list) {
+@@ -976,7 +977,7 @@ i915_gem_execbuffer_move_to_active(struct list_head *vmas,
+ 		i915_vma_move_to_active(vma, ring);
+ 		if (obj->base.write_domain) {
+ 			obj->dirty = 1;
+-			obj->last_write_seqno = intel_ring_get_seqno(ring);
++			i915_gem_request_assign(&obj->last_write_req, req);
+ 			/* check for potential scanout */
+ 			if (i915_gem_obj_ggtt_bound(obj) &&
+ 			    i915_gem_obj_to_ggtt(obj)->pin_count)
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index 72d12ed..f1cf9bfe 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -178,7 +178,7 @@ struct i915_address_space {
+ 	 * List of objects currently involved in rendering.
+ 	 *
+ 	 * Includes buffers having the contents of their GPU caches
+-	 * flushed, not necessarily primitives.  last_rendering_seqno
++	 * flushed, not necessarily primitives. last_read_req
+ 	 * represents when the rendering involved will be completed.
+ 	 *
+ 	 * A reference is held on the buffer while on this list.
+@@ -189,7 +189,7 @@ struct i915_address_space {
+ 	 * LRU list of objects which are not in the ringbuffer and
+ 	 * are ready to unbind, but are still in the GTT.
+ 	 *
+-	 * last_rendering_seqno is 0 while an object is in this list.
++	 * last_read_req is NULL while an object is in this list.
+ 	 *
+ 	 * A reference is not held on the buffer while on this list,
+ 	 * as merely being GTT-bound shouldn't prevent its being
+diff --git a/drivers/gpu/drm/i915/i915_gem_stolen.c b/drivers/gpu/drm/i915/i915_gem_stolen.c
+index 2ba4f4c..af02005 100644
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -404,7 +404,7 @@ static int i915_memset_stolen_obj_hw(struct drm_i915_gem_object *obj)
+ 	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
+ 	struct intel_engine_cs *ring = &dev_priv->ring[BCS];
+ 	unsigned alignment = 0;
+-	u32 seqno;
++	struct drm_i915_gem_request *req;
+ 	int ret;
+ 
+ 	/* Pre-Gen6, blitter engine is not on a separate ring */
+@@ -433,7 +433,7 @@ static int i915_memset_stolen_obj_hw(struct drm_i915_gem_object *obj)
+ 		return ret;
+ 	}
+ 
+-	seqno = intel_ring_get_seqno(ring);
++	req = intel_ring_get_request(ring);
+ 
+ 	/* Object now in render domain */
+ 	obj->base.read_domains = I915_GEM_DOMAIN_RENDER;
+@@ -442,7 +442,7 @@ static int i915_memset_stolen_obj_hw(struct drm_i915_gem_object *obj)
+ 	i915_vma_move_to_active(i915_gem_obj_to_ggtt(obj), ring);
+ 
+ 	obj->dirty = 1;
+-	obj->last_write_seqno = seqno;
++	i915_gem_request_assign(&obj->last_write_req, req);
+ 
+ 	/* Unconditionally force add_request to emit a full flush. */
+ 	ring->gpu_caches_dirty = true;
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 20ea5e4..526fae3 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -651,8 +651,8 @@ static void capture_bo(struct drm_i915_error_buffer *err,
+ 
+ 	err->size = obj->base.size;
+ 	err->name = obj->base.name;
+-	err->rseqno = obj->last_read_seqno;
+-	err->wseqno = obj->last_write_seqno;
++	err->rseqno = i915_gem_request_get_seqno(obj->last_read_req);
++	err->wseqno = i915_gem_request_get_seqno(obj->last_write_req);
+ 	err->gtt_offset = vma->node.start;
+ 	err->read_domains = obj->base.read_domains;
+ 	err->write_domain = obj->base.write_domain;
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index c0b1a04..cef4d9a 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10395,7 +10395,7 @@ static int intel_postpone_flip(struct drm_i915_gem_object *obj)
+ 
+ 	lockdep_assert_held(&obj->base.dev->struct_mutex);
+ 
+-	if (!obj->last_write_seqno)
++	if (!obj->last_write_req)
+ 		return 0;
+ 
+ 	ring = obj->ring;
+@@ -10407,10 +10407,10 @@ static int intel_postpone_flip(struct drm_i915_gem_object *obj)
+ 		return ret;
+ 
+ 	if (i915_seqno_passed(ring->get_seqno(ring, true),
+-			      obj->last_write_seqno))
++			      i915_gem_request_get_seqno(obj->last_write_req)))
+ 		return 0;
+ 
+-	ret = i915_gem_check_olr(ring, obj->last_write_seqno);
++	ret = i915_gem_check_olr(ring, i915_gem_request_get_seqno(obj->last_write_req));
+ 	if (ret)
+ 		return ret;
+ 
+@@ -10473,7 +10473,8 @@ static int intel_queue_mmio_flip(struct drm_device *dev,
+ 	}
+ 
+ 	spin_lock_irqsave(&dev_priv->mmio_flip_lock, irq_flags);
+-	intel_crtc->mmio_flip.seqno = obj->last_write_seqno;
++	intel_crtc->mmio_flip.seqno =
++			     i915_gem_request_get_seqno(obj->last_write_req);
+ 	intel_crtc->mmio_flip.ring_id = obj->ring->id;
+ 	spin_unlock_irqrestore(&dev_priv->mmio_flip_lock, irq_flags);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 6186437..05b82d0 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -260,7 +260,7 @@ struct intel_engine_cs {
+ 	 * ringbuffer.
+ 	 *
+ 	 * Includes buffers having the contents of their GPU caches
+-	 * flushed, not necessarily primitives.  last_rendering_seqno
++	 * flushed, not necessarily primitives.  last_read_req
+ 	 * represents when the rendering involved will be completed.
+ 	 *
+ 	 * A reference is held on the buffer while on this list.
+-- 
+1.7.9.5
+

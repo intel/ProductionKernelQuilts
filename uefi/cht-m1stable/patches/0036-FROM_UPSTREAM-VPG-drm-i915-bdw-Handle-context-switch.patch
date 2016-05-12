@@ -1,0 +1,372 @@
+From 3b3f6adadf4bd0d6ebb31183739a5495cb29da4f Mon Sep 17 00:00:00 2001
+Message-Id: <3b3f6adadf4bd0d6ebb31183739a5495cb29da4f.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Thomas Daniel <thomas.daniel@intel.com>
+Date: Thu, 24 Jul 2014 17:04:39 +0100
+Subject: [PATCH 36/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Handle context
+ switch events
+
+Handle all context status events in the context status buffer on every
+context switch interrupt. We only remove work from the execlist queue
+after a context status buffer reports that it has completed and we only
+attempt to schedule new contexts on interrupt when a previously submitted
+context completes (unless no contexts are queued, which means the GPU is
+free).
+
+We canot call intel_runtime_pm_get() in an interrupt (or with a spinlock
+grabbed, FWIW), because it might sleep, which is not a nice thing to do.
+Instead, do the runtime_pm get/put together with the create/destroy request,
+and handle the forcewake get/put directly.
+
+Signed-off-by: Thomas Daniel <thomas.daniel@intel.com>
+
+v2: Unreferencing the context when we are freeing the request might free
+the backing bo, which requires the struct_mutex to be grabbed, so defer
+unreferencing and freeing to a bottom half.
+
+v3:
+- Ack the interrupt inmediately, before trying to handle it (fix for
+missing interrupts by Bob Beckett <robert.beckett@intel.com>).
+- Update the Context Status Buffer Read Pointer, just in case (spotted
+by Damien Lespiau).
+
+v4: New namespace and multiple rebase changes.
+
+v5: Squash with "drm/i915/bdw: Do not call intel_runtime_pm_get() in an
+interrupt", as suggested by Daniel.
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+[danvet: Checkpatch ...]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit e981e7b17f2b41970e7e2367d4225e0bb3310667)
+
+Change-Id: Ic63fd6c54ecedf0870ec65a187a355274e451554
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: e981e7b17f2b41970e7e2367d4225e0bb3310667
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_irq.c         |   35 +++++---
+ drivers/gpu/drm/i915/intel_lrc.c        |  133 +++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_lrc.h        |    3 +
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    1 +
+ 4 files changed, 155 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 7127293..74b34f2 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1658,6 +1658,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_device *dev,
+ 				       struct drm_i915_private *dev_priv,
+ 				       u32 master_ctl)
+ {
++	struct intel_engine_cs *ring;
+ 	u32 rcs, bcs, vcs;
+ 	uint32_t tmp = 0;
+ 	irqreturn_t ret = IRQ_NONE;
+@@ -1667,14 +1668,20 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_device *dev,
+ 		if (tmp) {
+ 			I915_WRITE(GEN8_GT_IIR(0), tmp);
+ 			ret = IRQ_HANDLED;
++
+ 			rcs = tmp >> GEN8_RCS_IRQ_SHIFT;
+-			bcs = tmp >> GEN8_BCS_IRQ_SHIFT;
++			ring = &dev_priv->ring[RCS];
+ 			if (rcs & GT_RENDER_USER_INTERRUPT)
+-				notify_ring(dev, &dev_priv->ring[RCS]);
++				notify_ring(dev, ring);
++			if (rcs & GT_CONTEXT_SWITCH_INTERRUPT)
++				intel_execlists_handle_ctx_events(ring);
++
++			bcs = tmp >> GEN8_BCS_IRQ_SHIFT;
++			ring = &dev_priv->ring[BCS];
+ 			if (bcs & GT_RENDER_USER_INTERRUPT)
+-				notify_ring(dev, &dev_priv->ring[BCS]);
+-			if ((rcs | bcs) & GT_CONTEXT_SWITCH_INTERRUPT)
+-				DRM_DEBUG_DRIVER("TODO: Context switch\n");
++				notify_ring(dev, ring);
++			if (bcs & GT_CONTEXT_SWITCH_INTERRUPT)
++				intel_execlists_handle_ctx_events(ring);
+ 		} else
+ 			DRM_ERROR("The master control interrupt lied (GT0)!\n");
+ 	}
+@@ -1684,16 +1691,20 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_device *dev,
+ 		if (tmp) {
+ 			I915_WRITE(GEN8_GT_IIR(1), tmp);
+ 			ret = IRQ_HANDLED;
++
+ 			vcs = tmp >> GEN8_VCS1_IRQ_SHIFT;
++			ring = &dev_priv->ring[VCS];
+ 			if (vcs & GT_RENDER_USER_INTERRUPT)
+-				notify_ring(dev, &dev_priv->ring[VCS]);
++				notify_ring(dev, ring);
+ 			if (vcs & GT_CONTEXT_SWITCH_INTERRUPT)
+-				DRM_DEBUG_DRIVER("TODO: Context switch\n");
++				intel_execlists_handle_ctx_events(ring);
++
+ 			vcs = tmp >> GEN8_VCS2_IRQ_SHIFT;
++			ring = &dev_priv->ring[VCS2];
+ 			if (vcs & GT_RENDER_USER_INTERRUPT)
+-				notify_ring(dev, &dev_priv->ring[VCS2]);
++				notify_ring(dev, ring);
+ 			if (vcs & GT_CONTEXT_SWITCH_INTERRUPT)
+-				DRM_DEBUG_DRIVER("TODO: Context switch\n");
++				intel_execlists_handle_ctx_events(ring);
+ 		} else
+ 			DRM_ERROR("The master control interrupt lied (GT1)!\n");
+ 	}
+@@ -1714,11 +1725,13 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_device *dev,
+ 		if (tmp) {
+ 			I915_WRITE(GEN8_GT_IIR(3), tmp);
+ 			ret = IRQ_HANDLED;
++
+ 			vcs = tmp >> GEN8_VECS_IRQ_SHIFT;
++			ring = &dev_priv->ring[VECS];
+ 			if (vcs & GT_RENDER_USER_INTERRUPT)
+-				notify_ring(dev, &dev_priv->ring[VECS]);
++				notify_ring(dev, ring);
+ 			if (vcs & GT_CONTEXT_SWITCH_INTERRUPT)
+-				DRM_DEBUG_DRIVER("TODO: Context switch\n");
++				intel_execlists_handle_ctx_events(ring);
+ 		} else
+ 			DRM_ERROR("The master control interrupt lied (GT3)!\n");
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 9c812a4..6510f5b 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -49,6 +49,22 @@
+ #define RING_ELSP(ring)			((ring)->mmio_base+0x230)
+ #define RING_EXECLIST_STATUS(ring)	((ring)->mmio_base+0x234)
+ #define RING_CONTEXT_CONTROL(ring)	((ring)->mmio_base+0x244)
++#define RING_CONTEXT_STATUS_BUF(ring)	((ring)->mmio_base+0x370)
++#define RING_CONTEXT_STATUS_PTR(ring)	((ring)->mmio_base+0x3a0)
++
++#define RING_EXECLIST_QFULL		(1 << 0x2)
++#define RING_EXECLIST1_VALID		(1 << 0x3)
++#define RING_EXECLIST0_VALID		(1 << 0x4)
++#define RING_EXECLIST_ACTIVE_STATUS	(3 << 0xE)
++#define RING_EXECLIST1_ACTIVE		(1 << 0x11)
++#define RING_EXECLIST0_ACTIVE		(1 << 0x12)
++
++#define GEN8_CTX_STATUS_IDLE_ACTIVE	(1 << 0)
++#define GEN8_CTX_STATUS_PREEMPTED	(1 << 1)
++#define GEN8_CTX_STATUS_ELEMENT_SWITCH	(1 << 2)
++#define GEN8_CTX_STATUS_ACTIVE_IDLE	(1 << 3)
++#define GEN8_CTX_STATUS_COMPLETE	(1 << 4)
++#define GEN8_CTX_STATUS_LITE_RESTORE	(1 << 15)
+ 
+ #define CTX_LRI_HEADER_0		0x01
+ #define CTX_CONTEXT_CONTROL		0x02
+@@ -148,6 +164,7 @@ static void execlists_elsp_write(struct intel_engine_cs *ring,
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	uint64_t temp = 0;
+ 	uint32_t desc[4];
++	unsigned long flags;
+ 
+ 	/* XXX: You must always write both descriptors in the order below. */
+ 	if (ctx_obj1)
+@@ -161,9 +178,17 @@ static void execlists_elsp_write(struct intel_engine_cs *ring,
+ 	desc[3] = (u32)(temp >> 32);
+ 	desc[2] = (u32)temp;
+ 
+-	/* Set Force Wakeup bit to prevent GT from entering C6 while
+-	 * ELSP writes are in progress */
+-	gen6_gt_force_wake_get(dev_priv, FORCEWAKE_ALL);
++	/* Set Force Wakeup bit to prevent GT from entering C6 while ELSP writes
++	 * are in progress.
++	 *
++	 * The other problem is that we can't just call gen6_gt_force_wake_get()
++	 * because that function calls intel_runtime_pm_get(), which might sleep.
++	 * Instead, we do the runtime_pm_get/put when creating/destroying requests.
++	 */
++	spin_lock_irqsave(&dev_priv->uncore.lock, flags);
++	if (dev_priv->uncore.forcewake_count++ == 0)
++		dev_priv->uncore.funcs.force_wake_get(dev_priv, FORCEWAKE_ALL);
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, flags);
+ 
+ 	I915_WRITE(RING_ELSP(ring), desc[1]);
+ 	I915_WRITE(RING_ELSP(ring), desc[0]);
+@@ -174,7 +199,11 @@ static void execlists_elsp_write(struct intel_engine_cs *ring,
+ 	/* ELSP is a wo register, so use another nearby reg for posting instead */
+ 	POSTING_READ(RING_EXECLIST_STATUS(ring));
+ 
+-	gen6_gt_force_wake_put(dev_priv, FORCEWAKE_ALL);
++	/* Release Force Wakeup (see the big comment above). */
++	spin_lock_irqsave(&dev_priv->uncore.lock, flags);
++	if (--dev_priv->uncore.forcewake_count == 0)
++		dev_priv->uncore.funcs.force_wake_put(dev_priv, FORCEWAKE_ALL);
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, flags);
+ }
+ 
+ static int execlists_ctx_write_tail(struct drm_i915_gem_object *ctx_obj, u32 tail)
+@@ -222,6 +251,9 @@ static void execlists_context_unqueue(struct intel_engine_cs *ring)
+ {
+ 	struct intel_ctx_submit_request *req0 = NULL, *req1 = NULL;
+ 	struct intel_ctx_submit_request *cursor = NULL, *tmp = NULL;
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++
++	assert_spin_locked(&ring->execlist_lock);
+ 
+ 	if (list_empty(&ring->execlist_queue))
+ 		return;
+@@ -235,8 +267,7 @@ static void execlists_context_unqueue(struct intel_engine_cs *ring)
+ 			/* Same ctx: ignore first request, as second request
+ 			 * will update tail past first request's workload */
+ 			list_del(&req0->execlist_link);
+-			i915_gem_context_unreference(req0->ctx);
+-			kfree(req0);
++			queue_work(dev_priv->wq, &req0->work);
+ 			req0 = cursor;
+ 		} else {
+ 			req1 = cursor;
+@@ -249,11 +280,98 @@ static void execlists_context_unqueue(struct intel_engine_cs *ring)
+ 					 req1 ? req1->tail : 0));
+ }
+ 
++static bool execlists_check_remove_request(struct intel_engine_cs *ring,
++					   u32 request_id)
++{
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	struct intel_ctx_submit_request *head_req;
++
++	assert_spin_locked(&ring->execlist_lock);
++
++	head_req = list_first_entry_or_null(&ring->execlist_queue,
++					    struct intel_ctx_submit_request,
++					    execlist_link);
++
++	if (head_req != NULL) {
++		struct drm_i915_gem_object *ctx_obj =
++				head_req->ctx->engine[ring->id].state;
++		if (intel_execlists_ctx_id(ctx_obj) == request_id) {
++			list_del(&head_req->execlist_link);
++			queue_work(dev_priv->wq, &head_req->work);
++			return true;
++		}
++	}
++
++	return false;
++}
++
++void intel_execlists_handle_ctx_events(struct intel_engine_cs *ring)
++{
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	u32 status_pointer;
++	u8 read_pointer;
++	u8 write_pointer;
++	u32 status;
++	u32 status_id;
++	u32 submit_contexts = 0;
++
++	status_pointer = I915_READ(RING_CONTEXT_STATUS_PTR(ring));
++
++	read_pointer = ring->next_context_status_buffer;
++	write_pointer = status_pointer & 0x07;
++	if (read_pointer > write_pointer)
++		write_pointer += 6;
++
++	spin_lock(&ring->execlist_lock);
++
++	while (read_pointer < write_pointer) {
++		read_pointer++;
++
++		status = I915_READ(RING_CONTEXT_STATUS_BUF(ring) +
++				(read_pointer % 6) * 8);
++		status_id = I915_READ(RING_CONTEXT_STATUS_BUF(ring) +
++				(read_pointer % 6) * 8 + 4);
++
++		if (status & GEN8_CTX_STATUS_COMPLETE) {
++			if (execlists_check_remove_request(ring, status_id))
++				submit_contexts++;
++		}
++	}
++
++	if (submit_contexts != 0)
++		execlists_context_unqueue(ring);
++
++	spin_unlock(&ring->execlist_lock);
++
++	WARN(submit_contexts > 2, "More than two context complete events?\n");
++	ring->next_context_status_buffer = write_pointer % 6;
++
++	I915_WRITE(RING_CONTEXT_STATUS_PTR(ring),
++		   ((u32)ring->next_context_status_buffer & 0x07) << 8);
++}
++
++static void execlists_free_request_task(struct work_struct *work)
++{
++	struct intel_ctx_submit_request *req =
++		container_of(work, struct intel_ctx_submit_request, work);
++	struct drm_device *dev = req->ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	intel_runtime_pm_put(dev_priv);
++
++	mutex_lock(&dev->struct_mutex);
++	i915_gem_context_unreference(req->ctx);
++	mutex_unlock(&dev->struct_mutex);
++
++	kfree(req);
++}
++
+ static int execlists_context_queue(struct intel_engine_cs *ring,
+ 				   struct intel_context *to,
+ 				   u32 tail)
+ {
+ 	struct intel_ctx_submit_request *req = NULL;
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	unsigned long flags;
+ 	bool was_empty;
+ 
+@@ -264,6 +381,9 @@ static int execlists_context_queue(struct intel_engine_cs *ring,
+ 	i915_gem_context_reference(req->ctx);
+ 	req->ring = ring;
+ 	req->tail = tail;
++	INIT_WORK(&req->work, execlists_free_request_task);
++
++	intel_runtime_pm_get(dev_priv);
+ 
+ 	spin_lock_irqsave(&ring->execlist_lock, flags);
+ 
+@@ -905,6 +1025,7 @@ static int logical_ring_init(struct drm_device *dev, struct intel_engine_cs *rin
+ 
+ 	INIT_LIST_HEAD(&ring->execlist_queue);
+ 	spin_lock_init(&ring->execlist_lock);
++	ring->next_context_status_buffer = 0;
+ 
+ 	ret = intel_lr_context_deferred_create(dctx, ring);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index 3c389b3..a3f135c 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -65,6 +65,9 @@ struct intel_ctx_submit_request {
+ 	u32 tail;
+ 
+ 	struct list_head execlist_link;
++	struct work_struct work;
+ };
+ 
++void intel_execlists_handle_ctx_events(struct intel_engine_cs *ring);
++
+ #endif /* _INTEL_LRC_H_ */
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 50b82cd..126369f 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -167,6 +167,7 @@ struct  intel_engine_cs {
+ 	/* Execlists */
+ 	spinlock_t execlist_lock;
+ 	struct list_head execlist_queue;
++	u8 next_context_status_buffer;
+ 	u32             irq_keep_mask; /* bitmask for interrupts that should not be masked */
+ 	int		(*emit_request)(struct intel_ringbuffer *ringbuf);
+ 	int		(*emit_flush)(struct intel_ringbuffer *ringbuf,
+-- 
+1.7.9.5
+

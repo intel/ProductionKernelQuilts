@@ -1,0 +1,458 @@
+From 12bbea5a5f1622cc948db3360ffb3ff7a8f4c246 Mon Sep 17 00:00:00 2001
+From: Sumeet Pawnikar <sumeet.r.pawnikar@intel.com>
+Date: Tue, 28 Apr 2015 06:41:45 +0530
+Subject: [PATCH] [TYPE_C]: Add support for Type-C phy driver
+
+This patch enables the phy driver functionalities for Type-C and Power
+Delivery. Basically the Type-C phy driver provide the Type-C phy data
+and also
+which can get cable orientation from the phy data.
+
+Change-Id: I099091ef425b9a300dd6e62506323d0917e373d6
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-20615
+Signed-off-by: Albin B <albin.bala.krishnan@intel.com>
+Signed-off-by: R, Kannappan <r.kannappan@intel.com>
+Signed-off-by: Pavan Kumar S <pavan.kumar.s@intel.com>
+---
+ drivers/usb/Kconfig               |  15 +++
+ drivers/usb/Makefile              |   2 +
+ drivers/usb/typec/Kconfig         |   7 ++
+ drivers/usb/typec/Makefile        |   1 +
+ drivers/usb/typec/usb_typec_phy.c | 114 ++++++++++++++++++
+ include/linux/usb_typec_phy.h     | 238 ++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 377 insertions(+)
+ create mode 100644 drivers/usb/typec/Kconfig
+ create mode 100644 drivers/usb/typec/Makefile
+ create mode 100644 drivers/usb/typec/usb_typec_phy.c
+ create mode 100644 include/linux/usb_typec_phy.h
+
+diff --git a/drivers/usb/Kconfig b/drivers/usb/Kconfig
+index 2e6b832..24b4862 100644
+--- a/drivers/usb/Kconfig
++++ b/drivers/usb/Kconfig
+@@ -84,6 +84,15 @@ config USB
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called usbcore.
+ 
++config USB_TYPEC
++       tristate "support usb typec connector"
++       ---help---
++         USB Type-C is a new connector type defined by USB specification,
++         which will be widely used for USB connections across the devices.
++         It promotes commonly used connectors for USB communications across
++         devices, working seemlessly with existing solutions. Also provides
++         non-USB data-path options like display, audio, etc.
++
+ if USB
+ 
+ source "drivers/usb/core/Kconfig"
+@@ -104,6 +113,12 @@ source "drivers/usb/image/Kconfig"
+ 
+ endif
+ 
++if USB_TYPEC
++
++source "drivers/usb/typec/Kconfig"
++
++endif
++
+ source "drivers/usb/musb/Kconfig"
+ 
+ source "drivers/usb/dwc3/Kconfig"
+diff --git a/drivers/usb/Makefile b/drivers/usb/Makefile
+index 1ae2bf3..3e4772b 100644
+--- a/drivers/usb/Makefile
++++ b/drivers/usb/Makefile
+@@ -59,3 +59,5 @@ obj-$(CONFIG_USB_RENESAS_USBHS)	+= renesas_usbhs/
+ obj-$(CONFIG_USB_GADGET)	+= gadget/
+ 
+ obj-$(CONFIG_USB_COMMON)	+= usb-common.o
++
++obj-$(CONFIG_USB_TYPEC)		+= typec/
+diff --git a/drivers/usb/typec/Kconfig b/drivers/usb/typec/Kconfig
+new file mode 100644
+index 0000000..3ac3546d
+--- /dev/null
++++ b/drivers/usb/typec/Kconfig
+@@ -0,0 +1,7 @@
++config USB_TYPEC_CORE
++	bool "Support for Type-C"
++	depends on USB_TYPEC
++	help
++	  Say Y here if your system has a Type-C connector support
++	  for USB controller based on the USB phy IP Core.
++
+diff --git a/drivers/usb/typec/Makefile b/drivers/usb/typec/Makefile
+new file mode 100644
+index 0000000..aea9f25
+--- /dev/null
++++ b/drivers/usb/typec/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_USB_TYPEC_CORE) += usb_typec_phy.o
+diff --git a/drivers/usb/typec/usb_typec_phy.c b/drivers/usb/typec/usb_typec_phy.c
+new file mode 100644
+index 0000000..42d4162
+--- /dev/null
++++ b/drivers/usb/typec/usb_typec_phy.c
+@@ -0,0 +1,114 @@
++/*
++ * usb_typec_phy.c: usb phy driver for type-c cable connector
++ *
++ * Copyright (C) 2014 Intel Corporation
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. Seee the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ * Author: Kannappan, R <r.kannappan@intel.com>
++ */
++
++#include <linux/slab.h>
++#include <linux/export.h>
++#include <linux/sched.h>
++#include <linux/usb_typec_phy.h>
++
++static LIST_HEAD(typec_phy_list);
++static spinlock_t typec_irq_lock;
++
++struct typec_phy *typec_get_phy(int type)
++{
++	struct typec_phy *phy;
++	unsigned long flags;
++
++	spin_lock_irqsave(&typec_irq_lock, flags);
++	list_for_each_entry(phy, &typec_phy_list, list) {
++		if (phy->type != type)
++			continue;
++		spin_unlock_irqrestore(&typec_irq_lock, flags);
++		return phy;
++	}
++	spin_unlock_irqrestore(&typec_irq_lock, flags);
++
++	return ERR_PTR(-ENODEV);
++}
++EXPORT_SYMBOL_GPL(typec_get_phy);
++
++int typec_get_cc_orientation(struct typec_phy *x)
++{
++	struct typec_phy *phy;
++	unsigned long flags;
++
++	if (x) {
++		spin_lock_irqsave(&typec_irq_lock, flags);
++		list_for_each_entry(phy, &typec_phy_list, list) {
++			if (phy == x) {
++				spin_unlock_irqrestore(&typec_irq_lock, flags);
++				switch (phy->valid_cc) {
++				case TYPEC_PIN_CC1:
++					return TYPEC_POS_NORMAL;
++				case TYPEC_PIN_CC2:
++					return TYPEC_POS_SWAP;
++				default:
++					return TYPEC_POS_DISCONNECT;
++				}
++			}
++		}
++		spin_unlock_irqrestore(&typec_irq_lock, flags);
++	}
++
++	return -EINVAL;
++}
++EXPORT_SYMBOL_GPL(typec_get_cc_orientation);
++
++int typec_add_phy(struct typec_phy *phy)
++{
++	if (phy) {
++		phy->type = USB_TYPE_C;
++		phy->state = TYPEC_STATE_UNKNOWN;
++		ATOMIC_INIT_NOTIFIER_HEAD(&phy->notifier);
++		ATOMIC_INIT_NOTIFIER_HEAD(&phy->prot_notifier);
++		list_add_tail(&phy->list, &typec_phy_list);
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++int typec_remove_phy(struct typec_phy *x)
++{
++	struct typec_phy *phy;
++	unsigned long flags;
++
++	if (x) {
++		spin_lock_irqsave(&typec_irq_lock, flags);
++		list_for_each_entry(phy, &typec_phy_list, list) {
++			if (phy == x)
++				list_del(&phy->list);
++		}
++		spin_unlock_irqrestore(&typec_irq_lock, flags);
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static int __init phy_init(void)
++{
++	spin_lock_init(&typec_irq_lock);
++	return 0;
++}
++arch_initcall(phy_init);
+diff --git a/include/linux/usb_typec_phy.h b/include/linux/usb_typec_phy.h
+new file mode 100644
+index 0000000..1b4d36d
+--- /dev/null
++++ b/include/linux/usb_typec_phy.h
+@@ -0,0 +1,238 @@
++/*
++ * usb_typec_phy.h: usb type-c phy layer header file
++ *
++ * Copyright (C) 2014 Intel Corporation
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. Seee the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ * Author: Kannappan, R <r.kannappan@intel.com>
++ */
++
++#ifndef __USB_TYPEC_PHY_H__
++#define __USB_TYPEC_PHY_H__
++
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/notifier.h>
++#include <linux/errno.h>
++
++enum typec_state {
++	TYPEC_STATE_UNKNOWN,
++	TYPEC_STATE_POWERED,
++	TYPEC_STATE_UNATTACHED_UFP,
++	TYPEC_STATE_UNATTACHED_DFP,
++	TYPEC_STATE_ATTACHED_UFP,
++	TYPEC_STATE_ATTACHED_DFP,
++};
++
++enum typec_cc_pin {
++	TYPEC_PIN_CC1 = 1,
++	TYPEC_PIN_CC2 = 2,
++};
++
++enum typec_orientation {
++	TYPEC_POS_DISCONNECT,
++	TYPEC_POS_NORMAL,
++	TYPEC_POS_SWAP,
++};
++
++enum typec_current {
++	TYPEC_CURRENT_UNKNOWN = 0,
++	TYPEC_CURRENT_USB = 500,
++	TYPEC_CURRENT_1500 = 1500,
++	TYPEC_CURRENT_3000 = 3000
++};
++
++enum typec_cc_level {
++	USB_TYPEC_CC_VRD_UNKNOWN = -1,
++	USB_TYPEC_CC_VRA,
++	USB_TYPEC_CC_VRD_USB,
++	USB_TYPEC_CC_VRD_1500,
++	USB_TYPEC_CC_VRD_3000,
++};
++
++enum typec_event {
++	TYPEC_EVENT_UNKNOWN,
++	TYPEC_EVENT_VBUS,
++	TYPEC_EVENT_DRP,
++	TYPEC_EVENT_TIMER,
++	TYPEC_EVENT_NONE,
++	TYPEC_EVENT_DEV_SUSPEND,
++	TYPEC_EVENT_DEV_RESUME,
++	TYPEC_EVENT_DEV_REMOVE,
++};
++
++enum typec_mode {
++	TYPEC_MODE_UNKNOWN,
++	TYPEC_MODE_DFP,
++	TYPEC_MODE_UFP,
++	TYPEC_MODE_DRP,
++};
++
++enum typec_type {
++	USB_TYPE_C
++};
++
++struct typec_cc_psy {
++	enum typec_cc_level v_rd;
++	enum typec_current cur;
++};
++
++struct typec_phy;
++
++struct typec_ops {
++	/* Callback for setting host-current */
++	int (*set_host_current)(struct typec_phy *phy, enum typec_current cur);
++	/* Callback for getting host-current */
++	enum typec_current (*get_host_current)(struct typec_phy *phy);
++	/* Callback for measuring cc */
++	int (*measure_cc)(struct typec_phy *phy, enum typec_cc_pin pin,
++			struct typec_cc_psy *cc_psy, unsigned long timeout);
++	/* Callback for switching between pull-up & pull-down */
++	int (*switch_mode)(struct typec_phy *phy, enum typec_mode mode);
++	/* Callback for setting-up cc */
++	int (*setup_cc)(struct typec_phy *phy, enum typec_cc_pin cc,
++					enum typec_state state);
++};
++
++struct bmc_ops {
++	int pd_revision;
++	int (*send_packet)(struct typec_phy *phy, void *msg, int len);
++	int (*recv_packet)(struct typec_phy *phy, void *msg);
++};
++
++struct typec_phy {
++	const char *label;
++	struct device *dev;
++	struct typec_ops ops;
++	enum typec_type type;
++	enum typec_state state;
++	enum typec_cc_pin valid_cc;
++	bool valid_ra;
++
++	struct list_head list;
++	spinlock_t irq_lock;
++	struct atomic_notifier_head notifier;
++	struct atomic_notifier_head prot_notifier;
++
++	int (*notify_connect)(struct typec_phy *phy, enum typec_cc_level lvl);
++	int (*notify_disconnect)(struct typec_phy *phy);
++
++	int (*init)(struct typec_phy *phy);
++	int (*shutdown)(struct typec_phy *phy);
++	int (*get_pd_version)(struct typec_phy *phy);
++	bool (*is_pd_capable)(struct typec_phy *phy);
++};
++
++extern int typec_add_phy(struct typec_phy *phy);
++extern int typec_remove_phy(struct typec_phy *phy);
++struct typec_phy *typec_get_phy(int type);
++int typec_get_cc_orientation(struct typec_phy *phy);
++
++static inline int typec_phy_init(struct typec_phy *phy)
++{
++	if (phy && phy->init)
++		return phy->init(phy);
++	return -ENOTSUPP;
++}
++
++static inline int typec_phy_shutdown(struct typec_phy *phy)
++{
++	if (phy && phy->shutdown)
++		return phy->shutdown(phy);
++	return -ENOTSUPP;
++}
++
++static inline int typec_set_host_current(struct typec_phy *phy,
++		enum typec_current cur)
++{
++	if (phy && phy->ops.set_host_current)
++		return phy->ops.set_host_current(phy, cur);
++	return -ENOTSUPP;
++}
++
++static inline enum typec_current typec_get_host_current(struct typec_phy *phy)
++{
++	if (phy && phy->ops.get_host_current)
++		return phy->ops.get_host_current(phy);
++	return -ENOTSUPP;
++}
++
++static inline int typec_notify_connect(struct typec_phy *phy,
++			enum typec_cc_level lvl)
++{
++	if (phy && phy->notify_connect)
++		return phy->notify_connect(phy, lvl);
++	return -ENOTSUPP;
++}
++
++static inline int typec_notify_disconnect(struct typec_phy *phy)
++{
++	if (phy && phy->notify_disconnect)
++		return phy->notify_disconnect(phy);
++	return -ENOTSUPP;
++}
++
++static inline int
++typec_measure_cc(struct typec_phy *phy, int pin,
++		struct typec_cc_psy *cc_psy, unsigned long timeout)
++{
++	if (phy && phy->ops.measure_cc)
++		return phy->ops.measure_cc(phy, pin, cc_psy, timeout);
++	return -ENOTSUPP;
++}
++
++
++static inline int
++typec_register_notifier(struct typec_phy *phy, struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&phy->notifier, nb);
++}
++
++static inline int
++typec_unregister_notifier(struct typec_phy *phy, struct notifier_block *nb)
++{
++	return atomic_notifier_chain_unregister(&phy->notifier, nb);
++}
++
++static inline int
++typec_switch_mode(struct typec_phy *phy, enum typec_mode mode)
++{
++	if (phy && phy->ops.switch_mode)
++		return phy->ops.switch_mode(phy, mode);
++	return -ENOTSUPP;
++}
++
++static inline int typec_setup_cc(struct typec_phy *phy, enum typec_cc_pin cc,
++					enum typec_state state)
++{
++	if (phy && phy->ops.setup_cc)
++		return phy->ops.setup_cc(phy, cc, state);
++	return -ENOTSUPP;
++}
++
++static inline int typec_register_prot_notifier(struct typec_phy *phy,
++						struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&phy->prot_notifier, nb);
++}
++
++static inline int typec_unregister_prot_notifier(struct typec_phy *phy,
++						struct notifier_block *nb)
++{
++	return atomic_notifier_chain_unregister(&phy->prot_notifier, nb);
++}
++#endif /* __USB_TYPEC_PHY_H__ */
+-- 
+1.9.1
+

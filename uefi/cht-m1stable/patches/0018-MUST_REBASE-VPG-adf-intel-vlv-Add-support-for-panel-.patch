@@ -1,0 +1,275 @@
+From 69e295d8f83de3c38a5e0c2afdd35432451da98f Mon Sep 17 00:00:00 2001
+Message-Id: <69e295d8f83de3c38a5e0c2afdd35432451da98f.1424979244.git.feitong.yi@intel.com>
+In-Reply-To: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+References: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Wed, 28 Jan 2015 12:19:22 +0530
+Subject: [PATCH 18/28] MUST_REBASE [VPG]: adf/intel/vlv: Add support for
+ panel fitter
+
+Enable panel fitter by default on pipe A
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-4647
+Change-Id: I5e73f2a37f4e0a84c9c3f84000004f8d51df665f
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/vlv_pm.c          |   96 ++++++++++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_sp_plane.c    |   57 ++++++++++++
+ .../video/adf/intel/include/core/intel_dc_config.h |    6 ++
+ .../adf/intel/include/core/vlv/vlv_dc_config.h     |    1 +
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |    1 +
+ 5 files changed, 161 insertions(+)
+
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pm.c b/drivers/video/adf/intel/core/vlv/vlv_pm.c
+index d3847fd..ab58842 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pm.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pm.c
+@@ -181,6 +181,14 @@ void vlv_pm_on_post(struct intel_dc_config *intel_config,
+ 		}
+ 		config->status.maxfifo_enabled = true;
+ 	}
++
++	/* Update the panel fitter */
++	if (config->status.pfit_changed) {
++		REG_WRITE(PFIT_CONTROL, pipe->pipe_reg.pfit_control);
++		REG_WRITE(PIPESRC(pipe->base.idx),
++				pipe->pipe_reg.scaling_src_size);
++		config->status.pfit_changed = false;
++	}
+ }
+ 
+ void vlv_pm_pre_validate(struct intel_dc_config *intel_config,
+@@ -190,8 +198,15 @@ void vlv_pm_pre_validate(struct intel_dc_config *intel_config,
+ 	struct vlv_dc_config *config = to_vlv_dc_config(intel_config);
+ 	struct vlv_pipeline *pipeline = to_vlv_pipeline(intel_pipeline);
+ 	struct intel_adf_config *custom_config;
++	struct intel_adf_panelfitter *pfit = NULL;
++	struct dsi_pipe *dsi_pipe = NULL;
++	struct hdmi_pipe *hdmi_pipe = NULL;
++	struct dp_pipe *dp_pipe = NULL;
++	struct drm_mode_modeinfo mode;
+ 	u32 pipe_plane_stat = config->status.pipe_plane_status;
+ 	u32 pipe_stat = pipe_plane_stat & 0xF0000000;
++	u32 pfit_control = 0, pfitcontrol = 0;
++	u32 scaled_src = 0;
+ 	u8 i = 0, planes_enabled = 0;
+ 	u32 val = 0;
+ 
+@@ -201,6 +216,87 @@ void vlv_pm_pre_validate(struct intel_dc_config *intel_config,
+ 		/* Get the number of planes enabled */
+ 		if (custom_config->type == INTEL_ADF_CONFIG_PLANE)
+ 			planes_enabled++;
++
++		if (custom_config->type == INTEL_ADF_CONFIG_PANELFITTER) {
++			pfit = &custom_config->panelfitter;
++
++			/* handle panel fitter requests */
++			if (pfit->flags & INTEL_ADF_PANELFITTER_HINT_UNCHANGED)
++				continue;
++
++			/* get the scaled source size */
++			scaled_src = ((pfit->src.w - 1) << 16) |
++				((pfit->src.h - 1));
++			pipe->pipe_reg.scaling_src_size = scaled_src;
++
++			if (pfit->flags & INTEL_ADF_PANELFITTER_DISABLE) {
++				pfit = NULL;
++				continue;
++			}
++
++			/* Update the flag to say change in the panel fitter */
++			config->status.pfit_changed = true;
++
++			pfit_control = REG_READ(PFIT_CONTROL);
++			pfitcontrol = pfit_control;
++
++			/* Dynamic changing of pfit to diff pipe */
++			if ((((pfit_control & PFIT_PIPE_MASK) >>
++				PFIT_PIPE_SHIFT) != pipe->base.idx) &&
++				(pfit_control & PFIT_ENABLE)) {
++				pr_err("ADF:PFIT:Error:pfit is already enabled on other pipe");
++				config->status.pfit_changed = false;
++				continue;
++			}
++			pfit_control &= PFIT_PIPE_MASK;
++			pfit_control |= (pipe->base.idx << PFIT_PIPE_SHIFT);
++
++			pfit_control |= PFIT_ENABLE;
++			pfit_control &= MASK_PFIT_SCALING_MODE;
++			if (pfit->flags & INTEL_ADF_PANELFITTER_AUTO)
++				pfit_control |= PFIT_SCALING_AUTO;
++			else if (pfit->flags & INTEL_ADF_PANELFITTER_LETTERBOX)
++				pfit_control |= PFIT_SCALING_LETTER;
++			else if (pfit->flags & INTEL_ADF_PANELFITTER_PILLARBOX)
++				pfit_control |= PFIT_SCALING_PILLAR;
++			pipe->pipe_reg.pfit_control = pfit_control;
++			if (pfit_control == pfitcontrol)
++				config->status.pfit_changed = false;
++		}
++
++	}
++
++	/* If no pfit config and post partial is not set then disable pfit */
++	if (pfit == NULL && !(custom->flags & INTEL_ADF_POST_PARTIAL)) {
++		pfit_control = REG_READ(PFIT_CONTROL);
++		pfitcontrol = pfit_control;
++		if (pfit_control & PFIT_ENABLE) {
++			pfit_control &= ~PFIT_ENABLE;
++			pipe->pipe_reg.pfit_control = pfit_control;
++
++			/* set pipe src to 1:1 */
++			if (pipe->type == INTEL_PIPE_DSI) {
++				dsi_pipe = to_dsi_pipe(pipe);
++				dsi_pipe->panel->ops->get_config_mode(
++						&dsi_pipe->config, &mode);
++			} else if (pipe->type == INTEL_PIPE_HDMI) {
++				hdmi_pipe = hdmi_pipe_from_intel_pipe(pipe);
++				pipe->ops->get_current_mode(pipe, &mode);
++			} else if ((pipe->type == INTEL_PIPE_DP) ||
++					(pipe->type == INTEL_PIPE_EDP)) {
++				dp_pipe = to_dp_pipe(pipe);
++				pipe->ops->get_current_mode(pipe, &mode);
++			} else  {
++				pr_err("ADF: pm:pre_validate: unknown pipe type-%d",
++						pipe->type);
++				return;
++			}
++			pipe->pipe_reg.scaling_src_size = ((mode.hdisplay - 1)
++					<< 16) | (mode.vdisplay - 1);
++
++			/* panel fitter updated */
++			config->status.pfit_changed = true;
++		}
+ 	}
+ 
+ 	/* If we are moving to multiple plane then disable maxfifo */
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+index 2a6d4cd..8e6ef69 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+@@ -226,6 +226,54 @@ static void vlv_sp_pane_save_ddl(struct vlv_sp_plane *splane, u32 ddl)
+ 		(plane ? true : false), ddl);
+ }
+ 
++void vlv_get_pfit_mode(struct intel_plane_config *config,
++		struct intel_plane *plane)
++{
++	struct intel_pipe *intel_pipe = plane->pipe;
++	struct dsi_pipe *dsi_pipe = NULL;
++	struct hdmi_pipe *hdmi_pipe = NULL;
++	struct dp_pipe *dp_pipe = NULL;
++	struct drm_mode_modeinfo mode;
++	u32 scaled_width = 0;
++	u32 scaled_height = 0;
++	u32 pfit_control = intel_pipe->pipe_reg.pfit_control;
++
++	if (intel_pipe->type == INTEL_PIPE_DSI) {
++		dsi_pipe = to_dsi_pipe(intel_pipe);
++		dsi_pipe->panel->ops->get_config_mode(&dsi_pipe->config, &mode);
++	} else if (intel_pipe->type == INTEL_PIPE_HDMI) {
++		hdmi_pipe = hdmi_pipe_from_intel_pipe(intel_pipe);
++		intel_pipe->ops->get_current_mode(intel_pipe, &mode);
++	} else if ((intel_pipe->type == INTEL_PIPE_DP) ||
++		   (intel_pipe->type == INTEL_PIPE_EDP)) {
++		dp_pipe = to_dp_pipe(intel_pipe);
++		intel_pipe->ops->get_current_mode(intel_pipe, &mode);
++	} else  {
++		pr_err("ADF: sp:get_pfit_mode: unknown pipe type-%d",
++				intel_pipe->type);
++		return;
++	}
++	scaled_width = mode.hdisplay * config->src_h;
++	scaled_height = config->src_w * mode.vdisplay;
++	if (scaled_width > scaled_height) {
++		pfit_control &= MASK_PFIT_SCALING_MODE;
++		pfit_control |= PFIT_SCALING_PILLAR;
++	} else if (scaled_width < scaled_height) {
++		pfit_control &=  MASK_PFIT_SCALING_MODE;
++		pfit_control |= PFIT_SCALING_LETTER;
++	} else if (!(mode.hdisplay <= (config->src_w+25) &&
++			mode.hdisplay >= (config->src_w-25))) {
++		/*
++		 * TODO: If native width doest not lies b/n src layer
++		 * width-25 and width+25, we put pfit in auto scale,
++		 * not expecting variation more than 25
++		 */
++		pfit_control &=  MASK_PFIT_SCALING_MODE;
++		pfit_control |= PFIT_SCALING_AUTO;
++	}
++	intel_pipe->pipe_reg.pfit_control = pfit_control;
++}
++
+ static int vlv_sp_calculate(struct intel_plane *planeptr,
+ 			struct intel_buffer *buf,
+ 			struct intel_plane_config *config)
+@@ -254,6 +302,15 @@ static int vlv_sp_calculate(struct intel_plane *planeptr,
+ 	u32 dst_y = config->dst_y & VLV_SP_12BIT_MASK;
+ 	u8 i = 0;
+ 
++	/*
++	 * While disabling the panel fitter in decremental sequence, the scalar
++	 * mode is decided on the present resolution.
++	 */
++	if (vlv_config->status.pfit_changed &&
++			!(intel_pipe->pipe_reg.pfit_control & PFIT_ENABLE) &&
++			planeptr->pipe)
++		vlv_get_pfit_mode(config, planeptr);
++
+ 	/* Z-order */
+ 	s1_zorder = (order >> 3) & 0x1;
+ 	s1_bottom = (order >> 2) & 0x1;
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 491075e..f9595d6 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -478,6 +478,11 @@ struct intel_clock {
+ 	u32 p;
+ };
+ 
++struct intel_pipe_reg {
++	u32 pfit_control;
++	u32 scaling_src_size;
++};
++
+ struct intel_pipe {
+ 	struct intel_dc_component base;
+ 	bool primary;
+@@ -493,6 +498,7 @@ struct intel_pipe {
+ 	 * one shot later in flip calls
+ 	 */
+ 	struct pri_plane_regs regs;
++	struct intel_pipe_reg pipe_reg;
+ 	struct color_capabilities *color_ctx;
+ };
+ 
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+index 6593a57..f9c1c35 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+@@ -215,6 +215,7 @@ struct vlv_pipeline {
+ struct vlv_global_status {
+ 	bool maxfifo_enabled;
+ 	bool ddr_dvfs_enabled;
++	bool pfit_changed;
+ 	u32 pipe_plane_status;
+ };
+ 
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index 9fbc0ef..53d1e9b 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -2748,6 +2748,7 @@ extern int chv_cursor_offsets[];
+ #define   PFIT_SCALING_PROGRAMMED (1 << 26)
+ #define   PFIT_SCALING_PILLAR	(2 << 26)
+ #define   PFIT_SCALING_LETTER	(3 << 26)
++#define   MASK_PFIT_SCALING_MODE (0xe3ffffff)
+ #define PFIT_PGM_RATIOS	(VLV_DISPLAY_BASE + 0x61234)
+ /* Pre-965 */
+ #define		PFIT_VERT_SCALE_SHIFT		20
+-- 
+1.7.9.5
+

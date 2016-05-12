@@ -1,0 +1,126 @@
+From 686629a09eaacbfd934c8e9548969a48d7f1c875 Mon Sep 17 00:00:00 2001
+Message-Id: <686629a09eaacbfd934c8e9548969a48d7f1c875.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Shobhit Kumar <shobhit.kumar@intel.com>
+Date: Wed, 8 Oct 2014 17:58:09 +0530
+Subject: [PATCH 52/75] MUST_REBASE [VPG]: adf/intel/vlv: Add new pipe_op to
+ check hardware state
+
+In the disable path we can check the hardware state before disabling.
+Can be used for software/hardware state tracking for debugging later
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I32db74dadaf3a63773847ad2907fb3b86a825d5a
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ .../video/adf/intel/core/common/dsi/dsi_pipe_ops.c |   17 +++++++++++++++++
+ .../video/adf/intel/core/common/dsi/gen_dsi_pipe.c |    1 +
+ .../video/adf/intel/core/common/dsi/intel_dsi.h    |    1 +
+ drivers/video/adf/intel/core/vlv/vlv_mode_set.c    |   15 +++++++++++----
+ .../adf/intel/include/core/common/dsi/dsi_pipe.h   |    1 +
+ 5 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c b/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c
+index 619b0dc..d758831 100644
+--- a/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c
++++ b/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c
+@@ -640,3 +640,20 @@ int intel_adf_dsi_soc_backlight_off(struct dsi_pipe *dsi_pipe)
+ 	udelay(500);
+ 	return 0;
+ }
++
++bool intel_adf_dsi_get_hw_state(struct dsi_pipe *dsi_pipe)
++{
++	struct dsi_config *config = &dsi_pipe->config;
++	int pipe = config->pipe;
++	u32 port = REG_READ(MIPI_PORT_CTRL(pipe));
++	u32 func = REG_READ(MIPI_DSI_FUNC_PRG(pipe));
++
++	if ((port & DPI_ENABLE) || (func & CMD_MODE_DATA_WIDTH_MASK)) {
++		if (REG_READ(MIPI_DEVICE_READY(pipe)) & DEVICE_READY)
++			return true;
++		else
++			return false;
++	}
++
++	return false;
++}
+diff --git a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+index 40eb736..1f7c2ad 100644
+--- a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
++++ b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+@@ -504,6 +504,7 @@ int dsi_pipe_init(struct dsi_pipe *pipe, struct device *dev,
+ 	pipe->ops.set_event = intel_adf_dsi_set_events;
+ 	pipe->ops.get_events = intel_adf_dsi_get_events;
+ 	pipe->ops.handle_events = intel_adf_dsi_handle_events;
++	pipe->ops.get_hw_state = intel_adf_dsi_get_hw_state;
+ 	pipe->dpms_state = DRM_MODE_DPMS_OFF;
+ 
+ 	pipe->panel = panel;
+diff --git a/drivers/video/adf/intel/core/common/dsi/intel_dsi.h b/drivers/video/adf/intel/core/common/dsi/intel_dsi.h
+index 5acc9b0..d467240 100644
+--- a/drivers/video/adf/intel/core/common/dsi/intel_dsi.h
++++ b/drivers/video/adf/intel/core/common/dsi/intel_dsi.h
+@@ -44,6 +44,7 @@ extern void intel_adf_dsi_handle_events(struct dsi_pipe *dsi_pipe, u32 events);
+ extern void intel_adf_dsi_pre_disable(struct dsi_pipe *dsi_pipe);
+ extern int intel_adf_dsi_modeset(struct dsi_pipe *dsi_pipe,
+ 						struct drm_mode_modeinfo *mode);
++extern bool intel_adf_dsi_get_hw_state(struct dsi_pipe *dsi_pipe);
+ 
+ extern int intel_adf_dsi_soc_power_on(struct dsi_pipe *dsi_pipe);
+ extern int intel_adf_dsi_pmic_power_on(struct dsi_pipe *dsi_pipe);
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_mode_set.c b/drivers/video/adf/intel/core/vlv/vlv_mode_set.c
+index fd728cd..b8871f9 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_mode_set.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_mode_set.c
+@@ -151,6 +151,16 @@ int vlv_display_off(struct intel_pipe *pipe)
+ 	if (!pipe)
+ 		return -EINVAL;
+ 
++	if (is_dsi) {
++		dsi = to_dsi_pipe(pipe);
++
++		/* check harwdare state before disabling */
++		if (!dsi->ops.get_hw_state(dsi)) {
++			pr_err("%s: DSI device already disabled\n", __func__);
++			return 0;
++		}
++	}
++
+ 	index = pipe->base.idx;
+ 
+ 	/* Disable DPST */
+@@ -160,12 +170,9 @@ int vlv_display_off(struct intel_pipe *pipe)
+ 	pipe->ops->set_event(pipe, INTEL_PIPE_EVENT_VSYNC, false);
+ 
+ 	 /* encoder specifific disabling if needed */
+-	if (is_dsi) {
+-		dsi = to_dsi_pipe(pipe);
+-
++	if (is_dsi)
+ 		/* DSI Shutdown command */
+ 		dsi->ops.pre_power_off(dsi);
+-	}
+ 
+ 	/* Also check for pending flip and the vblank off  */
+ 
+diff --git a/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h b/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
+index fa08bfb..797d19a 100644
+--- a/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
++++ b/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
+@@ -57,6 +57,7 @@ struct dsi_pipe_ops {
+ 	void (*handle_events)(struct dsi_pipe *pipe, u32 events);
+ 	void (*set_brightness)(u32 level);
+ 	u32 (*get_brightness)(void);
++	bool (*get_hw_state)(struct dsi_pipe *pipe);
+ };
+ 
+ struct dsi_pipe {
+-- 
+1.7.9.5
+

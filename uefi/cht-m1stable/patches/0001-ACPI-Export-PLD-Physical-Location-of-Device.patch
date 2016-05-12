@@ -1,0 +1,194 @@
+From 64d983911463273534c1ff51a92b69a113e0f1fa Mon Sep 17 00:00:00 2001
+From: Faouaz TENOUTIT <faouaz.tenoutit@intel.com>
+Date: Wed, 13 Aug 2014 18:39:44 +0200
+Subject: [PATCH] ACPI: Export PLD (Physical Location of Device)
+
+This patch exports a sysfs directory with ACPI _PLD information:
+
+$ ls -l /sys/bus/acpi/devices/ACPI-DEV/pld
+-r--r--r-- root     root         4096 2014-05-30 08:39 panel
+-r--r--r-- root     root         4096 2014-05-30 08:39 revision
+-r--r--r-- root     root         4096 2014-05-30 08:39 rotation
+-r--r--r-- root     root         4096 2014-05-30 08:39 shape
+
+This information can be used by user applications to:
+- Determine which specific connector or device input mechanism may be used
+  for a given task.
+- Describes which panel surface of the system's housing the device
+  connection point resides on (Front, Back, ...)
+
+More information about these _PLD fields can be found here:
+Documentation/ABI/testing/sysfs-bus-acpi
+
+Change-Id: I78933c3b53156695ad1050eb446c0c0814ec1220
+Signed-off-by: Faouaz TENOUTIT <faouaz.tenoutit@intel.com>
+Acked-by: Samuel Ortiz <samuel.ortiz@intel.com>
+Acked-by: Andrew J Ross <andrew.j.ross@intel.com>
+---
+ Documentation/ABI/testing/sysfs-bus-acpi | 60 ++++++++++++++++++++++++++++++++
+ drivers/acpi/scan.c                      | 54 ++++++++++++++++++++++++++++
+ include/acpi/acpi_bus.h                  |  1 +
+ 3 files changed, 115 insertions(+)
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-acpi b/Documentation/ABI/testing/sysfs-bus-acpi
+index 7fa9cbc..be58159 100644
+--- a/Documentation/ABI/testing/sysfs-bus-acpi
++++ b/Documentation/ABI/testing/sysfs-bus-acpi
+@@ -56,3 +56,63 @@ Description:
+ 		Writing 1 to this attribute will trigger hot removal of
+ 		this device object.  This file exists for every device
+ 		object that has _EJ0 method.
++
++What:		/sys/bus/acpi/devices/.../pld
++Date:		August 2014
++Contact:	Faouaz Tenoutit <faouaz.tenoutit@intel.com>
++Description:
++		This optional directory provides description of the physical
++		location, orientation and position of external devices.
++		It is for example used to describe how camera sensors are
++		physically mounted and allows user space software to rotate
++		images accordingly.
++
++What:		/sys/bus/acpi/devices/.../pld/revision
++Date:		August 2014
++Contact:	Faouaz Tenoutit <faouaz.tenoutit@intel.com>
++Description:
++		The current Revision is 0x2
++
++What:		/sys/bus/acpi/devices/.../pld/panel
++Date:		August 2014
++Contact:	Faouaz Tenoutit <faouaz.tenoutit@intel.com>
++Description:
++		Describes which panel surface of the system's housing the device
++		connection point resides on:
++		0 Top
++		1 Bottom
++		2 Left
++		3 Right
++		4 Front
++		5 Back
++		6 Unknown
++
++What:		/sys/bus/acpi/devices/.../pld/shape
++Date:		August 2014
++Contact:	Faouaz Tenoutit <faouaz.tenoutit@intel.com>
++Description:
++		Describes the shape of the device connection point:
++		0 Round
++		1 Oval
++		2 Square
++		3 Vertical Rectangle
++		4 Horizontal Rectangle
++		5 Vertical Trapezoid
++		6 Horizontal Trapezoid
++		7 Unknown - Shape rendered as a Rectangle with dotted lines
++		8 Chamfered
++
++What:		/sys/bus/acpi/devices/.../pld/rotation
++Date:		August 2014
++Contact:	Faouaz Tenoutit <faouaz.tenoutit@intel.com>
++Description:
++		Rotates the Shape clockwise in 45 degree steps around its
++		origin where:
++		0 0°
++		1 45°
++		2 90°
++		3 135°
++		4 180°
++		5 225°
++		6 270°
++		7 315°
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index 7d518b4..933a4bc 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -686,6 +686,36 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_RO(status);
+ 
++#define ACPI_SYSFS_PLD_PROP(prop)				\
++	static ssize_t prop##_show(struct device *dev,		\
++			   struct device_attribute *attr,	\
++			   char *buf) {				\
++	struct acpi_device *acpi_dev = to_acpi_device(dev);     \
++	return sprintf(buf, "%d\n", acpi_dev->pld->prop);       \
++};							        \
++static DEVICE_ATTR_RO(prop)
++
++/*
++ * sysfs PLD parameters
++ */
++ACPI_SYSFS_PLD_PROP(revision);
++ACPI_SYSFS_PLD_PROP(panel);
++ACPI_SYSFS_PLD_PROP(shape);
++ACPI_SYSFS_PLD_PROP(rotation);
++
++static struct attribute *acpi_pld_attrs[] = {
++	&dev_attr_revision.attr,
++	&dev_attr_panel.attr,
++	&dev_attr_shape.attr,
++	&dev_attr_rotation.attr,
++	NULL,
++};
++
++static const struct attribute_group acpi_pld_attr_group = {
++	.name = "pld",
++	.attrs = acpi_pld_attrs,
++};
++
+ static int acpi_device_setup_files(struct acpi_device *dev)
+ {
+ 	struct acpi_buffer buffer = {ACPI_ALLOCATE_BUFFER, NULL};
+@@ -767,6 +797,22 @@ static int acpi_device_setup_files(struct acpi_device *dev)
+ 						    &dev_attr_real_power_state);
+ 	}
+ 
++	/*
++	 * If device has _PLD, 'pld' directory is created
++	 */
++	if (acpi_has_method(dev->handle, "_PLD")) {
++		status = acpi_get_physical_device_location(dev->handle,
++							   &dev->pld);
++		if (ACPI_SUCCESS(status)) {
++			result = sysfs_create_group(&dev->dev.kobj,
++						    &acpi_pld_attr_group);
++			if (result) {
++				ACPI_FREE(dev->pld);
++				dev->pld = NULL;
++			}
++		}
++	}
++
+ end:
+ 	return result;
+ }
+@@ -806,6 +852,14 @@ static void acpi_device_remove_files(struct acpi_device *dev)
+ 		device_remove_file(&dev->dev, &dev_attr_status);
+ 	if (dev->handle)
+ 		device_remove_file(&dev->dev, &dev_attr_path);
++
++	/*
++	 * If device has _PLD, remove 'pld' directory
++	 */
++	if (dev->pld) {
++		sysfs_remove_group(&dev->dev.kobj, &acpi_pld_attr_group);
++		ACPI_FREE(dev->pld);
++	}
+ }
+ /* --------------------------------------------------------------------------
+ 			ACPI Bus operations
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index 8256eb4..25db6c3 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -330,6 +330,7 @@ struct acpi_device {
+ 	struct acpi_device_dir dir;
+ 	struct acpi_scan_handler *handler;
+ 	struct acpi_driver *driver;
++	struct acpi_pld_info *pld;
+ 	void *driver_data;
+ 	struct device dev;
+ 	unsigned int physical_node_count;
+-- 
+1.8.3.2
+

@@ -1,0 +1,84 @@
+From 67246e8546ac64d94196b75d0af1aa2a4bacfce1 Mon Sep 17 00:00:00 2001
+Message-Id: <67246e8546ac64d94196b75d0af1aa2a4bacfce1.1415245452.git.chang-joon.lee@intel.com>
+In-Reply-To: <76203ad7c635d495ef3ec1e07b47bad9db4745ba.1415245452.git.chang-joon.lee@intel.com>
+References: <76203ad7c635d495ef3ec1e07b47bad9db4745ba.1415245452.git.chang-joon.lee@intel.com>
+From: Armin Reese <armin.c.reese@intel.com>
+Date: Fri, 11 Jul 2014 10:20:07 -0700
+Subject: [PATCH 03/30] FROM_UPSTREAM [VPG]: drm/i915: Do not unmap object
+ unless no other VMAs reference it
+
+When using an IOMMU, GEM objects are mapped by their DMA address as the
+physical address is unknown. This depends on the underlying IOMMU
+driver to map and unmap the physical pages properly as defined in
+intel_iommu.c.
+
+The current code will tell the IOMMU to unmap the GEM BO's pages on the
+destruction of the first VMA that "maps" that BO. This is clearly wrong
+as there may be other VMAs "mapping" that BO (using flink). The scanout
+is one such example.
+
+The patch fixes this issue by only unmapping the DMA maps when there are
+no more VMAs mapping that object. This is equivalent to when an object
+is considered unbound as can be seen by the code. On the first VMA that
+again because bound, we will remap.
+
+An alternate solution would be to move the dma mapping to object
+creation and destrubtion. I am not sure if this is considered an
+unfriendly thing to do.
+
+Some notes to backporters trying to backport full PPGTT:
+
+The bug can never be hit without enabling the IOMMU. The existing code
+will also do the right thing when the object is shared via dmabuf. The
+failure should be demonstrable with flink. In cases when not using
+intel_iommu_strict it is likely (likely, as defined by: off the top of
+my head) on current workloads to *not* hit this bug since we often
+teardown all VMAs for an object shared across multiple VMs.  We also
+finish access to that object before the first dma_unmapping.
+intel_iommu_strict with flinked buffers is likely to hit this issue.
+
+Signed-off-by: Armin Reese <armin.c.reese@intel.com>
+[danvet: Add the excellent commit message provided by Ben.]
+Reviewed-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 9490edb58865536e91baf489eff4e67709cf134c)
+
+Change-Id: I03a0eb49346cfa568c1cba046a72f458c7776fac
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 9490edb58865536e91baf489eff4e67709cf134c
+Upstream-as-of-tag: drm-intel-next-2014-07-25
+For: GMINL-2586
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c |    6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 8b1ef30..bbebf1e 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3076,8 +3076,6 @@ int i915_vma_unbind(struct i915_vma *vma)
+ 
+ 	vma->unbind_vma(vma);
+ 
+-	i915_gem_gtt_finish_object(obj);
+-
+ 	list_del_init(&vma->mm_list);
+ 	/* Avoid an unnecessary call to unbind on rebind. */
+ 	if (i915_is_ggtt(vma->vm))
+@@ -3088,8 +3086,10 @@ int i915_vma_unbind(struct i915_vma *vma)
+ 
+ 	/* Since the unbound list is global, only move to that list if
+ 	 * no more VMAs exist. */
+-	if (list_empty(&obj->vma_list))
++	if (list_empty(&obj->vma_list)) {
++		i915_gem_gtt_finish_object(obj);
+ 		list_move_tail(&obj->global_list, &dev_priv->mm.unbound_list);
++	}
+ 
+ 	/* And finally now the object is completely decoupled from this vma,
+ 	 * we can drop its hold on the backing storage and allow it to be
+-- 
+1.7.9.5
+

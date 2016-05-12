@@ -1,0 +1,134 @@
+From c902778a42c994b956caff8aa447b3a16fa7f34b Mon Sep 17 00:00:00 2001
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Fri, 24 Oct 2014 14:56:40 +0100
+Subject: [PATCH 559/634] arm64: Fix up /proc/cpuinfo
+
+Commit d7a49086f263164a (arm64: cpuinfo: print info for all CPUs)
+attempted to clean up /proc/cpuinfo, but due to concerns regarding
+further changes was reverted in commit 5e39977edf6500fd (Revert "arm64:
+cpuinfo: print info for all CPUs").
+
+There are two major issues with the arm64 /proc/cpuinfo format
+currently:
+
+* The "Features" line describes (only) the 64-bit hwcaps, which is
+  problematic for some 32-bit applications which attempt to parse it. As
+  the same names are used for analogous ISA features (e.g. aes) despite
+  these generally being architecturally unrelated, it is not possible to
+  simply append the 64-bit and 32-bit hwcaps in a manner that might not
+  be misleading to some applications.
+
+  Various potential solutions have appeared in vendor kernels. Typically
+  the format of the Features line varies depending on whether the task
+  is 32-bit.
+
+* Information is only printed regarding a single CPU. This does not
+  match the ARM format, and does not provide sufficient information in
+  big.LITTLE systems where CPUs are heterogeneous. The CPU information
+  printed is queried from the current CPU's registers, which is racy
+  w.r.t. cross-cpu migration.
+
+This patch attempts to solve these issues. The following changes are
+made:
+
+* When a task with a LINUX32 personality attempts to read /proc/cpuinfo,
+  the "Features" line contains the decoded 32-bit hwcaps, as with the
+  arm port. Otherwise, the decoded 64-bit hwcaps are shown. This aligns
+  with the behaviour of COMPAT_UTS_MACHINE and COMPAT_ELF_PLATFORM. In
+  the absense of compat support, the Features line is empty.
+
+  The set of hwcaps injected into a task's auxval are unaffected.
+
+* Properties are printed per-cpu, as with the ARM port. The per-cpu
+  information is queried from pre-recorded cpu information (as used by
+  the sanity checks).
+
+* As with the previous attempt at fixing up /proc/cpuinfo, the hardware
+  field is removed. The only users so far are 32-bit applications tied
+  to particular boards, so no portable applications should be affected,
+  and this should prevent future tying to particular boards.
+
+The following differences remain:
+
+* No model_name is printed, as this cannot be queried from the hardware
+  and cannot be provided in a stable fashion. Use of the CPU
+  {implementor,variant,part,revision} fields is sufficient to identify a
+  CPU and is portable across arm and arm64.
+
+* The following system-wide properties are not provided, as they are not
+  possible to provide generally. Programs relying on these are already
+  tied to particular (32-bit only) boards:
+  - Hardware
+  - Revision
+  - Serial
+
+No software has yet been identified for which these remaining
+differences are problematic.
+
+Cc: Greg Hackmann <ghackmann@google.com>
+Cc: Ian Campbell <ijc@hellion.org.uk>
+Cc: Serban Constantinescu <serban.constantinescu@arm.com>
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: cross-distro@lists.linaro.org
+Cc: linux-api@vger.kernel.org
+Cc: linux-arm-kernel@lists.infradead.org
+Cc: linux-kernel@vger.kernel.org
+Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Change-Id: I3de5b6bd4351ed0009b7198a605ba9d4cad58948
+---
+ arch/arm64/kernel/setup.c | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 290a642..55562dd 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -458,6 +458,15 @@ static const char *compat_hwcap_str[] = {
+ 	"lpae",
+ 	"evtstrm"
+ };
++
++static const char *compat_hwcap2_str[] = {
++	"aes",
++	"pmull",
++	"sha1",
++	"sha2",
++	"crc32",
++	NULL
++};
+ #endif /* CONFIG_COMPAT */
+ 
+ static int c_show(struct seq_file *m, void *v)
+@@ -489,6 +498,10 @@ static int c_show(struct seq_file *m, void *v)
+ 			for (j = 0; compat_hwcap_str[j]; j++)
+ 				if (compat_elf_hwcap & (1 << j))
+ 					seq_printf(m, " %s", compat_hwcap_str[j]);
++
++			for (j = 0; compat_hwcap2_str[j]; j++)
++				if (compat_elf_hwcap2 & (1 << j))
++					seq_printf(m, " %s", compat_hwcap2_str[j]);
+ #endif /* CONFIG_COMPAT */
+ 		} else {
+ 			for (j = 0; hwcap_str[j]; j++)
+@@ -497,11 +510,12 @@ static int c_show(struct seq_file *m, void *v)
+ 		}
+ 		seq_puts(m, "\n");
+ 
+-		seq_printf(m, "CPU implementer\t: 0x%02x\n", (midr >> 24));
++		seq_printf(m, "CPU implementer\t: 0x%02x\n",
++			   MIDR_IMPLEMENTOR(midr));
+ 		seq_printf(m, "CPU architecture: 8\n");
+-		seq_printf(m, "CPU variant\t: 0x%x\n", ((midr >> 20) & 0xf));
+-		seq_printf(m, "CPU part\t: 0x%03x\n", ((midr >> 4) & 0xfff));
+-		seq_printf(m, "CPU revision\t: %d\n\n", (midr & 0xf));
++		seq_printf(m, "CPU variant\t: 0x%x\n", MIDR_VARIANT(midr));
++		seq_printf(m, "CPU part\t: 0x%03x\n", MIDR_PARTNUM(midr));
++		seq_printf(m, "CPU revision\t: %d\n\n", MIDR_REVISION(midr));
+ 	}
+ 
+ 	return 0;
+-- 
+1.9.1
+

@@ -1,0 +1,121 @@
+From 82b9919f38314c1bd2eca566a10caf2210f4c784 Mon Sep 17 00:00:00 2001
+From: Mahesh Kumar P <mahesh.kumar.p@intel.com>
+Date: Tue, 7 Apr 2015 12:06:49 +0530
+Subject: [PATCH] pm: Add pm suspend debug notifier for South IPs
+
+The patch adds pm suspend debug notifier for South IPs.
+This points out potential S0ix blockers in the legacy suspend
+flow. The patch also adds the suspend residency in the last
+suspend cycle.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-7278
+Change-Id: I4afd4165e6de5aa0bd4ede0c5835e80441b3a33e
+Signed-off-by: Kumar P, Mahesh <mahesh.kumar.p@intel.com>
+---
+ arch/x86/kernel/pmc_atom.c | 37 +++++++++++++++++++++++++++++++------
+ include/linux/suspend.h    |  1 +
+ 2 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/kernel/pmc_atom.c b/arch/x86/kernel/pmc_atom.c
+index 058500aaa828..64d8df792b17 100644
+--- a/arch/x86/kernel/pmc_atom.c
++++ b/arch/x86/kernel/pmc_atom.c
+@@ -278,6 +278,9 @@ static int pm_suspend_exit_event(void)
+ 			pr_err("Post Suspend: PMC_S0I3_TMR register read returned negative value\n");
+ 		} else {
+ 			legacy_suspend.tmr_after_susp = tmr;
++			pr_info("Sleep residency in the last suspend cycle = %llu ms",
++			legacy_suspend.tmr_after_susp -
++			legacy_suspend.tmr_before_susp);
+ 			/* Compute the time spent in suspend */
+ 			legacy_suspend.residency +=
+ 			 (legacy_suspend.tmr_after_susp -
+@@ -305,24 +308,28 @@ static struct notifier_block pm_event_notifier = {
+ };
+ #endif /* CONFIG_PM_SLEEP */
+ 
+-#ifdef CONFIG_DEBUG_FS
+-static int pmc_dev_state_show(struct seq_file *s, void *unused)
++
++static void pmc_dev_state(void *seq_file)
+ {
+-	struct pmc_dev *pmc = s->private;
++	struct pmc_dev *pmc;
++	struct seq_file *s = (struct seq_file *)seq_file;
+ 	u32 func_dis, func_dis_2, func_dis_index;
+ 	u32 d3_sts_0, d3_sts_1, d3_sts_index;
+ 	int dev_index, reg_index;
+ 
++	if (s)
++		pmc = s->private;
++	else
++		pmc = &pmc_device;
++
+ 	func_dis = pmc_reg_read(pmc, PMC_FUNC_DIS);
+ 	func_dis_2 = pmc_reg_read(pmc, PMC_FUNC_DIS_2);
+ 	d3_sts_0 = pmc_reg_read(pmc, PMC_D3_STS_0);
+ 	d3_sts_1 = pmc_reg_read(pmc, PMC_D3_STS_1);
+ 
+-
+ 	for (dev_index = 0; dev_index < dev_num; dev_index++) {
+ 		reg_index = dev_index / PMC_REG_BIT_WIDTH;
+ 
+-
+ 		if (reg_index) {
+ 			func_dis_index =
+ 				(func_dis_2 & dev_map[dev_index].fn_dis_bit);
+@@ -333,13 +340,29 @@ static int pmc_dev_state_show(struct seq_file *s, void *unused)
+ 			d3_sts_index = d3_sts_0;
+ 		}
+ 
+-		seq_printf(s, "Dev: %-32s\tState: %s [%s]\n",
++		if ((pm_suspend_debug) && (s == NULL)) {
++			if (!(dev_map[dev_index].d3_sts_bit & d3_sts_index) &&
++				!func_dis_index)
++				pr_info("%s in SC is in D0 prior to sleep\n",
++					dev_map[dev_index].name);
++
++		} else {
++			seq_printf(s, "Dev: %-32s\tState: %s [%s]\n",
+ 			dev_map[dev_index].name,
+ 			func_dis_index ?
+ 			"Disabled" : "Enabled ",
+ 			dev_map[dev_index].d3_sts_bit & d3_sts_index ?
+ 			"D3" : "D0");
++		}
+ 	}
++	return;
++}
++
++#ifdef CONFIG_DEBUG_FS
++
++static int pmc_dev_state_show(struct seq_file *s, void *unused)
++{
++	pmc_dev_state(s);
+ 	return 0;
+ }
+ 
+@@ -622,6 +645,8 @@ static int pmc_setup_dev(struct pci_dev *pdev)
+ 		iounmap(pmc->regmap);
+ 		return ret;
+ 	}
++
++	sc_dev_state = pmc_dev_state;
+ #endif /* CONFIG_DEBUG_FS */
+ 	return 0;
+ }
+diff --git a/include/linux/suspend.h b/include/linux/suspend.h
+index 3c6106563c58..55ab23771326 100644
+--- a/include/linux/suspend.h
++++ b/include/linux/suspend.h
+@@ -9,6 +9,7 @@
+ #include <linux/freezer.h>
+ #include <asm/errno.h>
+ 
++extern void (*sc_dev_state)(void *);
+ #ifdef CONFIG_VT
+ extern void pm_set_vt_switch(int);
+ #else
+-- 
+2.1.0
+

@@ -1,0 +1,148 @@
+From 7e9008319f8c5ca414d707a7910b1632ca42bad8 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Date: Tue, 24 Jun 2014 16:56:27 +0100
+Subject: [PATCH 233/351] ASoC: wm_adsp: Add locking over firmware request
+
+There seem to be some race conditions requesting multiple firmwares from
+the same device in an asynchronous fashion. Fix this by locking over the
+firmware requests.
+
+Change-Id: I9f583d0e8d005476826fd76af10d5aa8a286df85
+Signed-off-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Signed-off-by: Nikesh Oswal <Nikesh.Oswal@wolfsonmicro.com>
+---
+ sound/soc/codecs/florida.c |    6 +++++-
+ sound/soc/codecs/wm5102.c  |    7 ++++++-
+ sound/soc/codecs/wm_adsp.c |    8 +++++++-
+ sound/soc/codecs/wm_adsp.h |    3 ++-
+ 4 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/sound/soc/codecs/florida.c b/sound/soc/codecs/florida.c
+index 0e1c3a0..c3b904e 100644
+--- a/sound/soc/codecs/florida.c
++++ b/sound/soc/codecs/florida.c
+@@ -53,6 +53,8 @@ struct florida_priv {
+ 	struct arizona_priv core;
+ 	struct arizona_fll fll[2];
+ 	struct florida_compr compr_info;
++
++	struct mutex fw_lock;
+ };
+ 
+ static const struct wm_adsp_region florida_dsp1_regions[] = {
+@@ -2135,6 +2137,7 @@ static int florida_probe(struct platform_device *pdev)
+ 	platform_set_drvdata(pdev, florida);
+ 
+ 	mutex_init(&florida->compr_info.lock);
++	mutex_init(&florida->fw_lock);
+ 
+ 	florida->core.arizona = arizona;
+ 	florida->core.num_inputs = 8;
+@@ -2152,7 +2155,8 @@ static int florida_probe(struct platform_device *pdev)
+ 		florida->core.adsp[i].num_mems
+ 			= ARRAY_SIZE(florida_dsp1_regions);
+ 
+-	        ret = wm_adsp2_init(&florida->core.adsp[i], false);
++		ret = wm_adsp2_init(&florida->core.adsp[i], false,
++				    &florida->fw_lock);
+ 		if (ret != 0)
+ 			return ret;
+ 	}
+diff --git a/sound/soc/codecs/wm5102.c b/sound/soc/codecs/wm5102.c
+index 36bc774..e9cd30b 100644
+--- a/sound/soc/codecs/wm5102.c
++++ b/sound/soc/codecs/wm5102.c
+@@ -36,6 +36,8 @@
+ struct wm5102_priv {
+ 	struct arizona_priv core;
+ 	struct arizona_fll fll[2];
++
++	struct mutex fw_lock;
+ };
+ 
+ static DECLARE_TLV_DB_SCALE(ana_tlv, 0, 100, 0);
+@@ -1961,6 +1963,8 @@ static int wm5102_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	platform_set_drvdata(pdev, wm5102);
+ 
++	mutex_init(&wm5102->fw_lock);
++
+ 	wm5102->core.arizona = arizona;
+ 	wm5102->core.num_inputs = 6;
+ 
+@@ -1973,7 +1977,8 @@ static int wm5102_probe(struct platform_device *pdev)
+ 	wm5102->core.adsp[0].mem = wm5102_dsp1_regions;
+ 	wm5102->core.adsp[0].num_mems = ARRAY_SIZE(wm5102_dsp1_regions);
+ 
+-	ret = wm_adsp2_init(&wm5102->core.adsp[0], true);
++	ret = wm_adsp2_init(&wm5102->core.adsp[0], true,
++			    &wm5102->fw_lock);
+ 	if (ret != 0)
+ 		return ret;
+ 
+diff --git a/sound/soc/codecs/wm_adsp.c b/sound/soc/codecs/wm_adsp.c
+index 2ab662b..b35a40e 100644
+--- a/sound/soc/codecs/wm_adsp.c
++++ b/sound/soc/codecs/wm_adsp.c
+@@ -843,7 +843,9 @@ static int wm_adsp_load(struct wm_adsp *dsp)
+ 		 dsp->firmwares[dsp->fw].file);
+ 	file[PAGE_SIZE - 1] = '\0';
+ 
++	mutex_lock(dsp->fw_lock);
+ 	ret = request_firmware(&firmware, file, dsp->dev);
++	mutex_unlock(dsp->fw_lock);
+ 	if (ret != 0) {
+ 		adsp_err(dsp, "Failed to request '%s'\n", file);
+ 		goto out;
+@@ -1662,7 +1664,9 @@ static int wm_adsp_load_coeff(struct wm_adsp *dsp)
+ 			 dsp->num, dsp->firmwares[dsp->fw].file);
+ 	file[PAGE_SIZE - 1] = '\0';
+ 
++	mutex_lock(dsp->fw_lock);
+ 	ret = request_firmware(&firmware, file, dsp->dev);
++	mutex_unlock(dsp->fw_lock);
+ 	if (ret != 0) {
+ 		adsp_warn(dsp, "Failed to request '%s'\n", file);
+ 		ret = 0;
+@@ -2371,7 +2375,7 @@ static inline int wm_adsp_of_parse_adsp(struct wm_adsp *adsp)
+ }
+ #endif
+ 
+-int wm_adsp2_init(struct wm_adsp *adsp, bool dvfs)
++int wm_adsp2_init(struct wm_adsp *adsp, bool dvfs, struct mutex *fw_lock)
+ {
+ 	int ret;
+ 
+@@ -2391,6 +2395,8 @@ int wm_adsp2_init(struct wm_adsp *adsp, bool dvfs)
+ 	INIT_WORK(&adsp->boot_work, wm_adsp2_boot_work);
+ 	mutex_init(&adsp->ctl_lock);
+ 
++	adsp->fw_lock = fw_lock;
++
+ 	if (dvfs) {
+ 		adsp->dvfs = devm_regulator_get(adsp->dev, "DCVDD");
+ 		if (IS_ERR(adsp->dvfs)) {
+diff --git a/sound/soc/codecs/wm_adsp.h b/sound/soc/codecs/wm_adsp.h
+index 4212e88..1ddba0c 100644
+--- a/sound/soc/codecs/wm_adsp.h
++++ b/sound/soc/codecs/wm_adsp.h
+@@ -109,6 +109,7 @@ struct wm_adsp {
+ 
+ 	struct list_head ctl_list;
+ 
++	struct mutex *fw_lock;
+ 	struct work_struct boot_work;
+ };
+ 
+@@ -128,7 +129,7 @@ extern const struct snd_kcontrol_new wm_adsp1_fw_controls[];
+ extern const struct snd_kcontrol_new wm_adsp2_fw_controls[];
+ 
+ int wm_adsp1_init(struct wm_adsp *adsp);
+-int wm_adsp2_init(struct wm_adsp *adsp, bool dvfs);
++int wm_adsp2_init(struct wm_adsp *adsp, bool dvfs, struct mutex *fw_lock);
+ int wm_adsp1_event(struct snd_soc_dapm_widget *w,
+ 		   struct snd_kcontrol *kcontrol, int event);
+ int wm_adsp2_early_event(struct snd_soc_dapm_widget *w,
+-- 
+1.7.9.5
+

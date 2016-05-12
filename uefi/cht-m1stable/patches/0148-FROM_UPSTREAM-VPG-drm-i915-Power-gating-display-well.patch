@@ -1,0 +1,150 @@
+From 0be74c461a002be208486a60bbdc4748214252b1 Mon Sep 17 00:00:00 2001
+Message-Id: <0be74c461a002be208486a60bbdc4748214252b1.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Borun Fu <borun.fu@intel.com>
+Date: Sat, 12 Jul 2014 10:02:27 +0530
+Subject: [PATCH 148/312] FROM_UPSTREAM [VPG]: drm/i915: Power gating display
+ wells during i915_pm_suspend
+
+On VLV, after i915_pm_suspend display power wells are staying
+power ungated. So, after initiating mem sleep "echo mem > /sys/power/state"
+Display is staing D0 State. There might be better way/place to power gate
+these wells. Also, we need to make sure that if wells are power gated due to
+DPMS OFF sequence, they need not be turned off by i915_pm_suspend again.
+
+v2: Extracted helper for intel_crtc_disable and power gating CRTC power wells.
+[Daniel]
+
+Issue: LCK-1074
+Cc: Imre Deak <imre.deak@intel.com>
+Cc: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Change-Id: I34c80da66aa24c423a5576c68aa1f3a8d0f43848
+Signed-off-by: Sagar Kamble <sagar.a.kamble@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_drv.c      |    4 ++--
+ drivers/gpu/drm/i915/i915_drv.h      |    4 ++++
+ drivers/gpu/drm/i915/intel_display.c |   31 ++++++++++++++++++-------------
+ drivers/gpu/drm/i915/intel_drv.h     |    1 +
+ 4 files changed, 25 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 02f391a..456a9c8 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -535,11 +535,11 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 
+ 		/*
+ 		 * Disable CRTCs directly since we want to preserve sw state
+-		 * for _thaw.
++		 * for _thaw. Also, power gate the CRTC power wells.
+ 		 */
+ 		drm_modeset_lock_all(dev);
+ 		for_each_crtc(dev, crtc) {
+-			dev_priv->display.crtc_disable(crtc);
++			intel_crtc_control(crtc, false);
+ 		}
+ 		drm_modeset_unlock_all(dev);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index aa3999c..31c8aa4 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -183,6 +183,10 @@ enum hpd_pin {
+ 	list_for_each_entry((intel_connector), &(dev)->mode_config.connector_list, base.head) \
+ 		if ((intel_connector)->base.encoder == (__encoder))
+ 
++#define for_each_power_domain(domain, mask)				\
++	for ((domain) = 0; (domain) < POWER_DOMAIN_NUM; (domain)++)	\
++		if ((1 << (domain)) & (mask))
++
+ struct drm_i915_private;
+ struct i915_mmu_object;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index e5f5ff7..a92fa6c 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -4889,10 +4889,6 @@ static void i9xx_pfit_enable(struct intel_crtc *crtc)
+ 	I915_WRITE(BCLRPAT(crtc->pipe), 0);
+ }
+ 
+-#define for_each_power_domain(domain, mask)				\
+-	for ((domain) = 0; (domain) < POWER_DOMAIN_NUM; (domain)++)	\
+-		if ((1 << (domain)) & (mask))
+-
+ enum intel_display_power_domain
+ intel_display_port_power_domain(struct intel_encoder *intel_encoder)
+ {
+@@ -5477,21 +5473,14 @@ static void intel_crtc_update_sarea(struct drm_crtc *crtc,
+ 	}
+ }
+ 
+-/**
+- * Sets the power management mode of the pipe and plane.
+- */
+-void intel_crtc_update_dpms(struct drm_crtc *crtc)
++/* Master function to enable/disable CRTC and corresponding power wells */
++void intel_crtc_control(struct drm_crtc *crtc, bool enable)
+ {
+ 	struct drm_device *dev = crtc->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+-	struct intel_encoder *intel_encoder;
+ 	enum intel_display_power_domain domain;
+ 	unsigned long domains;
+-	bool enable = false;
+-
+-	for_each_encoder_on_crtc(dev, crtc, intel_encoder)
+-		enable |= intel_encoder->connectors_active;
+ 
+ 	if (enable) {
+ 		if (!intel_crtc->active) {
+@@ -5499,6 +5488,7 @@ void intel_crtc_update_dpms(struct drm_crtc *crtc)
+ 			for_each_power_domain(domain, domains)
+ 				intel_display_power_get(dev_priv, domain);
+ 			intel_crtc->enabled_power_domains = domains;
++
+ 			dev_priv->display.crtc_enable(crtc);
+ 		}
+ 	} else {
+@@ -5511,6 +5501,21 @@ void intel_crtc_update_dpms(struct drm_crtc *crtc)
+ 			intel_crtc->enabled_power_domains = 0;
+ 		}
+ 	}
++}
++
++/**
++ * Sets the power management mode of the pipe and plane.
++ */
++void intel_crtc_update_dpms(struct drm_crtc *crtc)
++{
++	struct drm_device *dev = crtc->dev;
++	struct intel_encoder *intel_encoder;
++	bool enable = false;
++
++	for_each_encoder_on_crtc(dev, crtc, intel_encoder)
++		enable |= intel_encoder->connectors_active;
++
++	intel_crtc_control(crtc, enable);
+ 
+ 	intel_crtc_update_sarea(crtc, enable);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index f51e7a4..7beaca1 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -785,6 +785,7 @@ extern void intel_crtc_load_lut(struct drm_crtc *crtc);
+ void intel_crtc_restore_mode(struct drm_crtc *crtc);
+ void intel_crtc_queue_unpin(struct intel_crtc *crtc,
+ 			    struct drm_i915_gem_object *obj);
++void intel_crtc_control(struct drm_crtc *crtc, bool enable);
+ void intel_crtc_update_dpms(struct drm_crtc *crtc);
+ void intel_encoder_destroy(struct drm_encoder *encoder);
+ void intel_connector_dpms(struct drm_connector *, int mode);
+-- 
+1.7.9.5
+

@@ -1,0 +1,209 @@
+From 801317a55231d121139956bcb07267119e1ba284 Mon Sep 17 00:00:00 2001
+Message-Id: <801317a55231d121139956bcb07267119e1ba284.1421835211.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 7 Apr 2014 18:14:39 +0100
+Subject: [PATCH 59/63] FOR_UPSTREAM [VPG]: drm/i915: Early alloc request
+
+The scheduler needs to explicitly allocate a request to track each submitted
+batch buffer. This must happen a long time before any commands are actually
+written to the ring.
+
+Change-Id: Id01fbda123bcfaa84531896c38292435270025b1
+For: VIZ-1587
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    2 ++
+ drivers/gpu/drm/i915/i915_gem.c            |    2 ++
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   17 ++++++++++-------
+ drivers/gpu/drm/i915/intel_lrc.c           |   12 +++---------
+ drivers/gpu/drm/i915/intel_lrc.h           |    2 ++
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |    4 ++--
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    3 ++-
+ 7 files changed, 23 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 309daca..779b98e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1868,6 +1868,8 @@ struct drm_i915_private {
+ 
+ 	/* Abstract the submission mechanism (legacy ringbuffer or execlists) away */
+ 	struct {
++		int (*alloc_request)(struct intel_engine_cs *ring,
++				     struct intel_context *ctx);
+ 		int (*do_execbuf)(struct drm_device *dev, struct drm_file *file,
+ 				  struct intel_engine_cs *ring,
+ 				  struct intel_context *ctx,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index f961a32b..bb50b72 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5170,11 +5170,13 @@ int i915_gem_init(struct drm_device *dev)
+ 	}
+ 
+ 	if (!i915.enable_execlists) {
++		dev_priv->gt.alloc_request = intel_ring_alloc_request;
+ 		dev_priv->gt.do_execbuf = i915_gem_ringbuffer_submission;
+ 		dev_priv->gt.init_rings = i915_gem_init_rings;
+ 		dev_priv->gt.cleanup_ring = intel_cleanup_ring_buffer;
+ 		dev_priv->gt.stop_ring = intel_stop_ring_buffer;
+ 	} else {
++		dev_priv->gt.alloc_request = intel_logical_ring_alloc_request;
+ 		dev_priv->gt.do_execbuf = intel_execlists_submission;
+ 		dev_priv->gt.init_rings = intel_logical_rings_init;
+ 		dev_priv->gt.cleanup_ring = intel_logical_ring_cleanup;
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 253c5ed..ff007e0 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1136,10 +1136,6 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 		watchdog_running = 1;
+ 	}
+ 
+-	ret = intel_ring_alloc_request(ring);
+-	if (ret)
+-		goto error;
+-
+ #ifdef CONFIG_SYNC
+ 	if (args->flags & I915_EXEC_WAIT_FENCE) {
+ 		/* Validate the fence wait parameter but don't do the wait until
+@@ -1387,7 +1383,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	u64 exec_start = args->batch_start_offset;
+ 	u32 dispatch_flags;
+ 	int ret;
+-	bool need_relocs;
++	bool need_relocs, batch_pinned = false;
+ 
+ 	if (!i915_gem_check_execbuffer(args))
+ 		return -EINVAL;
+@@ -1545,23 +1541,30 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 		if (ret)
+ 			goto err;
+ 
++		batch_pinned = true;
+ 		exec_start += i915_gem_obj_ggtt_offset(batch_obj);
+ 	} else
+ 		exec_start += i915_gem_obj_offset(batch_obj, vm);
+ 
++	/* Allocate a request for this batch buffer nice and early. */
++	ret = dev_priv->gt.alloc_request(ring, ctx);
++	if (ret)
++		goto err;
++
+ 	ret = dev_priv->gt.do_execbuf(dev, file, ring, ctx, args,
+ 				      &eb->vmas, batch_obj, exec_start,
+ 				      dispatch_flags);
+ 
++err:
+ 	/*
+ 	 * FIXME: We crucially rely upon the active tracking for the (ppgtt)
+ 	 * batch vma for correctness. For less ugly and less fragility this
+ 	 * needs to be adjusted to also track the ggtt batch vma properly as
+ 	 * active.
+ 	 */
+-	if (dispatch_flags & I915_DISPATCH_SECURE)
++	if (batch_pinned)
+ 		i915_gem_object_ggtt_unpin(batch_obj);
+-err:
++
+ 	/* the request owns the ref now */
+ 	i915_gem_context_unreference(ctx);
+ 	eb_destroy(eb);
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index f2bae7d..778d472 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -205,8 +205,6 @@ enum {
+ };
+ #define GEN8_CTX_ID_SHIFT 32
+ 
+-static int logical_ring_alloc_request(struct intel_engine_cs *ring,
+-				      struct intel_context *ctx);
+ static int intel_lr_context_pin(struct intel_engine_cs *ring,
+ 		struct intel_context *ctx);
+ 
+@@ -1389,10 +1387,6 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = logical_ring_alloc_request(ring, ringbuf->FIXME_lrc_ctx);
+-	if (ret)
+-		return ret;
+-
+ #ifdef CONFIG_SYNC
+ 	if (args->flags & I915_EXEC_WAIT_FENCE) {
+ 		/* Validate the fence wait parameter but don't do the wait until
+@@ -1654,8 +1648,8 @@ void intel_lr_context_unpin(struct intel_engine_cs *ring,
+ 	}
+ }
+ 
+-static int logical_ring_alloc_request(struct intel_engine_cs *ring,
+-				      struct intel_context *ctx)
++int intel_logical_ring_alloc_request(struct intel_engine_cs *ring,
++				     struct intel_context *ctx)
+ {
+ 	struct drm_i915_gem_request *request;
+ 	struct drm_i915_private *dev_private = ring->dev->dev_private;
+@@ -1857,7 +1851,7 @@ int intel_logical_ring_begin(struct intel_ringbuffer *ringbuf, int num_dwords)
+ 		return ret;
+ 
+ 	/* Preallocate the olr before touching the ring */
+-	ret = logical_ring_alloc_request(ring, ringbuf->FIXME_lrc_ctx);
++	ret = intel_logical_ring_alloc_request(ring, ringbuf->FIXME_lrc_ctx);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index 4790bb3..eb6015a 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -35,6 +35,8 @@
+ #define RING_CONTEXT_STATUS_PTR(ring)	((ring)->mmio_base+0x3a0)
+ 
+ /* Logical Rings */
++int __must_check intel_logical_ring_alloc_request(struct intel_engine_cs *ring,
++						  struct intel_context *ctx);
+ void intel_logical_ring_stop(struct intel_engine_cs *ring);
+ void intel_logical_ring_cleanup(struct intel_engine_cs *ring);
+ int intel_logical_rings_init(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index c268680..5d146e1 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2469,7 +2469,7 @@ int intel_ring_idle(struct intel_engine_cs *ring)
+ }
+ 
+ int
+-intel_ring_alloc_request(struct intel_engine_cs *ring)
++intel_ring_alloc_request(struct intel_engine_cs *ring, struct intel_context *ctx)
+ {
+ 	int ret;
+ 	struct drm_i915_gem_request *request;
+@@ -2534,7 +2534,7 @@ int intel_ring_begin(struct intel_engine_cs *ring,
+ 		return ret;
+ 
+ 	/* Preallocate the olr before touching the ring */
+-	ret = intel_ring_alloc_request(ring);
++	ret = intel_ring_alloc_request(ring, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index ffd777c..7c60cd7 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -582,7 +582,8 @@ int intel_alloc_ringbuffer_obj(struct drm_device *dev,
+ 
+ void intel_stop_ring_buffer(struct intel_engine_cs *ring);
+ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring);
+-int __must_check intel_ring_alloc_request(struct intel_engine_cs *ring);
++int __must_check intel_ring_alloc_request(struct intel_engine_cs *ring,
++					  struct intel_context *ctx);
+ 
+ int __must_check intel_ring_begin(struct intel_engine_cs *ring, int n);
+ int __must_check intel_ring_cacheline_align(struct intel_engine_cs *ring);
+-- 
+1.7.9.5
+

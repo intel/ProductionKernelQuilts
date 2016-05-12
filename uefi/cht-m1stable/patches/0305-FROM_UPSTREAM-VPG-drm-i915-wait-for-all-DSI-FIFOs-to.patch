@@ -1,0 +1,105 @@
+From fa6ac970d6fcaf21539f65ddf93c8d06d91f53c4 Mon Sep 17 00:00:00 2001
+Message-Id: <fa6ac970d6fcaf21539f65ddf93c8d06d91f53c4.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Shobhit Kumar <shobhit.kumar@intel.com>
+Date: Sat, 12 Jul 2014 17:17:22 +0530
+Subject: [PATCH 305/312] FROM_UPSTREAM [VPG]: drm/i915: wait for all DSI
+ FIFOs to be empty
+
+Ensure that the DSI packets for a particular sequence are completely
+sent before going ahead in the enabling or disabling of the panel
+
+Issue: GMINL-2107
+Change-Id: Ic439ac28db74bb9e5cb78874b2a5eaa31e2595de
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Nabendu <nabendu.bikash.maiti@intel.com>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 1381308bb1e24fd7906eab3f046654041546cce3
+---
+ drivers/gpu/drm/i915/intel_dsi.c     |    8 ++++++++
+ drivers/gpu/drm/i915/intel_dsi_cmd.c |   16 ++++++++++++++++
+ drivers/gpu/drm/i915/intel_dsi_cmd.h |    1 +
+ 3 files changed, 25 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 75a36bc..b40e7e8 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -144,6 +144,8 @@ static void intel_dsi_enable(struct intel_encoder *encoder)
+ 		if (intel_dsi->dev.dev_ops->enable)
+ 			intel_dsi->dev.dev_ops->enable(&intel_dsi->dev);
+ 
++		wait_for_dsi_fifo_empty(intel_dsi);
++
+ 		/* assert ip_tg_enable signal */
+ 		temp = I915_READ(MIPI_PORT_CTRL(pipe)) & ~LANE_CONFIGURATION_MASK;
+ 		temp = temp | intel_dsi->port_bits;
+@@ -221,6 +223,8 @@ static void intel_dsi_pre_enable(struct intel_encoder *encoder)
+ 	if (intel_dsi->dev.dev_ops->send_otp_cmds)
+ 		intel_dsi->dev.dev_ops->send_otp_cmds(&intel_dsi->dev);
+ 
++	wait_for_dsi_fifo_empty(intel_dsi);
++
+ 	/* Enable port in pre-enable phase itself because as per hw team
+ 	 * recommendation, port should be enabled befor plane & pipe */
+ 	intel_dsi_enable(encoder);
+@@ -271,6 +275,8 @@ static void intel_dsi_disable(struct intel_encoder *encoder)
+ 				(intel_dsi->backlight_off_delay * 1000) + 500);
+ 
+ 	if (is_vid_mode(intel_dsi)) {
++		wait_for_dsi_fifo_empty(intel_dsi);
++
+ 		/* de-assert ip_tg_enable signal */
+ 		temp = I915_READ(MIPI_PORT_CTRL(pipe));
+ 		I915_WRITE(MIPI_PORT_CTRL(pipe), temp & ~DPI_ENABLE);
+@@ -300,6 +306,8 @@ static void intel_dsi_disable(struct intel_encoder *encoder)
+ 	 * some next enable sequence send turn on packet error is observed */
+ 	if (intel_dsi->dev.dev_ops->disable)
+ 		intel_dsi->dev.dev_ops->disable(&intel_dsi->dev);
++
++	wait_for_dsi_fifo_empty(intel_dsi);
+ }
+ 
+ static void intel_dsi_clear_device_ready(struct intel_encoder *encoder)
+diff --git a/drivers/gpu/drm/i915/intel_dsi_cmd.c b/drivers/gpu/drm/i915/intel_dsi_cmd.c
+index 3eeb21b..f5ac3cc 100644
+--- a/drivers/gpu/drm/i915/intel_dsi_cmd.c
++++ b/drivers/gpu/drm/i915/intel_dsi_cmd.c
+@@ -425,3 +425,19 @@ int dpi_send_cmd(struct intel_dsi *intel_dsi, u32 cmd, bool hs)
+ 
+ 	return 0;
+ }
++
++void wait_for_dsi_fifo_empty(struct intel_dsi *intel_dsi)
++{
++	struct drm_encoder *encoder = &intel_dsi->base.base;
++	struct drm_device *dev = encoder->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_crtc *intel_crtc = to_intel_crtc(encoder->crtc);
++	enum pipe pipe = intel_crtc->pipe;
++	u32 mask;
++
++	mask = LP_CTRL_FIFO_EMPTY | HS_CTRL_FIFO_EMPTY |
++					LP_DATA_FIFO_EMPTY | HS_DATA_FIFO_EMPTY;
++
++	if (wait_for((I915_READ(MIPI_GEN_FIFO_STAT(pipe)) & mask) == mask, 100))
++		DRM_ERROR("DPI FIFOs are not empty\n");
++}
+diff --git a/drivers/gpu/drm/i915/intel_dsi_cmd.h b/drivers/gpu/drm/i915/intel_dsi_cmd.h
+index 9a18cbf..46aa1ac 100644
+--- a/drivers/gpu/drm/i915/intel_dsi_cmd.h
++++ b/drivers/gpu/drm/i915/intel_dsi_cmd.h
+@@ -51,6 +51,7 @@ int dsi_vc_generic_read(struct intel_dsi *intel_dsi, int channel,
+ 			u8 *reqdata, int reqlen, u8 *buf, int buflen);
+ 
+ int dpi_send_cmd(struct intel_dsi *intel_dsi, u32 cmd, bool hs);
++void wait_for_dsi_fifo_empty(struct intel_dsi *intel_dsi);
+ 
+ /* XXX: questionable write helpers */
+ static inline int dsi_vc_dcs_write_0(struct intel_dsi *intel_dsi,
+-- 
+1.7.9.5
+

@@ -1,0 +1,253 @@
+From 321220b7d2f9d813d21726ed206fe0db83b49c5a Mon Sep 17 00:00:00 2001
+Message-Id: <321220b7d2f9d813d21726ed206fe0db83b49c5a.1439275593.git.chang-joon.lee@intel.com>
+From: Shubhangi Shrivastava <shubhangi.shrivastava@intel.com>
+Date: Wed, 29 Jul 2015 19:51:37 +0530
+Subject: [PATCH] REVERTME [VPG]: drm/i915: Enabling audio on HDMI for CHT HR
+
+Since audio driver registers its base address based on pipe which
+drives external panel, before the pipe gets enabled, therefore, the
+pipe driving external panel is obtained according to the port on
+which the external panel is connected during init function.
+
+In the current code, if the external panel is connected to port D,
+then pipe C will drive it, due to hardware limitations.
+For ports B and C, if eDP is present, then it will be driven by
+Pipe B, assigning Pipe A to external panel. But if MIPI is present,
+then Pipe B is assigned to external panel, assuming that MIPI will
+be driven by Pipe A.
+
+This patch checks if MIPI comes up on Port A or Port C. If MIPI is
+on Port A, then it is known to be driven by Pipe A, thus, Pipe B
+is assigned to external panel. If MIPI is on Port C, then it will
+be driven by Pipe B, thus, Pipe A is assigned to external panel.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-40431
+
+Tracked-On:
+Change-Id: Ie5aa9f5e72cba947efce4686b89ef035b390c8e9
+Signed-off-by: Shubhangi Shrivastava <shubhangi.shrivastava@intel.com>
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Signed-off-by: Durgadoss R <durgadoss.r@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c | 79 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_dp.c      | 41 +------------------
+ drivers/gpu/drm/i915/intel_drv.h     |  5 ++-
+ drivers/gpu/drm/i915/intel_hdmi.c    | 44 +-------------------
+ 4 files changed, 87 insertions(+), 82 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index b3462e4..8fdb04e 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -13521,6 +13521,85 @@ static void intel_setup_outputs(struct drm_device *dev)
+ 	drm_helper_move_panel_connectors_to_head(dev);
+ }
+ 
++void chv_set_lpe_audio_reg_pipe(struct drm_device *dev,
++				   struct intel_encoder *intel_encoder,
++				   struct hdmi_audio_priv *hdmi_priv,
++				   enum port port)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/*
++	 * Due to hardware limitaion, Port D will always
++	 * be driven by Pipe C. So Port B and Port C will
++	 * be driven by either Pipe A or PipeB, depending
++	 * on whether the LFP is MIPI or EDP.
++	 */
++
++	if (port == PORT_D) {
++		hdmi_priv->hdmi_lpe_audio_reg =
++			I915_HDMI_AUDIO_LPE_C_CONFIG;
++		hdmi_priv->pipe = PIPE_C;
++		if (intel_encoder->type == INTEL_OUTPUT_HDMI)
++			hdmi_priv->hdmi_reg =
++				VLV_CHV_HDMID;
++		else if (intel_encoder->type == INTEL_OUTPUT_DISPLAYPORT)
++			hdmi_priv->hdmi_reg =
++				CHV_DP_D;
++	} else {
++		list_for_each_entry(intel_encoder, &dev->
++			mode_config.encoder_list, base.head) {
++
++			/*
++			 * MIPI always comes on Pipe A or Pipe B
++			 * depending on Port A or Port C and EDP
++			 * comes on Pipe B. So the other pipe
++			 * will only be able to drive the DP.
++			 * MIPI on Port A is driven by Pipe A
++			 * and MIPI on Port C is driven by
++			 * Pipe B. So the other pipe will
++			 * drive DP.
++			 */
++
++			if (intel_encoder->type == INTEL_OUTPUT_EDP) {
++				hdmi_priv->hdmi_lpe_audio_reg =
++					I915_HDMI_AUDIO_LPE_A_CONFIG;
++				hdmi_priv->pipe = PIPE_A;
++				break;
++			} else if (intel_encoder->type == INTEL_OUTPUT_DSI &&
++				dev_priv->vbt.dsi.port == DVO_PORT_MIPIA) {
++				hdmi_priv->hdmi_lpe_audio_reg =
++					I915_HDMI_AUDIO_LPE_B_CONFIG;
++				hdmi_priv->pipe = PIPE_B;
++				break;
++			} else if (intel_encoder->type == INTEL_OUTPUT_DSI &&
++				dev_priv->vbt.dsi.port == DVO_PORT_MIPIC) {
++				hdmi_priv->hdmi_lpe_audio_reg =
++					I915_HDMI_AUDIO_LPE_A_CONFIG;
++				hdmi_priv->pipe = PIPE_A;
++				break;
++			}
++		}
++
++		if (port == PORT_B) {
++			if (intel_encoder->type == INTEL_OUTPUT_HDMI)
++				hdmi_priv->hdmi_reg =
++					VLV_CHV_HDMIB;
++			else if (intel_encoder->type ==
++					INTEL_OUTPUT_DISPLAYPORT)
++				hdmi_priv->hdmi_reg =
++					VLV_DP_B;
++		} else {
++			if (intel_encoder->type == INTEL_OUTPUT_HDMI)
++				hdmi_priv->hdmi_reg =
++					VLV_CHV_HDMIC;
++			else if (intel_encoder->type ==
++					INTEL_OUTPUT_DISPLAYPORT)
++				hdmi_priv->hdmi_reg =
++					VLV_DP_C;
++		}
++	}
++}
++
+ static void intel_user_framebuffer_destroy(struct drm_framebuffer *fb)
+ {
+ 	struct intel_framebuffer *intel_fb = to_intel_framebuffer(fb);
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 737fe0c..7a062f3 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -5484,45 +5484,8 @@ intel_dp_init(struct drm_device *dev, int output_reg, enum port port)
+ 		hdmi_priv->dev = dev;
+ 
+ 		if (IS_CHERRYVIEW(dev)) {
+-			/*
+-			 * Due to hardware limitaion, Port D will always
+-			 * be driven by Pipe C. So Port B and Port C will
+-			 * be driven by either Pipe A or PipeB, depending
+-			 * on whether the LFP is MIPI or EDP.
+-			 */
+-			if (port == PORT_D) {
+-				hdmi_priv->hdmi_lpe_audio_reg =
+-					I915_HDMI_AUDIO_LPE_C_CONFIG;
+-				hdmi_priv->pipe = PIPE_C;
+-				hdmi_priv->hdmi_reg = CHV_DP_D;
+-			} else {
+-				list_for_each_entry(intel_encoder, &dev->
+-					mode_config.encoder_list, base.head) {
+-					/*
+-					 * MIPI always comes on Pipe A and EDP
+-					 * on Pipe B. So the other pipe will
+-					 * only be able to drive the DP.
+-					 */
+-					if (intel_encoder->type ==
+-						INTEL_OUTPUT_EDP) {
+-						hdmi_priv->hdmi_lpe_audio_reg =
+-						I915_HDMI_AUDIO_LPE_A_CONFIG;
+-						hdmi_priv->pipe = PIPE_A;
+-						break;
+-					} else if (intel_encoder->type ==
+-						INTEL_OUTPUT_DSI) {
+-						hdmi_priv->hdmi_lpe_audio_reg =
+-						I915_HDMI_AUDIO_LPE_B_CONFIG;
+-						hdmi_priv->pipe = PIPE_B;
+-						break;
+-					}
+-				}
+-
+-				if (port == PORT_B)
+-					hdmi_priv->hdmi_reg = VLV_DP_B;
+-				else
+-					hdmi_priv->hdmi_reg = VLV_DP_C;
+-			}
++			chv_set_lpe_audio_reg_pipe(dev, intel_encoder,
++						hdmi_priv, port);
+ 		} else {
+ 			hdmi_priv->hdmi_lpe_audio_reg =
+ 				I915_HDMI_AUDIO_LPE_B_CONFIG;
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 365aa84..3a4cfdf 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -985,7 +985,10 @@ void intel_mode_from_pipe_config(struct drm_display_mode *mode,
+ 				 struct intel_crtc_config *pipe_config);
+ int intel_format_to_fourcc(int format);
+ void intel_crtc_wait_for_pending_flips(struct drm_crtc *crtc);
+-
++void chv_set_lpe_audio_reg_pipe(struct drm_device *dev,
++			    struct intel_encoder *intel_encoder,
++			    struct hdmi_audio_priv *hdmi_priv,
++			    enum port port);
+ 
+ /* intel_dp.c */
+ void intel_dp_init(struct drm_device *dev, int output_reg, enum port port);
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index cf9c9ee..22b949e 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -2112,48 +2112,8 @@ void intel_hdmi_init(struct drm_device *dev, int hdmi_reg, enum port port)
+ 		hdmi_priv->dev = dev;
+ 		hdmi_priv->hdmi_reg = hdmi_reg;
+ 		if (IS_CHERRYVIEW(dev)) {
+-			/*
+-			 * Due to hardware limitaion, Port D will always
+-			 * be driven by Pipe C. So Port B and Port C will
+-			 * be driven by either Pipe A or PipeB, depending
+-			 * on whether the LFP is MIPI or EDP.
+-			 */
+-			if (port == PORT_D) {
+-				hdmi_priv->hdmi_lpe_audio_reg =
+-					I915_HDMI_AUDIO_LPE_C_CONFIG;
+-				hdmi_priv->pipe = PIPE_C;
+-				hdmi_priv->hdmi_reg =
+-						VLV_CHV_HDMID;
+-			} else {
+-				list_for_each_entry(intel_encoder,
+-					&dev->mode_config.encoder_list,
+-					base.head) {
+-				/*
+-				 * MIPI always comes on Pipe A and EDP on
+-				 * Pipe B. So the other pipe will only be
+-				 * able to drive the DP.
+-				 */
+-					if (intel_encoder->type ==
+-							INTEL_OUTPUT_EDP) {
+-						hdmi_priv->hdmi_lpe_audio_reg =
+-						I915_HDMI_AUDIO_LPE_A_CONFIG;
+-						hdmi_priv->pipe = PIPE_A;
+-						break;
+-					} else if (intel_encoder->type ==
+-							INTEL_OUTPUT_DSI) {
+-						hdmi_priv->hdmi_lpe_audio_reg =
+-						I915_HDMI_AUDIO_LPE_B_CONFIG;
+-						hdmi_priv->pipe = PIPE_B;
+-						break;
+-					}
+-				}
+-				if (port == PORT_B)
+-					hdmi_priv->hdmi_reg =
+-						VLV_CHV_HDMIB;
+-				else
+-					hdmi_priv->hdmi_reg =
+-						VLV_CHV_HDMIC;
+-			}
++			chv_set_lpe_audio_reg_pipe(dev, intel_encoder,
++						hdmi_priv, port);
+ 		} else
+ 			hdmi_priv->hdmi_lpe_audio_reg =
+ 					I915_HDMI_AUDIO_LPE_B_CONFIG;
+-- 
+1.9.1
+

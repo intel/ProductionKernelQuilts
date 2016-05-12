@@ -1,0 +1,399 @@
+From 94bb7bc22992f77154922bebce68230f9885a0b6 Mon Sep 17 00:00:00 2001
+Message-Id: <94bb7bc22992f77154922bebce68230f9885a0b6.1414143271.git.chang-joon.lee@intel.com>
+In-Reply-To: <f393e797ccaaf66a25ee3d7c4e6136083a6effeb.1414143271.git.chang-joon.lee@intel.com>
+References: <f393e797ccaaf66a25ee3d7c4e6136083a6effeb.1414143271.git.chang-joon.lee@intel.com>
+From: Vandita Kulkarni <vandita.kulkarni@intel.com>
+Date: Tue, 14 Oct 2014 18:01:43 +0530
+Subject: [PATCH 20/26] FOR_UPSTREAM [VPG]: drm/i915: Add support for chv HDMI
+ LPE audio
+
+This patch adds support for chv audio interrupts,
+it also adds a function hdmi_audio_get_register_base
+This needs to be called from the audio driver during probe
+to get the hdmi lpe audio configuration address.
+This patch also schedules a wq to notify hpd to audio driver.
+
+Issue: GMINL-2456
+Change-Id: I37d81ed68d310b2180bf06106bcae0766ca77b20
+Signed-off-by: Gajanan Bhat <gajanan.bhat@intel.com>
+Signed-off-by: Vandita Kulkarni <vandita.kulkarni@intel.com>
+---
+ drivers/gpu/drm/i915/hdmi_audio_if.c |   31 +++++++----
+ drivers/gpu/drm/i915/hdmi_audio_if.h |    5 +-
+ drivers/gpu/drm/i915/i915_irq.c      |   99 ++++++++++++++++++++++++----------
+ drivers/gpu/drm/i915/i915_reg.h      |    7 ++-
+ drivers/gpu/drm/i915/intel_display.c |    9 ++++
+ drivers/gpu/drm/i915/intel_hdmi.c    |   10 +++-
+ sound/drivers/Kconfig                |    2 +-
+ 7 files changed, 119 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/hdmi_audio_if.c b/drivers/gpu/drm/i915/hdmi_audio_if.c
+index 99395c9..f153441 100644
+--- a/drivers/gpu/drm/i915/hdmi_audio_if.c
++++ b/drivers/gpu/drm/i915/hdmi_audio_if.c
+@@ -253,6 +253,16 @@ static int hdmi_audio_get_caps(enum had_caps_list get_element,
+ }
+ 
+ /**
++ * hdmi_audio_get_register_base
++ * used to get the current hdmi base address
++ */
++int hdmi_audio_get_register_base(uint32_t *reg_base)
++{
++	*reg_base = hdmi_priv->hdmi_lpe_audio_reg;
++	return 0;
++}
++
++/**
+  * hdmi_audio_set_caps:
+  * used to set the HDMI audio capabilities.
+  * e.g. Audio INT.
+@@ -264,25 +274,25 @@ static int hdmi_audio_set_caps(enum had_caps_list set_element,
+ 	struct drm_i915_private *dev_priv =
+ 		(struct drm_i915_private *) dev->dev_private;
+ 	int ret = 0;
+-	u32 hdmib;
++	u32 hdmi_reg;
+ 	u32 int_masks = 0;
+ 
+ 	DRM_DEBUG_DRIVER("\n");
+ 
+ 	switch (set_element) {
+ 	case HAD_SET_ENABLE_AUDIO:
+-		hdmib = I915_READ(hdmi_priv->hdmib_reg);
+-		if (hdmib & PORT_ENABLE)
+-			hdmib |= SDVO_AUDIO_ENABLE;
++		hdmi_reg = I915_READ(hdmi_priv->hdmi_reg);
++		if (hdmi_reg & PORT_ENABLE)
++			hdmi_reg |= SDVO_AUDIO_ENABLE;
+ 
+-		I915_WRITE(hdmi_priv->hdmib_reg, hdmib);
+-		I915_READ(hdmi_priv->hdmib_reg);
++		I915_WRITE(hdmi_priv->hdmi_reg, hdmi_reg);
++		I915_READ(hdmi_priv->hdmi_reg);
+ 		break;
+ 	case HAD_SET_DISABLE_AUDIO:
+-		hdmib = I915_READ(hdmi_priv->hdmib_reg) &
++		hdmi_reg = I915_READ(hdmi_priv->hdmi_reg) &
+ 			~SDVO_AUDIO_ENABLE;
+-		I915_WRITE(hdmi_priv->hdmib_reg, hdmib);
+-		I915_READ(hdmi_priv->hdmib_reg);
++		I915_WRITE(hdmi_priv->hdmi_reg, hdmi_reg);
++		I915_READ(hdmi_priv->hdmi_reg);
+ 		break;
+ 
+ 	case HAD_SET_ENABLE_AUDIO_INT:
+@@ -309,6 +319,7 @@ static int hdmi_audio_set_caps(enum had_caps_list set_element,
+ }
+ 
+ static struct  hdmi_audio_registers_ops hdmi_audio_reg_ops = {
++	.hdmi_audio_get_register_base = hdmi_audio_get_register_base,
+ 	.hdmi_audio_read_register = hdmi_audio_read,
+ 	.hdmi_audio_write_register = hdmi_audio_write,
+ 	.hdmi_audio_read_modify = hdmi_audio_rmw,
+@@ -336,6 +347,8 @@ int mid_hdmi_audio_setup(
+ 	dev = hdmi_priv->dev;
+ 	dev_priv = (struct drm_i915_private *) dev->dev_private;
+ 
++	reg_ops->hdmi_audio_get_register_base =
++		(hdmi_audio_reg_ops.hdmi_audio_get_register_base);
+ 	reg_ops->hdmi_audio_read_register =
+ 		(hdmi_audio_reg_ops.hdmi_audio_read_register);
+ 	reg_ops->hdmi_audio_write_register =
+diff --git a/drivers/gpu/drm/i915/hdmi_audio_if.h b/drivers/gpu/drm/i915/hdmi_audio_if.h
+index 87cc561..b398f11 100644
+--- a/drivers/gpu/drm/i915/hdmi_audio_if.h
++++ b/drivers/gpu/drm/i915/hdmi_audio_if.h
+@@ -75,6 +75,7 @@ typedef int (*had_event_call_back) (enum had_event_type event_type,
+ 		void *ctxt_info);
+ 
+ struct hdmi_audio_registers_ops {
++	int (*hdmi_audio_get_register_base)(uint32_t *reg_base);
+ 	int (*hdmi_audio_read_register)(uint32_t reg_addr, uint32_t *data);
+ 	int (*hdmi_audio_write_register)(uint32_t reg_addr, uint32_t data);
+ 	int (*hdmi_audio_read_modify)(uint32_t reg_addr, uint32_t data,
+@@ -101,8 +102,8 @@ struct snd_intel_had_interface {
+ 
+ struct hdmi_audio_priv {
+ 	struct drm_device *dev;
+-	u32 hdmib_reg;
+-
++	u32 hdmi_reg;
++	u32 hdmi_lpe_audio_reg;
+ 	bool is_hdcp_supported;
+ 	bool hdmi_hpd_connected;
+ 	int monitor_type;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 46dc76e..bb642cb 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -696,9 +696,15 @@ i915_enable_lpe_pipestat(struct drm_i915_private *dev_priv, int pipe)
+ 	u32 mask;
+ 	mask = dev_priv->hdmi_audio_interrupt_mask;
+ 	mask |= (I915_HDMI_AUDIO_UNDERRUN | I915_HDMI_AUDIO_BUFFER_DONE);
++
+ 	/* Enable the interrupt, clear any pending status */
+-	I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_B, mask);
+-	POSTING_READ(I915_LPE_AUDIO_HDMI_STATUS_B);
++	if (IS_CHERRYVIEW(dev_priv->dev)) {
++		I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_C, mask);
++		POSTING_READ(I915_LPE_AUDIO_HDMI_STATUS_C);
++	} else {
++		I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_B, mask);
++		POSTING_READ(I915_LPE_AUDIO_HDMI_STATUS_B);
++	}
+ }
+ 
+ void
+@@ -707,9 +713,15 @@ i915_disable_lpe_pipestat(struct drm_i915_private *dev_priv, int pipe)
+ 	u32 mask;
+ 	mask = dev_priv->hdmi_audio_interrupt_mask;
+ 	mask |= (I915_HDMI_AUDIO_UNDERRUN | I915_HDMI_AUDIO_BUFFER_DONE);
++
+ 	/* Disable the interrupt, clear any pending status */
+-	I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_B, mask);
+-	POSTING_READ(I915_LPE_AUDIO_HDMI_STATUS_B);
++	if (IS_CHERRYVIEW(dev_priv->dev)) {
++		I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_C, mask);
++		POSTING_READ(I915_LPE_AUDIO_HDMI_STATUS_C);
++	} else {
++		I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_B, mask);
++		POSTING_READ(I915_LPE_AUDIO_HDMI_STATUS_B);
++	}
+ }
+ #endif
+ 
+@@ -2009,6 +2021,26 @@ static bool intel_pipe_handle_vblank(struct drm_device *dev, enum pipe pipe)
+ 	return true;
+ }
+ 
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++static inline
++void i915_notify_audio_buffer_status(struct drm_device *dev, u32 reg)
++{
++	u32 lpe_stream = 0;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	lpe_stream = I915_READ(reg);
++	if (lpe_stream & I915_HDMI_AUDIO_UNDERRUN) {
++		I915_WRITE(reg, I915_HDMI_AUDIO_UNDERRUN);
++		mid_hdmi_audio_signal_event(dev,
++			HAD_EVENT_AUDIO_BUFFER_UNDERRUN);
++	}
++	if (lpe_stream & I915_HDMI_AUDIO_BUFFER_DONE) {
++		I915_WRITE(reg, I915_HDMI_AUDIO_BUFFER_DONE);
++		mid_hdmi_audio_signal_event(dev,
++			HAD_EVENT_AUDIO_BUFFER_DONE);
++	}
++}
++#endif
++
+ static void valleyview_pipestat_irq_handler(struct drm_device *dev, u32 iir)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -2016,9 +2048,6 @@ static void valleyview_pipestat_irq_handler(struct drm_device *dev, u32 iir)
+ 	struct intel_crtc *intel_crtc;
+ 	u32 pipe_stats[I915_MAX_PIPES] = { };
+ 	int pipe;
+-#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+-	int lpe_stream;
+-#endif
+ 
+ 	spin_lock(&dev_priv->irq_lock);
+ 	for_each_pipe(pipe) {
+@@ -2115,23 +2144,15 @@ static void valleyview_pipestat_irq_handler(struct drm_device *dev, u32 iir)
+ 	}
+ 
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+-		if (iir & I915_LPE_PIPE_B_INTERRUPT) {
+-			lpe_stream = I915_READ(I915_LPE_AUDIO_HDMI_STATUS_B);
+-			if (lpe_stream & I915_HDMI_AUDIO_UNDERRUN) {
+-				I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_B,
+-						lpe_stream);
+-				mid_hdmi_audio_signal_event(dev,
+-					HAD_EVENT_AUDIO_BUFFER_UNDERRUN);
+-			}
+-
+-			lpe_stream = I915_READ(I915_LPE_AUDIO_HDMI_STATUS_B);
+-			if (lpe_stream & I915_HDMI_AUDIO_BUFFER_DONE) {
+-				I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_B,
+-						lpe_stream);
+-				mid_hdmi_audio_signal_event(dev,
+-					HAD_EVENT_AUDIO_BUFFER_DONE);
+-			}
+-		}
++	if (IS_CHERRYVIEW(dev)) {
++		if (iir & I915_LPE_PIPE_C_INTERRUPT)
++			i915_notify_audio_buffer_status(dev,
++						I915_LPE_AUDIO_HDMI_STATUS_C);
++	} else {
++		if (iir & I915_LPE_PIPE_B_INTERRUPT)
++			i915_notify_audio_buffer_status(dev,
++						I915_LPE_AUDIO_HDMI_STATUS_B);
++	}
+ #endif
+ 
+ 	if (pipe_stats[0] & PIPE_GMBUS_INTERRUPT_STATUS)
+@@ -2208,6 +2229,7 @@ static irqreturn_t cherryview_irq_handler(int irq, void *arg)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	u32 master_ctl, iir;
+ 	irqreturn_t ret = IRQ_NONE;
++	int lpe_stream;
+ 
+ 	for (;;) {
+ 		master_ctl = I915_READ(GEN8_MASTER_IRQ) & ~GEN8_MASTER_IRQ_CONTROL;
+@@ -3147,8 +3169,12 @@ int i915_enable_hdmi_audio_int(struct drm_device *dev)
+ 
+ 	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
+ 	imr = I915_READ(VLV_IMR);
+-	/* Audio is on Stream B */
+-	imr &= ~I915_LPE_PIPE_B_INTERRUPT;
++	if (IS_CHERRYVIEW(dev_priv->dev))
++		imr &= ~I915_LPE_PIPE_C_INTERRUPT;
++	else {
++		/* Audio is on Stream B */
++		imr &= ~I915_LPE_PIPE_B_INTERRUPT;
++	}
+ 	I915_WRITE(VLV_IMR, imr);
+ 	i915_enable_lpe_pipestat(dev_priv, pipe);
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
+@@ -3165,7 +3191,11 @@ int i915_disable_hdmi_audio_int(struct drm_device *dev)
+ 
+ 	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
+ 	imr = I915_READ(VLV_IMR);
+-	imr |= I915_LPE_PIPE_B_INTERRUPT;
++	if (IS_CHERRYVIEW(dev_priv->dev))
++		imr |= I915_LPE_PIPE_C_INTERRUPT;
++	else
++		/* Audio is on Stream B */
++		imr |= I915_LPE_PIPE_B_INTERRUPT;
+ 	I915_WRITE(VLV_IMR, imr);
+ 	i915_disable_lpe_pipestat(dev_priv, pipe);
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
+@@ -3959,13 +3989,16 @@ static int cherryview_irq_postinstall(struct drm_device *dev)
+ 	u32 enable_mask = I915_DISPLAY_PORT_INTERRUPT |
+ 		I915_DISPLAY_PIPE_A_EVENT_INTERRUPT |
+ 		I915_DISPLAY_PIPE_B_EVENT_INTERRUPT |
+-		I915_DISPLAY_PIPE_C_EVENT_INTERRUPT;
++		I915_DISPLAY_PIPE_C_EVENT_INTERRUPT |
++		I915_LPE_PIPE_C_INTERRUPT;
+ 	u32 pipestat_enable = PLANE_FLIP_DONE_INT_STATUS_VLV |
+ 		SPRITE0_FLIP_DONE_INT_STATUS_VLV |
+ 		SPRITE1_FLIP_DONE_INT_STATUS_VLV |
+ 		PIPE_CRC_DONE_INTERRUPT_STATUS |
+-		PIPE_DPST_EVENT_STATUS;
++		PIPE_DPST_EVENT_STATUS |
++		I915_LPE_PIPE_C_INTERRUPT;
+ 	unsigned long irqflags;
++	u32 lpe_status_clear;
+ 	int pipe;
+ 
+ 	/*
+@@ -3977,6 +4010,14 @@ static int cherryview_irq_postinstall(struct drm_device *dev)
+ 	for_each_pipe(pipe)
+ 		I915_WRITE(PIPESTAT(pipe), 0xffff);
+ 
++	/* Added for HDMI Audio */
++	lpe_status_clear = I915_HDMI_AUDIO_UNDERRUN |
++	I915_HDMI_AUDIO_BUFFER_DONE;
++	I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_A, lpe_status_clear);
++	I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_B, lpe_status_clear);
++	I915_WRITE(I915_LPE_AUDIO_HDMI_STATUS_C, lpe_status_clear);
++	POSTING_READ(VLV_IER);
++
+ 	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
+ 	i915_enable_pipestat(dev_priv, PIPE_A, PIPE_GMBUS_INTERRUPT_STATUS);
+ 	for_each_pipe(pipe)
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 248a2e5..67475112 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -1519,7 +1519,6 @@ enum punit_power_well {
+ #define I915_GMCH_THERMAL_SENSOR_EVENT_INTERRUPT	(1<<14) /* p-state */
+ #define I915_DISPLAY_PIPE_A_HBLANK_INTERRUPT		(1<<13)
+ #define I915_HWB_OOM_INTERRUPT				(1<<13)
+-#define I915_LPE_PIPE_C_INTERRUPT			(1<<12)
+ #define I915_SYNC_STATUS_INTERRUPT			(1<<12)
+ #define I915_MISC_INTERRUPT				(1<<11)
+ #define I915_DISPLAY_PLANE_A_FLIP_PENDING_INTERRUPT	(1<<11)
+@@ -1546,12 +1545,16 @@ enum punit_power_well {
+ 	(dev_priv->info.display_mmio_offset + 0x65064)
+ #define I915_LPE_AUDIO_HDMI_STATUS_B \
+ 	(dev_priv->info.display_mmio_offset + 0x65864)
++#define I915_LPE_AUDIO_HDMI_STATUS_C \
++	(dev_priv->info.display_mmio_offset + 0x65964)
+ #define I915_LPE_PIPE_B_INTERRUPT	(1<<20)
+ #define I915_LPE_PIPE_A_INTERRUPT	(1<<21)
++#define I915_LPE_PIPE_C_INTERRUPT			(1<<12)
+ #define I915_HDMI_AUDIO_UNDERRUN	(1UL<<31)
+ #define I915_HDMI_AUDIO_BUFFER_DONE	(1UL<<29)
+ #define I915_HDMI_AUDIO_UNDERRUN_ENABLE	(1UL<<15)
+-
++#define I915_HDMI_AUDIO_LPE_C_CONFIG	0x65900
++#define I915_HDMI_AUDIO_LPE_B_CONFIG	0x65800
+ #define GEN6_BSD_RNCID			0x12198
+ 
+ #define GEN7_FF_THREAD_MODE		0x20a0
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 4e4e072..0598ae8 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5223,6 +5223,15 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
+ 	intel_crtc_load_lut(crtc);
+ 
+ 	intel_update_watermarks(crtc);
++
++	if (IS_VALLEYVIEW(dev) &&
++			intel_pipe_has_type(crtc, INTEL_OUTPUT_HDMI)) {
++		dev_priv->tmds_clock_speed =
++				intel_crtc->config.port_clock;
++		mid_hdmi_audio_signal_event
++				(dev_priv->dev, HAD_EVENT_MODE_CHANGING);
++	}
++
+ 	intel_enable_pipe(intel_crtc);
+ 
+ 	for_each_encoder_on_crtc(dev, crtc, encoder) {
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index d839db9..c4a18eb 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1115,6 +1115,8 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 		}
+ #endif
+ 	}
++	if (&dev_priv->hdmi_audio_wq)
++		schedule_work(&dev_priv->hdmi_audio_wq);
+ 
+ #ifdef CONFIG_EXTCON
+ 	if (strlen(intel_connector->hotplug_switch.name) != 0) {
+@@ -1839,7 +1841,13 @@ void intel_hdmi_init(struct drm_device *dev, int hdmi_reg, enum port port)
+ 		pr_err("failed to allocate memory");
+ 	} else {
+ 		hdmi_priv->dev = dev;
+-		hdmi_priv->hdmib_reg = HDMIB;
++		hdmi_priv->hdmi_reg = hdmi_reg;
++		if (IS_CHERRYVIEW(dev))
++			hdmi_priv->hdmi_lpe_audio_reg =
++					I915_HDMI_AUDIO_LPE_C_CONFIG;
++		else
++			hdmi_priv->hdmi_lpe_audio_reg =
++					I915_HDMI_AUDIO_LPE_B_CONFIG;
+ 		hdmi_priv->monitor_type = MONITOR_TYPE_HDMI;
+ 		hdmi_priv->is_hdcp_supported = true;
+ 		i915_hdmi_audio_init(hdmi_priv);
+diff --git a/sound/drivers/Kconfig b/sound/drivers/Kconfig
+index 2e05905..c14ccce 100644
+--- a/sound/drivers/Kconfig
++++ b/sound/drivers/Kconfig
+@@ -27,7 +27,7 @@ config SND_AC97_CODEC
+ config SND_INTEL_HDMI
+ 	tristate
+ 	depends on SUPPORT_LPDMA_HDMI_AUDIO
+-	default n
++	default y
+ 	help
+ 	  Choose this option to enable HDMI Audio by using direct DMA
+ 	  transfer.
+-- 
+1.7.9.5
+

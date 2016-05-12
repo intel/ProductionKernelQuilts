@@ -1,0 +1,822 @@
+From 30354954d43e4df5e61e53655f2ec8fa8d320b15 Mon Sep 17 00:00:00 2001
+From: Ecco park <eccopark@broadcom.com>
+Date: Fri, 3 Oct 2014 15:10:57 -0700
+Subject: [PATCH 09/27] net: wireless: bcmdhd: change the turn off/on sequence
+ of WLAN
+
+1) diable pcie irq during turning off WLAN
+2) clear resources during turning off WLAN
+
+b/17755061
+
+Change-Id: I41bb48064f5c2f68045c258dcb3ec37d6f87e42e
+Signed-off-by: Ecco park <eccopark@broadcom.com>
+---
+ drivers/net/wireless/bcmdhd/bcmutils.c         |  52 +++++++-
+ drivers/net/wireless/bcmdhd/dhd.h              |   2 +
+ drivers/net/wireless/bcmdhd/dhd_bus.h          |   3 +
+ drivers/net/wireless/bcmdhd/dhd_flowring.c     |  10 +-
+ drivers/net/wireless/bcmdhd/dhd_linux.c        | 170 +++++++++++--------------
+ drivers/net/wireless/bcmdhd/dhd_pcie.c         | 164 ++++++++++++++++++++++++
+ drivers/net/wireless/bcmdhd/dhd_pcie.h         |   4 +-
+ drivers/net/wireless/bcmdhd/dhd_pcie_linux.c   | 135 ++++++++++++++++++++
+ drivers/net/wireless/bcmdhd/include/bcmutils.h |   9 +-
+ drivers/net/wireless/bcmdhd/wl_cfg80211.c      |   2 +-
+ 10 files changed, 442 insertions(+), 109 deletions(-)
+
+diff --git a/drivers/net/wireless/bcmdhd/bcmutils.c b/drivers/net/wireless/bcmdhd/bcmutils.c
+index dfa7a43..1e94084 100644
+--- a/drivers/net/wireless/bcmdhd/bcmutils.c
++++ b/drivers/net/wireless/bcmdhd/bcmutils.c
+@@ -2,13 +2,13 @@
+  * Driver O/S-independent utility routines
+  *
+  * Copyright (C) 1999-2014, Broadcom Corporation
+- * 
++ *
+  *      Unless you and Broadcom execute a separate written software license
+  * agreement governing use of this software, this software is licensed to you
+  * under the terms of the GNU General Public License version 2 (the "GPL"),
+  * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+  * following added to such license:
+- * 
++ *
+  *      As a special exception, the copyright holders of this software give you
+  * permission to link this software with independent modules, and to copy and
+  * distribute the resulting executable under terms of your choice, provided that
+@@ -16,7 +16,7 @@
+  * the license of that module.  An independent module is a module which is not
+  * derived from this software.  The special exception does not apply to any
+  * modifications of the software.
+- * 
++ *
+  *      Notwithstanding the above, under no circumstances may you combine this
+  * software in any way with any other Broadcom software provided under a license
+  * other than the GPL, without Broadcom's express prior written consent.
+@@ -741,7 +741,7 @@ prpkt(const char *msg, osl_t *osh, void *p0)
+ 	for (p = p0; p; p = PKTNEXT(osh, p))
+ 		prhex(NULL, PKTDATA(osh, p), PKTLEN(osh, p));
+ }
+-#endif	
++#endif
+ 
+ /* Takes an Ethernet frame and sets out-of-bound PKTPRIO.
+  * Also updates the inplace vlan tag if requested.
+@@ -1542,7 +1542,7 @@ bcm_format_hex(char *str, const void *bytes, int len)
+ 	}
+ 	return (int)(p - str);
+ }
+-#endif 
++#endif
+ 
+ /* pretty hex print a contiguous buffer */
+ void
+@@ -1966,7 +1966,7 @@ bcm_format_ssid(char* buf, const uchar ssid[], uint ssid_len)
+ 
+ 	return (int)(p - buf);
+ }
+-#endif 
++#endif
+ 
+ #endif /* BCMDRIVER */
+ 
+@@ -2736,6 +2736,46 @@ id16_map_fini(osl_t *osh, void * id16_map_hndl)
+ 	return NULL;
+ }
+ 
++void
++id16_map_clear(void * id16_map_hndl, uint16 total_ids, uint16 start_val16)
++{
++	uint16 idx, val16;
++	id16_map_t * id16_map;
++
++	ASSERT(total_ids > 0);
++	ASSERT((start_val16 + total_ids) < ID16_INVALID);
++
++	id16_map = (id16_map_t *)id16_map_hndl;
++	if (id16_map == NULL) {
++		return;
++	}
++
++	id16_map->total = total_ids;
++	id16_map->start = start_val16;
++	id16_map->failures = 0;
++
++	/* Populate stack with 16bit id values, commencing with start_val16 */
++	id16_map->stack_idx = 0;
++	val16 = start_val16;
++
++	for (idx = 0; idx < total_ids; idx++, val16++) {
++		id16_map->stack_idx = idx;
++		id16_map->stack[id16_map->stack_idx] = val16;
++	}
++
++#if defined(BCM_DBG) && defined(BCM_DBG_ID16)
++	if (id16_map->dbg) {
++		id16_map_dbg_t *id16_map_dbg = (id16_map_dbg_t *)id16_map->dbg;
++
++		id16_map_dbg->total = total_ids;
++		for (idx = 0; idx < total_ids; idx++) {
++			id16_map_dbg->avail[idx] = TRUE;
++		}
++	}
++#endif /* BCM_DBG && BCM_DBG_ID16 */
++}
++
++
+ uint16 BCMFASTPATH /* Allocate a unique 16bit id */
+ id16_map_alloc(void * id16_map_hndl)
+ {
+diff --git a/drivers/net/wireless/bcmdhd/dhd.h b/drivers/net/wireless/bcmdhd/dhd.h
+index 7c29a33..ad49656 100644
+--- a/drivers/net/wireless/bcmdhd/dhd.h
++++ b/drivers/net/wireless/bcmdhd/dhd.h
+@@ -584,6 +584,8 @@ extern int dhd_register_if(dhd_pub_t *dhdp, int idx, bool need_rtnl_lock);
+ /* Indication from bus module regarding removal/absence of dongle */
+ extern void dhd_detach(dhd_pub_t *dhdp);
+ extern void dhd_free(dhd_pub_t *dhdp);
++extern void dhd_clear(dhd_pub_t *dhdp);
++
+ 
+ /* Indication from bus module to change flow-control state */
+ extern void dhd_txflowcontrol(dhd_pub_t *dhdp, int ifidx, bool on);
+diff --git a/drivers/net/wireless/bcmdhd/dhd_bus.h b/drivers/net/wireless/bcmdhd/dhd_bus.h
+index 525a73b..69215bc 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_bus.h
++++ b/drivers/net/wireless/bcmdhd/dhd_bus.h
+@@ -180,8 +180,11 @@ extern int dhdpcie_bus_clock_start(struct dhd_bus *bus);
+ extern int dhdpcie_bus_clock_stop(struct dhd_bus *bus);
+ extern int dhdpcie_bus_enable_device(struct dhd_bus *bus);
+ extern int dhdpcie_bus_disable_device(struct dhd_bus *bus);
++extern int dhdpcie_bus_alloc_resource(struct dhd_bus *bus);
++extern void dhdpcie_bus_free_resource(struct dhd_bus *bus);
+ extern bool dhdpcie_bus_dongle_attach(struct dhd_bus *bus);
+ extern int dhd_bus_release_dongle(struct dhd_bus *bus);
++extern int dhd_bus_request_irq(struct dhd_bus *bus);
+ 
+ #endif /* BCMPCIE */
+ #endif /* _dhd_bus_h_ */
+diff --git a/drivers/net/wireless/bcmdhd/dhd_flowring.c b/drivers/net/wireless/bcmdhd/dhd_flowring.c
+index 97c9098..4593216 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_flowring.c
++++ b/drivers/net/wireless/bcmdhd/dhd_flowring.c
+@@ -1,13 +1,13 @@
+ /*
+  * Broadcom Dongle Host Driver (DHD), Flow ring specific code at top level
+  * Copyright (C) 1999-2014, Broadcom Corporation
+- * 
++ *
+  *      Unless you and Broadcom execute a separate written software license
+  * agreement governing use of this software, this software is licensed to you
+  * under the terms of the GNU General Public License version 2 (the "GPL"),
+  * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+  * following added to such license:
+- * 
++ *
+  *      As a special exception, the copyright holders of this software give you
+  * permission to link this software with independent modules, and to copy and
+  * distribute the resulting executable under terms of your choice, provided that
+@@ -15,7 +15,7 @@
+  * the license of that module.  An independent module is a module which is not
+  * derived from this software.  The special exception does not apply to any
+  * modifications of the software.
+- * 
++ *
+  *      Notwithstanding the above, under no circumstances may you combine this
+  * software in any way with any other Broadcom software provided under a license
+  * other than the GPL, without Broadcom's express prior written consent.
+@@ -363,6 +363,10 @@ dhd_flowid_alloc(dhd_pub_t *dhdp, uint8 ifindex, uint8 prio, char *sa, char *da)
+ 	uint16 flowid;
+ 
+ 	fl_hash_node = (flow_hash_info_t *) MALLOC(dhdp->osh, sizeof(flow_hash_info_t));
++	if (fl_hash_node == NULL) {
++		DHD_ERROR(("%s: fl_hash_node alloc failed  \n", __FUNCTION__));
++		return FLOWID_INVALID;
++	}
+ 	memcpy(fl_hash_node->flow_info.da, da, sizeof(fl_hash_node->flow_info.da));
+ 
+ 	ASSERT(dhdp->flowid_allocator != NULL);
+diff --git a/drivers/net/wireless/bcmdhd/dhd_linux.c b/drivers/net/wireless/bcmdhd/dhd_linux.c
+index 63f924a..583cd43 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_linux.c
++++ b/drivers/net/wireless/bcmdhd/dhd_linux.c
+@@ -918,6 +918,7 @@ static void	dhd_if_flush_sta(dhd_if_t * ifp);
+ /* Construct/Destruct a sta pool. */
+ static int dhd_sta_pool_init(dhd_pub_t *dhdp, int max_sta);
+ static void dhd_sta_pool_fini(dhd_pub_t *dhdp, int max_sta);
++static void dhd_sta_pool_clear(dhd_pub_t *dhdp, int max_sta);
+ 
+ 
+ /* Return interface pointer */
+@@ -1089,6 +1090,56 @@ dhd_sta_pool_fini(dhd_pub_t *dhdp, int max_sta)
+ 	dhdp->staid_allocator = NULL;
+ }
+ 
++
++
++/* Clear the pool of dhd_sta_t objects for built-in type driver */
++static void
++dhd_sta_pool_clear(dhd_pub_t *dhdp, int max_sta)
++{
++	int idx, sta_pool_memsz;
++	dhd_sta_t * sta;
++	dhd_sta_pool_t * sta_pool;
++	void *staid_allocator;
++
++	if (!dhdp) {
++		DHD_ERROR(("%s: dhdp is NULL\n", __FUNCTION__));
++		return;
++	}
++
++	sta_pool = (dhd_sta_pool_t *)dhdp->sta_pool;
++	staid_allocator = dhdp->staid_allocator;
++
++	if (!sta_pool) {
++		DHD_ERROR(("%s: sta_pool is NULL\n", __FUNCTION__));
++		return;
++	}
++
++	if (!staid_allocator) {
++		DHD_ERROR(("%s: staid_allocator is NULL\n", __FUNCTION__));
++		return;
++	}
++
++	/* clear free pool */
++	sta_pool_memsz = ((max_sta + 1) * sizeof(dhd_sta_t));
++	bzero((uchar *)sta_pool, sta_pool_memsz);
++
++	/* dhd_sta objects per radio are managed in a table. id#0 reserved. */
++	id16_map_clear(staid_allocator, max_sta, 1);
++
++	/* Initialize all sta(s) for the pre-allocated free pool. */
++	for (idx = max_sta; idx >= 1; idx--) { /* skip sta_pool[0] */
++		sta = &sta_pool[idx];
++		sta->idx = id16_map_alloc(staid_allocator);
++		ASSERT(sta->idx <= max_sta);
++	}
++	/* Now place them into the pre-allocated free pool. */
++	for (idx = 1; idx <= max_sta; idx++) {
++		sta = &sta_pool[idx];
++		dhd_sta_free(dhdp, sta);
++	}
++}
++
++
+ /** Find STA with MAC address ea in an interface's STA list. */
+ dhd_sta_t *
+ dhd_find_sta(void *pub, int ifidx, void *ea)
+@@ -6509,6 +6560,29 @@ dhd_free(dhd_pub_t *dhdp)
+ 		dhd = NULL;
+ 	}
+ }
++void
++dhd_clear(dhd_pub_t *dhdp)
++{
++	DHD_TRACE(("%s: Enter\n", __FUNCTION__));
++
++	if (dhdp) {
++		int i;
++		for (i = 0; i < ARRAYSIZE(dhdp->reorder_bufs); i++) {
++			if (dhdp->reorder_bufs[i]) {
++				reorder_info_t *ptr;
++				uint32 buf_size = sizeof(struct reorder_info);
++				ptr = dhdp->reorder_bufs[i];
++				buf_size += ((ptr->max_idx + 1) * sizeof(void*));
++				DHD_REORDER(("free flow id buf %d, maxidx is %d, buf_size %d\n",
++					i, ptr->max_idx, buf_size));
++
++				MFREE(dhdp->osh, dhdp->reorder_bufs[i], buf_size);
++				dhdp->reorder_bufs[i] = NULL;
++			}
++		}
++		dhd_sta_pool_clear(dhdp, DHD_MAX_STA);
++	}
++}
+ 
+ static void
+ dhd_module_cleanup(void)
+@@ -7072,11 +7146,8 @@ int
+ dhd_net_bus_devreset(struct net_device *dev, uint8 flag)
+ {
+ 	int ret = 0;
+-#if defined (BCMPCIE)
+-	int retry = POWERUP_MAX_RETRY;
+-#endif
+-	dhd_info_t *dhd = DHD_DEV_INFO(dev);
+ 
++	dhd_info_t *dhd = DHD_DEV_INFO(dev);
+ 	if (flag == TRUE) {
+ 		/* Issue wl down command before resetting the chip */
+ 		if (dhd_wl_ioctl_cmd(&dhd->pub, WLC_DOWN, NULL, 0, TRUE, 0) < 0) {
+@@ -7105,101 +7176,12 @@ dhd_net_bus_devreset(struct net_device *dev, uint8 flag)
+ 		dhd_bus_update_fw_nv_path(dhd->pub.bus,
+ 			dhd->fw_path, dhd->nv_path);
+ 	}
+-
++#endif /* BCMSDIO */
+ 	ret = dhd_bus_devreset(&dhd->pub, flag);
+ 	if (ret) {
+ 		DHD_ERROR(("%s: dhd_bus_devreset: %d\n", __FUNCTION__, ret));
+ 		return ret;
+ 	}
+-#elif defined (BCMPCIE)
+-	if(dhd_download_fw_on_driverload) {
+-		ret = dhd_bus_start(&dhd->pub);
+-	} else {
+-		if(!flag) {
+-			if(dhd->pub.busstate == DHD_BUS_DOWN) {
+-				if (dhd->pub.dongle_reset) {
+-					while(retry--) {
+-						ret = dhdpcie_bus_clock_start(dhd->pub.bus);
+-						if(!ret)
+-							break;
+-						else
+-							OSL_SLEEP(10);
+-					}
+-
+-					if(ret && !retry) {
+-						DHD_ERROR(("%s: host pcie clock enable failed: %d\n", __FUNCTION__, ret));
+-						goto done;
+-					}
+-
+-					ret = dhdpcie_bus_enable_device(dhd->pub.bus);
+-					if(ret) {
+-						DHD_ERROR(("%s: host configuration restore failed: %d\n", __FUNCTION__, ret));
+-						goto done;
+-					}
+-
+-					ret = dhdpcie_bus_dongle_attach(dhd->pub.bus);
+-					if(ret) {
+-						DHD_ERROR(("%s: dhd_bus_start: %d\n", __FUNCTION__, ret));
+-						goto done;
+-					}
+-				}
+-				dhd->pub.dongle_reset = FALSE;
+-
+-				ret = dhd_bus_start(&dhd->pub);
+-				if(ret) {
+-					DHD_ERROR(("%s: dhd_bus_start: %d\n", __FUNCTION__, ret));
+-					goto done;
+-				}
+-			} else {
+-				DHD_ERROR(("%s: what should we do here\n", __FUNCTION__));
+-				goto done;
+-			}
+-		} else {
+-			if(dhd->pub.busstate != DHD_BUS_DOWN) {
+-				ret = dhdpcie_bus_disable_device(dhd->pub.bus);
+-				if(ret) {
+-					DHD_ERROR(("%s: dhdpcie_bus_disable_device: %d\n", __FUNCTION__, ret));
+-					goto done;
+-				}
+-
+-				dhd_os_wd_timer(&dhd->pub, 0);
+-				dhd_bus_stop(dhd->pub.bus, TRUE);
+-				dhd_bus_release_dongle(dhd->pub.bus);
+-
+-				ret = dhdpcie_bus_clock_stop(dhd->pub.bus);
+-				if(ret) {
+-					DHD_ERROR(("%s: host clock stop failed: %d\n", __FUNCTION__, ret));
+-					goto done;
+-				}
+-
+-				dhd->pub.busstate = DHD_BUS_DOWN;
+-				dhd->pub.dongle_reset = TRUE;
+-				dhd_prot_clear(&dhd->pub);
+-			}else {
+-				ret = dhdpcie_bus_disable_device(dhd->pub.bus);
+-				if(ret) {
+-					DHD_ERROR(("%s: dhdpcie_bus_disable_device: %d\n", __FUNCTION__, ret));
+-					goto done;
+-				}
+-
+-				dhd_bus_release_dongle(dhd->pub.bus);
+-
+-				ret = dhdpcie_bus_clock_stop(dhd->pub.bus);
+-				if(ret) {
+-					DHD_ERROR(("%s: host clock stop failed: %d\n", __FUNCTION__, ret));
+-					goto done;
+-				}
+-				dhd->pub.dongle_reset = TRUE;
+-
+-				dhd_prot_clear(&dhd->pub);
+-			}
+-		}
+-	}
+-done:
+-#endif /* BCMSDIO */
+-
+-	if (ret)
+-		dhd->pub.busstate = DHD_BUS_DOWN;
+ 	return ret;
+ }
+ 
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie.c b/drivers/net/wireless/bcmdhd/dhd_pcie.c
+index a4cfdbc..30fb56a 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie.c
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie.c
+@@ -2256,6 +2256,152 @@ done:
+ 	return BCME_OK;
+ }
+ #endif /* BCM_BUZZZ */
++int
++dhd_bus_devreset(dhd_pub_t *dhdp, uint8 flag)
++{
++	dhd_bus_t *bus = dhdp->bus;
++	int ret = 0;
++#ifdef CONFIG_ARCH_MSM
++	int retry = POWERUP_MAX_RETRY;
++#endif /* CONFIG_ARCH_MSM */
++
++	if (dhd_download_fw_on_driverload) {
++		ret = dhd_bus_start(dhdp);
++	} else {
++		if (flag == TRUE) {
++			 /* Turn off WLAN */
++			DHD_ERROR(("%s: == Power OFF ==\n", __FUNCTION__));
++			bus->dhd->up = FALSE;
++			if (bus->dhd->busstate != DHD_BUS_DOWN) {
++				if (bus->intr) {
++					dhdpcie_bus_intr_disable(bus);
++					dhdpcie_free_irq(bus);
++				}
++
++				dhd_os_wd_timer(dhdp, 0);
++				dhd_bus_stop(bus, TRUE);
++				dhd_prot_clear(dhdp);
++				dhd_clear(dhdp);
++				dhd_bus_release_dongle(bus);
++				dhdpcie_bus_free_resource(bus);
++				ret = dhdpcie_bus_disable_device(bus);
++				if (ret) {
++					DHD_ERROR(("%s: dhdpcie_bus_disable_device: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++
++#ifdef CONFIG_ARCH_MSM
++				ret = dhdpcie_bus_clock_stop(bus);
++				if (ret) {
++					DHD_ERROR(("%s: host clock stop failed: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++#endif /* CONFIG_ARCH_MSM */
++				bus->dhd->busstate = DHD_BUS_DOWN;
++			} else {
++				if (bus->intr) {
++					dhdpcie_bus_intr_disable(bus);
++					dhdpcie_free_irq(bus);
++				}
++
++				dhd_prot_clear(dhdp);
++				dhd_clear(dhdp);
++				dhd_bus_release_dongle(bus);
++				dhdpcie_bus_free_resource(bus);
++				ret = dhdpcie_bus_disable_device(bus);
++				if (ret) {
++					DHD_ERROR(("%s: dhdpcie_bus_disable_device: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++#ifdef CONFIG_ARCH_MSM
++				ret = dhdpcie_bus_clock_stop(bus);
++				if (ret) {
++					DHD_ERROR(("%s: host clock stop failed: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++#endif  /* CONFIG_ARCH_MSM */
++			}
++
++			bus->dhd->dongle_reset = TRUE;
++			DHD_ERROR(("%s:  WLAN OFF Done\n", __FUNCTION__));
++
++		} else {
++			if (bus->dhd->busstate == DHD_BUS_DOWN) {
++				/* Turn on WLAN */
++				DHD_ERROR(("%s: == Power ON ==\n", __FUNCTION__));
++#ifdef CONFIG_ARCH_MSM
++				while (retry--) {
++					ret = dhdpcie_bus_clock_start(bus);
++					if (!ret) {
++						DHD_ERROR(("%s: dhdpcie_bus_clock_start OK\n",
++							__FUNCTION__));
++						break;
++					}
++					else
++						OSL_SLEEP(10);
++				}
++
++				if (ret && !retry) {
++					DHD_ERROR(("%s: host pcie clock enable failed: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++#endif /* CONFIG_ARCH_MSM */
++				ret = dhdpcie_bus_enable_device(bus);
++				if (ret) {
++					DHD_ERROR(("%s: host configuration restore failed: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++
++				ret = dhdpcie_bus_alloc_resource(bus);
++				if (ret) {
++					DHD_ERROR(("%s: dhdpcie_bus_resource_alloc failed: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++
++				ret = dhdpcie_bus_dongle_attach(bus);
++				if (ret) {
++					DHD_ERROR(("%s: dhdpcie_bus_dongle_attach failed: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++
++				ret = dhd_bus_request_irq(bus);
++				if (ret) {
++					DHD_ERROR(("%s: dhd_bus_request_irq failed: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++
++				bus->dhd->dongle_reset = FALSE;
++
++				ret = dhd_bus_start(dhdp);
++				if (ret) {
++					DHD_ERROR(("%s: dhd_bus_start: %d\n",
++						__FUNCTION__, ret));
++					goto done;
++				}
++
++				bus->dhd->up = TRUE;
++				DHD_ERROR(("%s: WLAN Power On Done\n", __FUNCTION__));
++			} else {
++				DHD_ERROR(("%s: what should we do here\n", __FUNCTION__));
++				goto done;
++			}
++		}
++	}
++done:
++	if (ret)
++		bus->dhd->busstate = DHD_BUS_DOWN;
++
++	return ret;
++}
+ 
+ static int
+ dhdpcie_bus_doiovar(dhd_bus_t *bus, const bcm_iovar_t *vi, uint32 actionid, const char *name,
+@@ -4074,6 +4220,24 @@ dhdpcie_bus_enable_device(struct dhd_bus *bus)
+ 	return dhdpcie_enable_device(bus);
+ }
+ 
++int
++dhdpcie_bus_alloc_resource(struct dhd_bus *bus)
++{
++	return dhdpcie_alloc_resource(bus);
++}
++
++void
++dhdpcie_bus_free_resource(struct dhd_bus *bus)
++{
++	dhdpcie_free_resource(bus);
++}
++
++int
++dhd_bus_request_irq(struct dhd_bus *bus)
++{
++	return dhdpcie_bus_request_irq(bus);
++}
++
+ bool
+ dhdpcie_bus_dongle_attach(struct dhd_bus *bus)
+ {
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie.h b/drivers/net/wireless/bcmdhd/dhd_pcie.h
+index 095e574..f0c7bd9 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie.h
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie.h
+@@ -186,6 +186,8 @@ extern int dhdpcie_start_host_pcieclock(dhd_bus_t *bus);
+ extern int dhdpcie_stop_host_pcieclock(dhd_bus_t *bus);
+ extern int dhdpcie_disable_device(dhd_bus_t *bus);
+ extern int dhdpcie_enable_device(dhd_bus_t *bus);
+-
++extern int dhdpcie_alloc_resource(dhd_bus_t *bus);
++extern void dhdpcie_free_resource(dhd_bus_t *bus);
++extern int dhdpcie_bus_request_irq(struct dhd_bus *bus);
+ extern int dhd_buzzz_dump_dngl(dhd_bus_t *bus);
+ #endif /* dhd_pcie_h */
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c b/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c
+index 820cd44..373276f 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie_linux.c
+@@ -47,6 +47,7 @@
+ #include <bcmmsgbuf.h>
+ #include <pcicfg.h>
+ #include <dhd_pcie.h>
++#include <dhd_linux.h>
+ #if defined (CONFIG_ARCH_MSM)
+ #include <mach/msm_pcie.h>
+ #endif
+@@ -817,4 +818,138 @@ dhdpcie_enable_device(dhd_bus_t *bus)
+ 
+ 	return ret;
+ }
++int
++dhdpcie_alloc_resource(dhd_bus_t *bus)
++{
++	dhdpcie_info_t *dhdpcie_info;
++	phys_addr_t bar0_addr, bar1_addr;
++	ulong bar1_size;
++
++	do {
++		if (bus == NULL) {
++			DHD_ERROR(("%s: bus is NULL\n", __FUNCTION__));
++			break;
++		}
++
++		if (bus->dev == NULL) {
++			DHD_ERROR(("%s: bus->dev is NULL\n", __FUNCTION__));
++			break;
++		}
++
++		dhdpcie_info = pci_get_drvdata(bus->dev);
++		if (dhdpcie_info == NULL) {
++			DHD_ERROR(("%s: dhdpcie_info is NULL\n", __FUNCTION__));
++			break;
++		}
++
++		bar0_addr = pci_resource_start(bus->dev, 0);	/* Bar-0 mapped address */
++		bar1_addr = pci_resource_start(bus->dev, 2);	/* Bar-1 mapped address */
++
++		/* read Bar-1 mapped memory range */
++		bar1_size = pci_resource_len(bus->dev, 2);
++
++		if ((bar1_size == 0) || (bar1_addr == 0)) {
++			printf("%s: BAR1 Not enabled for this device size(%ld),"
++				" addr(0x"PRINTF_RESOURCE")\n",
++				__FUNCTION__, bar1_size, bar1_addr);
++			break;
++		}
++
++		dhdpcie_info->regs = (volatile char *) REG_MAP(bar0_addr, DONGLE_REG_MAP_SIZE);
++		if (!dhdpcie_info->regs) {
++			DHD_ERROR(("%s: ioremap() for regs is failed\n", __FUNCTION__));
++			break;
++		}
++
++		bus->regs = dhdpcie_info->regs;
++		dhdpcie_info->tcm = (volatile char *) REG_MAP(bar1_addr, DONGLE_TCM_MAP_SIZE);
++		dhdpcie_info->tcm_size = DONGLE_TCM_MAP_SIZE;
++		if (!dhdpcie_info->tcm) {
++			DHD_ERROR(("%s: ioremap() for regs is failed\n", __FUNCTION__));
++			REG_UNMAP(dhdpcie_info->regs);
++			bus->regs = NULL;
++			break;
++		}
++
++		bus->tcm = dhdpcie_info->tcm;
++
++		DHD_TRACE(("%s:Phys addr : reg space = %p base addr 0x"PRINTF_RESOURCE" \n",
++			__FUNCTION__, dhdpcie_info->regs, bar0_addr));
++		DHD_TRACE(("%s:Phys addr : tcm_space = %p base addr 0x"PRINTF_RESOURCE" \n",
++			__FUNCTION__, dhdpcie_info->tcm, bar1_addr));
++
++		return 0;
++	} while (0);
++
++	return BCME_ERROR;
++}
++
++void
++dhdpcie_free_resource(dhd_bus_t *bus)
++{
++	dhdpcie_info_t *dhdpcie_info;
++
++	if (bus == NULL) {
++		DHD_ERROR(("%s: bus is NULL\n", __FUNCTION__));
++		return;
++	}
++
++	if (bus->dev == NULL) {
++		DHD_ERROR(("%s: bus->dev is NULL\n", __FUNCTION__));
++		return;
++	}
++
++	dhdpcie_info = pci_get_drvdata(bus->dev);
++	if (dhdpcie_info == NULL) {
++		DHD_ERROR(("%s: dhdpcie_info is NULL\n", __FUNCTION__));
++		return;
++	}
++
++	if (bus->regs) {
++		REG_UNMAP(dhdpcie_info->regs);
++		bus->regs = NULL;
++	}
++
++	if (bus->tcm) {
++		REG_UNMAP(dhdpcie_info->tcm);
++		bus->tcm = NULL;
++	}
++}
++
++int
++dhdpcie_bus_request_irq(struct dhd_bus *bus)
++{
++	dhdpcie_info_t *dhdpcie_info;
++	int ret = 0;
++
++	if (bus == NULL) {
++		DHD_ERROR(("%s: bus is NULL\n", __FUNCTION__));
++		return BCME_ERROR;
++	}
++
++	if (bus->dev == NULL) {
++		DHD_ERROR(("%s: bus->dev is NULL\n", __FUNCTION__));
++		return BCME_ERROR;
++	}
++
++	dhdpcie_info = pci_get_drvdata(bus->dev);
++	if (dhdpcie_info == NULL) {
++		DHD_ERROR(("%s: dhdpcie_info is NULL\n", __FUNCTION__));
++		return BCME_ERROR;
++	}
++
++	if (bus->intr) {
++		/* Register interrupt callback, but mask it (not operational yet). */
++		DHD_INTR(("%s: Registering and masking interrupts\n", __FUNCTION__));
++		dhdpcie_bus_intr_disable(bus);
++		ret = dhdpcie_request_irq(dhdpcie_info);
++		if (ret) {
++			DHD_ERROR(("%s: request_irq() failed, ret=%d\n",
++				__FUNCTION__, ret));
++			return ret;
++		}
++	}
++
++	return ret;
++}
+ 
+diff --git a/drivers/net/wireless/bcmdhd/include/bcmutils.h b/drivers/net/wireless/bcmdhd/include/bcmutils.h
+index cac618b..b74fc9a 100644
+--- a/drivers/net/wireless/bcmdhd/include/bcmutils.h
++++ b/drivers/net/wireless/bcmdhd/include/bcmutils.h
+@@ -2,13 +2,13 @@
+  * Misc useful os-independent macros and functions.
+  *
+  * Copyright (C) 1999-2014, Broadcom Corporation
+- * 
++ *
+  *      Unless you and Broadcom execute a separate written software license
+  * agreement governing use of this software, this software is licensed to you
+  * under the terms of the GNU General Public License version 2 (the "GPL"),
+  * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+  * following added to such license:
+- * 
++ *
+  *      As a special exception, the copyright holders of this software give you
+  * permission to link this software with independent modules, and to copy and
+  * distribute the resulting executable under terms of your choice, provided that
+@@ -16,7 +16,7 @@
+  * the license of that module.  An independent module is a module which is not
+  * derived from this software.  The special exception does not apply to any
+  * modifications of the software.
+- * 
++ *
+  *      Notwithstanding the above, under no circumstances may you combine this
+  * software in any way with any other Broadcom software provided under a license
+  * other than the GPL, without Broadcom's express prior written consent.
+@@ -303,7 +303,7 @@ extern int bcm_iovar_lencheck(const bcm_iovar_t *table, void *arg, int len, bool
+ #if defined(WLTINYDUMP) || defined(WLMSG_INFORM) || defined(WLMSG_ASSOC) || \
+ 	defined(WLMSG_PRPKT) || defined(WLMSG_WSEC)
+ extern int bcm_format_ssid(char* buf, const uchar ssid[], uint ssid_len);
+-#endif 
++#endif
+ #endif	/* BCMDRIVER */
+ 
+ /* Base type definitions */
+@@ -925,6 +925,7 @@ extern void bcm_mwbmap_audit(struct bcm_mwbmap * mwbmap_hdl);
+  */
+ extern void * id16_map_init(osl_t *osh, uint16 total_ids, uint16 start_val16);
+ extern void * id16_map_fini(osl_t *osh, void * id16_map_hndl);
++extern void id16_map_clear(void * id16_map_hndl, uint16 total_ids, uint16 start_val16);
+ 
+ /* Allocate a unique 16bit id */
+ extern uint16 id16_map_alloc(void * id16_map_hndl);
+diff --git a/drivers/net/wireless/bcmdhd/wl_cfg80211.c b/drivers/net/wireless/bcmdhd/wl_cfg80211.c
+index 0fd61f8..00dd045 100644
+--- a/drivers/net/wireless/bcmdhd/wl_cfg80211.c
++++ b/drivers/net/wireless/bcmdhd/wl_cfg80211.c
+@@ -4060,7 +4060,7 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
+ 	err = wldev_iovar_setbuf_bsscfg(dev, "join", ext_join_params, join_params_size,
+ 		cfg->ioctl_buf, WLC_IOCTL_MAXLEN, bssidx, &cfg->ioctl_buf_sync);
+ 
+-	WL_ERR(("Connectting with" MACDBG " channel (%d) ssid \"%s\", len (%d)\n\n",
++	WL_ERR(("Connectting with " MACDBG " channel (%d) ssid \"%s\", len (%d)\n\n",
+ 		MAC2STRDBG((u8*)(&ext_join_params->assoc.bssid)), cfg->channel,
+ 		ext_join_params->ssid.SSID, ext_join_params->ssid.SSID_len));
+ 
+-- 
+1.9.1
+

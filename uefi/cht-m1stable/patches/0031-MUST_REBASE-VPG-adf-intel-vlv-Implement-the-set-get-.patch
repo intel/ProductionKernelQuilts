@@ -1,0 +1,193 @@
+From 361497460c2c12393660d452d2a43943fd12b1d7 Mon Sep 17 00:00:00 2001
+Message-Id: <361497460c2c12393660d452d2a43943fd12b1d7.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Shobhit Kumar <shobhit.kumar@intel.com>
+Date: Wed, 17 Sep 2014 18:02:16 +0530
+Subject: [PATCH 31/75] MUST_REBASE [VPG]: adf/intel/vlv: Implement the
+ set/get events ops for DSI pipe
+
+- Extends the intel_pipe_events with new VLV specififc events
+- Still need to do proper handling of all other events at intel_adf
+  layer. As of now VSYNC is already handled.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: Ice76770c8caea6d72a75e956a021e01cb32d8f40
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ .../video/adf/intel/core/common/dsi/gen_dsi_pipe.c |  100 ++++++++++++++++----
+ .../video/adf/intel/include/core/intel_dc_config.h |    8 +-
+ 2 files changed, 87 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+index c60518e..67b6c7b 100644
+--- a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
++++ b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+@@ -10,6 +10,7 @@
+ 
+ #include <core/intel_dc_config.h>
+ #include <core/vlv/vlv_dc_regs.h>
++#include <core/vlv/vlv_dc_hw.h>
+ #include <core/common/dsi/dsi_pipe.h>
+ #include <core/common/dsi/dsi_config.h>
+ #include <intel_adf_device.h>
+@@ -215,14 +216,53 @@ static u32 dsi_get_supported_events(struct intel_pipe *pipe)
+ 	return INTEL_PIPE_EVENT_VSYNC;
+ }
+ 
+-static int dsi_set_event(struct intel_pipe *pipe, u8 event, bool enabled)
++static int dsi_set_event(struct intel_pipe *pipe, u16 event, bool enabled)
+ {
+ 	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
+ 
++	u32 pipestat, value = 0;
++	u8 idx = pipe->base.idx;
++	value = REG_READ(PIPESTAT(idx));
++
++	if (enabled)
++		pipestat = 0;
++	else
++		pipestat = 0xFFFFFFFF;
++
++	switch (event) {
++	case INTEL_PIPE_EVENT_SPRITE2_FLIP:
++		enabled ? (pipestat |= SPRITE2_FLIP_DONE_EN) :
++			(pipestat &= ~SPRITE2_FLIP_DONE_EN);
++		break;
++	case INTEL_PIPE_EVENT_SPRITE1_FLIP:
++		enabled ? (pipestat |= SPRITE1_FLIP_DONE_EN) :
++			(pipestat &= ~SPRITE1_FLIP_DONE_EN);
++		break;
++	case INTEL_PIPE_EVENT_PRIMARY_FLIP:
++		enabled ? (pipestat |= PLANE_FLIP_DONE_EN) :
++			(pipestat &= ~PLANE_FLIP_DONE_EN);
++		break;
++	case INTEL_PIPE_EVENT_VSYNC:
++		enabled ? (pipestat |= VSYNC_EN) : (pipestat &= ~VSYNC_EN);
++		break;
++	case INTEL_PIPE_EVENT_DPST:
++		enabled ? (pipestat |= DPST_EVENT_EN) :
++			(pipestat &= ~DPST_EVENT_EN);
++		break;
++	}
++
++	if (enabled)
++		/* Enable interrupts */
++		REG_WRITE(PIPESTAT(idx), value | pipestat);
++	else
++		/* Disable interrupts */
++		REG_WRITE(PIPESTAT(idx), value & pipestat);
++
++	/* In case specififc interrupts for DSI like TE */
+ 	if (dsi_pipe->ops.set_event)
+ 		return dsi_pipe->ops.set_event(dsi_pipe, event, enabled);
+-	else
+-		return -EOPNOTSUPP;
++
++	return 0;
+ }
+ 
+ /**
+@@ -237,30 +277,52 @@ static void dsi_get_events(struct intel_pipe *pipe, u32 *events)
+ {
+ 	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
+ 	u8 idx = pipe->base.idx;
+-	u32 dc_events = REG_READ(VLV_IIR);
+-	u32 event_bit;
++
++	u32 pipestat = 0, value = 0;
++	pipestat = REG_READ(PIPESTAT(idx));
+ 
+ 	*events = 0;
+ 
+-	pr_debug("%s: IIR = %#x\n", __func__, dc_events);
++	pr_debug("%s: PIPESTAT = 0x%x\n", __func__, pipestat);
+ 
+-	switch (idx) {
+-	case 0:
+-		event_bit = I915_DISPLAY_PIPE_A_VBLANK_INTERRUPT;
+-		break;
+-	case 2:
+-		event_bit = I915_DISPLAY_PIPE_B_VBLANK_INTERRUPT;
+-		break;
+-	default:
+-		pr_err("%s: invalid pipe index %d\n", __func__, idx);
+-		return;
++	/* FIFO under run */
++	if (pipestat & FIFO_UNDERRUN_STAT) {
++		*events |= INTEL_PIPE_EVENT_UNDERRUN;
++		value |= FIFO_UNDERRUN_STAT;
++	}
++
++	/* Sprite B Flip done interrupt */
++	if (pipestat & SPRITE2_FLIP_DONE_STAT) {
++		*events |= INTEL_PIPE_EVENT_SPRITE2_FLIP;
++		value |= SPRITE2_FLIP_DONE_STAT;
+ 	}
+ 
+-	if (!(dc_events & event_bit))
+-		return;
++	/* Sprite A Flip done interrupt */
++	if (pipestat & SPRITE1_FLIP_DONE_STAT) {
++		*events |= INTEL_PIPE_EVENT_SPRITE1_FLIP;
++		value |= SPRITE2_FLIP_DONE_STAT;
++	}
++
++	/* Plane A Flip done interrupt */
++	if (pipestat & PLANE_FLIP_DONE_STAT) {
++		*events |= INTEL_PIPE_EVENT_PRIMARY_FLIP;
++		value |= PLANE_FLIP_DONE_STAT;
++	}
++
++	/* Vsync interrupt */
++	if (pipestat & VSYNC_STAT) {
++		*events |= INTEL_PIPE_EVENT_VSYNC;
++		value |= VSYNC_STAT;
++	}
++
++	/* DPST event */
++	if (pipestat & DPST_EVENT_STAT) {
++		*events |= INTEL_PIPE_EVENT_DPST;
++		value |= DPST_EVENT_STAT;
++	}
+ 
+ 	/* Clear the 1st level interrupt. */
+-	REG_WRITE(VLV_IIR, dc_events);
++	REG_WRITE(PIPESTAT(idx), pipestat | value);
+ 
+ 	if (dsi_pipe->ops.get_events)
+ 		dsi_pipe->ops.get_events(dsi_pipe, events);
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 1c1352a..3c0514a 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -217,7 +217,11 @@ enum intel_pipe_event {
+ 	INTEL_PIPE_EVENT_AUDIO_BUFFERDONE = 0x8,
+ 	INTEL_PIPE_EVENT_AUDIO_UNDERRUN = 0x10,
+ 	INTEL_PIPE_EVENT_REPEATED_FRAME = 0x20,
+-	/*TODO: add other known pipe events*/
++	INTEL_PIPE_EVENT_UNDERRUN = 0x40,
++	INTEL_PIPE_EVENT_SPRITE1_FLIP = 0x80,
++	INTEL_PIPE_EVENT_SPRITE2_FLIP = 0x100,
++	INTEL_PIPE_EVENT_PRIMARY_FLIP = 0x200,
++	INTEL_PIPE_EVENT_DPST = 0x400,
+ };
+ 
+ /**
+@@ -254,7 +258,7 @@ struct intel_pipe_ops {
+ 	bool (*is_screen_connected)(struct intel_pipe *pipe);
+ 
+ 	u32 (*get_supported_events)(struct intel_pipe *pipe);
+-	int (*set_event)(struct intel_pipe *pipe, u8 event, bool enabled);
++	int (*set_event)(struct intel_pipe *pipe, u16 event, bool enabled);
+ 	void (*get_events)(struct intel_pipe *pipe, u32 *active_events);
+ 	u32 (*get_vsync_counter)(struct intel_pipe *pipe, u32 interval);
+ 	void (*handle_events)(struct intel_pipe *pipe, u32 events);
+-- 
+1.7.9.5
+

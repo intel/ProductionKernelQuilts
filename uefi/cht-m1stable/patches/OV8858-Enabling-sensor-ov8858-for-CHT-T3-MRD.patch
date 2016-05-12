@@ -1,0 +1,299 @@
+From 853b6c4084e6767210f20aa2cebe05b74bd218f4 Mon Sep 17 00:00:00 2001
+From: Fernando Reyna <fernando.m.reyna.diaz@intel.com>
+Date: Wed, 17 Feb 2016 12:09:32 -0600
+Subject: [PATCH 3/3] OV8858: Enabling sensor ov8858 for CHT-T3 MRD
+
+Sensor OV8858:
+    - Added power rail control for ELDO1
+    - Added sequense for gpio1, on and off
+    - BLC valid lines are different between MRD and HR.
+    - Correction in binning factor for the resolutions that use it,
+    according to their registers values.
+
+Change-Id: I9ad151c9ff36d0d0d5edcbed32c5fab3c49872eb
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-20598
+Signed-off-by: Fernando Reyna <fernando.m.reyna.diaz@intel.com>
+Signed-off-by: Marco Salgado <marco.antonio.salgado.martinez@intel.com>
+Signed-off-by: Lopez Esparza, Ricardo <ricardo.lopez.esparza@intel.com>
+Signed-off-by: Yang Fan F <fan.f.yang@intel.com>
+Reviewed-on: https://android.intel.com:443/473242
+---
+ .../camera/drivers/media/i2c/imx/Makefile          |  2 +-
+ .../camera/drivers/media/i2c/ov8858.c              | 57 +++++++++++++++----
+ .../camera/drivers/media/i2c/ov8858.h              | 64 +++++++++++++++++-----
+ 3 files changed, 98 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/Makefile b/drivers/external_drivers/camera/drivers/media/i2c/imx/Makefile
+index d056bbb..4e6e238 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/Makefile
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/Makefile
+@@ -15,7 +15,7 @@ obj-$(CONFIG_VIDEO_IMX) += imx1x5.o
+ 
+ imx1x5-objs := imx.o drv201.o ad5816g.o dw9714.o dw9719.o dw9718.o vcm.o otp.o otp_imx.o otp_brcc064_e2prom.o otp_e2prom.o
+ 
+-ov8858_driver-objs := ../ov8858.o dw9718.o vcm.o
++ov8858_driver-objs := ../ov8858.o dw9718.o dw9714.o vcm.o
+ obj-$(CONFIG_VIDEO_OV8858)     += ov8858_driver.o
+ 
+ ccflags-y += -Werror
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov8858.c b/drivers/external_drivers/camera/drivers/media/i2c/ov8858.c
+index 8d8bb0e..f8c3c3f 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov8858.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov8858.c
+@@ -750,13 +750,26 @@ static int __power_ctrl(struct v4l2_subdev *sd, bool flag)
+ 		return dev->platform_data->power_ctrl(sd, flag);
+ 
+ #ifdef CONFIG_GMIN_INTEL_MID
+-	if (dev->platform_data->v1p2_ctrl) {
+-		ret = dev->platform_data->v1p2_ctrl(sd, flag);
+-		if (ret) {
+-			dev_err(&client->dev,
+-				"failed to power %s 1.2v power rail\n",
+-				flag ? "up" : "down");
+-			return ret;
++	/* CHT HR requires a power rail of 1.2v */
++	if (strcmp(dmi_get_system_info(DMI_BOARD_NAME), CHT_HR_DEV_NAME) == 0) {
++		if (dev->platform_data->v1p2_ctrl) {
++			ret = dev->platform_data->v1p2_ctrl(sd, flag);
++			if (ret) {
++				dev_err(&client->dev,
++						"failed to power %s 1.2v power rail\n",
++						flag ? "up" : "down");
++				return ret;
++			}
++		}
++	} else { /* CHT MRD requires a power rail of 1.6v */
++		if (dev->platform_data->v1p5_ctrl) {
++			ret = dev->platform_data->v1p5_ctrl(sd, flag);
++			if (ret) {
++				dev_err(&client->dev,
++						"failed to power %s 1.6v power rail\n",
++						flag ? "up" : "down");
++				return ret;
++			}
+ 		}
+ 	}
+ 
+@@ -806,11 +819,22 @@ static int __gpio_ctrl(struct v4l2_subdev *sd, bool flag)
+ 	if (dev->platform_data->gpio_ctrl)
+ 		return dev->platform_data->gpio_ctrl(sd, flag);
+ 
++
++	/*Just to execute specific code  dintinguishing between HR and MRD */
++	if (strcmp(dmi_get_system_info(DMI_BOARD_NAME), CHT_HR_DEV_NAME) == 0) {
+ #ifdef CONFIG_GMIN_INTEL_MID
+-	if (dev->platform_data->gpio0_ctrl)
+-		return dev->platform_data->gpio0_ctrl(sd, flag);
++		if (dev->platform_data->gpio0_ctrl)
++			return dev->platform_data->gpio0_ctrl(sd, flag);
+ #endif
+-
++	} else {
++		if (dev->platform_data->gpio0_ctrl) {
++			int ret;
++			ret = dev->platform_data->gpio0_ctrl(sd, flag);
++			if (dev->platform_data->gpio1_ctrl)
++				ret |= dev->platform_data->gpio1_ctrl(sd, flag);
++		return ret;
++		}
++	}
+ 	dev_err(&client->dev, "failed to find platform gpio callback\n");
+ 
+ 	return -EINVAL;
+@@ -1451,6 +1475,15 @@ static int ov8858_s_mbus_fmt(struct v4l2_subdev *sd,
+ 		dev->regs = res->regs;
+ 
+ 	ret = ov8858_write_reg_array(client, dev->regs);
++	/* W/A: For MRD, the valid BLC lines are different than in HR
++	 * making the image look green. */
++	if (strcmp(dmi_get_system_info(DMI_BOARD_NAME), CHT_HR_DEV_NAME) != 0) {
++		if (res->bin_factor_x || res->bin_factor_y)
++			ret = ov8858_write_reg(client, OV8858_8BIT,
++				OV8858_ANCHOR_RIGHT_START, 0x07);
++		else
++			ret = ov8858_write_reg_array(client, ov8858_BLC_MRD);
++	}
+ 	if (ret)
+ 		goto out;
+ 
+@@ -1678,7 +1711,11 @@ static int __update_ov8858_device_settings(struct ov8858_device *dev,
+ #ifdef CONFIG_EXTERNAL_BTNS_CAMERA
+ 		dev->vcm_driver = &ov8858_vcms[OV8858_ID_DEFAULT];
+ #else
++	/* CHT HR requires the vcm dw9718 and CHT MRD uses the vcm dw9714 */
++	if (strcmp(dmi_get_system_info(DMI_BOARD_NAME), CHT_HR_DEV_NAME) == 0)
+ 		dev->vcm_driver = &ov8858_vcms[OV8858_SUNNY];
++	else
++		dev->vcm_driver = &ov8858_vcms[OV8858_MRD];
+ #endif
+ 	else
+ 		return -ENODEV;
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov8858.h b/drivers/external_drivers/camera/drivers/media/i2c/ov8858.h
+index 13c8fb1..444a79bb 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov8858.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov8858.h
+@@ -23,6 +23,7 @@
+ #define __OV8858_H__
+ #include <linux/atomisp_platform.h>
+ #include <media/v4l2-ctrls.h>
++#include <linux/dmi.h>
+ 
+ #define I2C_MSG_LENGTH		0x2
+ 
+@@ -37,6 +38,7 @@
+  */
+ #define OV8858_ID_DEFAULT	0
+ #define OV8858_SUNNY		1
++#define OV8858_MRD			2
+ 
+ #define OV8858_OTP_START_ADDR	0x7010
+ #define OV8858_OTP_END_ADDR	0x7186
+@@ -125,6 +127,8 @@
+ #define OV8858_FORMAT1				0x3820
+ #define OV8858_FORMAT2				0x3821
+ 
++#define OV8858_ANCHOR_RIGHT_START	0x4024
++
+ #define OV8858_FLIP_ENABLE			0x06
+ 
+ #define OV8858_MWB_RED_GAIN_H			0x5032
+@@ -160,6 +164,8 @@
+ 
+ #define OV8858_TEST_PATTERN_REG			0x5E00
+ 
++char *CHT_HR_DEV_NAME  = "Cherry Trail FFD";
++
+ struct ov8858_vcm {
+ 	int (*power_up)(struct v4l2_subdev *sd);
+ 	int (*power_down)(struct v4l2_subdev *sd);
+@@ -320,6 +326,18 @@ extern int dw9718_q_focus_abs(struct v4l2_subdev *sd, s32 *value);
+ extern int dw9718_t_vcm_slew(struct v4l2_subdev *sd, s32 value);
+ extern int dw9718_t_vcm_timing(struct v4l2_subdev *sd, s32 value);
+ 
++extern int dw9714_vcm_power_up(struct v4l2_subdev *sd);
++extern int dw9714_vcm_power_down(struct v4l2_subdev *sd);
++extern int dw9714_vcm_init(struct v4l2_subdev *sd);
++extern int dw9714_t_focus_vcm(struct v4l2_subdev *sd, u16 val);
++extern int dw9714_t_focus_abs(struct v4l2_subdev *sd, s32 value);
++extern int dw9714_t_focus_rel(struct v4l2_subdev *sd, s32 value);
++extern int dw9714_q_focus_status(struct v4l2_subdev *sd, s32 *value);
++extern int dw9714_q_focus_abs(struct v4l2_subdev *sd, s32 *value);
++extern int dw9714_t_vcm_slew(struct v4l2_subdev *sd, s32 value);
++extern int dw9714_t_vcm_timing(struct v4l2_subdev *sd, s32 value);
++
++
+ extern int vcm_power_up(struct v4l2_subdev *sd);
+ extern int vcm_power_down(struct v4l2_subdev *sd);
+ 
+@@ -340,6 +358,18 @@ static struct ov8858_vcm ov8858_vcms[] = {
+ 		.power_up = NULL,
+ 		.power_down = NULL,
+ 	},
++	[OV8858_MRD] = {
++		.power_up = dw9714_vcm_power_up,
++		.power_down = dw9714_vcm_power_down,
++		.init = dw9714_vcm_init,
++		.t_focus_vcm = dw9714_t_focus_vcm,
++		.t_focus_abs = dw9714_t_focus_abs,
++		.t_focus_rel = dw9714_t_focus_rel,
++		.q_focus_status = dw9714_q_focus_status,
++		.q_focus_abs = dw9714_q_focus_abs,
++		.t_vcm_slew = dw9714_t_vcm_slew,
++		.t_vcm_timing = dw9714_t_vcm_timing,
++	},
+ };
+ 
+ 
+@@ -1222,6 +1252,12 @@ static const struct ov8858_reg ov8858_1640x926[] = {
+ 	{OV8858_TOK_TERM, 0, 0}
+ };
+ 
++static const struct ov8858_reg ov8858_BLC_MRD[] = {
++	{OV8858_8BIT, 0x402E, 0x04}, /* Bottom black line start = 12 */
++	{OV8858_8BIT, 0x402F, 0x08}, /* Bottom black line number = 2 */
++	{OV8858_TOK_TERM, 0, 0}
++};
++
+ static struct ov8858_resolution ov8858_res_preview[] = {
+ 	{
+ 		.desc = "ov8858_1640x926_PREVIEW",
+@@ -1229,8 +1265,8 @@ static struct ov8858_resolution ov8858_res_preview[] = {
+ 		.height = 926,
+ 		.used = 0,
+ 		.regs = ov8858_1640x926,
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.skip_frames = 0,
+ 		.fps_options = {
+ 			{
+@@ -1248,8 +1284,8 @@ static struct ov8858_resolution ov8858_res_preview[] = {
+ 		.height = 1232,
+ 		.used = 0,
+ 		.regs = ov8858_1640x1232,
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.skip_frames = 0,
+ 		.fps_options = {
+ 			{
+@@ -1308,8 +1344,8 @@ static struct ov8858_resolution ov8858_res_still[] = {
+ 		.height = 1232,
+ 		.used = 0,
+ 		.regs = ov8858_1640x1232,
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.skip_frames = 0,
+ 		.fps_options = {
+ 			{
+@@ -1327,8 +1363,8 @@ static struct ov8858_resolution ov8858_res_still[] = {
+ 		.height = 926,
+ 		.used = 0,
+ 		.regs = ov8858_1640x926,
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.skip_frames = 1,
+ 		.fps_options = {
+ 			{
+@@ -1388,8 +1424,8 @@ static struct ov8858_resolution ov8858_res_video[] = {
+ 		.height = 926,
+ 		.used = 0,
+ 		.regs = ov8858_1640x926,
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.skip_frames = 1,
+ 		.fps_options = {
+ 			{
+@@ -1407,8 +1443,8 @@ static struct ov8858_resolution ov8858_res_video[] = {
+ 		.height = 1232,
+ 		.used = 0,
+ 		.regs = ov8858_1640x1232,
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.skip_frames = 1,
+ 		.fps_options = {
+ 			{
+@@ -1426,8 +1462,8 @@ static struct ov8858_resolution ov8858_res_video[] = {
+ 		.height = 1096,
+ 		.used = 0,
+ 		.regs = ov8858_1640x1096,
+-		.bin_factor_x = 0,
+-		.bin_factor_y = 0,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
+ 		.skip_frames = 1,
+ 		.fps_options = {
+ 			{
+-- 
+1.9.1
+

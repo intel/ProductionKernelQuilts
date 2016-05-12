@@ -1,0 +1,299 @@
+From 99bcb78619a0975cbe289027d8b1228e642e493d Mon Sep 17 00:00:00 2001
+Message-Id: <99bcb78619a0975cbe289027d8b1228e642e493d.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Akash Goel <akash.goel@intel.com>
+Date: Tue, 17 Jun 2014 10:59:42 +0530
+Subject: [PATCH 124/312] FROM_UPSTREAM [VPG]: drm/i915: Added write-enable
+ pte bit support
+
+This adds support for a write-enable bit in the entry of GTT.
+This is handled via a read-only flag in the GEM buffer object which
+is then used to see how to set the bit when writing the GTT entries.
+Currently by default the Batch buffer & Ring buffers are marked as read only.
+
+v2: Moved the pte override code for read-only bit to 'byt_pte_encode'. (Chris)
+    Fixed the issue of leaving 'gt_old_ro' as unused. (Chris)
+
+v3: Removed the 'gt_old_ro' field, now setting RO bit only for Ring Buffers(Daniel).
+
+v4: Added a new 'flags' parameter to all the pte(gen6) encode & insert_entries functions,
+    in lieu of overloading the cache_level enum (Daniel).
+
+v5: Removed the superfluous VLV check & changed the definition location of PTE_READ_ONLY flag (Imre)
+
+Upstream-repo: drm-intel-nightly
+Upstream-Commit: 24f3a8cf7766e52a087904b4346794c7b410f957
+Change-Id: I3d4b56216fdb42aa9e35869c144c1d08ebfb4756
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    6 ++++
+ drivers/gpu/drm/i915/i915_gem_gtt.c     |   52 ++++++++++++++++++++-----------
+ drivers/gpu/drm/i915/i915_gem_gtt.h     |    6 ++--
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    3 ++
+ 4 files changed, 46 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index aa221f4..89b0826 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1789,6 +1789,12 @@ struct drm_i915_gem_object {
+ 	unsigned int pin_display:1;
+ 
+ 	/*
++	 * Is the object to be mapped as read-only to the GPU
++	 * Only honoured if hardware has relevant pte bit
++	 */
++	unsigned long gt_ro:1;
++
++	/*
+ 	 * Is the GPU currently using a fence to access this buffer,
+ 	 */
+ 	unsigned int pending_fenced_gpu_access:1;
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 7902e87..93ecc66 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -110,7 +110,7 @@ static inline gen8_ppgtt_pde_t gen8_pde_encode(struct drm_device *dev,
+ 
+ static gen6_gtt_pte_t snb_pte_encode(dma_addr_t addr,
+ 				     enum i915_cache_level level,
+-				     bool valid)
++				     bool valid, u32 unused)
+ {
+ 	gen6_gtt_pte_t pte = valid ? GEN6_PTE_VALID : 0;
+ 	pte |= GEN6_PTE_ADDR_ENCODE(addr);
+@@ -132,7 +132,7 @@ static gen6_gtt_pte_t snb_pte_encode(dma_addr_t addr,
+ 
+ static gen6_gtt_pte_t ivb_pte_encode(dma_addr_t addr,
+ 				     enum i915_cache_level level,
+-				     bool valid)
++				     bool valid, u32 unused)
+ {
+ 	gen6_gtt_pte_t pte = valid ? GEN6_PTE_VALID : 0;
+ 	pte |= GEN6_PTE_ADDR_ENCODE(addr);
+@@ -156,7 +156,7 @@ static gen6_gtt_pte_t ivb_pte_encode(dma_addr_t addr,
+ 
+ static gen6_gtt_pte_t byt_pte_encode(dma_addr_t addr,
+ 				     enum i915_cache_level level,
+-				     bool valid)
++				     bool valid, u32 flags)
+ {
+ 	gen6_gtt_pte_t pte = valid ? GEN6_PTE_VALID : 0;
+ 	pte |= GEN6_PTE_ADDR_ENCODE(addr);
+@@ -164,7 +164,8 @@ static gen6_gtt_pte_t byt_pte_encode(dma_addr_t addr,
+ 	/* Mark the page as writeable.  Other platforms don't have a
+ 	 * setting for read-only/writable, so this matches that behavior.
+ 	 */
+-	pte |= BYT_PTE_WRITEABLE;
++	if (!(flags & PTE_READ_ONLY))
++		pte |= BYT_PTE_WRITEABLE;
+ 
+ 	if (level != I915_CACHE_NONE)
+ 		pte |= BYT_PTE_SNOOPED_BY_CPU_CACHES;
+@@ -174,7 +175,7 @@ static gen6_gtt_pte_t byt_pte_encode(dma_addr_t addr,
+ 
+ static gen6_gtt_pte_t hsw_pte_encode(dma_addr_t addr,
+ 				     enum i915_cache_level level,
+-				     bool valid)
++				     bool valid, u32 unused)
+ {
+ 	gen6_gtt_pte_t pte = valid ? GEN6_PTE_VALID : 0;
+ 	pte |= HSW_PTE_ADDR_ENCODE(addr);
+@@ -187,7 +188,7 @@ static gen6_gtt_pte_t hsw_pte_encode(dma_addr_t addr,
+ 
+ static gen6_gtt_pte_t iris_pte_encode(dma_addr_t addr,
+ 				      enum i915_cache_level level,
+-				      bool valid)
++				      bool valid, u32 unused)
+ {
+ 	gen6_gtt_pte_t pte = valid ? GEN6_PTE_VALID : 0;
+ 	pte |= HSW_PTE_ADDR_ENCODE(addr);
+@@ -301,7 +302,8 @@ static void gen8_ppgtt_clear_range(struct i915_address_space *vm,
+ static void gen8_ppgtt_insert_entries(struct i915_address_space *vm,
+ 				      struct sg_table *pages,
+ 				      uint64_t start,
+-				      enum i915_cache_level cache_level)
++				      enum i915_cache_level cache_level,
++				      u32 unused)
+ {
+ 	struct i915_hw_ppgtt *ppgtt =
+ 		container_of(vm, struct i915_hw_ppgtt, base);
+@@ -692,7 +694,7 @@ static void gen6_dump_ppgtt(struct i915_hw_ppgtt *ppgtt, struct seq_file *m)
+ 	uint32_t pd_entry;
+ 	int pte, pde;
+ 
+-	scratch_pte = vm->pte_encode(vm->scratch.addr, I915_CACHE_LLC, true);
++	scratch_pte = vm->pte_encode(vm->scratch.addr, I915_CACHE_LLC, true, 0);
+ 
+ 	pd_addr = (gen6_gtt_pte_t __iomem *)dev_priv->gtt.gsm +
+ 		ppgtt->pd_offset / sizeof(gen6_gtt_pte_t);
+@@ -994,7 +996,7 @@ static void gen6_ppgtt_clear_range(struct i915_address_space *vm,
+ 	unsigned first_pte = first_entry % I915_PPGTT_PT_ENTRIES;
+ 	unsigned last_pte, i;
+ 
+-	scratch_pte = vm->pte_encode(vm->scratch.addr, I915_CACHE_LLC, true);
++	scratch_pte = vm->pte_encode(vm->scratch.addr, I915_CACHE_LLC, true, 0);
+ 
+ 	while (num_entries) {
+ 		last_pte = first_pte + num_entries;
+@@ -1017,7 +1019,8 @@ static void gen6_ppgtt_clear_range(struct i915_address_space *vm,
+ static void gen6_ppgtt_insert_entries(struct i915_address_space *vm,
+ 				      struct sg_table *pages,
+ 				      uint64_t start,
+-				      enum i915_cache_level cache_level)
++				      enum i915_cache_level cache_level,
++				      u32 flags)
+ {
+ 	struct i915_hw_ppgtt *ppgtt =
+ 		container_of(vm, struct i915_hw_ppgtt, base);
+@@ -1034,7 +1037,8 @@ static void gen6_ppgtt_insert_entries(struct i915_address_space *vm,
+ 
+ 		pt_vaddr[act_pte] =
+ 			vm->pte_encode(sg_page_iter_dma_address(&sg_iter),
+-				       cache_level, true);
++				       cache_level, true, flags);
++
+ 		if (++act_pte == I915_PPGTT_PT_ENTRIES) {
+ 			kunmap_atomic(pt_vaddr);
+ 			pt_vaddr = NULL;
+@@ -1271,8 +1275,12 @@ ppgtt_bind_vma(struct i915_vma *vma,
+ 	       enum i915_cache_level cache_level,
+ 	       u32 flags)
+ {
++	/* Currently applicable only to VLV */
++	if (vma->obj->gt_ro)
++		flags |= PTE_READ_ONLY;
++
+ 	vma->vm->insert_entries(vma->vm, vma->obj->pages, vma->node.start,
+-				cache_level);
++				cache_level, flags);
+ }
+ 
+ static void ppgtt_unbind_vma(struct i915_vma *vma)
+@@ -1447,7 +1455,7 @@ static inline void gen8_set_pte(void __iomem *addr, gen8_gtt_pte_t pte)
+ static void gen8_ggtt_insert_entries(struct i915_address_space *vm,
+ 				     struct sg_table *st,
+ 				     uint64_t start,
+-				     enum i915_cache_level level)
++				     enum i915_cache_level level, u32 unused)
+ {
+ 	struct drm_i915_private *dev_priv = vm->dev->dev_private;
+ 	unsigned first_entry = start >> PAGE_SHIFT;
+@@ -1493,7 +1501,7 @@ static void gen8_ggtt_insert_entries(struct i915_address_space *vm,
+ static void gen6_ggtt_insert_entries(struct i915_address_space *vm,
+ 				     struct sg_table *st,
+ 				     uint64_t start,
+-				     enum i915_cache_level level)
++				     enum i915_cache_level level, u32 flags)
+ {
+ 	struct drm_i915_private *dev_priv = vm->dev->dev_private;
+ 	unsigned first_entry = start >> PAGE_SHIFT;
+@@ -1505,7 +1513,8 @@ static void gen6_ggtt_insert_entries(struct i915_address_space *vm,
+ 
+ 	for_each_sg_page(st->sgl, &sg_iter, st->nents, 0) {
+ 		addr = sg_page_iter_dma_address(&sg_iter);
+-		iowrite32(vm->pte_encode(addr, level, true), &gtt_entries[i]);
++		iowrite32(vm->pte_encode(addr, level, true, flags),
++							&gtt_entries[i]);
+ 		i++;
+ 	}
+ 
+@@ -1517,7 +1526,7 @@ static void gen6_ggtt_insert_entries(struct i915_address_space *vm,
+ 	 */
+ 	if (i != 0)
+ 		WARN_ON(readl(&gtt_entries[i-1]) !=
+-			vm->pte_encode(addr, level, true));
++			vm->pte_encode(addr, level, true, flags));
+ 
+ 	/* This next bit makes the above posting read even more important. We
+ 	 * want to flush the TLBs only after we're certain all the PTE updates
+@@ -1571,7 +1580,8 @@ static void gen6_ggtt_clear_range(struct i915_address_space *vm,
+ 		 first_entry, num_entries, max_entries))
+ 		num_entries = max_entries;
+ 
+-	scratch_pte = vm->pte_encode(vm->scratch.addr, I915_CACHE_LLC, use_scratch);
++	scratch_pte = vm->pte_encode(vm->scratch.addr, I915_CACHE_LLC,
++							use_scratch, 0);
+ 
+ 	for (i = 0; i < num_entries; i++)
+ 		iowrite32(scratch_pte, &gtt_base[i]);
+@@ -1620,6 +1630,10 @@ static void ggtt_bind_vma(struct i915_vma *vma,
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_gem_object *obj = vma->obj;
+ 
++	/* Currently applicable only to VLV */
++	if (obj->gt_ro)
++		flags |= PTE_READ_ONLY;
++
+ 	/* If there is no aliasing PPGTT, or the caller needs a global mapping,
+ 	 * or we have a global mapping already but the cacheability flags have
+ 	 * changed, set the global PTEs.
+@@ -1636,7 +1650,7 @@ static void ggtt_bind_vma(struct i915_vma *vma,
+ 		    (cache_level != obj->cache_level)) {
+ 			vma->vm->insert_entries(vma->vm, obj->pages,
+ 						vma->node.start,
+-						cache_level);
++						cache_level, flags);
+ 			obj->has_global_gtt_mapping = 1;
+ 		}
+ 	}
+@@ -1648,7 +1662,7 @@ static void ggtt_bind_vma(struct i915_vma *vma,
+ 		appgtt->base.insert_entries(&appgtt->base,
+ 					    vma->obj->pages,
+ 					    vma->node.start,
+-					    cache_level);
++					    cache_level, flags);
+ 		vma->obj->has_aliasing_ppgtt_mapping = 1;
+ 	}
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index 5943c09..dd6117e 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -154,6 +154,7 @@ struct i915_vma {
+ 	void (*unbind_vma)(struct i915_vma *vma);
+ 	/* Map an object into an address space with the given cache flags. */
+ #define GLOBAL_BIND (1<<0)
++#define PTE_READ_ONLY (1<<1)
+ 	void (*bind_vma)(struct i915_vma *vma,
+ 			 enum i915_cache_level cache_level,
+ 			 u32 flags);
+@@ -197,7 +198,8 @@ struct i915_address_space {
+ 	/* FIXME: Need a more generic return type */
+ 	gen6_gtt_pte_t (*pte_encode)(dma_addr_t addr,
+ 				     enum i915_cache_level level,
+-				     bool valid); /* Create a valid PTE */
++				     bool valid,
++				     u32 flags); /* Create a valid PTE */
+ 	void (*clear_range)(struct i915_address_space *vm,
+ 			    uint64_t start,
+ 			    uint64_t length,
+@@ -205,7 +207,7 @@ struct i915_address_space {
+ 	void (*insert_entries)(struct i915_address_space *vm,
+ 			       struct sg_table *st,
+ 			       uint64_t start,
+-			       enum i915_cache_level cache_level);
++			       enum i915_cache_level cache_level, u32 flags);
+ 	void (*cleanup)(struct i915_address_space *vm);
+ };
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 00b00a5..413554c 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1413,6 +1413,9 @@ static int allocate_ring_buffer(struct intel_engine_cs *ring)
+ 	if (obj == NULL)
+ 		return -ENOMEM;
+ 
++	/* mark ring buffers as read-only from GPU side by default */
++	obj->gt_ro = 1;
++
+ 	ret = i915_gem_obj_ggtt_pin(obj, PAGE_SIZE, PIN_MAPPABLE);
+ 	if (ret)
+ 		goto err_unref;
+-- 
+1.7.9.5
+

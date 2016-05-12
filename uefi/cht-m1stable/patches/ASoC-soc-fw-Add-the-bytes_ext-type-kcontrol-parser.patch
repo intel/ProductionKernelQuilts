@@ -1,0 +1,348 @@
+From 9ef0a5c6da4ff4984aa5e38faabea5c7bd7230e4 Mon Sep 17 00:00:00 2001
+From: Mythri P K <mythri.p.k@intel.com>
+Date: Tue, 22 Apr 2014 18:23:06 +0530
+Subject: [PATCH 11/39] ASoC: soc-fw: Add the bytes_ext type kcontrol parser
+
+Issue: GMINL-3679
+
+Add parsing support for SND_SOC_BYTES_EXT type
+in socfw
+
+Change-Id: I2f5f7740488dc850c625cd2688decd1bac64c23a
+Signed-off-by: Mythri P K <mythri.p.k@intel.com>
+---
+ include/sound/soc.h       |  14 ++++-
+ include/uapi/sound/asoc.h |  14 ++++-
+ sound/soc/soc-core.c      |   3 +
+ sound/soc/soc-fw.c        | 139 ++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 166 insertions(+), 4 deletions(-)
+
+diff --git a/include/sound/soc.h b/include/sound/soc.h
+index 9e6a08c..41a2e83 100644
+--- a/include/sound/soc.h
++++ b/include/sound/soc.h
+@@ -483,7 +483,7 @@ struct snd_soc_codec {
+ 	/* dynamic mixer and enum controls */
+ 	struct list_head dmixers;
+ 	struct list_head denums;
+-
++	struct list_head dbytes;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs_codec_root;
+ 	struct dentry *debugfs_reg;
+@@ -608,7 +608,7 @@ struct snd_soc_platform {
+ 	/* dynamic mixer and enum controls */
+ 	struct list_head dmixers;
+ 	struct list_head denums;
+-
++	struct list_head dbytes;
+ 	struct snd_soc_dapm_context dapm;
+ 
+ #ifdef CONFIG_DEBUG_FS
+@@ -800,7 +800,7 @@ struct snd_soc_card {
+ 	/* dynamic mixer and enum controls */
+ 	struct list_head dmixers;
+ 	struct list_head denums;
+-
++	struct list_head dbytes;
+ 	/* Generic DAPM context for the card */
+ 	struct snd_soc_dapm_context dapm;
+ 	struct snd_soc_dapm_stats dapm_stats;
+@@ -880,6 +880,14 @@ struct soc_mreg_control {
+ 
+ struct soc_bytes_ext {
+ 	int max;
++
++	/* dynamic controls */
++	struct list_head list;
++	struct snd_kcontrol *dcontrol;
++	int index;
++
++	unsigned int pvt_data_len;
++	char *pvt_data;
+ };
+ 
+ /* enumerated kcontrol */
+diff --git a/include/uapi/sound/asoc.h b/include/uapi/sound/asoc.h
+index e9e3911..9ad911b 100644
+--- a/include/uapi/sound/asoc.h
++++ b/include/uapi/sound/asoc.h
+@@ -328,6 +328,7 @@
+ #define SOC_CONTROL_TYPE_BOOL_EXT	9
+ #define SOC_CONTROL_TYPE_RANGE		10
+ #define SOC_CONTROL_TYPE_STROBE		11
++#define SOC_CONTROL_TYPE_BYTES_EXT	12
+ 
+ /* compound control IDs */
+ #define SOC_CONTROL_IO_VOLSW \
+@@ -374,7 +375,10 @@
+ 	SOC_CONTROL_ID(SOC_CONTROL_TYPE_STROBE, \
+ 		SOC_CONTROL_TYPE_STROBE, \
+ 		SOC_CONTROL_TYPE_STROBE)
+-
++#define SOC_CONTROL_IO_BYTES_EXT \
++	SOC_CONTROL_ID(SOC_CONTROL_TYPE_EXT, \
++		SOC_CONTROL_TYPE_EXT, \
++		SOC_CONTROL_TYPE_BYTES_EXT)
+ /* widget has no PM register bit */
+ #define SND_SOC_NOPM	-1
+ 
+@@ -841,6 +845,14 @@ struct snd_soc_fw_enum_control {
+ 	__le32 values[SND_SOC_FW_NUM_TEXTS * SND_SOC_FW_TEXT_SIZE / 4];
+ } __attribute__((packed));
+ 
++
++struct snd_soc_fw_bytes_ext {
++	struct snd_soc_fw_control_hdr hdr;
++	__s32 max;
++	__le32 reserved[12]; /* Reserved for future use */
++	__le32 pvt_data_len;
++	char pvt_data[0];
++} __attribute__((packed));
+ /*
+  * kcontrol Header
+  */
+diff --git a/sound/soc/soc-core.c b/sound/soc/soc-core.c
+index 6e8b4cd..d54b0fa 100644
+--- a/sound/soc/soc-core.c
++++ b/sound/soc/soc-core.c
+@@ -3906,6 +3906,7 @@ int snd_soc_register_card(struct snd_soc_card *card)
+ 	INIT_LIST_HEAD(&card->dapm_dirty);
+ 	INIT_LIST_HEAD(&card->denums);
+ 	INIT_LIST_HEAD(&card->dmixers);
++	INIT_LIST_HEAD(&card->dbytes);
+ 	card->instantiated = 0;
+ 	mutex_init(&card->mutex);
+ 	mutex_init(&card->dapm_mutex);
+@@ -4297,6 +4298,7 @@ int snd_soc_add_platform(struct device *dev, struct snd_soc_platform *platform,
+ 	mutex_init(&platform->mutex);
+ 	INIT_LIST_HEAD(&platform->denums);
+ 	INIT_LIST_HEAD(&platform->dmixers);
++	INIT_LIST_HEAD(&platform->dbytes);
+ 
+ 	mutex_lock(&client_mutex);
+ 	list_add(&platform->list, &platform_list);
+@@ -4456,6 +4458,7 @@ int snd_soc_register_codec(struct device *dev,
+ 	mutex_init(&codec->mutex);
+ 	INIT_LIST_HEAD(&codec->denums);
+ 	INIT_LIST_HEAD(&codec->dmixers);
++	INIT_LIST_HEAD(&codec->dbytes);
+ 
+ 	for (i = 0; i < num_dai; i++) {
+ 		fixup_codec_formats(&dai_drv[i].playback);
+diff --git a/sound/soc/soc-fw.c b/sound/soc/soc-fw.c
+index 1fd5426..52451ea 100644
+--- a/sound/soc/soc-fw.c
++++ b/sound/soc/soc-fw.c
+@@ -96,6 +96,8 @@ static const struct snd_soc_fw_kcontrol_ops io_ops[] = {
+ 		snd_soc_bytes_put, snd_soc_bytes_info},
+ 	{SOC_CONTROL_IO_BOOL_EXT, NULL,
+ 		NULL, snd_ctl_boolean_mono_info},
++	{SOC_CONTROL_IO_BYTES_EXT, NULL,
++		NULL, snd_soc_info_bytes_ext},
+ 	{SOC_CONTROL_IO_RANGE, snd_soc_get_volsw_range,
+ 		snd_soc_put_volsw_range, snd_soc_info_volsw_range},
+ 	{SOC_CONTROL_IO_VOLSW_XR_SX, snd_soc_get_xr_sx,
+@@ -136,6 +138,18 @@ static inline void soc_fw_list_add_mixer(struct soc_fw *sfw,
+ 		BUG();
+ }
+ 
++static inline void soc_fw_list_add_bytes(struct soc_fw *sfw,
++	struct soc_bytes_ext *sb)
++{
++	if (sfw->codec)
++		list_add(&sb->list, &sfw->codec->dbytes);
++	else if (sfw->platform)
++		list_add(&sb->list, &sfw->platform->dbytes);
++	else if (sfw->card)
++		list_add(&sb->list, &sfw->card->dbytes);
++	else
++		dev_err(sfw->dev, "Cannot add dbytes no valid type\n");
++}
+ static inline struct snd_soc_dapm_context *soc_fw_dapm_get(struct soc_fw *sfw)
+ {
+ 	if (sfw->codec)
+@@ -411,6 +425,95 @@ static inline void soc_fw_free_tlv(struct soc_fw *sfw,
+ 	kfree(kc->tlv.p);
+ }
+ 
++static int soc_fw_dbytes_create(struct soc_fw *sfw, unsigned int count,
++	size_t size)
++{
++	struct snd_soc_fw_bytes_ext *be;
++	struct soc_bytes_ext  *sbe;
++	struct snd_kcontrol_new kc;
++	int i, err, ext;
++
++	if (soc_fw_check_control_count(sfw,
++		sizeof(struct snd_soc_fw_bytes_ext), count, size)) {
++		dev_err(sfw->dev, "Asoc: Invalid count %d for byte control\n",
++				count);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < count; i++) {
++		be = (struct snd_soc_fw_bytes_ext *)sfw->pos;
++
++		/* validate kcontrol */
++		if (strnlen(be->hdr.name, SND_SOC_FW_TEXT_SIZE) ==
++			SND_SOC_FW_TEXT_SIZE)
++			return -EINVAL;
++
++		sbe = kzalloc(sizeof(*sbe) + be->pvt_data_len, GFP_KERNEL);
++		if (!sbe)
++			return -ENOMEM;
++
++		sfw->pos += (sizeof(struct snd_soc_fw_bytes_ext) + be->pvt_data_len);
++
++		dev_dbg(sfw->dev,
++			"ASoC: adding bytes kcontrol %s with access 0x%x\n",
++			be->hdr.name, be->hdr.access);
++
++		memset(&kc, 0, sizeof(kc));
++		kc.name = be->hdr.name;
++		kc.private_value = (long)sbe;
++		kc.iface = SNDRV_CTL_ELEM_IFACE_MIXER;
++		kc.access = be->hdr.access;
++
++		sbe->max = be->max;
++
++		if (be->pvt_data_len)
++			soc_fw_init_pvt_data(sfw, be->hdr.index, (unsigned long)sbe, (unsigned long)be);
++
++		INIT_LIST_HEAD(&sbe->list);
++
++		/* map standard io handlers and check for external handlers */
++		ext = soc_fw_kcontrol_bind_io(be->hdr.index, &kc, io_ops,
++			ARRAY_SIZE(io_ops));
++
++		if (ext) {
++			/* none exist, so now try and map ext handlers */
++			ext = soc_fw_kcontrol_bind_io(be->hdr.index, &kc,
++				sfw->io_ops, sfw->io_ops_count);
++			if (ext) {
++				dev_err(sfw->dev,
++					"ASoC: no complete mixer IO handler for %s type (g,p,i) %d:%d:%d\n",
++					be->hdr.name,
++					SOC_CONTROL_GET_ID_GET(be->hdr.index),
++					SOC_CONTROL_GET_ID_PUT(be->hdr.index),
++					SOC_CONTROL_GET_ID_INFO(be->hdr.index));
++				kfree(sbe);
++				continue;
++			}
++
++			err = soc_fw_init_kcontrol(sfw, &kc);
++			if (err < 0) {
++				dev_err(sfw->dev, "ASoC: failed to init %s\n",
++					be->hdr.name);
++				kfree(sbe);
++				continue;
++			}
++		}
++
++		/* register control here */
++		err = soc_fw_add_kcontrol(sfw, &kc, &sbe->dcontrol);
++		if (err < 0) {
++			dev_err(sfw->dev, "ASoC: failed to add %s\n", be->hdr.name);
++			kfree(sbe);
++			continue;
++		}
++		/* This needs to  be change to a widget which would not work
++		 * unless we made changes to snd_soc_code, snd_soc_platform as
++		 * that has only enumns and mixer everywhere that list is used*/
++		soc_fw_list_add_bytes(sfw, sbe);
++	}
++	return 0;
++
++}
+ static int soc_fw_dmixer_create(struct soc_fw *sfw, unsigned int count,
+ 	size_t size)
+ {
+@@ -696,6 +799,9 @@ static int soc_fw_kcontrol_load(struct soc_fw *sfw, struct snd_soc_fw_hdr *hdr)
+ 		case SOC_DAPM_TYPE_ENUM_EXT:
+ 			soc_fw_denum_create(sfw, 1, hdr->size);
+ 			break;
++		case SOC_CONTROL_TYPE_BYTES_EXT:
++			soc_fw_dbytes_create(sfw, 1, hdr->size);
++			break;
+ 		default:
+ 			dev_err(sfw->dev, "ASoC: invalid control type %d:%d:%d count %d\n",
+ 				SOC_CONTROL_GET_ID_GET(control_hdr->index),
+@@ -1502,6 +1608,7 @@ void snd_soc_fw_dcontrols_remove_codec(struct snd_soc_codec *codec,
+ {
+ 	struct soc_mixer_control *sm, *next_sm;
+ 	struct soc_enum *se, *next_se;
++	struct soc_bytes_ext *sb, *next_sb;
+ 	struct snd_card *card = codec->card->snd_card;
+ 	const unsigned int *p = NULL;
+ 	int i;
+@@ -1532,6 +1639,16 @@ void snd_soc_fw_dcontrols_remove_codec(struct snd_soc_codec *codec,
+ 			kfree(se->dtexts[i]);
+ 		kfree(se);
+ 	}
++
++	list_for_each_entry_safe(sb, next_sb, &codec->dbytes, list) {
++
++		if (sm->index != index)
++			continue;
++
++		snd_ctl_remove(card, sb->dcontrol);
++		list_del(&sb->list);
++		kfree(sb);
++	}
+ }
+ EXPORT_SYMBOL_GPL(snd_soc_fw_dcontrols_remove_codec);
+ 
+@@ -1541,6 +1658,7 @@ void snd_soc_fw_dcontrols_remove_platform(struct snd_soc_platform *platform,
+ {
+ 	struct soc_mixer_control *sm, *next_sm;
+ 	struct soc_enum *se, *next_se;
++	struct soc_bytes_ext *sb, *next_sb;
+ 	struct snd_card *card = platform->card->snd_card;
+ 	const unsigned int *p = NULL;
+ 	int i;
+@@ -1571,6 +1689,16 @@ void snd_soc_fw_dcontrols_remove_platform(struct snd_soc_platform *platform,
+ 			kfree(se->dtexts[i]);
+ 		kfree(se);
+ 	}
++
++	list_for_each_entry_safe(sb, next_sb, &platform->dbytes, list) {
++
++		if (sm->index != index)
++			continue;
++
++		snd_ctl_remove(card, sb->dcontrol);
++		list_del(&sb->list);
++		kfree(sb);
++	}
+ }
+ EXPORT_SYMBOL_GPL(snd_soc_fw_dcontrols_remove_platform);
+ 
+@@ -1580,6 +1708,7 @@ void snd_soc_fw_dcontrols_remove_card(struct snd_soc_card *soc_card,
+ {
+ 	struct soc_mixer_control *sm, *next_sm;
+ 	struct soc_enum *se, *next_se;
++	struct soc_bytes_ext *sb, *next_sb;
+ 	struct snd_card *card = soc_card->snd_card;
+ 	const unsigned int *p = NULL;
+ 	int i;
+@@ -1610,6 +1739,16 @@ void snd_soc_fw_dcontrols_remove_card(struct snd_soc_card *soc_card,
+ 			kfree(se->dtexts[i]);
+ 		kfree(se);
+ 	}
++
++	list_for_each_entry_safe(sb, next_sb, &soc_card->dbytes, list) {
++
++		if (sm->index != index)
++			continue;
++
++		snd_ctl_remove(card, sb->dcontrol);
++		list_del(&sb->list);
++		kfree(sb);
++	}
+ }
+ EXPORT_SYMBOL_GPL(snd_soc_fw_dcontrols_remove_card);
+ 
+-- 
+1.9.1
+

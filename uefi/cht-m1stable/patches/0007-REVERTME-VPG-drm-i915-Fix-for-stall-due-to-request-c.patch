@@ -1,0 +1,88 @@
+From 4a7296deaca23f834ef2f82db85db347a0d59065 Mon Sep 17 00:00:00 2001
+Message-Id: <4a7296deaca23f834ef2f82db85db347a0d59065.1432858002.git.chang-joon.lee@intel.com>
+In-Reply-To: <944dfa31d45b9ee101932dfa029ec3452a83cb30.1432858002.git.chang-joon.lee@intel.com>
+References: <944dfa31d45b9ee101932dfa029ec3452a83cb30.1432858002.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Fri, 15 May 2015 17:33:40 +0100
+Subject: [PATCH 7/7] REVERTME [VPG]: drm/i915: Fix for stall due to request
+ completion race condition
+
+One particular dEPQ test was stalling for about one second. This was
+because the last batch buffer submitted was incredibly small and was
+waited for by the test using the native sync interface rather than the
+driver's wait interface. The problem is that the add_request()
+function generates and sends the seqno interrupt commands before
+adding the request to the request list. This creates a window of
+opportunity for the batch buffer to complete and raise the interrupt
+before the request is on the list. Thus the interrupt handle cannot
+mark the request as complete.
+
+There is code in the driver to cope with this. Specifically, the wait
+for request function starts by calling the retire function to check
+for missed completion events. Unfortunately, the test program was not
+doing the wait with driver knowledge but just waiting on the native
+sync file handle. Thus the driver has no opportunity to do an explicit
+test before sleeping. The second back up plan is that the retire
+handler runs asynchronously with a one second delay after the last
+batch has been submitted. Thus, the request is guaranteed to complete
+eventually. This is why the test would suffer a one second stall.
+
+It is unclear whether it is safe to re-order the seqno interrupt emit
+and the request list update. Reversing these could cause other,
+unforseen, problems due to adding a request structure to the request
+list when it is only partially filled in (there are various fields
+that are not known until the seqno command has been emitted).
+
+This patch beefs up the race work around by explicitly calling the
+retire request function at the end of the add request code. This is
+only done if a fresh read of the seqno returns a value equal or
+greater than the seqno of the request being processed.
+
+NB: This patch is a REVERTME because the problem is already fixed
+by patches in the upstream mailing list. Specifically, the conversion
+of requests to use struct fence eliminates the race condition entirely
+and no work around is required. Unfortunately, that patch series has a
+large number of pre-requisites and cannot simply be dropped into the
+current GMin tree. Once those patches arrive in a future forklift,
+this patch can be dropped.
+
+Change-Id: I22b5d3e96b1ce8fd5ebc119a5dceda8d74ad3a52
+Issue: GMINL-9535
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 70ca973..4246a00 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2612,10 +2612,6 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	list_add_tail(&request->list, &ring->request_list);
+ 	request->file_priv = NULL;
+ 
+-	/* Avoid race condition where the request completes before it has
+-	 * been added to the list. */
+-	ring->last_read_seqno = 0;
+-
+ 	if (file) {
+ 		struct drm_i915_file_private *file_priv = file->driver_priv;
+ 
+@@ -2635,6 +2631,14 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 		intel_mark_busy(dev_priv->dev);
+ 	}
+ 
++	/*
++	 * Avoid race condition where the request completes before it has
++	 * been added to the list.
++	 */
++	ring->last_read_seqno = 0;
++	if (i915_seqno_passed(ring->get_seqno(ring, false), request->seqno))
++		i915_gem_complete_requests_ring(request->ring, true);
++
+ end:
+ 	intel_runtime_pm_put(dev_priv);
+ 
+-- 
+1.9.1
+

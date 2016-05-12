@@ -1,0 +1,84 @@
+From 0f1e2e5eef412dd3c71f724f1a4082716d5b7eb7 Mon Sep 17 00:00:00 2001
+Message-Id: <0f1e2e5eef412dd3c71f724f1a4082716d5b7eb7.1417780878.git.chang-joon.lee@intel.com>
+In-Reply-To: <cb098d33cdac3271103834fbce08218248d7bddb.1417780878.git.chang-joon.lee@intel.com>
+References: <cb098d33cdac3271103834fbce08218248d7bddb.1417780878.git.chang-joon.lee@intel.com>
+From: Tomas Elf <tomas.elf@intel.com>
+Date: Thu, 6 Nov 2014 09:06:17 +0000
+Subject: [PATCH 07/34] FOR_UPSTREAM [VPG]: drm/i915: Block mutex acquisition
+ during reset
+
+The GPU reset code currently releases struct_mutex in the middle
+of recovering from a GPU hang, before completing all necessary
+steps. This means that other submitters can come in, grab the
+struct_mutex and submit work while other resources are being
+torn down. Especially when introducing TDR v5 in an upcoming
+patch this is going to become problematic due to various
+race conditions in the TDR path. TDR expects exclusive access
+to the submission path even after releasing the struct_mutex
+and before resetting the reset_in_progress flag, otherwise
+unsynchronized accesses between TDR and other submitters
+might lead to nasty, unforseen errors.
+
+This patch makes sure that all submitters first makes sure to
+wait until the reset_in_progress flag has been reset before
+the struct_mutex can be acquired. Also, even after a submitter
+has acquired the struct_mutex the flag is checked to make sure
+that no resets were signalled while the submitter was waiting
+for the mutex. If so, the submitter gives up the mutex and is
+asked to try again later. This ensures that nobody gets the
+mutex while reset is ongoing.
+
+Issue: GMIN-3568
+Tracked-On: https://jira01.devtools.intel.com/browse/GMIN-3568
+Signed-off-by: Tomas Elf <tomas.elf@intel.com>
+Change-Id: Ib77845a5ec70eab14ed58d1b481e68068a940bee
+---
+ drivers/gpu/drm/i915/i915_gem.c |   25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 1bba46c..4c43cc0 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -172,17 +172,34 @@ int i915_gem_wedged(struct drm_device *dev, bool interruptible)
+ int i915_mutex_lock_interruptible(struct drm_device *dev)
+ {
+ 	int ret;
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	/*
+-	 * There should be no need to call i915_gem_wait_for_error
+-	 * as the error recovery handler takes dev->struct_mutex
+-	 * so if it is active we will wait on the mutex_lock_interruptible
+-	 * call instead
++	 * Since the full GPU reset has to release the struct_mutex
++	 * and then re-acquire it in the middle of reset it is not
++	 * enough to trust the struct_mutex alone.
++	 * i915_gem_wait_for_error checks i915_reset_in_progress and
++	 * waits until reset has been completed.
+ 	 */
++	ret = i915_gem_wait_for_error(dev, &dev_priv->gpu_error);
++	if (ret)
++		return ret;
++
+ 	ret = mutex_lock_interruptible(&dev->struct_mutex);
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * If reset is ongoing at this point it means that while we
++	 * were waiting for the struct_mutex a hang was detected and reset
++	 * was initiated. In that case we should back off and try again.
++	 * We don't want to step on the toes of TDR.
++	 */
++	if (i915_gem_wedged(dev, true)) {
++		mutex_unlock(&dev->struct_mutex);
++		return -EAGAIN;
++	}
++
+ 	WARN_ON(i915_verify_lists(dev));
+ 	return 0;
+ }
+-- 
+1.7.9.5
+

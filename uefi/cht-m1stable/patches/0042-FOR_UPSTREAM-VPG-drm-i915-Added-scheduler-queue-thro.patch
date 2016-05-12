@@ -1,0 +1,161 @@
+From 3e2aa406abf5db4d4aa43f75bb45ddc35540b4c6 Mon Sep 17 00:00:00 2001
+Message-Id: <3e2aa406abf5db4d4aa43f75bb45ddc35540b4c6.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 16 Apr 2014 15:34:53 +0100
+Subject: [PATCH 42/61] FOR_UPSTREAM [VPG]: drm/i915: Added scheduler queue
+ throttling by DRM file handle
+
+The scheduler decouples the submission of batch buffers to the driver from their
+subsequent submission to the hardware. This means that an application which is
+continuously submitting buffers as fast as it can could potentialy flood the
+driver. To prevent this, the driver now tracks how many buffers are in progress
+(queued in software or executing in hardware) and limits this to a given
+(tunable) number. If this number is exceeded then the queue to the driver will
+return EAGAIN and thus prevent the scheduler's queue becoming arbitrarily
+large.
+
+Change-Id: I83258240aec7c810db08c006a3062d46aa91363f
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    2 ++
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    8 +++++++
+ drivers/gpu/drm/i915/i915_scheduler.c      |   34 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.h      |    2 ++
+ 4 files changed, 46 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index a11a909..b82689b 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2232,6 +2232,8 @@ struct drm_i915_file_private {
+ 	struct bin_attribute *obj_attr;
+ 
+ 	struct drm_i915_perfmon_file perfmon;
++
++	u32 scheduler_queue_length;
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 713a095..baad84e 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1795,6 +1795,10 @@ i915_gem_execbuffer(struct drm_device *dev, void *data,
+ 		return -EINVAL;
+ 	}
+ 
++	/* Throttle batch requests per device file */
++	if (i915_scheduler_file_queue_is_full(file))
++		return -EAGAIN;
++
+ 	/* Copy in the exec list from userland */
+ 	exec_list = drm_malloc_ab(sizeof(*exec_list), args->buffer_count);
+ 	exec2_list = drm_malloc_ab(sizeof(*exec2_list), args->buffer_count);
+@@ -1883,6 +1887,10 @@ i915_gem_execbuffer2(struct drm_device *dev, void *data,
+ 		return -EINVAL;
+ 	}
+ 
++	/* Throttle batch requests per device file */
++	if (i915_scheduler_file_queue_is_full(file))
++		return -EAGAIN;
++
+ 	exec2_list = kmalloc(sizeof(*exec2_list)*args->buffer_count,
+ 			     GFP_TEMPORARY | __GFP_NOWARN | __GFP_NORETRY);
+ 	if (exec2_list == NULL)
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 37749ca..c361516 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -40,6 +40,8 @@ void        i915_scheduler_priority_bump_clear(struct i915_scheduler *scheduler)
+ int         i915_scheduler_priority_bump(struct i915_scheduler *scheduler,
+ 				struct i915_scheduler_queue_entry *target,
+ 				uint32_t bump);
++void        i915_scheduler_file_queue_inc(struct drm_file *file);
++void        i915_scheduler_file_queue_dec(struct drm_file *file);
+ 
+ bool i915_scheduler_is_enabled(struct drm_device *dev)
+ {
+@@ -72,6 +74,7 @@ int i915_scheduler_init(struct drm_device *dev)
+ 	scheduler->priority_level_max     = ~0U;
+ 	scheduler->priority_level_preempt = 900;
+ 	scheduler->min_flying             = 2;
++	scheduler->file_queue_max         = 64;
+ 
+ 	dev_priv->scheduler = scheduler;
+ 
+@@ -233,6 +236,8 @@ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe)
+ 
+ 	list_add_tail(&node->link, &scheduler->node_queue[ring->id]);
+ 
++	i915_scheduler_file_queue_inc(node->params.file);
++
+ 	if (i915.scheduler_override & i915_so_submit_on_queue)
+ 		not_flying = true;
+ 	else
+@@ -576,6 +581,12 @@ static int i915_scheduler_remove(struct intel_engine_cs *ring)
+ 		/* Strip the dependency info while the mutex is still locked */
+ 		i915_scheduler_remove_dependent(scheduler, node);
+ 
++		/* Likewise clean up the file descriptor before it might disappear. */
++		if (node->params.file) {
++			i915_scheduler_file_queue_dec(node->params.file);
++			node->params.file = NULL;
++		}
++
+ 		continue;
+ 	}
+ 
+@@ -1294,3 +1305,26 @@ bool i915_scheduler_is_ring_idle(struct intel_engine_cs *ring)
+ 
+ 	return idle;
+ }
++
++bool i915_scheduler_file_queue_is_full(struct drm_file *file)
++{
++	struct drm_i915_file_private *file_priv = file->driver_priv;
++	struct drm_i915_private      *dev_priv  = file_priv->dev_priv;
++	struct i915_scheduler        *scheduler = dev_priv->scheduler;
++
++	return file_priv->scheduler_queue_length >= scheduler->file_queue_max;
++}
++
++void i915_scheduler_file_queue_inc(struct drm_file *file)
++{
++	struct drm_i915_file_private *file_priv = file->driver_priv;
++
++	file_priv->scheduler_queue_length++;
++}
++
++void i915_scheduler_file_queue_dec(struct drm_file *file)
++{
++	struct drm_i915_file_private *file_priv = file->driver_priv;
++
++	file_priv->scheduler_queue_length--;
++}
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 1e8f529..6c2759b 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -86,6 +86,7 @@ struct i915_scheduler {
+ 	uint32_t            priority_level_max;
+ 	uint32_t            priority_level_preempt;
+ 	uint32_t            min_flying;
++	uint32_t            file_queue_max;
+ };
+ 
+ /* Flag bits for i915_scheduler::flags */
+@@ -114,5 +115,6 @@ int         i915_scheduler_flush_request(struct drm_i915_gem_request *req,
+ 					 bool is_locked);
+ bool        i915_scheduler_is_request_tracked(struct drm_i915_gem_request *req,
+ 					      bool *completed, bool *busy);
++bool        i915_scheduler_file_queue_is_full(struct drm_file *file);
+ 
+ #endif  /* _I915_SCHEDULER_H_ */
+-- 
+1.7.9.5
+

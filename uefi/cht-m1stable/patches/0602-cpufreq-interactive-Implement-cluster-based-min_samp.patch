@@ -1,0 +1,112 @@
+From bb5eee7cfc0693936300239b10c49137c49b5512 Mon Sep 17 00:00:00 2001
+From: Junjie Wu <junjiew@codeaurora.org>
+Date: Tue, 24 Mar 2015 15:51:10 -0700
+Subject: [PATCH 602/634] cpufreq: interactive: Implement cluster-based
+ min_sample_time
+
+min_sample_time needs to be cluster-based to match
+above_hispeed_delay. If each CPU keeps making local decisions, it's
+possible min_sample_time is not correctly enforced at cluster level,
+which results in undesired frequency drops.
+
+Change-Id: Ia2ec2ad9b7a8d715d4408c924d6762b7e532e4b4
+Reviewed-by: Saravana Kannan <skannan@codeaurora.org>
+Signed-off-by: Junjie Wu <junjiew@codeaurora.org>
+---
+ drivers/cpufreq/cpufreq_interactive.c | 30 ++++++++++++++++++++----------
+ 1 file changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/cpufreq/cpufreq_interactive.c b/drivers/cpufreq/cpufreq_interactive.c
+index 437e759..8ddb6fc 100644
+--- a/drivers/cpufreq/cpufreq_interactive.c
++++ b/drivers/cpufreq/cpufreq_interactive.c
+@@ -48,7 +48,8 @@ struct cpufreq_interactive_cpuinfo {
+ 	unsigned int target_freq;
+ 	unsigned int floor_freq;
+ 	unsigned int max_freq;
+-	u64 floor_validate_time;
++	u64 pol_floor_val_time; /* policy floor_validate_time */
++	u64 loc_floor_val_time; /* per-cpu floor_validate_time */
+ 	u64 pol_hispeed_val_time; /* policy hispeed_validate_time */
+ 	u64 loc_hispeed_val_time; /* per-cpu hispeed_validate_time */
+ 	struct rw_semaphore enable_sem;
+@@ -346,6 +347,7 @@ static void cpufreq_interactive_timer(unsigned long data)
+ 	unsigned int loadadjfreq;
+ 	unsigned int index;
+ 	unsigned long flags;
++	u64 max_fvtime;
+ 
+ 	if (!down_read_trylock(&pcpu->enable_sem))
+ 		return;
+@@ -409,9 +411,10 @@ static void cpufreq_interactive_timer(unsigned long data)
+ 	 * Do not scale below floor_freq unless we have been at or above the
+ 	 * floor frequency for the minimum sample time since last validated.
+ 	 */
+-	if (new_freq < pcpu->floor_freq) {
+-		if (now - pcpu->floor_validate_time <
+-				tunables->min_sample_time) {
++	max_fvtime = max(pcpu->pol_floor_val_time, pcpu->loc_floor_val_time);
++	if (new_freq < pcpu->floor_freq &&
++	    pcpu->target_freq >= pcpu->policy->cur) {
++		if (now - max_fvtime < tunables->min_sample_time) {
+ 			trace_cpufreq_interactive_notyet(
+ 				data, cpu_load, pcpu->target_freq,
+ 				pcpu->policy->cur, new_freq);
+@@ -430,7 +433,9 @@ static void cpufreq_interactive_timer(unsigned long data)
+ 
+ 	if (!tunables->boosted || new_freq > tunables->hispeed_freq) {
+ 		pcpu->floor_freq = new_freq;
+-		pcpu->floor_validate_time = now;
++		if (pcpu->target_freq >= pcpu->policy->cur ||
++		    new_freq >= pcpu->policy->cur)
++			pcpu->loc_floor_val_time = now;
+ 	}
+ 
+ 	if (pcpu->target_freq == new_freq &&
+@@ -555,7 +560,7 @@ static int cpufreq_interactive_speedchange_task(void *data)
+ 			unsigned int j;
+ 			unsigned int max_freq = 0;
+ 			struct cpufreq_interactive_cpuinfo *pjcpu;
+-			u64 hvt = ~0ULL;
++			u64 hvt = ~0ULL, fvt = 0;
+ 
+ 			pcpu = &per_cpu(cpuinfo, cpu);
+ 			if (!down_read_trylock(&pcpu->enable_sem))
+@@ -568,6 +573,7 @@ static int cpufreq_interactive_speedchange_task(void *data)
+ 			for_each_cpu(j, pcpu->policy->cpus) {
+ 				pjcpu = &per_cpu(cpuinfo, j);
+ 
++				fvt = max(fvt, pjcpu->loc_floor_val_time);
+ 				if (pjcpu->target_freq > max_freq) {
+ 					max_freq = pjcpu->target_freq;
+ 					hvt = pjcpu->loc_hispeed_val_time;
+@@ -575,6 +581,10 @@ static int cpufreq_interactive_speedchange_task(void *data)
+ 					hvt = min(hvt, pjcpu->loc_hispeed_val_time);
+ 				}
+ 			}
++			for_each_cpu(j, pcpu->policy->cpus) {
++				pjcpu = &per_cpu(cpuinfo, j);
++				pjcpu->pol_floor_val_time = fvt;
++			}
+ 
+ 			if (max_freq != pcpu->policy->cur) {
+ 				__cpufreq_driver_target(pcpu->policy,
+@@ -1243,11 +1253,11 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
+ 			pcpu->target_freq = policy->cur;
+ 			pcpu->freq_table = freq_table;
+ 			pcpu->floor_freq = pcpu->target_freq;
+-			pcpu->floor_validate_time =
++			pcpu->pol_floor_val_time =
+ 				ktime_to_us(ktime_get());
+-			pcpu->pol_hispeed_val_time =
+-				pcpu->floor_validate_time;
+-			pcpu->loc_hispeed_val_time = pcpu->floor_validate_time;
++			pcpu->loc_floor_val_time = pcpu->pol_floor_val_time;
++			pcpu->pol_hispeed_val_time = pcpu->pol_floor_val_time;
++			pcpu->loc_hispeed_val_time = pcpu->pol_floor_val_time;
+ 			pcpu->max_freq = policy->max;
+ 			down_write(&pcpu->enable_sem);
+ 			del_timer_sync(&pcpu->cpu_timer);
+-- 
+1.9.1
+

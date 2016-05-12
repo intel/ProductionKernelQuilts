@@ -1,0 +1,520 @@
+From fcb09adfd3da5279aaa89ec863bcc19c815cec0e Mon Sep 17 00:00:00 2001
+From: raosrini <srinidhi.rao@intel.com>
+Date: Thu, 19 Feb 2015 16:52:43 +0530
+Subject: [PATCH] EM/FG: Implement calibration corrections to coulomb counter
+
+TI PMIC dolar lake TC supports coulomb counter and GP ADC
+channels which can measure current and voltage on the battery.
+But the CC and VBAT registers will only give a raw value
+and this raw value needs a conversion faction as well as
+some corrections have to be added to get the accurate
+values of current and voltage on the battery.
+This patch enables the calibration of CC and GP ADC
+channels and also adds correction to the raw values
+read from CC and VBAT registers.
+
+Change-Id: I34e8eea975e5c20dfb996ca6b651c259ee293ee8
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1051
+Signed-off-by: raosrini <srinidhi.rao@intel.com>
+---
+ drivers/iio/adc/dc_ti_gpadc.c   | 117 +++++++++++++++++++++++++++++---
+ drivers/platform/x86/dc_ti_cc.c | 145 +++++++++++++++++++++++++++++++---------
+ 2 files changed, 223 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/iio/adc/dc_ti_gpadc.c b/drivers/iio/adc/dc_ti_gpadc.c
+index 0b9244f..2549bad 100644
+--- a/drivers/iio/adc/dc_ti_gpadc.c
++++ b/drivers/iio/adc/dc_ti_gpadc.c
+@@ -72,7 +72,23 @@
+ 
+ #define DEV_NAME			"dollar_cove_ti_adc"
+ 
+-#define SW_TRIM_VAL		1
++/*Calibration related data*/
++#define ADC_DIETEMP_ZSE_REG		0x51
++
++#define ADC_GP_BTHERM_GAIN_REG		0x52
++#define ADC_GPIN_GAIN	0xF0
++#define ADC_BTHERM_GAIN		0x0F
++
++#define ADC_VBAT_GAIN_OFFSET_REG	0x53
++#define ADC_VBAT_GAIN	0x0F
++#define ADC_VBAT_OFFSET		0xF0
++
++enum {
++	VBAT_CAL = 0,
++	DIETEMP_CAL,
++	BPTHERM_CAL,
++	GPADC_CAL
++};
+ 
+ static struct gpadc_regmap_t {
+ 	char *name;
+@@ -124,6 +140,31 @@ static struct iio_map iio_maps[] = {
+ 	{},
+ };
+ 
++/* ADC correction lookup table */
++struct dc_ti_adc_calibration {
++	s8 offset;
++	s8 gain;
++};
++static int vbat_gain_lookup[14][2] = {
++	{0, 0},
++	{1, 15},
++	{2, 30},
++	{3, 45},
++	{4, 60},
++	{5, 75},
++	{6, 90},
++	{7, 105},
++	{8, -120},
++	{9, -105},
++	{10, -90},
++	{11, -75},
++	{12, -60},
++	{13, -45}
++};
++
++static struct dc_ti_adc_calibration
++	dc_ti_adc_cal[GPADC_CH_NUM];
++
+ static irqreturn_t dc_ti_gpadc_isr(int irq, void *data)
+ {
+ 	struct gpadc_info *info = data;
+@@ -147,7 +188,7 @@ int iio_dc_ti_gpadc_sample(struct iio_dev *indio_dev,
+ 				int ch, struct gpadc_result *res)
+ {
+ 	struct gpadc_info *info = iio_priv(indio_dev);
+-	int i, ret, adc_en_mask;
++	int i, ret, adc_en_mask, corrected_code, raw_code, gain_err;
+ 	u8 th, tl;
+ 
+ 	/* prepare ADC channel enable mask */
+@@ -200,7 +241,7 @@ int iio_dc_ti_gpadc_sample(struct iio_dev *indio_dev,
+ 	 */
+ 	usleep_range(25, 40);
+ 
+-	/*Start the ADC conversion for the selected channel */
++	/* Start the ADC conversion for the selected channel */
+ 	ret = intel_soc_pmic_setb(DC_PMIC_ADC_CNTL_REG, (u8)CNTL_ADC_START);
+ 	if (ret < 0)
+ 		goto done;
+@@ -232,12 +273,21 @@ int iio_dc_ti_gpadc_sample(struct iio_dev *indio_dev,
+ 			 * So the result's DATAH should be maksed(0x03)
+ 			 * and shifted(8 bits) before adding to the DATAL.
+ 			 */
+-			/*As per TI, The PMIC Silicon need S/W Trim.
+-			Hence applying TRIM value*/
+-			res->data[i] = (((th & 0x3) << 8) + tl) - SW_TRIM_VAL;
++			/*
++			 * As per TI, The PMIC Silicon ADC raw values needs
++			 * to be Trimmed with offset and gain values read
++			 * from calibration registers in PMIC.
++			 * Hence applying TRIM value
++			 */
++			raw_code = (((th & 0x3) << 8) + tl);
++			corrected_code = raw_code - dc_ti_adc_cal[i].offset;
++			/* Gain Unit is 0.15% already in Table */
++			res->data[i] = DIV_ROUND_CLOSEST(((corrected_code)
++				* (10000 - dc_ti_adc_cal[i].gain)), 10000);
++
+ 		}
+ 	}
+-	/*Clear IRQ Register */
++	/* Clear IRQ Register */
+ 	intel_soc_pmic_clearb(DC_ADC_IRQ_MASK_REG, IRQ_MASK_ADC);
+ 	/* disable ADC channels */
+ 	intel_soc_pmic_clearb(DC_PMIC_ADC_CNTL_REG, (u8)(adc_en_mask |
+@@ -276,6 +326,53 @@ static const struct iio_info dc_ti_adc_info = {
+ 	.driver_module = THIS_MODULE,
+ };
+ 
++/**
++ * dc_ti_adc_calibrate: Function to store the offset and gain calibration.
++ * @indio: Pointer to the iio device.
++ * Returns 0 for success, Negetive value for failure.
++ */
++static int dc_ti_adc_calibrate(struct iio_dev *indio)
++{
++	int ret_val = 0, i;
++	u8 val;
++
++	/* Store the calib data for all channels */
++	val = intel_soc_pmic_readb(ADC_DIETEMP_ZSE_REG);
++	if (val < 0)
++		return val;
++	/*
++	 * Correction for DIE TEMP will be done by Thermal Driver.
++	 * Hence set the gain and offset co-efficients for DIE_TEMP
++	 * as zero.
++	 */
++	dc_ti_adc_cal[DIETEMP_CAL].gain = 0;
++	dc_ti_adc_cal[DIETEMP_CAL].offset = (s8)0;
++
++	val = intel_soc_pmic_readb(ADC_VBAT_GAIN_OFFSET_REG);
++	if (val < 0)
++		return val;
++	dc_ti_adc_cal[VBAT_CAL].gain = (s8)(val & ADC_VBAT_GAIN);
++	dc_ti_adc_cal[VBAT_CAL].gain =
++			vbat_gain_lookup[dc_ti_adc_cal[VBAT_CAL].gain][1];
++	dc_ti_adc_cal[VBAT_CAL].offset = (s8)((val & ADC_VBAT_OFFSET) >> 4);
++
++	val = intel_soc_pmic_readb(ADC_GP_BTHERM_GAIN_REG);
++	if (val < 0)
++		return val;
++	dc_ti_adc_cal[BPTHERM_CAL].gain = (s8)(val & ADC_BTHERM_GAIN);
++	dc_ti_adc_cal[GPADC_CAL].gain = (s8)((val & ADC_GPIN_GAIN) >> 4);
++
++	dc_ti_adc_cal[BPTHERM_CAL].offset = dc_ti_adc_cal[VBAT_CAL].offset;
++	dc_ti_adc_cal[GPADC_CAL].offset = dc_ti_adc_cal[VBAT_CAL].offset;
++
++	for (i = 0; i < GPADC_CH_NUM; i++) {
++		dev_dbg(indio->dev.parent,
++		"dc_ti_adc_cal[%d].gain = %d, dc_ti_adc_cal[%d].offset = %d\n",
++		i, dc_ti_adc_cal[i].gain, i, dc_ti_adc_cal[i].offset);
++	}
++	return ret_val;
++}
++
+ static int dc_ti_gpadc_probe(struct platform_device *pdev)
+ {
+ 	int err;
+@@ -319,8 +416,12 @@ static int dc_ti_gpadc_probe(struct platform_device *pdev)
+ 		/* Unmask VBUS interrupt */
+ 		intel_soc_pmic_clearb(DC_ADC_IRQ_MASK_REG, IRQ_MASK_ADC);
+ 	}
++	/* Calibrate all the channels */
++	err = dc_ti_adc_calibrate(indio_dev);
++	if (err)
++		dev_err(info->dev, "Error during reading calibration values\n");
+ 
+-	dev_info(&pdev->dev, "dc_ti adc probed\n");
++	dev_dbg(&pdev->dev, "dc_ti adc probed\n");
+ 
+ 	return 0;
+ 
+diff --git a/drivers/platform/x86/dc_ti_cc.c b/drivers/platform/x86/dc_ti_cc.c
+index 651a98a..24515c1 100644
+--- a/drivers/platform/x86/dc_ti_cc.c
++++ b/drivers/platform/x86/dc_ti_cc.c
+@@ -29,6 +29,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/delay.h>
+ #include <linux/notifier.h>
++#include <linux/acpi.h>
+ #include <linux/iio/consumer.h>
+ #include <linux/mfd/intel_soc_pmic.h>
+ #include <linux/power/intel_fuel_gauge.h>
+@@ -100,6 +101,9 @@
+ #define DEFAULT_CC_OFFSET_SHIFT	0
+ #define TRIM_REV_3_OFFSET_SHIFT	1
+ 
++#define DC_TI_CC_OFF_HI		0x61
++#define DC_TI_CC_OFF_LO		0x62
++
+ #define EEPROM_ACCESS_CONTROL		0x88
+ #define EEPROM_UNLOCK			0xDA
+ #define EEPROM_LOCK			0x00
+@@ -112,19 +116,27 @@
+ #define EEPROM_GAIN_REG		0xF4  /* b7~b4 : CC gain */
+ #define DC_PMIC_TRIM_REVISION_3	0x03
+ #define DEF_PMIC_TRIM_REVISON		0x00
+-/*CC Accumulator Bit unit 3.662uV/10mohm */
++#define DC_TI_PMIC_VERSION_REG		0x00
++#define PMIC_VERSION_A0		0xC0
++#define PMIC_VERSION_A1		0xC1
++/* CC Accumulator Bit unit 3.662uV/10mohm */
+ #define MAX_CC_SCALE			3662
+ 
++#define OCV_AVG_SAMPLE_CNT		3
++
+ struct dc_ti_trim {
+ 	s8 cc_offset_extra;
+ 	s8 cc_gain_extra;
+ 	s8 cc_off_shift;
+ 	s8 cc_step;
+ 	s8 cc_trim_rev;
++	s16 cc_offset_intcal;
++	u8 pmic_version;
++	bool apply_trim;
+ };
+ struct dc_ti_cc_info {
+ 	struct platform_device *pdev;
+-	struct work_struct	init_work;
++	struct delayed_work	init_work;
+ 	struct dc_ti_trim trim;
+ 
+ 	int		vbat_socv;
+@@ -395,7 +407,8 @@ static int dc_ti_get_cc_delta(struct dc_ti_cc_info *info, int *acc_val)
+ 	dev_info(&info->pdev->dev, "delta_smpl:%d\n", delta_smpl);
+ 
+ 	/* Apply the Offset and Gain corrections to delta_q */
+-	if (info->trim.cc_trim_rev == DC_PMIC_TRIM_REVISION_3) {
++	if (info->trim.apply_trim) {
++		dev_dbg(&info->pdev->dev, "Applying TRIM correction to CC\n");
+ 		delta_q -= ((info->trim.cc_offset_extra * info->trim.cc_step *
+ 				delta_smpl) >> info->trim.cc_off_shift);
+ 
+@@ -405,13 +418,16 @@ static int dc_ti_get_cc_delta(struct dc_ti_cc_info *info, int *acc_val)
+ 				* MAX_CC_SCALE), 100000);
+ 	} else {
+ 		/* convert CC to to uAhr without offset and gain correction */
++		dev_dbg(&info->pdev->dev,
++					"TRIM correction not Applied to CC\n");
+ 		delta_q = CC_ACC_TO_UA(delta_q);
+ 	}
+ 
+ 	dev_info(&info->pdev->dev, "delta_q correction:%d\n", delta_q);
+ 	/* ibatt_avg in uA */
+ 	if (delta_smpl)
+-		info->ibatt_avg = DIV_ROUND_CLOSEST((delta_q * 4), delta_smpl);
++		info->ibatt_avg = DIV_ROUND_CLOSEST((delta_q * 4),
++						delta_smpl);
+ 
+ 	*acc_val = DIV_ROUND_CLOSEST(delta_q, 3600);
+ 
+@@ -486,7 +502,7 @@ static int dc_ti_get_ibatt_avg(struct dc_ti_cc_info *info, int *ibatt_avg)
+ static int dc_ti_fg_get_ibatt(struct dc_ti_cc_info *info, int *ibatt)
+ {
+ 	int ret, val;
+-	short int cc_intg_val;
++	short int cc_intg_val, corrected_val;
+ 
+ 	ret = intel_soc_pmic_readb(DC_TI_CC_INTG0_REG);
+ 	if (ret < 0)
+@@ -496,11 +512,20 @@ static int dc_ti_fg_get_ibatt(struct dc_ti_cc_info *info, int *ibatt)
+ 	ret = intel_soc_pmic_readb(DC_TI_CC_INTG1_REG);
+ 	if (ret < 0)
+ 		goto ibatt_read_failed;
++
+ 	val |= (ret & DC_TI_CC_INTG1_MASK) << 8;
+ 
+ 	/* scale the readings to seconds */
+ 	cc_intg_val = (short int)(val << 2);
+ 
++	corrected_val = ((cc_intg_val)
++			- ((2 * info->trim.cc_offset_intcal)
++			+ (info->trim.cc_offset_extra)));
++
++	corrected_val /= (1 + DIV_ROUND_CLOSEST((CC_GAIN_STEP
++			- (info->trim.cc_gain_extra * CC_GAIN_STEP)),
++			10000));
++
+ 	/* convert the cc integrator value to uA */
+ 	*ibatt = CC_INTG_TO_UA((int)cc_intg_val);
+ 
+@@ -680,7 +705,7 @@ static struct intel_fg_input fg_input = {
+ 
+ static void dc_ti_update_boot_ocv(struct dc_ti_cc_info *info)
+ {
+-	int ret;
++	int ret, vocv, idx;
+ 
+ 	ret = intel_soc_pmic_setb(DC_TI_CC_CNTL_REG, CC_CNTL_CC_CTR_EN);
+ 	if (ret < 0)
+@@ -692,12 +717,22 @@ static void dc_ti_update_boot_ocv(struct dc_ti_cc_info *info)
+ 	 */
+ 	msleep(250);
+ 
+-	ret = dc_ti_cc_get_vocv(&info->vbat_bocv);
+-	if (ret)
+-		dev_err(&info->pdev->dev,
+-			"Failed to read IBAT bootup:%d\n", ret);
++	/*
++	 * take the average of 3 OCV samples
++	 * for better accuracy.
++	 */
++	info->vbat_bocv = 0;
++	for (idx = 0; idx < OCV_AVG_SAMPLE_CNT; idx++) {
++		ret = dc_ti_cc_get_vocv(&vocv);
++		if (ret)
++			dev_err(&info->pdev->dev,
++				"Failed to read bootup vocv:%d\n", ret);
++		info->vbat_bocv += vocv;
++	}
++	info->vbat_bocv /= OCV_AVG_SAMPLE_CNT;
+ 
+-	ret = intel_soc_pmic_clearb(DC_TI_CC_CNTL_REG, CC_CNTL_CC_CTR_EN);
++	ret = intel_soc_pmic_clearb(DC_TI_CC_CNTL_REG,
++			CC_CNTL_CC_CTR_EN);
+ 	if (ret < 0)
+ 		dev_err(&info->pdev->dev,
+ 			"Failed to clr CC_CTR_EN bit:%d\n", ret);
+@@ -711,8 +746,15 @@ static void dc_ti_update_boot_ocv(struct dc_ti_cc_info *info)
+ static int dc_ti_cc_read_trim_values(struct dc_ti_cc_info *info)
+ {
+ 	int ret;
+-	u8	val_offset, val_gain;
++	u8	val_offset, val_gain, val_int_cal_hi, val_int_cal_lo;
+ 
++	/* Read the PMIC Version register*/
++	info->trim.pmic_version = intel_soc_pmic_readb(DC_TI_PMIC_VERSION_REG);
++	if (info->trim.pmic_version < 0) {
++		dev_err(&info->pdev->dev, "Error while reading PMIC Version Reg\n");
++		ret = info->trim.pmic_version;
++		goto exit_trim;
++	}
+ 	/*
+ 	 * As per the PMIC Vendor, the calibration offset and gain err
+ 	 * values are stored in EEPROM Bank 0 and Bank 1 of the PMIC.
+@@ -720,48 +762,81 @@ static int dc_ti_cc_read_trim_values(struct dc_ti_cc_info *info)
+ 	 * to apply the corrections to the raw coulomb counter value.
+ 	 */
+ 	/* UNLOCK the EEPROM Access */
+-	ret = intel_soc_pmic_writeb(EEPROM_ACCESS_CONTROL, EEPROM_UNLOCK);
++	ret = intel_soc_pmic_writeb(EEPROM_ACCESS_CONTROL,
++				EEPROM_UNLOCK);
+ 	if (ret < 0) {
+-		dev_err(&info->pdev->dev, "Error while unlocking EEPROM\n");
++		dev_err(&info->pdev->dev,
++				"Err while unlocking EEPROM\n");
+ 		goto exit_trim;
+ 	}
+ 	/* Select Bank 1 to read CC GAIN Err correction */
+ 	ret = intel_soc_pmic_writeb(EEPROM_CTRL,
+ 			((u8)(EEPROM_CTRL_EEPSEL_MASK & EEPROM_BANK1_SEL)));
+ 	if (ret < 0) {
+-		dev_err(&info->pdev->dev, "Error while selecting EEPROM Bank1\n");
++		dev_err(&info->pdev->dev,
++				"Err while selecting EEPROM Bank1\n");
+ 		goto exit_trim;
+ 	}
+ 	val_gain = intel_soc_pmic_readb(EEPROM_GAIN_REG);
+ 	if (val_gain < 0) {
+-		dev_err(&info->pdev->dev, "Error while reading Gain Reg\n");
++		dev_err(&info->pdev->dev,
++				"Err while reading Gain Reg\n");
+ 		ret = val_gain;
+ 		goto exit_trim;
+ 	}
+ 	info->trim.cc_gain_extra = val_gain >> 4;
+ 	info->trim.cc_trim_rev = (val_gain & 0x0F);
+ 
+-	if (info->trim.cc_trim_rev == DC_PMIC_TRIM_REVISION_3) {
++	val_int_cal_hi = intel_soc_pmic_readb(DC_TI_CC_OFF_HI);
++	if (val_int_cal_hi < 0) {
++		dev_err(&info->pdev->dev,
++				"Err while reading Offset Reg\n");
++		ret = val_int_cal_hi;
++		goto exit_trim;
++	}
++	val_int_cal_lo = intel_soc_pmic_readb(DC_TI_CC_OFF_LO);
++	if (val_int_cal_lo < 0) {
++		dev_err(&info->pdev->dev,
++				"Err while reading Offset Reg\n");
++		ret = val_int_cal_lo;
++		goto exit_trim;
++	}
++	info->trim.cc_offset_intcal =
++		(s16)(((val_int_cal_hi << 8) & 0x1F)
++			| (val_int_cal_lo));
++	if ((s8)val_int_cal_hi & 0x3F)
++		info->trim.cc_offset_intcal *= -1;
++
++	if ((info->trim.cc_trim_rev != DEF_PMIC_TRIM_REVISON &&
++		info->trim.pmic_version == PMIC_VERSION_A1) ||
++		(info->trim.cc_trim_rev == DC_PMIC_TRIM_REVISION_3 &&
++		info->trim.pmic_version == PMIC_VERSION_A0)) {
+ 		/* Select Bank 0 to read CC OFFSET Correction */
+ 		ret = intel_soc_pmic_writeb(EEPROM_CTRL,
+ 			((u8)(EEPROM_CTRL_EEPSEL_MASK & EEPROM_BANK0_SEL)));
+ 		if (ret < 0) {
+-			dev_err(&info->pdev->dev, "Error while selecting EEPROM Bank1\n");
++			dev_err(&info->pdev->dev,
++				"Error while selecting EEPROM Bank1\n");
+ 			goto exit_trim;
+ 		}
+ 		val_offset = intel_soc_pmic_readb(OFFSET_REG_TRIM_REV_3);
+ 		if (val_offset < 0) {
+-			dev_err(&info->pdev->dev, "Error while reading Offset Reg\n");
++			dev_err(&info->pdev->dev,
++				"Error while reading Offset Reg\n");
+ 			ret = val_offset;
+ 			goto exit_trim;
+ 		}
+ 		info->trim.cc_offset_extra = (s8)(val_offset);
+ 		info->trim.cc_step = TRIM_REV_3_OFFSET_STEP;
+ 		info->trim.cc_off_shift = TRIM_REV_3_OFFSET_SHIFT;
+-		dev_info(&info->pdev->dev, "TRIM Revision 3, Apply TRIM\n");
++		info->trim.apply_trim = true;
++		dev_warn(&info->pdev->dev,
++		"TRIM Revision %d PMIC Version %d, Apply TRIM\n",
++		info->trim.cc_trim_rev, info->trim.pmic_version);
+ 	} else {
+ 		/* Read offset trim value from Bank 0 */
+-		val_offset = intel_soc_pmic_readb(OFFSET_REG_TRIM_REV_DEFAULT);
++		val_offset = intel_soc_pmic_readb(
++					OFFSET_REG_TRIM_REV_DEFAULT);
+ 		if (val_offset < 0) {
+ 			dev_err(&info->pdev->dev,
+ 				"Error while reading Offset Reg\n");
+@@ -771,9 +846,13 @@ static int dc_ti_cc_read_trim_values(struct dc_ti_cc_info *info)
+ 		info->trim.cc_offset_extra = ((s8)val_offset) >> 4;
+ 		info->trim.cc_step = DEFAULT_CC_OFFSET_STEP;
+ 		info->trim.cc_off_shift = DEFAULT_CC_OFFSET_SHIFT;
++
++		dev_warn(&info->pdev->dev,
++		"TRIM Revision %d PMIC Version %d, Do Not Apply TRIM\n",
++		info->trim.cc_trim_rev, info->trim.pmic_version);
++
+ 		info->trim.cc_trim_rev = DEF_PMIC_TRIM_REVISON;
+-		dev_info(&info->pdev->dev,
+-			 "TRIM Revision old, Do not Apply TRIM\n");
++		info->trim.apply_trim = false;
+ 	}
+ 
+ exit_trim:
+@@ -783,23 +862,24 @@ exit_trim:
+ 		/* Reset the PMIC TRIM Revision number when error
+ 		 * is encountered */
+ 		info->trim.cc_trim_rev = DEF_PMIC_TRIM_REVISON;
++		info->trim.apply_trim = false;
++		dev_err(&info->pdev->dev, "Err Reset the TRIM params\n");
+ 	}
+-	dev_info(&info->pdev->dev, "CC OFFSET = %d GAIN = %d\n",
++	dev_warn(&info->pdev->dev, "CC OFFSET = %d GAIN = %d\n",
+ 			info->trim.cc_offset_extra, info->trim.cc_gain_extra);
+ 	return ret;
+ }
+ static void dc_ti_cc_init_worker(struct work_struct *work)
+ {
+ 	struct dc_ti_cc_info *info =
+-	    container_of(work, struct dc_ti_cc_info, init_work);
++	    container_of(to_delayed_work(work), struct dc_ti_cc_info,
++				init_work.work);
+ 	int ret;
+-	u8 val_offset, val_gain;
+ 
+ 	dc_ti_cc_read_trim_values(info);
+ 	/* read bootup OCV */
+ 	dc_ti_update_boot_ocv(info);
+ 	dc_ti_cc_init_data(info);
+-	info_ptr = info;
+ 
+ 	ret = intel_fg_register_input(&fg_input);
+ 	if (ret < 0)
+@@ -818,13 +898,16 @@ static int dc_ti_cc_probe(struct platform_device *pdev)
+ 
+ 	info->pdev = pdev;
+ 	platform_set_drvdata(pdev, info);
+-	INIT_WORK(&info->init_work, dc_ti_cc_init_worker);
++	INIT_DELAYED_WORK(&info->init_work, dc_ti_cc_init_worker);
+ 
++	info_ptr = info;
+ 	/*
+-	 * scheduling the init worker
+-	 * to reduce the boot time.
++	 * scheduling the init worker to reduce
++	 * delays during boot time. Also delayed
++	 * worker is being used to time the
++	 * OCV measurment later if neccessary.
+ 	 */
+-	schedule_work(&info->init_work);
++	schedule_delayed_work(&info->init_work, 0);
+ 
+ 	return 0;
+ }
+-- 
+1.9.1
+

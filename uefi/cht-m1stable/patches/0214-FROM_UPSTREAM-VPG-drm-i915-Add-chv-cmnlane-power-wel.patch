@@ -1,0 +1,168 @@
+From 1207f990e98784960d150b8e287abad8fe9fac0e Mon Sep 17 00:00:00 2001
+Message-Id: <1207f990e98784960d150b8e287abad8fe9fac0e.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Sat, 28 Jun 2014 02:04:08 +0300
+Subject: [PATCH 214/312] FROM_UPSTREAM [VPG]: drm/i915: Add chv cmnlane power
+ wells
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CHV has two display PHYs so there are also two cmnlane power wells. Add
+the approriate code to power the wells up/down.
+
+Like on VLV we do the cmnreset assert/deassert and the DPLL refclock
+enabling at approriate times.
+
+This code actually works on my bsw.
+
+Change-Id: I53522cf1045effbeeb4ffc46c24deccf083aebad
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 9d8e343a8483e0002cf00503aae7670b651c186d
+Upstream-as-of-tag: <not available>
+---
+ drivers/gpu/drm/i915/i915_reg.h |    1 +
+ drivers/gpu/drm/i915/intel_pm.c |   90 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 91 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index d21de24..0a1bb3a 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -529,6 +529,7 @@ enum punit_power_well {
+ 	PUNIT_POWER_WELL_DPIO_TX_C_LANES_23	= 9,
+ 	PUNIT_POWER_WELL_DPIO_RX0		= 10,
+ 	PUNIT_POWER_WELL_DPIO_RX1		= 11,
++	PUNIT_POWER_WELL_DPIO_CMN_D		= 12,
+ 
+ 	PUNIT_POWER_WELL_NUM,
+ };
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index ead5fcb..1f148f6 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -6929,6 +6929,64 @@ static void vlv_display_power_well_disable(struct drm_i915_private *dev_priv,
+ 	vlv_set_power_well(dev_priv, power_well, false);
+ }
+ 
++static void chv_dpio_cmn_power_well_enable(struct drm_i915_private *dev_priv,
++					   struct i915_power_well *power_well)
++{
++	enum dpio_phy phy;
++
++	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DPIO_CMN_BC &&
++		     power_well->data != PUNIT_POWER_WELL_DPIO_CMN_D);
++
++	/*
++	 * Enable the CRI clock source so we can get at the
++	 * display and the reference clock for VGA
++	 * hotplug / manual detection.
++	 */
++	if (power_well->data == PUNIT_POWER_WELL_DPIO_CMN_BC) {
++		phy = DPIO_PHY0;
++		I915_WRITE(DPLL(PIPE_B), I915_READ(DPLL(PIPE_B)) |
++			   DPLL_REFA_CLK_ENABLE_VLV);
++		I915_WRITE(DPLL(PIPE_B), I915_READ(DPLL(PIPE_B)) |
++			   DPLL_REFA_CLK_ENABLE_VLV | DPLL_INTEGRATED_CRI_CLK_VLV);
++	} else {
++		phy = DPIO_PHY1;
++		I915_WRITE(DPLL(PIPE_C), I915_READ(DPLL(PIPE_C)) |
++			   DPLL_REFA_CLK_ENABLE_VLV | DPLL_INTEGRATED_CRI_CLK_VLV);
++	}
++	udelay(1); /* >10ns for cmnreset, >0ns for sidereset */
++	vlv_set_power_well(dev_priv, power_well, true);
++
++	/* Poll for phypwrgood signal */
++	if (wait_for(I915_READ(DISPLAY_PHY_STATUS) & PHY_POWERGOOD(phy), 1))
++		DRM_ERROR("Display PHY %d is not power up\n", phy);
++
++	I915_WRITE(DISPLAY_PHY_CONTROL,
++		   PHY_COM_LANE_RESET_DEASSERT(phy, I915_READ(DISPLAY_PHY_CONTROL)));
++}
++
++static void chv_dpio_cmn_power_well_disable(struct drm_i915_private *dev_priv,
++					    struct i915_power_well *power_well)
++{
++	enum dpio_phy phy;
++
++	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DPIO_CMN_BC &&
++		     power_well->data != PUNIT_POWER_WELL_DPIO_CMN_D);
++
++	if (power_well->data == PUNIT_POWER_WELL_DPIO_CMN_BC) {
++		phy = DPIO_PHY0;
++		assert_pll_disabled(dev_priv, PIPE_A);
++		assert_pll_disabled(dev_priv, PIPE_B);
++	} else {
++		phy = DPIO_PHY1;
++		assert_pll_disabled(dev_priv, PIPE_C);
++	}
++
++	I915_WRITE(DISPLAY_PHY_CONTROL,
++		   PHY_COM_LANE_RESET_ASSERT(phy, I915_READ(DISPLAY_PHY_CONTROL)));
++
++	vlv_set_power_well(dev_priv, power_well, false);
++}
++
+ static void check_power_well_state(struct drm_i915_private *dev_priv,
+ 				   struct i915_power_well *power_well)
+ {
+@@ -7119,6 +7177,18 @@ EXPORT_SYMBOL_GPL(i915_get_cdclk_freq);
+ 	BIT(POWER_DOMAIN_PORT_DDI_C_4_LANES) |	\
+ 	BIT(POWER_DOMAIN_INIT))
+ 
++#define CHV_DPIO_CMN_BC_POWER_DOMAINS (		\
++	BIT(POWER_DOMAIN_PORT_DDI_B_2_LANES) |	\
++	BIT(POWER_DOMAIN_PORT_DDI_B_4_LANES) |	\
++	BIT(POWER_DOMAIN_PORT_DDI_C_2_LANES) |	\
++	BIT(POWER_DOMAIN_PORT_DDI_C_4_LANES) |	\
++	BIT(POWER_DOMAIN_INIT))
++
++#define CHV_DPIO_CMN_D_POWER_DOMAINS (		\
++	BIT(POWER_DOMAIN_PORT_DDI_D_2_LANES) |	\
++	BIT(POWER_DOMAIN_PORT_DDI_D_4_LANES) |	\
++	BIT(POWER_DOMAIN_INIT))
++
+ static const struct i915_power_well_ops i9xx_always_on_power_well_ops = {
+ 	.sync_hw = i9xx_always_on_power_well_noop,
+ 	.enable = i9xx_always_on_power_well_noop,
+@@ -7241,6 +7311,13 @@ static struct i915_power_well vlv_power_wells[] = {
+ 	},
+ };
+ 
++static const struct i915_power_well_ops chv_dpio_cmn_power_well_ops = {
++	.sync_hw = vlv_power_well_sync_hw,
++	.enable = chv_dpio_cmn_power_well_enable,
++	.disable = chv_dpio_cmn_power_well_disable,
++	.is_enabled = vlv_power_well_enabled,
++};
++
+ static struct i915_power_well chv_power_wells[] = {
+ 	{
+ 		.name = "always-on",
+@@ -7248,6 +7325,19 @@ static struct i915_power_well chv_power_wells[] = {
+ 		.domains = VLV_ALWAYS_ON_POWER_DOMAINS,
+ 		.ops = &i9xx_always_on_power_well_ops,
+ 	},
++	{
++		.name = "dpio-common-bc",
++		.domains = CHV_DPIO_CMN_BC_POWER_DOMAINS,
++		.data = PUNIT_POWER_WELL_DPIO_CMN_BC,
++		.ops = &chv_dpio_cmn_power_well_ops,
++	},
++	{
++		.name = "dpio-common-d",
++		.domains = CHV_DPIO_CMN_D_POWER_DOMAINS,
++		.data = PUNIT_POWER_WELL_DPIO_CMN_D,
++		.ops = &chv_dpio_cmn_power_well_ops,
++	},
++
+ };
+ 
+ 
+-- 
+1.7.9.5
+

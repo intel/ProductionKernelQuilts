@@ -1,0 +1,454 @@
+From d23f608acca9032b0b746b944367d1a9a9ea0feb Mon Sep 17 00:00:00 2001
+Message-Id: <d23f608acca9032b0b746b944367d1a9a9ea0feb.1424979244.git.feitong.yi@intel.com>
+In-Reply-To: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+References: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+From: Jon Bloomfield <jon.bloomfield@intel.com>
+Date: Wed, 28 Jan 2015 19:07:39 +0000
+Subject: [PATCH 28/28] FOR_UPSTREAM [VPG]: drm/i915: Support for bo userdata
+
+Provide a machanism for attaching and maintaining user private
+data to i915 bo's.
+
+Three operations are supported:
+	CREATE: Allocate the data, up to 4K Bytes, and optionally
+		initialize the data from a user-supplied block.
+	SET:	Modify a section of the data, using supplied offset
+		and byte-length
+	GET:	Retrieve a section of data, using supplied offset
+		and byte-length.
+
+All operations are atomic
+
+v2: Leave old userdata API untouched to make revert easier
+
+v3: Use dedicated rwlock instead of grabbing the object mutex
+
+v4: Return previously allocated bytes
+
+Issue: GMINL-5533
+Change-Id: Iebd87436d4aadcd74b769647de4d0a04268c0d51
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/Makefile            |    3 +
+ drivers/gpu/drm/i915/i915_drv.h          |    4 +
+ drivers/gpu/drm/i915/i915_ext_ioctl.c    |    3 +
+ drivers/gpu/drm/i915/i915_gem.c          |    2 +
+ drivers/gpu/drm/i915/i915_gem_userdata.c |  219 ++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gem_userdata.h |   46 +++++++
+ include/uapi/drm/i915_drm.h              |   43 ++++++
+ 7 files changed, 320 insertions(+)
+ create mode 100644 drivers/gpu/drm/i915/i915_gem_userdata.c
+ create mode 100644 drivers/gpu/drm/i915/i915_gem_userdata.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index 18531b7..94d2039 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -85,7 +85,10 @@ i915-y += i915_dma.o \
+ 	  i915_ums.o
+ 
+ # Extended ioctl interface
++# Note that these are separated out to reduce the chance of conflicts
++# with the upstream Linux
+ i915-y += i915_ext_ioctl.o
++i915-y += i915_gem_userdata.o
+ 
+ obj-$(CONFIG_DRM_I915)  += i915.o
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 02af959..3a1d710 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -51,6 +51,7 @@
+ 	#include "hdmi_audio_if.h"
+ #endif
+ #include "i915_perfmon_defs.h"
++#include "i915_gem_userdata.h"
+ 
+ 
+ /* General customization:
+@@ -2098,6 +2099,9 @@ struct drm_i915_gem_object {
+ 	/** Object userdata */
+ 	uint32_t userdata;
+ 
++	/** Optional object userdata block */
++	struct i915_gem_userdata *userdata_blk;
++
+ 	union {
+ 		struct i915_gem_userptr {
+ 			uintptr_t ptr;
+diff --git a/drivers/gpu/drm/i915/i915_ext_ioctl.c b/drivers/gpu/drm/i915/i915_ext_ioctl.c
+index 03526db..4debb27 100644
+--- a/drivers/gpu/drm/i915/i915_ext_ioctl.c
++++ b/drivers/gpu/drm/i915/i915_ext_ioctl.c
+@@ -28,6 +28,7 @@
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+ #include "i915_ext_ioctl.h"
++#include "i915_gem_userdata.h"
+ 
+ const struct drm_ioctl_desc i915_ext_ioctls[];
+ int i915_max_ext_ioctl;
+@@ -155,6 +156,8 @@ err_i1:
+  */
+ 
+ const struct drm_ioctl_desc i915_ext_ioctls[] = {
++	DRM_IOCTL_DEF_DRV(I915_EXT_USERDATA, i915_gem_userdata_ioctl,
++			  DRM_UNLOCKED|DRM_CONTROL_ALLOW|DRM_RENDER_ALLOW),
+ };
+ 
+ int i915_max_ext_ioctl = ARRAY_SIZE(i915_ext_ioctls);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 6229bd1..16febb4 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4923,6 +4923,8 @@ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ 
+ 	trace_i915_gem_object_destroy(obj);
+ 
++	kfree(obj->userdata_blk);
++
+ 	list_for_each_entry_safe(vma, next, &obj->vma_list, vma_link) {
+ 		int ret;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_userdata.c b/drivers/gpu/drm/i915/i915_gem_userdata.c
+new file mode 100644
+index 0000000..c670ffd
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_gem_userdata.c
+@@ -0,0 +1,219 @@
++/*
++ * Copyright © 2014 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Authors:
++ *    Jon Bloomfield <jon.bloomfield@intel.com>
++ *
++ */
++#include <drm/drmP.h>
++#include <drm/i915_drm.h>
++#include <linux/spinlock.h>
++#include "i915_drv.h"
++
++static int
++i915_gem_userdata(struct drm_device *dev,
++		  struct drm_file *file,
++		  u16 op, u16 flags,
++		  u32 handle, u32 offset, u32 bytes,
++		  void __user *data,
++		  u16 *actual_bytes)
++{
++#define SIZE_LIMIT 4096
++	struct drm_i915_gem_object *obj;
++	int set = 0;
++	int ret = -EINVAL;
++	u8 *stored_data = NULL;
++	struct i915_gem_userdata *userdata_blk;
++
++	DRM_DEBUG("op=%u, flags=0x%x, handle=%0lx, offset=%lu, bytes=%lu\n",
++		  (unsigned)op, (unsigned)flags,
++		  (unsigned long)handle,
++		  (unsigned long)offset, (unsigned long)bytes);
++
++
++	WARN_ON(!actual_bytes);
++	*actual_bytes = 0;
++
++	obj = to_intel_bo(drm_gem_object_lookup(dev, file, handle));
++	if (&obj->base == NULL) {
++		DRM_ERROR("Bad object: handle=%lx\n",
++			  (unsigned long)handle);
++		ret = -ENOENT;
++		goto unref;
++	}
++
++	/* All operations return the currently allocated length */
++	userdata_blk = obj->userdata_blk;
++	if (userdata_blk)
++		*actual_bytes = userdata_blk->length;
++
++	if (bytes > SIZE_LIMIT) {
++		DRM_ERROR("Bad size (%lu): data is limitted to %u bytes\n",
++			  (unsigned long)bytes, SIZE_LIMIT);
++		ret = -E2BIG;
++		goto unref;
++	}
++
++	switch (op) {
++	case I915_USERDATA_CREATE_OP:
++		/* Cannot re-create if already created */
++		if (userdata_blk) {
++			DRM_ERROR("userdata already created: size %u\n",
++				  (unsigned)userdata_blk->length);
++			ret = -EEXIST;
++			goto unref;
++		}
++
++		/* offset is not used for create and must be 0 */
++		if (offset != 0) {
++			DRM_ERROR("invalid offset: Must be 0 for CREATE\n");
++			goto unref;
++		}
++
++		if (!bytes) {
++			DRM_ERROR("invalid size (0). Must be > 0\n");
++			goto unref;
++		}
++
++		if ((flags != 0) && (flags != I915_USERDATA_READONLY)) {
++			DRM_ERROR("invalid flags: %x\n", (unsigned)flags);
++			goto unref;
++		}
++
++		userdata_blk =
++			kmalloc(sizeof(userdata_blk[0])+bytes, GFP_KERNEL);
++		if (!userdata_blk) {
++			DRM_ERROR("Failed to alloc userdata len=%lu\n",
++				  (unsigned long)bytes);
++			ret = -ENOMEM;
++			goto unref;
++		}
++
++		userdata_blk->length = (u16)bytes;
++		userdata_blk->flags  = flags;
++		userdata_blk->lock = __RW_LOCK_UNLOCKED(userdata_blk->lock);
++
++		if (data) {
++			ret = copy_from_user(userdata_blk->data, data, bytes);
++			if (ret != 0) {
++				kfree(userdata_blk);
++				ret = -EFAULT;
++				goto unref;
++			}
++		} else {
++			memset(userdata_blk->data, 0, bytes);
++		}
++
++		/*
++		 * We're about to link the new area into the object.
++		 * The pointer assignment below will be atomic, but we must
++		 * ensure that no readers can observe the pointer before they
++		 * can observe the above initialization
++		 */
++		wmb();
++
++		/* Make the data visible to readers */
++		obj->userdata_blk = userdata_blk;
++		ret = 0;
++		break;
++
++	case I915_USERDATA_SET_OP:
++		set = 1;
++	case I915_USERDATA_GET_OP:
++		if (!userdata_blk) {
++			DRM_ERROR("Can't set/get: userdata not created\n");
++			goto unref;
++		}
++
++		if (flags != 0) {
++			DRM_ERROR("Only create can accept flags\n");
++			goto unref;
++		}
++
++		if (set && (userdata_blk->flags & I915_USERDATA_READONLY)) {
++			DRM_ERROR("Can't set: userdata is read-only\n");
++			ret = -EPERM;
++			goto unref;
++		}
++
++		if (offset > SIZE_LIMIT) {
++			DRM_ERROR("Bad offset (%lu): max is %u bytes\n",
++				  (unsigned long)bytes, SIZE_LIMIT);
++			ret = -E2BIG;
++			goto unref;
++		}
++
++		if ((offset + bytes) > userdata_blk->length) {
++			DRM_ERROR("Overflow: Allocated userdata size: %u,"
++				  "offset: %u, bytes: %u\n",
++				  (unsigned)userdata_blk->length,
++				  (unsigned)offset, (unsigned)bytes);
++			ret = -E2BIG;
++			goto unref;
++		}
++
++		stored_data = userdata_blk->data + offset;
++		if (set) {
++			write_lock(&userdata_blk->lock);
++			ret = copy_from_user(stored_data, data, bytes);
++			write_unlock(&userdata_blk->lock);
++		} else {
++			read_lock(&userdata_blk->lock);
++			ret = copy_to_user(data, stored_data, bytes);
++			read_unlock(&userdata_blk->lock);
++		}
++
++		if (ret != 0)
++			ret = -EFAULT;
++		break;
++
++	default:
++		DRM_ERROR("invalid op: %u\n", (unsigned)(op));
++	}
++
++unref:
++	drm_gem_object_unreference(&obj->base);
++
++	return ret;
++#undef SIZE_LIMIT
++}
++
++int
++i915_gem_userdata_ioctl(struct drm_device *dev, void *data,
++			struct drm_file *file)
++{
++	struct drm_i915_gem_userdata_blk *args = data;
++	u16 actual_bytes = 0;
++
++	int ret = i915_gem_userdata(dev, file,
++				    args->op,
++				    args->flags,
++				    args->handle,
++				    args->offset,
++				    args->bytes,
++				    to_user_ptr(args->data_ptr),
++				    &actual_bytes);
++
++	/* Original size is returned back in the bytes arg */
++	args->bytes = actual_bytes;
++	return ret;
++}
+diff --git a/drivers/gpu/drm/i915/i915_gem_userdata.h b/drivers/gpu/drm/i915/i915_gem_userdata.h
+new file mode 100644
+index 0000000..7bd4b8f
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_gem_userdata.h
+@@ -0,0 +1,46 @@
++/*
++ * Copyright © 2014 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Authors:
++ *    Jon Bloomfield <jon.bloomfield@intel.com>
++ *
++ */
++
++#ifndef _I915_GEM_USERDATA_H_
++#define _I915_GEM_USERDATA_H_
++
++#include <drm/drmP.h>
++#include <linux/spinlock.h>
++#include <drm/i915_drm.h>
++
++struct i915_gem_userdata {
++	rwlock_t lock;
++	u16      flags;
++	u16      length; /* In bytes */
++	u8       data[0];
++};
++
++extern int
++i915_gem_userdata_ioctl(struct drm_device *dev, void *data,
++			struct drm_file *file);
++
++#endif
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 11f1509..c800df3 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -310,6 +310,14 @@ struct i915_ext_ioctl_data {
+ /* Special, two-level, extended ioctl */
+ #define DRM_I915_EXT_IOCTL		0x5F
+ 
++
++/* Extended ioctl definitions */
++#define DRM_I915_EXT_USERDATA		0x0
++
++#define DRM_IOCTL_I915_EXT_USERDATA \
++	DRM_IOWR(DRM_I915_EXT_USERDATA, struct drm_i915_gem_userdata_blk)
++
++
+ #define DRM_IOCTL_I915_INIT		DRM_IOW( DRM_COMMAND_BASE + DRM_I915_INIT, drm_i915_init_t)
+ #define DRM_IOCTL_I915_FLUSH		DRM_IO ( DRM_COMMAND_BASE + DRM_I915_FLUSH)
+ #define DRM_IOCTL_I915_FLIP		DRM_IO ( DRM_COMMAND_BASE + DRM_I915_FLIP)
+@@ -1044,6 +1052,41 @@ struct drm_i915_gem_access_userdata {
+ 	__u32 write;
+ };
+ 
++/* Interface allowing user metadata to be attached to gem bo's */
++#define I915_USERDATA_CREATE_OP 0
++#define I915_USERDATA_SET_OP    1
++#define I915_USERDATA_GET_OP    2
++
++#define I915_USERDATA_READONLY 1 /* Data cannot be set after create */
++
++struct drm_i915_gem_userdata_blk {
++	/* One of the USERDATA OP defines above */
++	__u16 op;
++
++	/* Create flags */
++	__u16 flags;
++
++	/* Handle of the buffer whose userdata will be accessed */
++	__u32 handle;
++
++	/* Byte offset into data block */
++	__u32 offset;
++
++	/*
++	 * Number of bytes to allocate or move
++	 * On return, the number of bytes previously allocated
++	*/
++	__u32 bytes;
++
++	/*
++	 * User-space pointer could be 32-bits or 64-bits
++	 * so use u64 to guarantee compatibility with 64-bit kernels
++	 * This obviates the need to provide both a compat_ioctl and standard
++	 * ioctl for this interface
++	*/
++	__u64 data_ptr;
++};
++
+ struct drm_i915_gem_get_aperture {
+ 	/** Total size of the aperture used by i915_gem_execbuffer, in bytes */
+ 	__u64 aper_size;
+-- 
+1.7.9.5
+

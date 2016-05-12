@@ -1,0 +1,106 @@
+From c792077ca5c251f6684a2a32a7112b278c429804 Mon Sep 17 00:00:00 2001
+From: arun <arun.radhakrishnan@intel.com>
+Date: Thu, 7 Apr 2016 02:57:49 -0500
+Subject: [PATCH 2/4] iio: als: ltr501: added support for gpio probe
+
+it was observed that probe function did not receive an interrupt pin
+assignation so the devm_request_threaded_irq was never called.
+added the ltr501_gpio_probe function to pick up the correct
+gpio-irq mapping.
+also updated the iio_event_spec with the enable bits for the rising
+and falling threshold values
+
+Change-Id: I7b80f77a0cdc180046c7c767e3bdab0663db63dd
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-28189
+Signed-off-by: Arun Radhakrishnan <arun.radhakrishnan@intel.com>
+Reviewed-on: https://android.intel.com:443/491709
+---
+ drivers/iio/light/ltr501.c | 47 +++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/iio/light/ltr501.c b/drivers/iio/light/ltr501.c
+index 4d15b9e..b345b47 100644
+--- a/drivers/iio/light/ltr501.c
++++ b/drivers/iio/light/ltr501.c
+@@ -18,6 +18,7 @@
+ #include <linux/delay.h>
+ #include <linux/regmap.h>
+ #include <linux/acpi.h>
++#include <linux/gpio/consumer.h>
+ 
+ #include <linux/iio/iio.h>
+ #include <linux/iio/events.h>
+@@ -525,16 +526,13 @@ static const struct iio_event_spec ltr501_als_event_spec[] = {
+ 	{
+ 		.type = IIO_EV_TYPE_THRESH,
+ 		.dir = IIO_EV_DIR_RISING,
+-		.mask_separate = BIT(IIO_EV_INFO_VALUE),
++		.mask_separate = BIT(IIO_EV_INFO_ENABLE) |
++				BIT(IIO_EV_INFO_VALUE),
+ 	}, {
+ 		.type = IIO_EV_TYPE_THRESH,
+ 		.dir = IIO_EV_DIR_FALLING,
+-		.mask_separate = BIT(IIO_EV_INFO_VALUE),
+-	}, {
+-		.type = IIO_EV_TYPE_THRESH,
+-		.dir = IIO_EV_DIR_EITHER,
+ 		.mask_separate = BIT(IIO_EV_INFO_ENABLE) |
+-				 BIT(IIO_EV_INFO_PERIOD),
++				BIT(IIO_EV_INFO_VALUE),
+ 	},
+ 
+ };
+@@ -1374,6 +1372,37 @@ static const char *ltr501_match_acpi_device(struct device *dev, int *chip_idx)
+ 	return dev_name(dev);
+ }
+ 
++static int ltr501_gpio_probe(struct i2c_client *client,
++				struct ltr501_data *data)
++{
++	struct device *dev;
++	struct gpio_desc *gpio;
++	int ret;
++
++	if (!client)
++		return -EINVAL;
++
++	dev = &client->dev;
++
++	/* data ready gpio interrupt pin */
++	gpio = devm_gpiod_get_index(dev, "ltr501_int", 0);
++	if (IS_ERR(gpio)) {
++		dev_err(dev, "acpi gpio get index failed\n");
++		return PTR_ERR(gpio);
++	}
++
++	ret = gpiod_direction_input(gpio);
++	if (ret)
++		return ret;
++
++	ret = gpiod_to_irq(gpio);
++
++	dev_dbg(dev, "GPIO resource, no:%d irq:%d\n", desc_to_gpio(gpio), ret);
++
++	return ret;
++}
++
++
+ static int ltr501_probe(struct i2c_client *client,
+ 			const struct i2c_device_id *id)
+ {
+@@ -1478,7 +1507,11 @@ static int ltr501_probe(struct i2c_client *client,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (client->irq > 0) {
++
++	if (client->irq < 0)
++		client->irq = ltr501_gpio_probe(client, data);
++
++	if (client->irq >= 0) {
+ 		ret = devm_request_threaded_irq(&client->dev, client->irq,
+ 						NULL, ltr501_interrupt_handler,
+ 						IRQF_TRIGGER_FALLING |
+-- 
+1.9.1
+

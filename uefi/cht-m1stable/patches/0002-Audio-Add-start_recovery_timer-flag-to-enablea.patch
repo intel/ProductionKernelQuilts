@@ -1,0 +1,174 @@
+From a37468ba51819134aa7ba4d80942be6fdfc0d334 Mon Sep 17 00:00:00 2001
+From: "Subhransu S. Prusty" <subhransu.s.prusty@intel.com>
+Date: Mon, 25 Aug 2014 13:20:40 +0530
+Subject: [PATCH 02/12] Audio: Add start_recovery_timer flag to enablea
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Add start_recovery_timer flag to provide flexibility to
+enable or disable the recovery feature, keep timer based
+recovery disabled now for CHT/BYT.
+
+Change-Id: Idbf7a42f1372e185d8b24a57884e46949b3095a6
+Signed-off-by: Subhransu S. Prusty <subhransu.s.prusty@intel.com>
+---
+ arch/x86/include/asm/platform_sst.h     |  1 +
+ sound/soc/intel/sst/sst.c               | 20 ++++++++++++++------
+ sound/soc/intel/sst/sst_acpi.c          | 19 +++++++++++++++----
+ sound/soc/intel/sst/sst_drv_interface.c |  3 ++-
+ sound/soc/intel/sst/sst_pvt.c           |  9 ++++++---
+ 5 files changed, 38 insertions(+), 14 deletions(-)
+
+diff --git a/arch/x86/include/asm/platform_sst.h b/arch/x86/include/asm/platform_sst.h
+index 12fa1a6..397ee16 100644
+--- a/arch/x86/include/asm/platform_sst.h
++++ b/arch/x86/include/asm/platform_sst.h
+@@ -128,6 +128,7 @@ struct sst_platform_info {
+ 	const struct sst_platform_debugfs_data *debugfs_data;
+ 	const struct sst_lib_dnld_info *lib_info;
+ 	bool enable_recovery;
++	bool start_recovery_timer;
+ };
+ 
+ #endif
+diff --git a/sound/soc/intel/sst/sst.c b/sound/soc/intel/sst/sst.c
+index 0f489bf..7649e16 100644
+--- a/sound/soc/intel/sst/sst.c
++++ b/sound/soc/intel/sst/sst.c
+@@ -964,10 +964,13 @@ static int intel_sst_probe(struct pci_dev *pci,
+ 		goto do_free_qos;
+ 	}
+ 
+-	ret = sst_recovery_init(sst_drv_ctx);
+-	if (ret) {
+-		pr_err("%s:sst recovery intialization failed", __func__);
+-		goto do_free_misc;
++	if (sst_drv_ctx->pdata->start_recovery_timer) {
++		ret = sst_recovery_init(sst_drv_ctx);
++		if (ret) {
++			pr_err("%s:sst recovery intialization failed", __func__);
++			goto do_free_misc;
++		}
++
+ 	}
+ 
+ 	pr_info("%s successfully done!\n", __func__);
+@@ -1051,14 +1054,19 @@ static void intel_sst_remove(struct pci_dev *pci)
+ 	if (sst_drv_ctx->pci_id == SST_CLV_PCI_ID)
+ 		kfree(sst_drv_ctx->probe_bytes);
+ 
+-	device_remove_file(sst_drv_ctx->dev, &dev_attr_audio_recovery_interval);
++	if (sst_drv_ctx->pdata->start_recovery_timer) {
++		device_remove_file(sst_drv_ctx->dev,
++			 &dev_attr_audio_recovery_interval);
++		destroy_workqueue(sst_drv_ctx->recovery_wq);
++	}
++
++
+ 	device_remove_file(sst_drv_ctx->dev, &dev_attr_audio_recovery);
+ 	kfree(sst_drv_ctx->fw_cntx);
+ 	kfree(sst_drv_ctx->runtime_param.param.addr);
+ 	flush_scheduled_work();
+ 	destroy_workqueue(sst_drv_ctx->post_msg_wq);
+ 	destroy_workqueue(sst_drv_ctx->mad_wq);
+-	destroy_workqueue(sst_drv_ctx->recovery_wq);
+ 	pm_qos_remove_request(sst_drv_ctx->qos);
+ 	kfree(sst_drv_ctx->qos);
+ 	kfree(sst_drv_ctx->fw_sg_list.src);
+diff --git a/sound/soc/intel/sst/sst_acpi.c b/sound/soc/intel/sst/sst_acpi.c
+index 496eed4..37e2971 100644
+--- a/sound/soc/intel/sst/sst_acpi.c
++++ b/sound/soc/intel/sst/sst_acpi.c
+@@ -212,6 +212,7 @@ struct sst_platform_info cht_platform_data = {
+ 	.pdata = NULL,
+ 	.ipc_info = &cht_ipc_info,
+ 	.lib_info = NULL,
++	.start_recovery_timer = false,
+ };
+ 
+ struct sst_platform_info byt_rvp_platform_data = {
+@@ -221,6 +222,7 @@ struct sst_platform_info byt_rvp_platform_data = {
+ 	.pdata = &sst_byt_pdata,
+ 	.ipc_info = &byt_ipc_info,
+ 	.lib_info = &byt_lib_dnld_info,
++	.start_recovery_timer = false,
+ };
+ 
+ struct sst_platform_info byt_ffrd8_platform_data = {
+@@ -230,6 +232,7 @@ struct sst_platform_info byt_ffrd8_platform_data = {
+ 	.pdata = &sst_byt_pdata,
+ 	.ipc_info = &byt_ipc_info,
+ 	.lib_info = &byt_lib_dnld_info,
++	.start_recovery_timer = false,
+ };
+ 
+ int sst_workqueue_init(struct intel_sst_drv *ctx)
+@@ -653,11 +656,15 @@ int sst_acpi_probe(struct platform_device *pdev)
+ 	pm_runtime_enable(dev);
+ 	register_sst(dev);
+ 	sst_debugfs_init(ctx);
+-	ret = sst_recovery_init(ctx);
+-	if (ret) {
+-		pr_err("%s:sst recovery intialization failed", __func__);
+-		goto do_free_misc;
++
++	if (ctx->pdata->start_recovery_timer) {
++		ret = sst_recovery_init(ctx);
++		if (ret) {
++			pr_err("%s:sst recovery intialization failed", __func__);
++			goto do_free_misc;
++		}
+ 	}
++
+ 	sst_set_fw_state_locked(ctx, SST_RESET);
+ 	sst_save_shim64(ctx, ctx->shim, ctx->shim_regs64);
+ 	pr_info("%s successfully done!\n", __func__);
+@@ -687,6 +694,10 @@ int sst_acpi_remove(struct platform_device *pdev)
+ 	struct intel_sst_drv *ctx;
+ 
+ 	ctx = platform_get_drvdata(pdev);
++	if (sst_drv_ctx->pdata->start_recovery_timer) {
++		device_remove_file(sst_drv_ctx->dev,
++			&dev_attr_audio_recovery_interval);
++	}
+ 	sst_debugfs_exit(ctx);
+ 	pm_runtime_get_noresume(ctx->dev);
+ 	pm_runtime_disable(ctx->dev);
+diff --git a/sound/soc/intel/sst/sst_drv_interface.c b/sound/soc/intel/sst/sst_drv_interface.c
+index 8e108a1..2e6b674 100644
+--- a/sound/soc/intel/sst/sst_drv_interface.c
++++ b/sound/soc/intel/sst/sst_drv_interface.c
+@@ -1062,7 +1062,8 @@ static int sst_set_generic_params(enum sst_controls cmd, void *arg)
+ 		break;
+ 	}
+ 	case SST_SET_MONITOR_LPE: {
+-		ret_val = sst_set_timer(&sst_drv_ctx->monitor_lpe, *(bool *)arg);
++		if (sst_drv_ctx->pdata->start_recovery_timer)
++			ret_val = sst_set_timer(&sst_drv_ctx->monitor_lpe, *(bool *)arg);
+ 		break;
+ 	}
+ 	default:
+diff --git a/sound/soc/intel/sst/sst_pvt.c b/sound/soc/intel/sst/sst_pvt.c
+index 711386d..404c774 100644
+--- a/sound/soc/intel/sst/sst_pvt.c
++++ b/sound/soc/intel/sst/sst_pvt.c
+@@ -574,10 +574,13 @@ void sst_clean_stream(struct stream_info *stream)
+ void sst_update_timer(struct intel_sst_drv *sst_drv_ctx)
+ {
+ 	struct intel_sst_drv *sst = sst_drv_ctx;
+-	if (&sst->monitor_lpe.sst_timer != NULL) {
+-		mod_timer(&sst->monitor_lpe.sst_timer, jiffies +
++
++	if (sst_drv_ctx->pdata->start_recovery_timer) {
++		if (&sst->monitor_lpe.sst_timer != NULL) {
++			mod_timer(&sst->monitor_lpe.sst_timer, jiffies +
+ 				msecs_to_jiffies(sst->monitor_lpe.interval));
+-		sst->monitor_lpe.prev_match_val = read_shim_data(sst, SST_TMRCTL);
++			sst->monitor_lpe.prev_match_val = read_shim_data(sst, SST_TMRCTL);
++		}
+ 	}
+ }
+ 
+-- 
+1.8.3.2
+

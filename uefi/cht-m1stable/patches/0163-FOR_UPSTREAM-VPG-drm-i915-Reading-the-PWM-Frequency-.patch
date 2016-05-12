@@ -1,0 +1,179 @@
+From 16aa5b06b0c3c441753e6b630f464a29f212cb88 Mon Sep 17 00:00:00 2001
+Message-Id: <16aa5b06b0c3c441753e6b630f464a29f212cb88.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: vkorjani <vikas.korjani@intel.com>
+Date: Fri, 1 Aug 2014 05:33:41 +0530
+Subject: [PATCH 163/312] FOR_UPSTREAM [VPG]: drm/i915: Reading the PWM
+ Frequency of BYT_CR from BIOS
+
+PWM Frequency for BYT_CR was hardcoded to 1.5KHZ. This patch
+reads the value from bios and if it is less than 400HZ, PWM frequency
+is set around 380HZ as it is the minimum value of PWM frequency.
+
+Issue: GMIN-2128
+Change-Id: I09639dca0a5fcf1e684af78e70caf8528e76c621
+Signed-off-by: vkorjani <vikas.korjani@intel.com>
+Signed-off-by: Deepak M <m.deepak@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h    |    2 ++
+ drivers/gpu/drm/i915/intel_bios.c  |   18 +++++++++++++++
+ drivers/gpu/drm/i915/intel_bios.h  |   12 ++++++++++
+ drivers/gpu/drm/i915/intel_panel.c |   45 ++++++++++++++++++++++++++++++++----
+ 4 files changed, 73 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 8360392..63f289d 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1323,6 +1323,8 @@ struct intel_vbt_data {
+ 	} dsi;
+ 
+ 	int crt_ddc_pin;
++	/* Assuming only 1 LFP */
++	u16 pwm_frequency;
+ 
+ 	int child_dev_num;
+ 	union child_device_config *child_dev;
+diff --git a/drivers/gpu/drm/i915/intel_bios.c b/drivers/gpu/drm/i915/intel_bios.c
+index 05fce5b..ce7d484 100644
+--- a/drivers/gpu/drm/i915/intel_bios.c
++++ b/drivers/gpu/drm/i915/intel_bios.c
+@@ -201,6 +201,23 @@ get_lvds_fp_timing(const struct bdb_header *bdb,
+ 	return (const struct lvds_fp_timing *)((const u8 *)bdb + ofs);
+ }
+ 
++static void parse_backlight_data(struct drm_i915_private *dev_priv,
++		struct bdb_header *bdb)
++{
++	struct bdb_panel_backlight *vbt_panel_bl = NULL;
++	char *bl_start = NULL;
++
++	bl_start = find_section(bdb, BDB_LVDS_BACKLIGHT);
++	if (!bl_start) {
++		DRM_DEBUG_KMS("No backlight BDB found");
++		return;
++	}
++	DRM_DEBUG_KMS("Found backlight BDB");
++	vbt_panel_bl = (struct bdb_panel_backlight *)(bl_start + 1) +
++								panel_type;
++	dev_priv->vbt.pwm_frequency = vbt_panel_bl->pwm_freq;
++}
++
+ /* Try to find integrated panel data */
+ static void
+ parse_lfp_panel_data(struct drm_i915_private *dev_priv,
+@@ -1236,6 +1253,7 @@ intel_parse_bios(struct drm_device *dev)
+ 	parse_device_mapping(dev_priv, bdb);
+ 	parse_driver_features(dev_priv, bdb);
+ 	parse_edp(dev_priv, bdb);
++	parse_backlight_data(dev_priv, bdb);
+ 	parse_mipi(dev_priv, bdb);
+ 	parse_ddi_ports(dev_priv, bdb);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_bios.h b/drivers/gpu/drm/i915/intel_bios.h
+index 162a624..c56553f 100644
+--- a/drivers/gpu/drm/i915/intel_bios.h
++++ b/drivers/gpu/drm/i915/intel_bios.h
+@@ -311,6 +311,18 @@ struct bdb_lvds_options {
+ 	u32 blt_control_type_bits;
+ } __packed;
+ 
++struct bdb_panel_backlight {
++	/* Backlight control parameters */
++	u8 type:2;
++	u8 inverter_pol:1;
++	u8 gpio:3;
++	u8 gmbus:2;
++	u16 pwm_freq;
++	u8 minbrightness;
++	u8 i2c_slave_addr;
++	u8 brightnesscmd;
++} __packed;
++
+ /* LFP pointer table contains entries to the struct below */
+ struct bdb_lvds_lfp_data_ptr {
+ 	u16 fp_timing_offset; /* offsets are from start of bdb */
+diff --git a/drivers/gpu/drm/i915/intel_panel.c b/drivers/gpu/drm/i915/intel_panel.c
+index a4664b6..f973afc 100644
+--- a/drivers/gpu/drm/i915/intel_panel.c
++++ b/drivers/gpu/drm/i915/intel_panel.c
+@@ -466,8 +466,9 @@ static u32 _vlv_get_backlight(struct drm_device *dev, enum pipe pipe)
+ 			BACKLIGHT_DUTY_CYCLE_MASK;
+ }
+ 
+-static u32 vlv_get_mipi_backlight(struct drm_device *dev)
++static u32 vlv_get_mipi_backlight(struct intel_connector *connector)
+ {
++	struct drm_device *dev = connector->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	if (dev_priv->vbt.dsi.config->pmic_soc_blc)
+@@ -775,17 +776,53 @@ static void bdw_enable_backlight(struct intel_connector *connector)
+ 	intel_panel_actually_set_backlight(connector, panel->backlight.level);
+ }
+ 
++static uint32_t compute_pwm_base(uint16_t freq)
++{
++	uint32_t base_unit;
++	if (freq < 400)
++		freq = 400;
++	/*The PWM block is clocked by the 25MHz oscillator clock.
++	 * The output frequency can be estimated with the equation:
++	 * Target frequency = XOSC * Base_unit_value/256
++	 */
++	base_unit = (freq * 256) / 25;
++
++	/* Also Base_unit_value need to converted to QM.N notation
++	 * to program the value in register
++	 * Using the following for converting to Q8.8 notation
++	 * For QM.N representation, consider a floating point variable 'a' :
++	 * Step 1: Calculate b = a* 2^N , where N is the fractional length
++	 * of the variable.
++	 * Note that a is represented in decimal.
++	 * Step 2: Round the value of 'b' to the nearest integer value.
++	 * For example:
++	 * RoundOff (1.05) --> 1
++	 * RoundOff (1.5)  --> 2
++	 * Step 3: Convert 'b' from decimal to binary representation and
++	 * name the new variable 'c'
++	 */
++	base_unit = base_unit * 256;
++	base_unit = DIV_ROUND_CLOSEST(base_unit, 1000000);
++
++	return base_unit;
++}
++
+ static void lpio_enable_backlight(struct drm_i915_private *dev_priv)
+ {
+ 	uint32_t val;
++	uint32_t pwm_base;
+ 
+ 	/* GPIOC_94 config to PWM0 function */
+ 	val = vlv_gps_core_read(dev_priv, GPIO_NC_22_PCONF0);
+ 	vlv_gps_core_write(dev_priv, GPIO_NC_22_PCONF0, 0x2000CC01);
+ 	vlv_gps_core_write(dev_priv, GPIO_NC_22_PAD, 0x5);
+ 
+-	/* PWM enable*/
+-	lpio_bl_write(0, LPIO_PWM_CTRL, 0x20c00);
++	/* PWM enable
++	 * Assuming only 1 LFP
++	 */
++	pwm_base = compute_pwm_base(dev_priv->vbt.pwm_frequency);
++	pwm_base = pwm_base << 8;
++	lpio_bl_write(0, LPIO_PWM_CTRL, pwm_base);
+ 	lpio_bl_update(0, LPIO_PWM_CTRL);
+ 	lpio_bl_write_bits(0, LPIO_PWM_CTRL, 0x80000000,
+ 			0x80000000);
+@@ -1249,7 +1286,7 @@ static int vlv_setup_mipi_backlight(struct intel_connector *connector)
+ 
+ 	panel->backlight.max = 0xFF;
+ 
+-	val = vlv_get_mipi_backlight(dev);
++	val = vlv_get_mipi_backlight(connector);
+ 	panel->backlight.level = intel_panel_compute_brightness(connector, val);
+ 
+ 	if (dev_priv->vbt.dsi.config->pmic_soc_blc) {
+-- 
+1.7.9.5
+

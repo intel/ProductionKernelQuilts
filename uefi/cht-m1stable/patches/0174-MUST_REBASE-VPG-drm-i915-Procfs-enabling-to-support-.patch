@@ -1,0 +1,215 @@
+From 1f732cef407b1f1cc498b2e7411e0a1ac1c5e85e Mon Sep 17 00:00:00 2001
+Message-Id: <1f732cef407b1f1cc498b2e7411e0a1ac1c5e85e.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Thu, 31 Jul 2014 15:40:21 +0530
+Subject: [PATCH 174/312] MUST_REBASE [VPG]: drm/i915: Procfs enabling to
+ support get/put operations
+
+To avoid any invalid access from user space application (for ex.
+read/write registers). App should do open on
+"/proc/driver/i915rpm/i915_rpm_op" file exposed by this patch.
+With each open call a "pm_runtime_get_sync" is initiated and with
+close "runtime_pm_put_autosuspend" is called.
+
+!FOR_UPSTREAM: This patch is specific to register access from coreu on android.
+This patch will help handle any register access from coreu when system is in sleep.
+
+Procfs open/close makes sure that the get/put are always in
+pairs even if an application has crashed.
+
+Test case scenarios covered:
+  1-Single process open, access, close.
+  2-Single process open, open, access, close, close.
+  3-Multiple concurrent opens by different processes.
+  4-Open, kill the process. Confirm that the refcount gets decremented.
+  5-Open, kill -9 the process.
+  6-Verified through vi file open
+  7-Verified through coreu service with and without close message called
+  8-Verified through libreg put/get over register access
+
+Issue: GMIN-3126
+Change-Id: Ie5261603b4c62ccce5f88c2b3253d845e0335f9f
+Signed-off-by: Deepak S <deepak.s@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c |    5 +++
+ drivers/gpu/drm/i915/i915_drv.h |   13 ++++++
+ drivers/gpu/drm/i915/intel_pm.c |   89 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 107 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 4039458..532299f 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1767,6 +1767,10 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 	}
+ 
+ 	i915_setup_sysfs(dev);
++	ret = i915_setup_rpm_procfs(dev);
++	if (ret)
++		DRM_ERROR("Unable to initialize rpm procfs entry");
++
+ 	dev_priv->is_first_modeset = true;
+ 
+ 	if (IS_VALLEYVIEW(dev))
+@@ -1838,6 +1842,7 @@ int i915_driver_unload(struct drm_device *dev)
+ 	intel_power_domains_remove(dev_priv);
+ 
+ 	i915_teardown_sysfs(dev);
++	i915_teardown_rpm_procfs(dev);
+ 
+ 	WARN_ON(unregister_oom_notifier(&dev_priv->mm.oom_notifier));
+ 	unregister_shrinker(&dev_priv->mm.shrinker);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 8adc37b..05c1a2c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -526,6 +526,12 @@ struct intel_uncore {
+ 	struct timer_list force_wake_timer;
+ };
+ 
++struct i915_rpm {
++	/* procfs related */
++	struct proc_dir_entry *i915_proc_dir;
++	struct proc_dir_entry *i915_proc_file;
++};
++
+ #define DEV_INFO_FOR_EACH_FLAG(func, sep) \
+ 	func(is_mobile) sep \
+ 	func(is_i85x) sep \
+@@ -1442,6 +1448,8 @@ struct drm_i915_private {
+ 
+ 	struct intel_uncore uncore;
+ 
++	struct i915_rpm rpm;
++
+ 	struct intel_gmbus gmbus[GMBUS_NUM_PORTS];
+ 
+ 
+@@ -2976,6 +2984,11 @@ timespec_to_jiffies_timeout(const struct timespec *value)
+ 	return min_t(unsigned long, MAX_JIFFY_OFFSET, j + 1);
+ }
+ 
++int i915_setup_rpm_procfs(struct drm_device *drm_dev);
++int i915_teardown_rpm_procfs(struct drm_device *drm_dev);
++int i915_rpm_get_procfs(struct inode *inode, struct file *file);
++int i915_rpm_put_procfs(struct inode *inode, struct file *file);
++
+ /*
+  * If you need to wait X milliseconds between events A and B, but event B
+  * doesn't happen exactly after event A, you record the timestamp (jiffies) of
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 100335a..fbd23d6 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -33,10 +33,23 @@
+ #include <linux/vgaarb.h>
+ #include <drm/i915_powerwell.h>
+ #include <linux/pm_runtime.h>
++#include <linux/proc_fs.h>  /* Needed for procfs access */
++#include <linux/fs.h>      /* For the basic file system */
++#include <linux/kernel.h>
+ 
+ static void gen6_disable_rps_interrupts(struct drm_device *dev);
+ static void gen6_enable_rps_interrupts(struct drm_device *dev);
+ 
++#define RPM_PROC_ENTRY_FILENAME     "i915_rpm_op"
++#define RPM_PROC_ENTRY_DIRECTORY        "driver/i915rpm"
++
++/* proc file operations supported */
++static const struct file_operations rpm_file_ops = {
++	.owner      = THIS_MODULE,
++	.open       = i915_rpm_get_procfs,
++	.release    = i915_rpm_put_procfs,
++};
++
+ /**
+  * RC6 is a special power stage which allows the GPU to enter an very
+  * low-voltage mode when idle, using down to 0V while at this stage.  This
+@@ -7312,6 +7325,82 @@ void program_pfi_credits(struct drm_i915_private *dev_priv, bool flag)
+ 		DRM_ERROR("cd clk < cz clk");
+ }
+ 
++/*
++ * These operations are caled from user mode (CoreU) to make sure
++ * Gfx is up before register accesses from user mode
++ */
++int i915_rpm_get_procfs(struct inode *inode, struct file *file)
++{
++	struct drm_device *dev = PDE_DATA(inode);
++
++	intel_runtime_pm_get(dev->dev_private);
++
++	return 0;
++}
++
++int i915_rpm_put_procfs(struct inode *inode, struct file *file)
++{
++	struct drm_device *dev = PDE_DATA(inode);
++
++	intel_runtime_pm_put(dev->dev_private);
++
++	return 0;
++}
++
++int i915_setup_rpm_procfs(struct drm_device *drm_dev)
++{
++	struct drm_i915_private *dev_priv = drm_dev->dev_private;
++	dev_priv->rpm.i915_proc_dir = NULL;
++	dev_priv->rpm.i915_proc_file = NULL;
++
++	/**
++	 * Create directory for rpm file(s)
++	 */
++	dev_priv->rpm.i915_proc_dir = proc_mkdir(RPM_PROC_ENTRY_DIRECTORY,
++						 NULL);
++	if (dev_priv->rpm.i915_proc_dir == NULL) {
++		DRM_ERROR("Could not initialize %s\n",
++				RPM_PROC_ENTRY_DIRECTORY);
++		return -ENOMEM;
++	}
++
++	/**
++	 * Create the /proc file
++	 */
++	dev_priv->rpm.i915_proc_file = proc_create_data(
++						RPM_PROC_ENTRY_FILENAME,
++						S_IRUGO | S_IWUSR,
++						dev_priv->rpm.i915_proc_dir,
++						&rpm_file_ops,
++						drm_dev);
++
++	/* check if file is created successfuly */
++	if (dev_priv->rpm.i915_proc_file == NULL) {
++		DRM_ERROR("Could not initialize %s/%s\n",
++			RPM_PROC_ENTRY_DIRECTORY, RPM_PROC_ENTRY_FILENAME);
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++int i915_teardown_rpm_procfs(struct drm_device *drm_dev)
++{
++	struct drm_i915_private *dev_priv = drm_dev->dev_private;
++
++	/* Clean up proc file */
++	if (dev_priv->rpm.i915_proc_file) {
++		remove_proc_entry(RPM_PROC_ENTRY_FILENAME,
++				 dev_priv->rpm.i915_proc_dir);
++		dev_priv->rpm.i915_proc_file = NULL;
++	}
++	if (dev_priv->rpm.i915_proc_dir) {
++		remove_proc_entry(RPM_PROC_ENTRY_DIRECTORY, NULL);
++		dev_priv->rpm.i915_proc_dir = NULL;
++	}
++	return 0;
++}
++
+ void intel_pm_setup(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-- 
+1.7.9.5
+

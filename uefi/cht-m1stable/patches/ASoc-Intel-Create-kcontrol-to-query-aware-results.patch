@@ -1,0 +1,241 @@
+From 95163b5055def558448f4bdb094977a5a5a10e3e Mon Sep 17 00:00:00 2001
+From: Samreen Nilofer <samreen.nilofer@intel.com>
+Date: Tue, 17 Mar 2015 16:14:52 +0530
+Subject: [PATCH] ASoc: Intel: Create kcontrol to query aware results
+
+Issue: GMINL-10853
+
+Through the kcontrol, the userspace can query the aware
+classification results.
+
+Change-Id: I465e1337a96233eee772393a108ba47697a4507b
+Signed-off-by: Samreen Nilofer <samreen.nilofer@intel.com>
+Signed-off-by: Divya Prakash <divya1.prakash@intel.com>
+---
+ sound/soc/intel/platform-libs/atom_controls.h    |  1 +
+ sound/soc/intel/platform-libs/controls_v2_dpcm.c | 96 +++++++++++++++++++++++-
+ sound/soc/intel/platform-libs/controls_v2_dpcm.h | 10 +++
+ sound/soc/intel/platform-libs/sst_widgets.h      | 29 +++++++
+ 4 files changed, 132 insertions(+), 4 deletions(-)
+
+diff --git a/sound/soc/intel/platform-libs/atom_controls.h b/sound/soc/intel/platform-libs/atom_controls.h
+index f17efa899a06..56d3af53774f 100644
+--- a/sound/soc/intel/platform-libs/atom_controls.h
++++ b/sound/soc/intel/platform-libs/atom_controls.h
+@@ -195,5 +195,6 @@ enum sst_cmd {
+ 	AWARE_ENV_CLASS_PARAMS	= 130,
+ 	FBA_VB_ALGO_LOCK	= 132,
+ 	VAD_ENV_CLASS_PARAMS	= 2049,
++	AWARE_ENV_CLASS_RESULTS = 2305,
+ };
+ #endif /* __ATOM_CONTROLS_H__ */
+diff --git a/sound/soc/intel/platform-libs/controls_v2_dpcm.c b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+index e67079835305..49faf642e8ae 100644
+--- a/sound/soc/intel/platform-libs/controls_v2_dpcm.c
++++ b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+@@ -33,14 +33,14 @@
+ #include "controls_v2_dpcm.h"
+ #include "sst_widgets.h"
+ 
+-static inline void sst_fill_byte_control(char *param,
++static inline void sst_fill_byte_control(char *param, u16 type,
+ 					 u8 ipc_msg, u8 block,
+ 					 u8 task_id, u8 pipe_id,
+ 					 u16 len, void *cmd_data)
+ {
+ 
+ 	struct snd_sst_bytes_v2 *byte_data = (struct snd_sst_bytes_v2 *)param;
+-	byte_data->type = SST_CMD_BYTES_SET;
++	byte_data->type = type;
+ 	byte_data->ipc_msg = ipc_msg;
+ 	byte_data->block = block;
+ 	byte_data->task_id = task_id;
+@@ -214,8 +214,9 @@ static int sst_fill_and_send_cmd_unlocked(struct sst_data *sst,
+ 				 u8 ipc_msg, u8 block, u8 task_id, u8 pipe_id,
+ 				 void *cmd_data, u16 len)
+ {
+-	sst_fill_byte_control(sst->byte_stream, ipc_msg, block, task_id, pipe_id,
+-			      len, cmd_data);
++	sst_fill_byte_control(sst->byte_stream, SST_CMD_BYTES_SET, ipc_msg,
++				block, task_id, pipe_id, len, cmd_data);
++
+ 	return sst_dsp->ops->set_generic_params(SST_SET_BYTE_STREAM,
+ 						sst->byte_stream);
+ }
+@@ -239,6 +240,42 @@ static int sst_fill_and_send_cmd(struct sst_data *sst,
+ 	return ret;
+ }
+ 
++/**
++ * sst_get_aware_results - generate & send IPC message to get the aware
++			results.
++ * @dstn:	pointer to fill the results
++ * @ipc_msg:	type of IPC (CMD, SET_PARAMS, GET_PARAMS)
++ * @cmd_data:	the IPC payload
++ */
++static int sst_get_aware_results(struct sst_data *sst,
++				void *dstn, u8 ipc_msg, u8 block,
++				u8 task_id, u8 pipe_id,
++				void *cmd_data, u16 len)
++{
++	int ret;
++	struct snd_sst_bytes_v2 *bytes;
++	struct sst_cmd_set_aware *aware;
++
++	mutex_lock(&sst->lock);
++
++	sst_fill_byte_control(sst->byte_stream, SST_CMD_BYTES_GET, ipc_msg,
++				block, task_id, pipe_id, len, cmd_data);
++
++	ret = sst_dsp->ops->set_generic_params(SST_SET_BYTE_STREAM,
++						sst->byte_stream);
++
++	/* Copy only the payload to the destn */
++	bytes = (struct snd_sst_bytes_v2 *)sst->byte_stream;
++	aware = (struct sst_cmd_set_aware *)bytes->bytes;
++
++	if (bytes->ipc_msg == SST_IPC_IA_GET_PARAMS)
++		memcpy(dstn, (void *)&aware->results, aware->header.length);
++
++	mutex_unlock(&sst->lock);
++
++	return ret;
++}
++
+ static int sst_probe_get(struct snd_kcontrol *kcontrol,
+ 			 struct snd_ctl_elem_value *ucontrol)
+ {
+@@ -434,6 +471,45 @@ int sst_vtsv_event_get(struct snd_kcontrol *kcontrol,
+ 	return 0;
+ }
+ 
++int sst_get_aware_data(struct snd_kcontrol *kcontrol,
++			struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_platform *platform = snd_kcontrol_chip(kcontrol);
++	struct sst_data *sst = snd_soc_platform_get_drvdata(platform);
++	struct soc_bytes_ext *sb = (void *) kcontrol->private_value;
++	struct sst_aware_data *aware = (struct sst_aware_data *)sb->pvt_data;
++	struct sst_cmd_set_aware aware_cmd;
++	int ret;
++
++	if (aware == NULL) {
++		pr_err("Aware pvt data is NULL\n");
++		return -EINVAL;
++	}
++
++	pr_debug("%s: mod %#x pipe %#x commd %#x task %#x inst %#x\n",
++			__func__, aware->module_id, aware->pipe_id,
++			aware->cmd_id, aware->task_id, aware->instance_id);
++
++	memset(&aware_cmd, 0, sizeof(aware_cmd));
++	SST_FILL_DEFAULT_DESTINATION(aware_cmd.header.dst);
++
++	aware_cmd.header.command_id = aware->cmd_id;
++	aware_cmd.header.length = sizeof(struct aware_classifier_result);
++	SST_FILL_DESTINATION(2, aware_cmd.header.dst,
++				(aware->pipe_id << 8) | aware->instance_id,
++				aware->module_id);
++
++	ret = sst_get_aware_results(sst, (void *)ucontrol->value.bytes.data,
++				SST_IPC_IA_GET_PARAMS, SST_FLAG_BLOCKED,
++				aware->task_id, aware->pipe_id, &aware_cmd,
++				sizeof(aware_cmd));
++
++	print_hex_dump_bytes("bytes aware: ", DUMP_PREFIX_OFFSET,
++				ucontrol->value.bytes.data,
++				aware_cmd.header.length);
++	return ret;
++}
++
+ static int sst_mux_get(struct snd_kcontrol *kcontrol,
+ 		       struct snd_ctl_elem_value *ucontrol)
+ {
+@@ -1753,6 +1829,16 @@ static const struct snd_kcontrol_new sst_vtsv_read[] = {
+ 		 sst_vtsv_event_get, NULL),
+ };
+ 
++/* length == 4 == struct aware_classifier_result */
++static const struct snd_kcontrol_new sst_aware_read[] = {
++	SST_AWARE_KCONTROL("aware event", 4,
++			SST_MODULE_ID_CONTEXT_ALGO_AWARE,
++			SST_DFW_PATH_INDEX_AWARE_OUT >> 8,
++			SST_TASK_AWARE,
++			AWARE_ENV_CLASS_RESULTS, 0,
++			sst_get_aware_data, NULL),
++};
++
+ static const char * const sst_bt_fm_texts[] = {
+ 	"fm", "bt",
+ };
+@@ -2803,6 +2889,8 @@ int sst_dsp_init_v2_dpcm_dfw(struct snd_soc_platform *platform)
+ 			ARRAY_SIZE(sst_vad_enroll));
+ 	snd_soc_add_platform_controls(platform, sst_vtsv_read,
+ 			ARRAY_SIZE(sst_vtsv_read));
++	snd_soc_add_platform_controls(platform, sst_aware_read,
++			ARRAY_SIZE(sst_aware_read));
+ 
+ 	/* initialize the names of the probe points */
+ 	for (i = 0; i < ARRAY_SIZE(sst_probes); i++)
+diff --git a/sound/soc/intel/platform-libs/controls_v2_dpcm.h b/sound/soc/intel/platform-libs/controls_v2_dpcm.h
+index 3d7a821e87ef..4310781c8b85 100644
+--- a/sound/soc/intel/platform-libs/controls_v2_dpcm.h
++++ b/sound/soc/intel/platform-libs/controls_v2_dpcm.h
+@@ -478,6 +478,16 @@ struct sst_cmd_sba_hw_set_ssp {
+ 	u16 start_delay:8;	/* Start delay in terms of clock ticks */
+ } __packed;
+ 
++struct aware_classifier_result {
++	s16 classid;  /* Classifier result */
++	s16 dBval;   /* dB value of audio data */
++} __packed;
++
++struct sst_cmd_set_aware {
++	struct sst_dsp_header header;
++	struct aware_classifier_result results;
++} __packed;
++
+ #define SST_MAX_TDM_SLOTS 8
+ 
+ struct sst_param_sba_ssp_slot_map {
+diff --git a/sound/soc/intel/platform-libs/sst_widgets.h b/sound/soc/intel/platform-libs/sst_widgets.h
+index cf995a4a2076..a2a0451b62a0 100644
+--- a/sound/soc/intel/platform-libs/sst_widgets.h
++++ b/sound/soc/intel/platform-libs/sst_widgets.h
+@@ -358,4 +358,33 @@ struct sst_probe_value {
+ 	.private_value = (unsigned long)&(struct sst_probe_value) \
+ 	{ .val = 0, .p_enum = &xenum } }
+ 
++/* Aware data */
++struct sst_aware_data {
++	u16 module_id;
++	u16 cmd_id;
++	u8 instance_id;
++	u8 pipe_id;
++	u8 task_id;
++} __packed;
++
++/* size of the control = size of params + size of length field */
++#define SST_AWARE_CTL_VALUE(xcount, xpipe, xmod, xtask, xcmd, xinst)	\
++	(struct soc_bytes_ext) {.max = xcount,				\
++		.pvt_data = (char *) &(struct sst_aware_data)		\
++		{.module_id = xmod, .pipe_id = xpipe,			\
++		.task_id = xtask, .cmd_id = xcmd,			\
++		.instance_id = xinst,					\
++		}							\
++	}
++
++#define SST_AWARE_KCONTROL(xname, xcount, xmod, xpipe,			\
++			  xtask, xcmd, xinst, xget, xput)		\
++{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,				\
++	.name =  xname, .index = SOC_CONTROL_IO_BYTES_EXT,		\
++	.info = snd_soc_info_bytes_ext, .get = xget, .put = xput,	\
++	.private_value = (unsigned long)&				\
++			SST_AWARE_CTL_VALUE(xcount, xpipe,		\
++					   xmod, xtask, xcmd, xinst),	\
++}
++
+ #endif
+-- 
+1.9.1
+

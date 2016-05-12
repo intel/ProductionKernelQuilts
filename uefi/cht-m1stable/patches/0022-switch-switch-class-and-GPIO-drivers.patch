@@ -1,0 +1,517 @@
+From c8a039baa21664faa0dfe9a4e580e583545cf042 Mon Sep 17 00:00:00 2001
+From: Mike Lockwood <lockwood@android.com>
+Date: Tue, 14 Oct 2008 12:50:16 -0400
+Subject: [PATCH 022/634] switch: switch class and GPIO drivers.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+switch: Export symbol switch_set_state.
+
+Signed-off-by: Mike Lockwood <lockwood@android.com>
+
+switch: gpio: Don't call request_irq with interrupts disabled
+
+Signed-off-by: Arve Hjønnevåg <arve@android.com>
+
+switch: Use device_create instead of device_create_drvdata.
+
+device_create_drvdata is obsolete.
+
+Signed-off-by: Arve Hjønnevåg <arve@android.com>
+
+switch_gpio: Add missing #include <linux/interrupt.h>
+
+Change-Id: I6c397e41bbe1457162cc69e31a29db5d9f76fccb
+Signed-off-by: Mike Lockwood <lockwood@android.com>
+---
+ drivers/Kconfig               |   2 +
+ drivers/Makefile              |   1 +
+ drivers/switch/Kconfig        |  15 ++++
+ drivers/switch/Makefile       |   4 +
+ drivers/switch/switch_class.c | 174 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/switch/switch_gpio.c  | 172 +++++++++++++++++++++++++++++++++++++++++
+ include/linux/switch.h        |  53 +++++++++++++
+ 7 files changed, 421 insertions(+)
+ create mode 100644 drivers/switch/Kconfig
+ create mode 100644 drivers/switch/Makefile
+ create mode 100644 drivers/switch/switch_class.c
+ create mode 100644 drivers/switch/switch_gpio.c
+ create mode 100644 include/linux/switch.h
+
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index b3138fb..5e0eb15 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -98,6 +98,8 @@ source "drivers/memstick/Kconfig"
+ 
+ source "drivers/leds/Kconfig"
+ 
++source "drivers/switch/Kconfig"
++
+ source "drivers/accessibility/Kconfig"
+ 
+ source "drivers/infiniband/Kconfig"
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 8e3b8b0..cde0860 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -113,6 +113,7 @@ obj-$(CONFIG_CPU_IDLE)		+= cpuidle/
+ obj-y				+= mmc/
+ obj-$(CONFIG_MEMSTICK)		+= memstick/
+ obj-y				+= leds/
++obj-$(CONFIG_SWITCH)		+= switch/
+ obj-$(CONFIG_INFINIBAND)	+= infiniband/
+ obj-$(CONFIG_SGI_SN)		+= sn/
+ obj-y				+= firmware/
+diff --git a/drivers/switch/Kconfig b/drivers/switch/Kconfig
+new file mode 100644
+index 0000000..19404b6
+--- /dev/null
++++ b/drivers/switch/Kconfig
+@@ -0,0 +1,15 @@
++menuconfig SWITCH
++	tristate "Switch class support"
++	help
++	  Say Y here to enable switch class support. This allows
++	  monitoring switches by userspace via sysfs and uevent.
++
++if SWITCH
++
++config SWITCH_GPIO
++	tristate "GPIO Swith support"
++	depends on GPIOLIB
++	help
++	  Say Y here to enable GPIO based switch support.
++
++endif # SWITCH
+diff --git a/drivers/switch/Makefile b/drivers/switch/Makefile
+new file mode 100644
+index 0000000..f7606ed
+--- /dev/null
++++ b/drivers/switch/Makefile
+@@ -0,0 +1,4 @@
++# Switch Class Driver
++obj-$(CONFIG_SWITCH)		+= switch_class.o
++obj-$(CONFIG_SWITCH_GPIO)	+= switch_gpio.o
++
+diff --git a/drivers/switch/switch_class.c b/drivers/switch/switch_class.c
+new file mode 100644
+index 0000000..e05fc25
+--- /dev/null
++++ b/drivers/switch/switch_class.c
+@@ -0,0 +1,174 @@
++/*
++ *  drivers/switch/switch_class.c
++ *
++ * Copyright (C) 2008 Google, Inc.
++ * Author: Mike Lockwood <lockwood@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++*/
++
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/init.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/err.h>
++#include <linux/switch.h>
++
++struct class *switch_class;
++static atomic_t device_count;
++
++static ssize_t state_show(struct device *dev, struct device_attribute *attr,
++		char *buf)
++{
++	struct switch_dev *sdev = (struct switch_dev *)
++		dev_get_drvdata(dev);
++
++	if (sdev->print_state) {
++		int ret = sdev->print_state(sdev, buf);
++		if (ret >= 0)
++			return ret;
++	}
++	return sprintf(buf, "%d\n", sdev->state);
++}
++
++static ssize_t name_show(struct device *dev, struct device_attribute *attr,
++		char *buf)
++{
++	struct switch_dev *sdev = (struct switch_dev *)
++		dev_get_drvdata(dev);
++
++	if (sdev->print_name) {
++		int ret = sdev->print_name(sdev, buf);
++		if (ret >= 0)
++			return ret;
++	}
++	return sprintf(buf, "%s\n", sdev->name);
++}
++
++static DEVICE_ATTR(state, S_IRUGO | S_IWUSR, state_show, NULL);
++static DEVICE_ATTR(name, S_IRUGO | S_IWUSR, name_show, NULL);
++
++void switch_set_state(struct switch_dev *sdev, int state)
++{
++	char name_buf[120];
++	char state_buf[120];
++	char *prop_buf;
++	char *envp[3];
++	int env_offset = 0;
++	int length;
++
++	if (sdev->state != state) {
++		sdev->state = state;
++
++		prop_buf = (char *)get_zeroed_page(GFP_KERNEL);
++		if (prop_buf) {
++			length = name_show(sdev->dev, NULL, prop_buf);
++			if (length > 0) {
++				if (prop_buf[length - 1] == '\n')
++					prop_buf[length - 1] = 0;
++				snprintf(name_buf, sizeof(name_buf),
++					"SWITCH_NAME=%s", prop_buf);
++				envp[env_offset++] = name_buf;
++			}
++			length = state_show(sdev->dev, NULL, prop_buf);
++			if (length > 0) {
++				if (prop_buf[length - 1] == '\n')
++					prop_buf[length - 1] = 0;
++				snprintf(state_buf, sizeof(state_buf),
++					"SWITCH_STATE=%s", prop_buf);
++				envp[env_offset++] = state_buf;
++			}
++			envp[env_offset] = NULL;
++			kobject_uevent_env(&sdev->dev->kobj, KOBJ_CHANGE, envp);
++			free_page((unsigned long)prop_buf);
++		} else {
++			printk(KERN_ERR "out of memory in switch_set_state\n");
++			kobject_uevent(&sdev->dev->kobj, KOBJ_CHANGE);
++		}
++	}
++}
++EXPORT_SYMBOL_GPL(switch_set_state);
++
++static int create_switch_class(void)
++{
++	if (!switch_class) {
++		switch_class = class_create(THIS_MODULE, "switch");
++		if (IS_ERR(switch_class))
++			return PTR_ERR(switch_class);
++		atomic_set(&device_count, 0);
++	}
++
++	return 0;
++}
++
++int switch_dev_register(struct switch_dev *sdev)
++{
++	int ret;
++
++	if (!switch_class) {
++		ret = create_switch_class();
++		if (ret < 0)
++			return ret;
++	}
++
++	sdev->index = atomic_inc_return(&device_count);
++	sdev->dev = device_create(switch_class, NULL,
++		MKDEV(0, sdev->index), NULL, sdev->name);
++	if (IS_ERR(sdev->dev))
++		return PTR_ERR(sdev->dev);
++
++	ret = device_create_file(sdev->dev, &dev_attr_state);
++	if (ret < 0)
++		goto err_create_file_1;
++	ret = device_create_file(sdev->dev, &dev_attr_name);
++	if (ret < 0)
++		goto err_create_file_2;
++
++	dev_set_drvdata(sdev->dev, sdev);
++	sdev->state = 0;
++	return 0;
++
++err_create_file_2:
++	device_remove_file(sdev->dev, &dev_attr_state);
++err_create_file_1:
++	device_destroy(switch_class, MKDEV(0, sdev->index));
++	printk(KERN_ERR "switch: Failed to register driver %s\n", sdev->name);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(switch_dev_register);
++
++void switch_dev_unregister(struct switch_dev *sdev)
++{
++	device_remove_file(sdev->dev, &dev_attr_name);
++	device_remove_file(sdev->dev, &dev_attr_state);
++	device_destroy(switch_class, MKDEV(0, sdev->index));
++	dev_set_drvdata(sdev->dev, NULL);
++}
++EXPORT_SYMBOL_GPL(switch_dev_unregister);
++
++static int __init switch_class_init(void)
++{
++	return create_switch_class();
++}
++
++static void __exit switch_class_exit(void)
++{
++	class_destroy(switch_class);
++}
++
++module_init(switch_class_init);
++module_exit(switch_class_exit);
++
++MODULE_AUTHOR("Mike Lockwood <lockwood@android.com>");
++MODULE_DESCRIPTION("Switch class driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/switch/switch_gpio.c b/drivers/switch/switch_gpio.c
+new file mode 100644
+index 0000000..621d62d
+--- /dev/null
++++ b/drivers/switch/switch_gpio.c
+@@ -0,0 +1,172 @@
++/*
++ *  drivers/switch/switch_gpio.c
++ *
++ * Copyright (C) 2008 Google, Inc.
++ * Author: Mike Lockwood <lockwood@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++*/
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/switch.h>
++#include <linux/workqueue.h>
++#include <linux/gpio.h>
++
++struct gpio_switch_data {
++	struct switch_dev sdev;
++	unsigned gpio;
++	const char *name_on;
++	const char *name_off;
++	const char *state_on;
++	const char *state_off;
++	int irq;
++	struct work_struct work;
++};
++
++static void gpio_switch_work(struct work_struct *work)
++{
++	int state;
++	struct gpio_switch_data	*data =
++		container_of(work, struct gpio_switch_data, work);
++
++	state = gpio_get_value(data->gpio);
++	switch_set_state(&data->sdev, state);
++}
++
++static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
++{
++	struct gpio_switch_data *switch_data =
++	    (struct gpio_switch_data *)dev_id;
++
++	schedule_work(&switch_data->work);
++	return IRQ_HANDLED;
++}
++
++static ssize_t switch_gpio_print_state(struct switch_dev *sdev, char *buf)
++{
++	struct gpio_switch_data	*switch_data =
++		container_of(sdev, struct gpio_switch_data, sdev);
++	const char *state;
++	if (switch_get_state(sdev))
++		state = switch_data->state_on;
++	else
++		state = switch_data->state_off;
++
++	if (state)
++		return sprintf(buf, "%s\n", state);
++	return -1;
++}
++
++static int gpio_switch_probe(struct platform_device *pdev)
++{
++	struct gpio_switch_platform_data *pdata = pdev->dev.platform_data;
++	struct gpio_switch_data *switch_data;
++	int ret = 0;
++
++	if (!pdata)
++		return -EBUSY;
++
++	switch_data = kzalloc(sizeof(struct gpio_switch_data), GFP_KERNEL);
++	if (!switch_data)
++		return -ENOMEM;
++
++	switch_data->sdev.name = pdata->name;
++	switch_data->gpio = pdata->gpio;
++	switch_data->name_on = pdata->name_on;
++	switch_data->name_off = pdata->name_off;
++	switch_data->state_on = pdata->state_on;
++	switch_data->state_off = pdata->state_off;
++	switch_data->sdev.print_state = switch_gpio_print_state;
++
++	ret = switch_dev_register(&switch_data->sdev);
++	if (ret < 0)
++		goto err_switch_dev_register;
++
++	ret = gpio_request(switch_data->gpio, pdev->name);
++	if (ret < 0)
++		goto err_request_gpio;
++
++	ret = gpio_direction_input(switch_data->gpio);
++	if (ret < 0)
++		goto err_set_gpio_input;
++
++	INIT_WORK(&switch_data->work, gpio_switch_work);
++
++	switch_data->irq = gpio_to_irq(switch_data->gpio);
++	if (switch_data->irq < 0) {
++		ret = switch_data->irq;
++		goto err_detect_irq_num_failed;
++	}
++
++	ret = request_irq(switch_data->irq, gpio_irq_handler,
++			  IRQF_TRIGGER_LOW, pdev->name, switch_data);
++	if (ret < 0)
++		goto err_request_irq;
++
++	/* Perform initial detection */
++	gpio_switch_work(&switch_data->work);
++
++	return 0;
++
++err_request_irq:
++err_detect_irq_num_failed:
++err_set_gpio_input:
++	gpio_free(switch_data->gpio);
++err_request_gpio:
++	switch_dev_unregister(&switch_data->sdev);
++err_switch_dev_register:
++	kfree(switch_data);
++
++	return ret;
++}
++
++static int gpio_switch_remove(struct platform_device *pdev)
++{
++	struct gpio_switch_data *switch_data = platform_get_drvdata(pdev);
++
++	cancel_work_sync(&switch_data->work);
++	gpio_free(switch_data->gpio);
++	switch_dev_unregister(&switch_data->sdev);
++	kfree(switch_data);
++
++	return 0;
++}
++
++static struct platform_driver gpio_switch_driver = {
++	.probe		= gpio_switch_probe,
++	.remove		= gpio_switch_remove,
++	.driver		= {
++		.name	= "switch-gpio",
++		.owner	= THIS_MODULE,
++	},
++};
++
++static int __init gpio_switch_init(void)
++{
++	return platform_driver_register(&gpio_switch_driver);
++}
++
++static void __exit gpio_switch_exit(void)
++{
++	platform_driver_unregister(&gpio_switch_driver);
++}
++
++module_init(gpio_switch_init);
++module_exit(gpio_switch_exit);
++
++MODULE_AUTHOR("Mike Lockwood <lockwood@android.com>");
++MODULE_DESCRIPTION("GPIO Switch driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/switch.h b/include/linux/switch.h
+new file mode 100644
+index 0000000..3e4c748
+--- /dev/null
++++ b/include/linux/switch.h
+@@ -0,0 +1,53 @@
++/*
++ *  Switch class driver
++ *
++ * Copyright (C) 2008 Google, Inc.
++ * Author: Mike Lockwood <lockwood@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++*/
++
++#ifndef __LINUX_SWITCH_H__
++#define __LINUX_SWITCH_H__
++
++struct switch_dev {
++	const char	*name;
++	struct device	*dev;
++	int		index;
++	int		state;
++
++	ssize_t	(*print_name)(struct switch_dev *sdev, char *buf);
++	ssize_t	(*print_state)(struct switch_dev *sdev, char *buf);
++};
++
++struct gpio_switch_platform_data {
++	const char *name;
++	unsigned 	gpio;
++
++	/* if NULL, switch_dev.name will be printed */
++	const char *name_on;
++	const char *name_off;
++	/* if NULL, "0" or "1" will be printed */
++	const char *state_on;
++	const char *state_off;
++};
++
++extern int switch_dev_register(struct switch_dev *sdev);
++extern void switch_dev_unregister(struct switch_dev *sdev);
++
++static inline int switch_get_state(struct switch_dev *sdev)
++{
++	return sdev->state;
++}
++
++extern void switch_set_state(struct switch_dev *sdev, int state);
++
++#endif /* __LINUX_SWITCH_H__ */
+-- 
+1.9.1
+

@@ -1,0 +1,283 @@
+From 0a9f505a6971278ff17481acd4ca5a484d8f0d01 Mon Sep 17 00:00:00 2001
+Message-Id: <0a9f505a6971278ff17481acd4ca5a484d8f0d01.1421830308.git.chang-joon.lee@intel.com>
+In-Reply-To: <49dde4951ccd12ce81e60aed3b24793e0ac12fed.1421830308.git.chang-joon.lee@intel.com>
+References: <49dde4951ccd12ce81e60aed3b24793e0ac12fed.1421830308.git.chang-joon.lee@intel.com>
+From: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+Date: Wed, 3 Dec 2014 14:47:24 +0530
+Subject: [PATCH 04/17] FOR_UPSTREAM [VPG]: drm/i915: Program mipi and crtc
+ registers for mipi cmd mode
+
+Program MIPI and CRTC registers for MIPI command mode.
+
+Issue: GMINL-1644
+Change-Id: I867cc58af6ff3e98b1732c2af82c3535d7b0695b
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+Signed-off-by: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+---
+ drivers/gpu/drm/i915/i915_reg.h      |    1 +
+ drivers/gpu/drm/i915/intel_display.c |   30 +++++++++-
+ drivers/gpu/drm/i915/intel_dsi.c     |  109 +++++++++++++++++-----------------
+ 3 files changed, 85 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index d1ae1aa..61c4c72 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -3904,6 +3904,7 @@ enum punit_power_well {
+ #define   PIPECONF_INTERLACED_DBL_ILK		(4 << 21) /* ilk/snb only */
+ #define   PIPECONF_PFIT_PF_INTERLACED_DBL_ILK	(5 << 21) /* ilk/snb only */
+ #define   PIPECONF_INTERLACE_MODE_MASK		(7 << 21)
++#define   PIPECONF_MIPI_DSR_ENABLE		(1 << 20)
+ #define   PIPECONF_EDP_RR_MODE_SWITCH		(1 << 20)
+ #define   PIPECONF_EDP_RR_MODE_SWITCH_VLV	(1 << 14)
+ #define   PIPECONF_CXSR_DOWNCLOCK	(1<<16)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 9d6f149..ffb6360 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -41,6 +41,7 @@
+ #include <drm/drm_crtc_helper.h>
+ #include <linux/dma_remapping.h>
+ #include "intel_clrmgr.h"
++#include "intel_dsi.h"
+ 
+ #define DIV_ROUND_CLOSEST_ULL(ll, d)	\
+ 	({ unsigned long long _tmp = (ll)+(d)/2; do_div(_tmp, d); _tmp; })
+@@ -2108,6 +2109,8 @@ static void intel_enable_pipe(struct intel_crtc *crtc)
+ 	enum transcoder cpu_transcoder = intel_pipe_to_cpu_transcoder(dev_priv,
+ 								      pipe);
+ 	enum pipe pch_transcoder;
++	struct intel_encoder *encoder;
++	struct intel_dsi *intel_dsi;
+ 	int reg;
+ 	u32 val;
+ 
+@@ -2148,7 +2151,19 @@ static void intel_enable_pipe(struct intel_crtc *crtc)
+ 		return;
+ 	}
+ 
+-	I915_WRITE(reg, val | PIPECONF_ENABLE);
++	for_each_encoder_on_crtc(dev, &crtc->base, encoder) {
++		if (encoder->type == INTEL_OUTPUT_DSI) {
++			intel_dsi = enc_to_intel_dsi(&encoder->base);
++			if (intel_dsi && is_cmd_mode(intel_dsi)) {
++				val = val | PIPECONF_MIPI_DSR_ENABLE;
++				I915_WRITE(reg, val);
++			}
++			break;
++		}
++	}
++
++	val = val | PIPECONF_ENABLE;
++	I915_WRITE(reg, val);
+ 	POSTING_READ(reg);
+ }
+ 
+@@ -2169,6 +2184,10 @@ static void intel_disable_pipe(struct drm_i915_private *dev_priv,
+ {
+ 	enum transcoder cpu_transcoder = intel_pipe_to_cpu_transcoder(dev_priv,
+ 								      pipe);
++	struct intel_encoder *encoder;
++	struct intel_dsi *intel_dsi;
++	struct drm_crtc *crtc = dev_priv->pipe_to_crtc_mapping[pipe];
++	struct drm_device *dev = crtc->dev;
+ 	int reg;
+ 	u32 val;
+ 
+@@ -2189,6 +2208,15 @@ static void intel_disable_pipe(struct drm_i915_private *dev_priv,
+ 	if ((val & PIPECONF_ENABLE) == 0)
+ 		return;
+ 
++	for_each_encoder_on_crtc(dev, crtc, encoder) {
++		if (encoder->type == INTEL_OUTPUT_DSI) {
++			intel_dsi = enc_to_intel_dsi(&encoder->base);
++			if (intel_dsi && is_cmd_mode(intel_dsi))
++				val = val & ~PIPECONF_MIPI_DSR_ENABLE;
++			break;
++		}
++	}
++
+ 	I915_WRITE(reg, val & ~PIPECONF_ENABLE);
+ 	intel_wait_for_pipe_off(dev_priv->dev, pipe);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 4b31c6b..09275d5 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -184,12 +184,27 @@ static void intel_dsi_port_enable(struct intel_encoder *encoder)
+ 	struct intel_dsi *intel_dsi = enc_to_intel_dsi(&encoder->base);
+ 	int pipe = intel_crtc->pipe;
+ 	u32 temp, port_control = 0;
++	int count = 1;
++
++	/* Configure the ports */
++
++	temp = I915_READ(MIPI_PORT_CTRL(0));
++	temp = temp | intel_dsi->port_bits;
++	I915_WRITE(MIPI_PORT_CTRL(0), temp);
+ 
+ 	if (intel_dsi->dual_link) {
++		temp |= pipe ? LANE_CONFIGURATION_DUAL_LINK_B :
++					LANE_CONFIGURATION_DUAL_LINK_A;
++
+ 		port_control = (intel_dsi->dual_link - 1)
+ 					<< DUAL_LINK_MODE_SHIFT;
+-		port_control |= pipe ? LANE_CONFIGURATION_DUAL_LINK_B :
+-					LANE_CONFIGURATION_DUAL_LINK_A;
++		temp = temp | port_control;
++
++		I915_WRITE(MIPI_PORT_CTRL(0), temp);
++
++		temp = I915_READ(MIPI_PORT_CTRL(1));
++		temp = temp | port_control;
++		I915_WRITE(MIPI_PORT_CTRL(1), temp);
+ 
+ 		if ((intel_dsi->dual_link & MIPI_DUAL_LINK_FRONT_BACK) &&
+ 			((IS_CHERRYVIEW(dev_priv->dev) && STEP_FROM(STEP_B0)) ||
+@@ -198,31 +213,21 @@ static void intel_dsi_port_enable(struct intel_encoder *encoder)
+ 					<< PIXEL_OVERLAP_CNT_SHIFT,
+ 					PIXEL_OVERLAP_CNT_MASK);
+ 
+-		temp = I915_READ(MIPI_PORT_CTRL(0));
+-		temp = temp | port_control;
+-		I915_WRITE(MIPI_PORT_CTRL(0), temp | DPI_ENABLE);
+-		POSTING_READ(MIPI_PORT_CTRL(0));
+-
+-		if (IS_CHERRYVIEW(dev_priv->dev) && STEP_TO(STEP_B3))
+-			I915_WRITE(MIPI_PORT_CTRL(1), DPI_ENABLE);
+-		else
+-			I915_WRITE_BITS(MIPI_PORT_CTRL(1), DPI_ENABLE,
+-								DPI_ENABLE);
+-		POSTING_READ(MIPI_PORT_CTRL(1));
++		count = 2;
++		pipe = PIPE_A;
+ 
+-	} else {
+-		if (IS_CHERRYVIEW(dev_priv->dev) && STEP_TO(STEP_B3) &&
+-						pipe == PIPE_B)
+-			I915_WRITE(MIPI_PORT_CTRL(pipe), DPI_ENABLE);
+-		else {
+-			/* assert ip_tg_enable signal */
+-			temp = I915_READ(MIPI_PORT_CTRL(pipe)) &
+-					~LANE_CONFIGURATION_MASK;
+-			temp = temp | intel_dsi->port_bits;
+-			I915_WRITE(MIPI_PORT_CTRL(pipe), temp | DPI_ENABLE);
+-		}
+-		POSTING_READ(MIPI_PORT_CTRL(pipe));
+ 	}
++
++	/* Enable the ports */
++
++	do {
++		temp = I915_READ(MIPI_PORT_CTRL(pipe));
++		temp |= is_cmd_mode(intel_dsi) ?
++					TEARING_EFFECT_GPIO : DPI_ENABLE;
++		I915_WRITE(MIPI_PORT_CTRL(pipe), temp);
++
++		pipe = PIPE_B;
++	} while (--count > 0);
+ }
+ 
+ static void intel_dsi_enable(struct intel_encoder *encoder)
+@@ -241,14 +246,13 @@ static void intel_dsi_enable(struct intel_encoder *encoder)
+ 	else {
+ 		dpi_send_cmd(intel_dsi, TURN_ON, DPI_LP_MODE_EN);
+ 		usleep_range(1500, 2000);
++	}
+ 
+-		if (intel_dsi->dev.dev_ops->enable)
+-			intel_dsi->dev.dev_ops->enable(&intel_dsi->dev);
+-
+-		wait_for_dsi_fifo_empty(intel_dsi);
++	if (intel_dsi->dev.dev_ops->enable)
++		intel_dsi->dev.dev_ops->enable(&intel_dsi->dev);
+ 
+-		intel_dsi_port_enable(encoder);
+-	}
++	wait_for_dsi_fifo_empty(intel_dsi);
++	intel_dsi_port_enable(encoder);
+ 
+ 	if (intel_dsi->backlight_on_delay >= 20)
+ 		msleep(intel_dsi->backlight_on_delay);
+@@ -380,23 +384,12 @@ static void intel_dsi_port_disable(struct intel_encoder *encoder)
+ 
+ 	wait_for_dsi_fifo_empty(intel_dsi);
+ 
+-	if (intel_dsi->dual_link) {
+-		I915_WRITE_BITS(MIPI_PORT_CTRL(0), 0, DPI_ENABLE);
+-		POSTING_READ(MIPI_PORT_CTRL(0));
++	I915_WRITE(MIPI_PORT_CTRL(pipe), 0);
++	POSTING_READ(MIPI_PORT_CTRL(pipe));
+ 
+-		if (IS_CHERRYVIEW(dev_priv->dev) && STEP_TO(STEP_B3))
+-			I915_WRITE(MIPI_PORT_CTRL(1), ~DPI_ENABLE);
+-		else
+-			I915_WRITE_BITS(MIPI_PORT_CTRL(1), 0, DPI_ENABLE);
+-		POSTING_READ(MIPI_PORT_CTRL(1));
+-	} else {
+-		/* de-assert ip_tg_enable signal */
+-		if (IS_CHERRYVIEW(dev_priv->dev) && STEP_TO(STEP_B3) &&
+-						pipe == PIPE_B)
+-			I915_WRITE(MIPI_PORT_CTRL(pipe), ~DPI_ENABLE);
+-		else
+-			I915_WRITE_BITS(MIPI_PORT_CTRL(pipe), 0, DPI_ENABLE);
+-		POSTING_READ(MIPI_PORT_CTRL(pipe));
++	if (intel_dsi->dual_link) {
++		I915_WRITE(MIPI_PORT_CTRL(pipe ? 0 : 1), 0);
++		POSTING_READ(MIPI_PORT_CTRL(pipe ? 0 : 1));
+ 	}
+ }
+ 
+@@ -412,10 +405,8 @@ static void intel_dsi_disable(struct intel_encoder *encoder)
+ 
+ 	DRM_DEBUG_KMS("\n");
+ 
+-	if (is_vid_mode(intel_dsi)) {
+-		intel_dsi_port_disable(encoder);
+-		usleep_range(2000, 2500);
+-	}
++	intel_dsi_port_disable(encoder);
++	usleep_range(2000, 2500);
+ 
+ 	if (intel_dsi->dual_link) {
+ 		count = 2;
+@@ -760,7 +751,8 @@ static void intel_dsi_mode_set(struct intel_encoder *intel_encoder)
+ 		   adjusted_mode->vdisplay << VERTICAL_ADDRESS_SHIFT |
+ 		   adjusted_mode->hdisplay << HORIZONTAL_ADDRESS_SHIFT);
+ 
+-	set_dsi_timings(encoder, adjusted_mode);
++	if (is_vid_mode(intel_dsi))
++		set_dsi_timings(encoder, adjusted_mode);
+ 
+ 	if (intel_dsi->dual_link) {
+ 		pipe = PIPE_A;
+@@ -773,7 +765,11 @@ static void intel_dsi_mode_set(struct intel_encoder *intel_encoder)
+ 		if (is_cmd_mode(intel_dsi)) {
+ 			val |= intel_dsi->channel <<
+ 					CMD_MODE_CHANNEL_NUMBER_SHIFT;
+-			val |= CMD_MODE_DATA_WIDTH_8_BIT; /* XXX */
++			val |= CMD_MODE_DATA_WIDTH_OPTION2;
++
++			I915_WRITE(MIPI_DBI_FIFO_THROTTLE(pipe),
++					DBI_FIFO_EMPTY_QUARTER);
++			I915_WRITE(MIPI_HS_LP_DBI_ENABLE(pipe), 0);
+ 		} else {
+ 			val |= intel_dsi->channel <<
+ 					VID_MODE_CHANNEL_NUMBER_SHIFT;
+@@ -882,7 +878,12 @@ static void intel_dsi_mode_set(struct intel_encoder *intel_encoder)
+ 				intel_dsi->video_mode_format |
+ 				IP_TG_CONFIG |
+ 				RANDOM_DPI_DISPLAY_RESOLUTION);
+-		}
++		} else
++			I915_WRITE(MIPI_VIDEO_MODE_FORMAT(pipe),
++					intel_dsi->video_frmt_cfg_bits |
++					IP_TG_CONFIG |
++					RANDOM_DPI_DISPLAY_RESOLUTION);
++
+ 
+ 		/* For Port C for dual link */
+ 		if (intel_dsi->dual_link)
+-- 
+1.7.9.5
+

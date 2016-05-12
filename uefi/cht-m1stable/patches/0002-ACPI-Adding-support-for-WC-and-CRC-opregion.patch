@@ -1,0 +1,1829 @@
+From 7874a04454f4b2a8ae99401566d6ccc50cc5c9ed Mon Sep 17 00:00:00 2001
+From: ysiyer <yegnesh.s.iyer@intel.com>
+Date: Wed, 22 Oct 2014 18:19:15 +0530
+Subject: [PATCH 2/8] ACPI: Adding support for WC and CRC opregion
+
+Existing opregion driver was supporting only CRC. Modified
+the opregion to be a generic opregion driver to support multiple
+PMICs. Added support for CRC and Whiskey Cove opregion definitions
+and PMIC specific functions
+
+Change-Id: I82dcff42cc04706df8bc78704c85bfb4a8865aa8
+Signed-off-by: Lu, Aaron <aaron.lu@intel.com>
+Signed-off-by: Iyer, Yegnesh S <yegnesh.s.iyer@intel.com>
+---
+ drivers/acpi/Kconfig                               |  22 +
+ drivers/acpi/Makefile                              |   5 +
+ .../pmic_opregion/intel_soc_pmic_crc_opregion.c    | 442 +++++++++++++++++++++
+ .../acpi/pmic_opregion/intel_soc_pmic_opregion.c   | 346 ++++++++++++++++
+ .../acpi/pmic_opregion/intel_soc_pmic_opregion.h   |  36 ++
+ .../pmic_opregion/intel_soc_pmic_wc_opregion.c     | 419 +++++++++++++++++++
+ drivers/mfd/Makefile                               |   2 +-
+ drivers/mfd/intel_soc_pmic_crc.c                   |   4 +-
+ drivers/mfd/intel_soc_pmic_opregion.c              | 429 --------------------
+ drivers/mfd/intel_soc_pmic_wc.c                    |   3 +
+ 10 files changed, 1277 insertions(+), 431 deletions(-)
+ create mode 100644 drivers/acpi/pmic_opregion/intel_soc_pmic_crc_opregion.c
+ create mode 100644 drivers/acpi/pmic_opregion/intel_soc_pmic_opregion.c
+ create mode 100644 drivers/acpi/pmic_opregion/intel_soc_pmic_opregion.h
+ create mode 100644 drivers/acpi/pmic_opregion/intel_soc_pmic_wc_opregion.c
+ delete mode 100644 drivers/mfd/intel_soc_pmic_opregion.c
+
+diff --git a/drivers/acpi/Kconfig b/drivers/acpi/Kconfig
+index ba6d36e..82cc294 100644
+--- a/drivers/acpi/Kconfig
++++ b/drivers/acpi/Kconfig
+@@ -389,4 +389,26 @@ config ACPI_EXTLOG
+ 	  information to system software, synchronous with MCE or CMCI. This
+ 	  driver adds support for that functionality.
+ 
++menuconfig PMIC_OPREGION
++	bool "PMIC (Power Management Integrated Circuit) operation region support"
++	help
++	  Select this option to enable support for ACPI operation
++	  region of the PMIC chip. The operation region can be used
++	  to control power rails and sensor reading/writing on the
++	  PMIC chip.
++
++if PMIC_OPREGION
++config CRC_PMIC_OPREGION
++	bool "ACPI operation region support for CrystalCove PMIC"
++	depends on INTEL_SOC_PMIC
++	help
++	  This config adds ACPI operation region support for CrystalCove PMIC.
++
++config WC_PMIC_OPREGION
++	bool "ACPI operation region support for Whiskey Cove PMIC"
++	depends on INTEL_SOC_PMIC
++	help
++	  This config adds ACPI operation region support for WhiskeyCove PMIC.
++endif
++
+ endif	# ACPI
+diff --git a/drivers/acpi/Makefile b/drivers/acpi/Makefile
+index 0c3425a..72a8791 100644
+--- a/drivers/acpi/Makefile
++++ b/drivers/acpi/Makefile
+@@ -86,3 +86,8 @@ obj-$(CONFIG_ACPI_PROCESSOR_AGGREGATOR) += acpi_pad.o
+ obj-$(CONFIG_ACPI_APEI)		+= apei/
+ 
+ obj-$(CONFIG_ACPI_EXTLOG)	+= acpi_extlog.o
++
++obj-$(CONFIG_PMIC_OPREGION)	+= pmic_opregion/intel_soc_pmic_opregion.o
++obj-$(CONFIG_CRC_PMIC_OPREGION) += pmic_opregion/intel_soc_pmic_crc_opregion.o
++obj-$(CONFIG_WC_PMIC_OPREGION) += pmic_opregion/intel_soc_pmic_wc_opregion.o
++
+diff --git a/drivers/acpi/pmic_opregion/intel_soc_pmic_crc_opregion.c b/drivers/acpi/pmic_opregion/intel_soc_pmic_crc_opregion.c
+new file mode 100644
+index 0000000..7ba8141
+--- /dev/null
++++ b/drivers/acpi/pmic_opregion/intel_soc_pmic_crc_opregion.c
+@@ -0,0 +1,442 @@
++/*
++ * intel_soc_pmic_crc_opregion.c - Intel SoC PMIC operation region Driver
++ *
++ * Copyright (C) 2014 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/module.h>
++#include <linux/acpi.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/platform_device.h>
++#include "intel_soc_pmic_opregion.h"
++
++#define DRV_NAME "crystal_cove_region"
++
++#define PWR_SOURCE_SELECT       BIT(1)
++#define PMIC_A0LOCK_REG         0xc5
++
++static struct pmic_pwr_table pwr_table[] = {
++	{
++		.address = 0x04,
++		.pwr_reg = {
++			.reg = 0x63,
++			.bit = 0x00,
++		},
++	},/* SYSX -> VSYS_SX */
++	{
++		.address = 0x08,
++		.pwr_reg = {
++			.reg = 0x62,
++			.bit = 0x00,
++		},
++	},/* SYSU -> VSYS_U */
++	{
++		.address = 0x0c,
++		.pwr_reg = {
++			.reg = 0x64,
++			.bit = 0x00,
++		},
++	},/* SYSS -> VSYS_S */
++	{
++		.address = 0x10,
++		.pwr_reg = {
++			.reg = 0x6a,
++			.bit = 0x00,
++		},
++	},/* V50S -> V5P0S */
++	{
++		.address = 0x14,
++		.pwr_reg = {
++			.reg = 0x6b,
++			.bit = 0x00,
++		},
++	},/* HOST -> VHOST, USB2/3 host */
++	{
++		.address = 0x18,
++		.pwr_reg = {
++			.reg = 0x6c,
++			.bit = 0x00,
++		},
++	},/* VBUS -> VBUS, USB2/3 OTG */
++	{
++		.address = 0x1c,
++		.pwr_reg = {
++			.reg = 0x6d,
++			.bit = 0x00,
++		},
++	},/* HDMI -> VHDMI */
++	{
++		.address = 0x24,
++		.pwr_reg = {
++			.reg = 0x66,
++			.bit = 0x00,
++		},
++	},/* X285 -> V2P85SX, camara */
++	{
++		.address = 0x2c,
++		.pwr_reg = {
++			.reg = 0x69,
++			.bit = 0x00,
++		},
++	},/* V33S -> V3P3S, display/ssd/audio */
++	{
++		.address = 0x30,
++		.pwr_reg = {
++			.reg = 0x68,
++			.bit = 0x00,
++		},
++	},/* V33U -> V3P3U, SDIO wifi&bt */
++	{
++		.address = 0x44,
++		.pwr_reg = {
++			.reg = 0x5c,
++			.bit = 0x00,
++		},
++	},/* V18S -> V1P8S, SOC/USB PHY/SIM */
++	{
++		.address = 0x48,
++		.pwr_reg = {
++			.reg = 0x5d,
++			.bit = 0x00,
++		},
++	},/* V18X -> V1P8SX, eMMC/camara/audio */
++	{
++		.address = 0x4c,
++		.pwr_reg = {
++			.reg = 0x5b,
++			.bit = 0x00,
++		},
++	},/* V18U -> V1P8U, LPDDR */
++	{
++		.address = 0x50,
++		.pwr_reg = {
++			.reg = 0x61,
++			.bit = 0x00,
++		},
++	},/* V12X -> V1P2SX, SOC SFR */
++	{
++		.address = 0x54,
++		.pwr_reg = {
++			.reg = 0x60,
++			.bit = 0x00,
++		},
++	},/* V12S -> V1P2S, MIPI */
++	{
++		.address = 0x5c,
++		.pwr_reg = {
++			.reg = 0x56,
++			.bit = 0x00,
++		},
++	},/* V10S -> V1P0S, SOC GFX */
++	{
++		.address = 0x60,
++		.pwr_reg = {
++			.reg = 0x57,
++			.bit = 0x00,
++		},
++	},/* V10X -> V1P0SX, SOC display/DDR IO/PCIe */
++	{
++		.address = 0x64,
++		.pwr_reg = {
++			.reg = 0x59,
++			.bit = 0x00,
++		},
++	},/* V105 -> V1P05S, L2 SRAM */
++};
++
++static struct pmic_dptf_table dptf_table[] = {
++	{
++		.address = 0x00,
++		.reg = 0x75
++	},      /* TMP0 -> SYS0_THRM_RSLT_L */
++	{
++		.address = 0x04,
++		.reg = 0x95
++	},      /* AX00 -> SYS0_THRMALRT0_L */
++	{
++		.address = 0x08,
++		.reg = 0x97
++	},      /* AX01 -> SYS0_THRMALRT1_L */
++	{
++		.address = 0x0c,
++		.reg = 0x77
++	},      /* TMP1 -> SYS1_THRM_RSLT_L */
++	{
++		.address = 0x10,
++		.reg = 0x9a
++	},      /* AX10 -> SYS1_THRMALRT0_L */
++	{
++		.address = 0x14,
++		.reg = 0x9c
++	},      /* AX11 -> SYS1_THRMALRT1_L */
++	{
++		.address = 0x18,
++		.reg = 0x79
++	},      /* TMP2 -> SYS2_THRM_RSLT_L */
++	{
++		.address = 0x1c,
++		.reg = 0x9f
++	},      /* AX20 -> SYS2_THRMALRT0_L */
++	{
++		.address = 0x20,
++		.reg = 0xa1
++	},      /* AX21 -> SYS2_THRMALRT1_L */
++	{
++		.address = 0x24,
++		.reg = 0x7b,
++	},	/* TMP3 -> BAT0_THRM_RSLT_L */
++	{
++		.address = 0x28,
++		.reg = 0xa4
++	},	/* AX30 -> BAT0_THRMALRT0_L */
++	{
++		.address = 0x2c,
++		.reg = 0xa6
++	},	/* AX31 -> BAT0_THRMALRT1_L */
++	{
++		.address = 0x30,
++		.reg = 0x7d
++	},	/* TMP4 -> BAT1_THRM_RSLT_L */
++	{
++		.address = 0x34,
++		.reg = 0xaa
++	},	/* AX40 -> BAT1_THRMALRT0_L */
++	{
++		.address = 0x38,
++		.reg = 0xac
++	},	/* AX41 -> BAT1_THRMALRT1_L */
++	{
++		.address = 0x3c,
++		.reg = 0x7f
++	},	/* TMP5 -> PMIC_THRM_RSLT_L */
++	{
++		.address = 0x40,
++		.reg = 0xb0
++	},	/* AX50 -> PMIC_THRMALRT0_L */
++	{
++		.address = 0x44,
++		.reg = 0xb2
++	},	/* AX51 -> PMIC_THRMALRT1_L */
++	{
++		.address = 0x48,
++		.reg = 0x94
++	},      /* PEN0 -> SYS0_THRMALRT0_H */
++	{
++		.address = 0x4c,
++		.reg = 0x99
++	},      /* PEN1 -> SYS1_THRMALRT1_H */
++	{
++		.address = 0x50,
++		.reg = 0x9e
++	},      /* PEN2 -> SYS2_THRMALRT2_H */
++	{
++		.address = 0x54,
++		.reg = 0xa3
++	},	/* PEN3 -> BAT0_THRMALRT0_H */
++	{
++		.address = 0x58,
++		.reg = 0xa9
++	},	/* PEN4 -> BAT1_THRMALRT0_H */
++	{
++		.address = 0x5c,
++		.reg = 0xaf
++	},	/* PEN5 -> PMIC_THRMALRT0_H */
++};
++
++static int intel_crc_pmic_get_power(struct pmic_pwr_reg *preg, u64 *value)
++{
++	int ret;
++	u8 data;
++
++	ret = intel_soc_pmic_readb(preg->reg);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			preg->reg, ret);
++		return -EIO;
++	}
++	data = (u8) ret;
++
++	*value = (data & PWR_SOURCE_SELECT) && (data & BIT(preg->bit)) ? 1 : 0;
++	return 0;
++}
++
++static int intel_crc_pmic_update_power(struct pmic_pwr_reg *preg, bool on)
++{
++	int ret;
++	u8 data;
++
++	ret = intel_soc_pmic_readb(preg->reg);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			preg->reg, ret);
++		return -EIO;
++	}
++
++	data = (u8)ret;
++	if (on) {
++		data |= PWR_SOURCE_SELECT | BIT(preg->bit);
++	} else {
++		data &= ~BIT(preg->bit);
++		data |= PWR_SOURCE_SELECT;
++	}
++
++	ret = intel_soc_pmic_writeb(preg->reg, data);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "write reg 0x%x failed, 0x%x\n",
++			preg->reg, ret);
++		return -EIO;
++	}
++	return 0;
++}
++
++/* Raw temperature value is 10bits: 8bits in reg and 2bits in reg-1 bit0,1 */
++static int intel_crc_pmic_get_raw_temp(int reg)
++{
++	int ret;
++	u8 temp_l, temp_h;
++
++	ret = intel_soc_pmic_readb(reg);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	temp_l = (u8)ret;
++	ret = intel_soc_pmic_readb(reg - 1);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	temp_h = (u8)ret;
++
++	return temp_l | ((temp_h & 0x3) << 8);
++}
++
++static int
++intel_crc_pmic_update_aux(int reg, int raw)
++{
++	int ret;
++
++	ret = intel_soc_pmic_writeb(reg, (u8)raw);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "write reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	ret = intel_soc_pmic_update(reg - 1, raw >> 8, 0x3);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "update reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int
++intel_crc_pmic_get_policy(int reg, u64 *value)
++{
++	int ret;
++
++	ret = intel_soc_pmic_readb(reg);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	*value = ret >> 7;
++	return 0;
++}
++
++static int intel_crc_pmic_update_policy(int reg, int enable)
++{
++	int alert0;
++	int ret;
++
++	/* Update to policy enable bit requires unlocking a0lock */
++	ret = intel_soc_pmic_readb(PMIC_A0LOCK_REG);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	alert0 = ret;
++	ret = intel_soc_pmic_update(PMIC_A0LOCK_REG, 0, 0x01);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "update reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	ret = intel_soc_pmic_update(reg, (enable << 7), 0x80);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "update reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	/* restore alert0 */
++	ret = intel_soc_pmic_writeb(PMIC_A0LOCK_REG, alert0);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "write reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static struct intel_soc_pmic_opregion_data intel_crc_pmic_opregion_data = {
++	.get_power      = intel_crc_pmic_get_power,
++	.update_power   = intel_crc_pmic_update_power,
++	.get_raw_temp   = intel_crc_pmic_get_raw_temp,
++	.update_aux     = intel_crc_pmic_update_aux,
++	.get_policy     = intel_crc_pmic_get_policy,
++	.update_policy  = intel_crc_pmic_update_policy,
++	.pwr_table      = pwr_table,
++	.pwr_table_count = ARRAY_SIZE(pwr_table),
++	.dptf_table     = dptf_table,
++	.dptf_table_count = ARRAY_SIZE(dptf_table),
++};
++
++static int intel_crc_pmic_opregion_probe(struct platform_device *pdev)
++{
++	return intel_soc_pmic_install_opregion_handler(&pdev->dev,
++			ACPI_HANDLE(pdev->dev.parent),
++			&intel_crc_pmic_opregion_data);
++}
++
++static int intel_crc_pmic_opregion_remove(struct platform_device *pdev)
++{
++	intel_soc_pmic_remove_opregion_handler(ACPI_HANDLE(pdev->dev.parent));
++	return 0;
++}
++
++static struct platform_device_id crystal_cove_opregion_id_table[] = {
++	{ .name = DRV_NAME },
++	{},
++};
++
++static struct platform_driver intel_crc_pmic_opregion_driver = {
++	.probe = intel_crc_pmic_opregion_probe,
++	.remove = intel_crc_pmic_opregion_remove,
++	.id_table = crystal_cove_opregion_id_table,
++	.driver = {
++		.name = DRV_NAME,
++	},
++};
++
++MODULE_DEVICE_TABLE(platform, crystal_cove_opregion_id_table);
++
++module_platform_driver(intel_crc_pmic_opregion_driver);
++
++MODULE_DESCRIPTION("CrystalCove ACPI opregion driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/acpi/pmic_opregion/intel_soc_pmic_opregion.c b/drivers/acpi/pmic_opregion/intel_soc_pmic_opregion.c
+new file mode 100644
+index 0000000..fa5e6c4
+--- /dev/null
++++ b/drivers/acpi/pmic_opregion/intel_soc_pmic_opregion.c
+@@ -0,0 +1,346 @@
++/*
++ * intel_soc_pmic_opregion.c - Intel SoC PMIC operation region Driver
++ *
++ * Copyright (C) 2013, 2014 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/module.h>
++#include <linux/acpi.h>
++#include "intel_soc_pmic_opregion.h"
++
++#define PMIC_PMOP_OPREGION_ID   0x8d
++#define PMIC_DPTF_OPREGION_ID   0x8c
++
++struct acpi_lpat {
++	int temp;
++	int raw;
++};
++
++struct intel_soc_pmic_opregion {
++	struct mutex lock;
++	struct acpi_lpat *lpat;
++	int lpat_count;
++	struct intel_soc_pmic_opregion_data *data;
++};
++
++static struct pmic_pwr_reg *
++pmic_get_pwr_reg(int address, struct pmic_pwr_table *table, int count)
++{
++	int i;
++
++	for (i = 0; i < count; i++) {
++		if (table[i].address == address)
++			return &table[i].pwr_reg;
++	}
++	return NULL;
++}
++
++static int
++pmic_get_dptf_reg(int address, struct pmic_dptf_table *table, int count)
++{
++	int i;
++
++	for (i = 0; i < count; i++) {
++		if (table[i].address == address)
++			return table[i].reg;
++	}
++	return -ENOENT;
++}
++
++/* Return temperature from raw value through LPAT table */
++static int raw_to_temp(struct acpi_lpat *lpat, int count, int raw)
++{
++	int i, delta_temp, delta_raw, temp;
++
++	for (i = 0; i < count - 1; i++) {
++		if ((raw >= lpat[i].raw && raw <= lpat[i+1].raw) ||
++				(raw <= lpat[i].raw && raw >= lpat[i+1].raw))
++			break;
++	}
++
++	if (i == count - 1)
++		return -ENOENT;
++
++	delta_temp = lpat[i+1].temp - lpat[i].temp;
++	delta_raw = lpat[i+1].raw - lpat[i].raw;
++	temp = lpat[i].temp + (raw - lpat[i].raw) * delta_temp / delta_raw;
++
++	return temp;
++}
++
++/* Return raw value from temperature through LPAT table */
++static int temp_to_raw(struct acpi_lpat *lpat, int count, int temp)
++{
++	int i, delta_temp, delta_raw, raw;
++
++	for (i = 0; i < count - 1; i++) {
++		if (temp >= lpat[i].temp && temp <= lpat[i+1].temp)
++			break;
++	}
++
++	if (i == count - 1)
++		return -ENOENT;
++
++	delta_temp = lpat[i+1].temp - lpat[i].temp;
++	delta_raw = lpat[i+1].raw - lpat[i].raw;
++	raw = lpat[i].raw + (temp - lpat[i].temp) * delta_raw / delta_temp;
++
++	return raw;
++}
++
++static void
++pmic_dptf_lpat(struct intel_soc_pmic_opregion *opregion, acpi_handle handle,
++		struct device *dev)
++{
++	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
++	union acpi_object *obj_p, *obj_e;
++	int *lpat, i;
++	acpi_status status;
++
++	status = acpi_evaluate_object(handle, "LPAT", NULL, &buffer);
++	if (ACPI_FAILURE(status))
++		return;
++
++	obj_p = (union acpi_object *)buffer.pointer;
++	if (!obj_p || (obj_p->type != ACPI_TYPE_PACKAGE) ||
++		(obj_p->package.count % 2) || (obj_p->package.count < 4))
++		goto out;
++
++	lpat = devm_kmalloc(dev, sizeof(*lpat) * obj_p->package.count,
++			GFP_KERNEL);
++	if (!lpat)
++		goto out;
++
++	for (i = 0; i < obj_p->package.count; i++) {
++		obj_e = &obj_p->package.elements[i];
++		if (obj_e->type != ACPI_TYPE_INTEGER)
++			goto out;
++		lpat[i] = obj_e->integer.value;
++	}
++
++	opregion->lpat = (struct acpi_lpat *)lpat;
++	opregion->lpat_count = obj_p->package.count / 2;
++
++out:
++	kfree(buffer.pointer);
++}
++
++static acpi_status
++intel_soc_pmic_pmop_handler(u32 function, acpi_physical_address address,
++				u32 bits, u64 *value64,
++				void *handler_context, void *region_context)
++{
++	struct intel_soc_pmic_opregion *opregion = region_context;
++	struct intel_soc_pmic_opregion_data *d = opregion->data;
++	struct pmic_pwr_reg *preg;
++	int result;
++
++	if (bits != 32 || !value64)
++		return AE_BAD_PARAMETER;
++
++	if (function == ACPI_WRITE && !(*value64 == 0 || *value64 == 1))
++		return AE_BAD_PARAMETER;
++
++	preg = pmic_get_pwr_reg(address, d->pwr_table, d->pwr_table_count);
++	if (!preg)
++		return AE_BAD_PARAMETER;
++
++	mutex_lock(&opregion->lock);
++
++	if (function == ACPI_READ)
++		result = d->get_power(preg, value64);
++	else
++		result = d->update_power(preg, *value64 == 1);
++
++	mutex_unlock(&opregion->lock);
++
++	return result ? AE_ERROR : AE_OK;
++}
++
++static acpi_status pmic_read_temp(struct intel_soc_pmic_opregion *opregion,
++		int reg, u64 *value)
++{
++	int raw_temp, temp;
++
++	if (!opregion->data->get_raw_temp)
++		return AE_BAD_PARAMETER;
++
++	raw_temp = opregion->data->get_raw_temp(reg);
++	if (raw_temp < 0)
++		return AE_ERROR;
++
++	if (!opregion->lpat) {
++		*value = raw_temp;
++		return AE_OK;
++	}
++
++	temp = raw_to_temp(opregion->lpat, opregion->lpat_count, raw_temp);
++	if (temp < 0) {
++		pr_err("opregion: (LPAT) temp outside range!!\n");
++		return AE_ERROR;
++	}
++
++	*value = temp;
++	return AE_OK;
++}
++
++static acpi_status pmic_dptf_temp(struct intel_soc_pmic_opregion *opregion,
++		int reg, u32 function, u64 *value)
++{
++	if (function != ACPI_READ)
++		return AE_BAD_PARAMETER;
++
++	return pmic_read_temp(opregion, reg, value);
++}
++
++static acpi_status pmic_dptf_aux(struct intel_soc_pmic_opregion *opregion,
++		int reg, u32 function, u64 *value)
++{
++	int raw_temp;
++
++	if (function == ACPI_READ)
++		return pmic_read_temp(opregion, reg, value);
++
++	if (!opregion->data->update_aux)
++		return AE_BAD_PARAMETER;
++
++	if (opregion->lpat) {
++		raw_temp = temp_to_raw(opregion->lpat, opregion->lpat_count,
++				*value);
++		if (raw_temp < 0)
++			return AE_ERROR;
++	} else {
++		raw_temp = *value;
++	}
++
++	return opregion->data->update_aux(reg, raw_temp) ?
++		AE_ERROR : AE_OK;
++}
++
++static acpi_status pmic_dptf_pen(struct intel_soc_pmic_opregion *opregion,
++		int reg, u32 function, u64 *value)
++{
++	struct intel_soc_pmic_opregion_data *d = opregion->data;
++
++	if (!d->get_policy || !d->update_policy)
++		return AE_BAD_PARAMETER;
++
++	if (function == ACPI_READ)
++		return d->get_policy(reg, value) ? AE_ERROR : AE_OK;
++
++	if (*value != 0 || *value != 1)
++		return AE_BAD_PARAMETER;
++
++	return d->update_policy(reg, *value) ? AE_ERROR : AE_OK;
++}
++
++static bool pmic_dptf_is_temp(int address)
++{
++	return (address <= 0x3c) && !(address % 12);
++}
++
++static bool pmic_dptf_is_aux(int address)
++{
++	return (address >= 4 && address <= 0x40 && !((address - 4) % 12)) ||
++		(address >= 8 && address <= 0x44 && !((address - 8) % 12));
++}
++
++static bool pmic_dptf_is_pen(int address)
++{
++	return address >= 0x48 && address <= 0x5c;
++}
++
++static acpi_status
++intel_soc_pmic_dptf_handler(u32 function, acpi_physical_address address,
++				u32 bits, u64 *value64,
++				void *handler_context, void *region_context)
++{
++	struct intel_soc_pmic_opregion *opregion = region_context;
++	int reg;
++	int result;
++
++	if (bits != 32 || !value64)
++		return AE_BAD_PARAMETER;
++
++	reg = pmic_get_dptf_reg(address, opregion->data->dptf_table,
++			opregion->data->dptf_table_count);
++	if (!reg)
++		return AE_BAD_PARAMETER;
++
++	mutex_lock(&opregion->lock);
++
++	result = AE_BAD_PARAMETER;
++	if (pmic_dptf_is_temp(address))
++		result = pmic_dptf_temp(opregion, reg, function, value64);
++	else if (pmic_dptf_is_aux(address))
++		result = pmic_dptf_aux(opregion, reg, function, value64);
++	else if (pmic_dptf_is_pen(address))
++		result = pmic_dptf_pen(opregion, reg, function, value64);
++
++	mutex_unlock(&opregion->lock);
++
++	return result;
++}
++
++int
++intel_soc_pmic_install_opregion_handler(struct device *dev,
++			acpi_handle handle,
++			struct intel_soc_pmic_opregion_data *d)
++{
++	acpi_status status;
++	struct intel_soc_pmic_opregion *opregion;
++
++	if (!dev || !d)
++		return -EINVAL;
++
++	if (!handle)
++		return -ENODEV;
++
++	opregion = devm_kzalloc(dev, sizeof(*opregion), GFP_KERNEL);
++	if (!opregion)
++		return -ENOMEM;
++
++	mutex_init(&opregion->lock);
++	pmic_dptf_lpat(opregion, handle, dev);
++
++	status = acpi_install_address_space_handler(handle,
++			PMIC_PMOP_OPREGION_ID,
++			intel_soc_pmic_pmop_handler,
++			NULL, opregion);
++	if (ACPI_FAILURE(status))
++		return -ENODEV;
++
++	status = acpi_install_address_space_handler(handle,
++			PMIC_DPTF_OPREGION_ID,
++			intel_soc_pmic_dptf_handler,
++			NULL, opregion);
++	if (ACPI_FAILURE(status)) {
++		acpi_remove_address_space_handler(handle, PMIC_PMOP_OPREGION_ID,
++				intel_soc_pmic_pmop_handler);
++		return -ENODEV;
++	}
++
++	opregion->data = d;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(intel_soc_pmic_install_opregion_handler);
++
++void intel_soc_pmic_remove_opregion_handler(acpi_handle handle)
++{
++	acpi_remove_address_space_handler(handle, PMIC_PMOP_OPREGION_ID,
++			intel_soc_pmic_pmop_handler);
++	acpi_remove_address_space_handler(handle, PMIC_DPTF_OPREGION_ID,
++			intel_soc_pmic_dptf_handler);
++}
++EXPORT_SYMBOL_GPL(intel_soc_pmic_remove_opregion_handler);
++
++MODULE_LICENSE("GPL");
+diff --git a/drivers/acpi/pmic_opregion/intel_soc_pmic_opregion.h b/drivers/acpi/pmic_opregion/intel_soc_pmic_opregion.h
+new file mode 100644
+index 0000000..e5b1ff1
+--- /dev/null
++++ b/drivers/acpi/pmic_opregion/intel_soc_pmic_opregion.h
+@@ -0,0 +1,36 @@
++#ifndef __INTEL_SOC_PMIC_OPREGION_H__
++#define __INTEL_SOC_PMIC_OPREGION_H__
++
++struct pmic_pwr_reg {
++	int reg;        /* corresponding PMIC register */
++	int bit;        /* control bit for power */
++};
++
++struct pmic_pwr_table {
++	int address;    /* operation region address */
++	struct pmic_pwr_reg pwr_reg;
++};
++
++struct pmic_dptf_table {
++	int address;    /* operation region address */
++	int reg;        /* corresponding thermal register */
++};
++
++struct intel_soc_pmic_opregion_data {
++	int (*get_power)(struct pmic_pwr_reg *preg, u64 *value);
++	int (*update_power)(struct pmic_pwr_reg *preg, bool on);
++	int (*get_raw_temp)(int reg);
++	int (*update_aux)(int reg, int raw_temp);
++	int (*get_policy)(int reg, u64 *value);
++	int (*update_policy)(int reg, int enable);
++	struct pmic_pwr_table *pwr_table;
++	int pwr_table_count;
++	struct pmic_dptf_table *dptf_table;
++	int dptf_table_count;
++};
++
++int intel_soc_pmic_install_opregion_handler(struct device *dev,
++		acpi_handle handle,
++		struct intel_soc_pmic_opregion_data *d);
++void intel_soc_pmic_remove_opregion_handler(acpi_handle handle);
++#endif
+diff --git a/drivers/acpi/pmic_opregion/intel_soc_pmic_wc_opregion.c b/drivers/acpi/pmic_opregion/intel_soc_pmic_wc_opregion.c
+new file mode 100644
+index 0000000..1fb5ce1
+--- /dev/null
++++ b/drivers/acpi/pmic_opregion/intel_soc_pmic_wc_opregion.c
+@@ -0,0 +1,419 @@
++/*
++ * intel_soc_pmic_wc_opregion.c - Intel SoC PMIC operation region Driver
++ *
++ * Copyright (C) 2014 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/module.h>
++#include <linux/acpi.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/platform_device.h>
++#include "intel_soc_pmic_opregion.h"
++
++#define DRV_NAME "whiskey_cove_region"
++
++#define PWR_SOURCE_SELECT       BIT(1)
++#define PMIC_A0LOCK_REG         0xc5
++#define CURR_SRC_MULTIPLIER	130210
++
++static struct pmic_pwr_table pwr_table[] = {
++	{
++		.address = 0x04,
++		.pwr_reg = {
++			.reg = 0x57,
++			.bit = 0x00,
++		},
++	}, /* V18X -> V1P8SX */
++	{
++		.address = 0x10,
++		.pwr_reg = {
++			.reg = 0x5a,
++			.bit = 0x00,
++		},
++	}, /* V12X -> V1P2SXCNT */
++	{
++		.address = 0x14,
++		.pwr_reg = {
++			.reg = 0x5d,
++			.bit = 0x00,
++		},
++	}, /* V28X -> V2P8SXCNT */
++	{
++		.address = 0x1c,
++		.pwr_reg = {
++			.reg = 0x5f,
++			.bit = 0x00,
++		},
++	}, /* V3SD -> V3P3SDCNT */
++	{
++		.address = 0x20,
++		.pwr_reg = {
++			.reg = 0x67,
++			.bit = 0x00,
++		},
++	}, /* VSD -> VSDIOCNT */
++	{
++		.address = 0x24,
++		.pwr_reg = {
++			.reg = 0x69,
++			.bit = 0x05,
++		},
++	}, /* VSW2 -> VLD0CNT Bit 5*/
++	{
++		.address = 0x28,
++		.pwr_reg = {
++			.reg = 0x69,
++			.bit = 0x04,
++		},
++	}, /* VSW1 -> VLD0CNT Bit 4 */
++	{
++		.address = 0x2C,
++		.pwr_reg = {
++			.reg = 0x69,
++			.bit = 0x01,
++		},
++	}, /* VUPY -> VLDOCNT Bit 1 */
++	{
++		.address = 0x30,
++		.pwr_reg = {
++			.reg = 0x6B,
++			.bit = 0x00,
++		},
++	}, /* VRSO -> VREFSOCCNT*/
++	{
++		.address = 0x34,
++		.pwr_reg = {
++			.reg = 0x90,
++			.bit = 0x00,
++		},
++	}, /* VP1A -> VPROG1ACNT */
++	{
++		.address = 0x38,
++		.pwr_reg = {
++			.reg = 0x91,
++			.bit = 0x00,
++		},
++	}, /* VP1B -> VPROG1BCNT */
++	{
++		.address = 0x3c,
++		.pwr_reg = {
++			.reg = 0x95,
++			.bit = 0x00,
++		},
++	}, /* VP1F -> VPROG1FCNT */
++	{
++		.address = 0x40,
++		.pwr_reg = {
++			.reg = 0x99,
++			.bit = 0x00,
++		},
++	}, /* VP2D -> VPROG2DCNT */
++	{
++		.address = 0x44,
++		.pwr_reg = {
++			.reg = 0x9a,
++			.bit = 0x00,
++		},
++	}, /* VP3A -> VPROG3ACNT */
++	{
++		.address = 0x48,
++		.pwr_reg = {
++			.reg = 0x9b,
++			.bit = 0x00,
++		},
++	}, /* VP3B -> VPROG3BCNT */
++	{
++		.address = 0x4c,
++		.pwr_reg = {
++			.reg = 0x9c,
++			.bit = 0x00,
++		},
++	}, /* VP4A -> VPROG4ACNT */
++	{
++		.address = 0x50,
++		.pwr_reg = {
++			.reg = 0x9d,
++			.bit = 0x00,
++		},
++	}, /* VP4B -> VPROG4BCNT*/
++	{
++		.address = 0x54,
++		.pwr_reg = {
++			.reg = 0x9e,
++			.bit = 0x00,
++		},
++	}, /* VP4C -> VPROG4CCNT */
++	{
++		.address = 0x58,
++		.pwr_reg = {
++			.reg = 0x9f,
++			.bit = 0x00,
++		},
++	}, /* VP4D -> VPROG4DCNT*/
++
++	{
++		.address = 0x5c,
++		.pwr_reg = {
++			.reg = 0xa0,
++			.bit = 0x00,
++		},
++	}, /* VP5A -> VPROG5ACNT */
++	{
++		.address = 0x60,
++		.pwr_reg = {
++			.reg = 0xa1,
++			.bit = 0x00,
++		},
++	}, /* VP5B -> VPROG5BCNT*/
++	{
++		.address = 0x64,
++		.pwr_reg = {
++			.reg = 0xa2,
++			.bit = 0x00,
++		},
++	}, /* VP6A -> VPROG6ACNT */
++	{
++		.address = 0x68,
++		.pwr_reg = {
++			.reg = 0xa3,
++			.bit = 0x00,
++		},
++	}  /* VP6B -> VPROG6BCNT*/
++};
++
++static struct pmic_dptf_table dptf_table[] = {
++	{
++		.address = 0x00,
++		.reg = 0x4F39
++	},      /* TMP0 -> SYS0_THRM_RSLT_L */
++	{
++		.address = 0x04,
++		.reg = 0x4F24
++	},      /* AX00 -> SYS0_THRMALRT0_L */
++	{
++		.address = 0x08,
++		.reg = 0x4F26
++	},      /* AX01 -> SYS0_THRMALRT1_L */
++	{
++		.address = 0x0c,
++		.reg = 0x4F3B
++	},      /* TMP1 -> SYS1_THRM_RSLT_L */
++	{
++		.address = 0x10,
++		.reg = 0x4F28
++	},      /* AX10 -> SYS1_THRMALRT0_L */
++	{
++		.address = 0x14,
++		.reg = 0x4F2A
++	},      /* AX11 -> SYS1_THRMALRT1_L */
++	{
++		.address = 0x18,
++		.reg = 0x4F3D
++	},      /* TMP2 -> SYS2_THRM_RSLT_L */
++	{
++		.address = 0x1c,
++		.reg = 0x4F2C
++	},      /* AX20 -> SYS2_THRMALRT0_L */
++	{
++		.address = 0x20,
++		.reg = 0x4F2E
++	},      /* AX21 -> SYS2_THRMALRT1_L */
++	{
++		.address = 0x24,
++		.reg = 0x4F3F
++	},      /* TMP3 -> BAT0_THRM_RSLT_L */
++	{
++		.address = 0x28,
++		.reg = 0x4F30
++	},	/* AX30 -> BAT0_THRMALRT0_L */
++	{
++		.address = 0x30,
++		.reg = 0x4F41
++	},      /* TMP4 -> BAT1_THRM_RSLT_L */
++	{
++		.address = 0x34,
++		.reg = 0x4F32
++	},	/* AX40 -> BAT1_THRMALRT0_L */
++	{
++		.address = 0x3c,
++		.reg = 0x4F43
++	},      /* TMP5 -> PMIC_THRM_RSLT_L */
++	{
++		.address = 0x40,
++		.reg = 0x4F34
++	}	/* AX50 -> PMIC_THRMALRT0_L */
++	/* TODO - Add policy enable opregion - reg mapping */
++};
++
++static int intel_wc_pmic_get_power(struct pmic_pwr_reg *preg, u64 *value)
++{
++	int ret;
++	u8 data;
++
++	ret = intel_soc_pmic_readb(preg->reg);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			preg->reg, ret);
++		return -EIO;
++	}
++	data = (u8) ret;
++
++	*value = (data & PWR_SOURCE_SELECT) && (data & BIT(preg->bit)) ? 1 : 0;
++	return 0;
++}
++
++static int intel_wc_pmic_update_power(struct pmic_pwr_reg *preg, bool on)
++{
++	int ret;
++	u8 data;
++
++	ret = intel_soc_pmic_readb(preg->reg);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			preg->reg, ret);
++		return -EIO;
++	}
++
++	data = (u8)ret;
++	if (on) {
++		data |= PWR_SOURCE_SELECT | BIT(preg->bit);
++	} else {
++		data &= ~BIT(preg->bit);
++		data |= PWR_SOURCE_SELECT;
++	}
++
++	ret = intel_soc_pmic_writeb(preg->reg, data);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "write reg 0x%x failed, 0x%x\n",
++			preg->reg, ret);
++		return -EIO;
++	}
++	return 0;
++}
++
++/* Raw temperature value is 10bits: 8bits in reg and 2bits in reg-1 bit0,1 */
++static int intel_wc_pmic_get_raw_temp(int reg)
++{
++	int ret;
++	unsigned int adc_val;
++	unsigned int reg_val;
++	u8 temp_l, temp_h;
++	u8 cursrc;
++	unsigned long rlsb;
++	static const unsigned long rlsb_array[] = {
++		0, 260420, 130210, 65100, 32550, 16280,
++		8140, 4070, 2030, 0, 260420, 130210};
++
++	ret = intel_soc_pmic_readb(reg);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	temp_l = (u8)ret;
++	ret = intel_soc_pmic_readb(reg - 1);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	temp_h = (u8)ret;
++
++	reg_val = (temp_l | ((temp_h & 0x0F) << 8));
++	cursrc = (temp_h & 0xF0) >> 4;
++	rlsb = rlsb_array[cursrc];
++	adc_val = reg_val * rlsb / 1000;
++
++	dev_dbg(intel_soc_pmic_dev(), "adc_val = %x temp_h=%x temp_l=%x\n",
++		adc_val, temp_h, temp_l);
++
++	return adc_val;
++}
++
++static int
++intel_wc_pmic_update_aux(int reg, int raw)
++{
++	int ret;
++
++	ret = intel_soc_pmic_update(reg - 1, raw >> 8, 0x3);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "update reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++	ret = intel_soc_pmic_writeb(reg, (u8)raw);
++	if (ret < 0) {
++		dev_err(intel_soc_pmic_dev(), "write reg 0x%x failed, 0x%x\n",
++			reg, ret);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int
++intel_wc_pmic_get_policy(int reg, u64 *value)
++{
++	return 0;
++}
++
++static int intel_wc_pmic_update_policy(int reg, int enable)
++{
++	return 0;
++}
++
++static struct intel_soc_pmic_opregion_data intel_wc_pmic_opregion_data = {
++	.get_power      = intel_wc_pmic_get_power,
++	.update_power   = intel_wc_pmic_update_power,
++	.get_raw_temp   = intel_wc_pmic_get_raw_temp,
++	.update_aux     = intel_wc_pmic_update_aux,
++	.get_policy     = intel_wc_pmic_get_policy,
++	.update_policy  = intel_wc_pmic_update_policy,
++	.pwr_table      = pwr_table,
++	.pwr_table_count = ARRAY_SIZE(pwr_table),
++	.dptf_table     = dptf_table,
++	.dptf_table_count = ARRAY_SIZE(dptf_table),
++};
++
++static int intel_wc_pmic_opregion_probe(struct platform_device *pdev)
++{
++	return intel_soc_pmic_install_opregion_handler(&pdev->dev,
++			ACPI_HANDLE(pdev->dev.parent),
++			&intel_wc_pmic_opregion_data);
++}
++
++static int intel_wc_pmic_opregion_remove(struct platform_device *pdev)
++{
++	intel_soc_pmic_remove_opregion_handler(ACPI_HANDLE(pdev->dev.parent));
++	return 0;
++}
++
++static struct platform_device_id whiskey_cove_opregion_id_table[] = {
++	{ .name = DRV_NAME },
++	{},
++};
++
++static struct platform_driver intel_wc_pmic_opregion_driver = {
++	.probe = intel_wc_pmic_opregion_probe,
++	.remove = intel_wc_pmic_opregion_remove,
++	.id_table = whiskey_cove_opregion_id_table,
++	.driver = {
++		.name = DRV_NAME,
++	},
++};
++
++MODULE_DEVICE_TABLE(platform, whiskey_cove_opregion_id_table);
++
++module_platform_driver(intel_wc_pmic_opregion_driver);
++
++MODULE_DESCRIPTION("WhiskeyCove ACPI opregion driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index 596809c..8894643 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -167,7 +167,7 @@ obj-$(CONFIG_MFD_AS3711)	+= as3711.o
+ obj-$(CONFIG_MFD_AS3722)	+= as3722.o
+ obj-$(CONFIG_MFD_STW481X)	+= stw481x.o
+ 
+-intel-soc-pmic-objs		:= intel_soc_pmic_core.o intel_soc_pmic_i2c.o intel_soc_pmic_opregion.o
++intel-soc-pmic-objs		:= intel_soc_pmic_core.o intel_soc_pmic_i2c.o
+ intel-soc-pmic-objs 		+= intel_soc_pmic_crc.o intel_soc_pmic_dc.o intel_soc_pmic_dc_ti.o
+ intel-soc-pmic-objs 		+= intel_soc_pmic_wc.o
+ obj-$(CONFIG_INTEL_SOC_PMIC)	+= intel-soc-pmic.o
+diff --git a/drivers/mfd/intel_soc_pmic_crc.c b/drivers/mfd/intel_soc_pmic_crc.c
+index aedc294..47b7a2b 100644
+--- a/drivers/mfd/intel_soc_pmic_crc.c
++++ b/drivers/mfd/intel_soc_pmic_crc.c
+@@ -130,6 +130,9 @@ static struct mfd_cell crystal_cove_dev[] = {
+ 		.num_resources = 0,
+ 		.resources = NULL,
+ 	},
++	{
++		.name = "crystal_cove_region",
++	},
+ 
+ 	{NULL, },
+ };
+@@ -167,7 +170,6 @@ static int crystal_cove_init(void)
+ {
+ 	pr_debug("Crystal Cove: ID 0x%02X, VERSION 0x%02X\n",
+ 		 intel_soc_pmic_readb(CHIPID), intel_soc_pmic_readb(CHIPVER));
+-	intel_pmic_install_handlers(&crystal_cove_pmic);
+ 
+ 	crc_set_gpio_pdata();
+ 	return 0;
+diff --git a/drivers/mfd/intel_soc_pmic_opregion.c b/drivers/mfd/intel_soc_pmic_opregion.c
+deleted file mode 100644
+index 17ac9a0..0000000
+--- a/drivers/mfd/intel_soc_pmic_opregion.c
++++ /dev/null
+@@ -1,429 +0,0 @@
+-/*
+- * intel_soc_pmic_opregion.c - Intel SoC PMIC operation region Driver
+- *
+- * Copyright (C) 2013, 2014 Intel Corporation. All rights reserved.
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License version
+- * 2 as published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- */
+-
+-#include <linux/acpi.h>
+-#include <linux/mfd/intel_soc_pmic.h>
+-#include "intel_soc_pmic_core.h"
+-
+-struct pmic_table {
+-	int address;	/* operation region address */
+-	int reg;	/* corresponding PMIC register */
+-};
+-
+-static struct pmic_table pwr_regmap[] = {
+-	{ 0x04, 0x63 }, /* SYSX -> VSYS_SX */
+-	{ 0x08, 0x62 }, /* SYSU -> VSYS_U */
+-	{ 0x0c, 0x64 }, /* SYSS -> VSYS_S */
+-	{ 0x10, 0x6a }, /* V50S -> V5P0S */
+-	{ 0x14, 0x6b }, /* HOST -> VHOST, USB2/3 host */
+-	{ 0x18, 0x6c }, /* VBUS -> VBUS, USB2/3 OTG */
+-	{ 0x1c, 0x6d }, /* HDMI -> VHDMI */
+-	/*0x20, S285 */
+-	{ 0x24, 0x66 }, /* X285 -> V2P85SX, camara */
+-	/*0x28, V33A */
+-	{ 0x2c, 0x69 }, /* V33S -> V3P3S, display/ssd/audio */
+-	{ 0x30, 0x68 }, /* V33U -> V3P3U, SDIO wifi&bt */
+-	/*0x34, V33I */
+-	/*0x38, V18A */
+-	/*0x3c, REFQ */
+-	/*0x40, V12A */
+-	{ 0x44, 0x5c }, /* V18S -> V1P8S, SOC/USB PHY/SIM */
+-	{ 0x48, 0x5d }, /* V18X -> V1P8SX, eMMC/camara/audio */
+-	{ 0x4c, 0x5b }, /* V18U -> V1P8U, LPDDR */
+-	{ 0x50, 0x61 }, /* V12X -> V1P2SX, SOC SFR */
+-	{ 0x54, 0x60 }, /* V12S -> V1P2S, MIPI */
+-	/*0x58, V10A */
+-	{ 0x5c, 0x56 }, /* V10S -> V1P0S, SOC GFX */
+-	{ 0x60, 0x57 }, /* V10X -> V1P0SX, SOC display/DDR IO/PCIe */
+-	{ 0x64, 0x59 }, /* V105 -> V1P05S, L2 SRAM */
+-};
+-
+-static struct pmic_table dptf_regmap[] = {
+-	{ 0x00, 0x75 }, /* TMP0 -> SYS0_THRM_RSLT_L */
+-	{ 0x04, 0x95 }, /* AX00 -> SYS0_THRMALRT0_L */
+-	{ 0x08, 0x97 }, /* AX01 -> SYS0_THRMALRT1_L */
+-	{ 0x0c, 0x77 }, /* TMP1 -> SYS1_THRM_RSLT_L */
+-	{ 0x10, 0x9a }, /* AX10 -> SYS1_THRMALRT0_L */
+-	{ 0x14, 0x9c }, /* AX11 -> SYS1_THRMALRT1_L */
+-	{ 0x18, 0x79 }, /* TMP2 -> SYS2_THRM_RSLT_L */
+-	{ 0x1c, 0x9f }, /* AX20 -> SYS2_THRMALRT0_L */
+-	{ 0x20, 0xa1 }, /* AX21 -> SYS2_THRMALRT1_L */
+-	{ 0x24, 0x7b }, /* TMP3 -> BAT0_THRM_RSLT_L */
+-	{ 0x28, 0xa4 }, /* AX30 -> BAT0_THRMALRT0_L */
+-	{ 0x2c, 0xa6 }, /* AX31 -> BAT0_THRMALRT1_L */
+-	{ 0x30, 0x7d }, /* TMP4 -> BAT1_THRM_RSLT_L */
+-	{ 0x34, 0xaa }, /* AX40 -> BAT1_THRMALRT0_L */
+-	{ 0x38, 0xac }, /* AX41 -> BAT1_THRMALRT1_L */
+-	{ 0x3c, 0x7f }, /* TMP5 -> PMIC_THRM_RSLT_L */
+-	{ 0x40, 0xb0 }, /* AX50 -> PMIC_THRMALRT0_L */
+-	{ 0x44, 0xb2 }, /* AX51 -> PMIC_THRMALRT1_L */
+-	{ 0x48, 0x94 }, /* PEN0 -> SYS0_THRMALRT0_H */
+-	{ 0x4c, 0x99 }, /* PEN1 -> SYS1_THRMALRT1_H */
+-	{ 0x50, 0x9e }, /* PEN2 -> SYS2_THRMALRT2_H */
+-	{ 0x54, 0xa3 }, /* PEN3 -> BAT0_THRMALRT0_H */
+-	{ 0x58, 0xa9 }, /* PEN4 -> BAT1_THRMALRT0_H */
+-	{ 0x5c, 0xaf }, /* PEN5 -> PMIC_THRMALRT0_H */
+-};
+-
+-static int pmic_opregion_readb(int reg)
+-{
+-	int ret = intel_soc_pmic_readb(reg);
+-	if (ret < 0)
+-		dev_err(intel_soc_pmic_dev(), "read reg 0x%x failed, 0x%x\n",
+-			reg, ret);
+-	return ret;
+-}
+-
+-static int pmic_opregion_writeb(int reg, u8 value)
+-{
+-	int ret = intel_soc_pmic_writeb(reg, value);
+-	if (ret < 0)
+-		dev_err(intel_soc_pmic_dev(), "write reg 0x%x failed, 0x%x\n",
+-			reg, ret);
+-	return ret;
+-}
+-
+-static int pmic_get_reg(int address, struct pmic_table *regmap, int count)
+-{
+-	int i;
+-	for (i = 0; i < count; i++) {
+-		if (regmap[i].address == address)
+-			return regmap[i].reg;
+-	}
+-	return -1;
+-}
+-
+-static acpi_status
+-pmic_power_space_handler(u32 function, acpi_physical_address address,
+-			 u32 bits, u64 *value64,
+-			 void *handler_context, void *region_context)
+-{
+-	int pmic_reg, ret;
+-
+-	if (bits != 32 || !value64)
+-		return AE_BAD_PARAMETER;
+-
+-	if (function == ACPI_WRITE && !(*value64 == 0 || *value64 == 1))
+-		return AE_BAD_PARAMETER;
+-
+-	pmic_reg = pmic_get_reg(address, pwr_regmap, ARRAY_SIZE(pwr_regmap));
+-	if (pmic_reg == -1) {
+-		dev_err(intel_soc_pmic_dev(),
+-			"opregion address 0x%x not supported\n", (int)address);
+-		return AE_BAD_PARAMETER;
+-	}
+-
+-	ret = pmic_opregion_readb(pmic_reg);
+-	if (ret < 0)
+-		return AE_BAD_DATA;
+-
+-	if (function == ACPI_READ) {
+-		*value64 = ret & 0x1;
+-	} else {
+-		if (*value64 == 1)
+-			ret |= 0x3;
+-		else {
+-			ret &= ~0x3;
+-			ret |= 0x2;
+-		}
+-
+-		ret = pmic_opregion_writeb(pmic_reg, ret);
+-		if (ret < 0)
+-			return AE_BAD_DATA;
+-	}
+-
+-	return AE_OK;
+-}
+-
+-/* Return temperature from raw value through LPAT table */
+-static int acpi_lpat_tmp(struct acpi_lpat *lpat, int count, int raw)
+-{
+-	int i, delta_tmp, delta_raw, tmp;
+-
+-	for (i = 0; i < count - 1; i++) {
+-		if ((raw >= lpat[i].raw && raw <= lpat[i+1].raw) ||
+-		    (raw <= lpat[i].raw && raw >= lpat[i+1].raw))
+-			break;
+-	}
+-
+-	if (i == count - 1) {
+-		dev_err(intel_soc_pmic_dev(), "Not in LPAT range\n");
+-		return -1;
+-	}
+-
+-	delta_tmp = lpat[i+1].tmp - lpat[i].tmp;
+-	delta_raw = lpat[i+1].raw - lpat[i].raw;
+-	tmp = lpat[i].tmp + (raw - lpat[i].raw) * delta_tmp / delta_raw;
+-
+-	return tmp;
+-}
+-
+-/* Return raw value from temperature through LPAT table */
+-static int acpi_lpat_raw(struct acpi_lpat *lpat, int count, int tmp)
+-{
+-	int i, delta_tmp, delta_raw, raw;
+-
+-	for (i = 0; i < count - 1; i++) {
+-		if (tmp >= lpat[i].tmp && tmp <= lpat[i+1].tmp)
+-			break;
+-	}
+-
+-	if (i == count - 1) {
+-		dev_err(intel_soc_pmic_dev(), "Not in LPAT range\n");
+-		return -1;
+-	}
+-
+-	delta_tmp = lpat[i+1].tmp - lpat[i].tmp;
+-	delta_raw = lpat[i+1].raw - lpat[i].raw;
+-	raw = lpat[i].raw + (tmp - lpat[i].tmp) * delta_raw / delta_tmp;
+-
+-	return raw;
+-}
+-
+-static struct intel_soc_pmic *intel_soc_pmic(void)
+-{
+-	return &crystal_cove_pmic;
+-}
+-
+-static int pmic_read_tmp(int pmic_reg, u64 *value)
+-{
+-	struct intel_pmic_opregion *opregion = intel_soc_pmic()->opregion;
+-	int tmp_l, tmp_h, raw_tmp, tmp;
+-
+-	tmp_l = pmic_opregion_readb(pmic_reg);
+-	tmp_h = pmic_opregion_readb(pmic_reg - 1);
+-	if (tmp_l < 0 || tmp_h < 0)
+-		return -1;
+-
+-	raw_tmp = tmp_l | ((tmp_h & 0x3) << 8);
+-
+-	if (!opregion->lpat) {
+-		*value = raw_tmp;
+-		return 0;
+-	}
+-
+-	tmp = acpi_lpat_tmp(opregion->lpat, opregion->lpat_count, raw_tmp);
+-	if (tmp == -1)
+-		return -1;
+-	*value = tmp;
+-	return 0;
+-}
+-
+-static acpi_status pmic_dptf_tmp(int pmic_reg, u32 function, u64 *value)
+-{
+-	if (function != ACPI_READ)
+-		return AE_BAD_PARAMETER;
+-
+-	if (pmic_read_tmp(pmic_reg, value) == -1)
+-		return AE_ERROR;
+-
+-	return AE_OK;
+-}
+-
+-static acpi_status pmic_dptf_aux(int pmic_reg, u32 function, u64 *value)
+-{
+-	struct intel_pmic_opregion *opregion;
+-	int tmp, raw, aux_h, ret;
+-
+-	if (function == ACPI_READ)
+-		return pmic_read_tmp(pmic_reg, value) == -1 ? AE_ERROR : AE_OK;
+-
+-	if (function == ACPI_WRITE) {
+-		opregion = intel_soc_pmic()->opregion;
+-		tmp = *value;
+-		raw = acpi_lpat_raw(opregion->lpat, opregion->lpat_count, tmp);
+-		if (raw == -1)
+-			return AE_ERROR;
+-		ret = pmic_opregion_writeb(pmic_reg, raw & 0xff);
+-		if (ret < 0)
+-			return AE_ERROR;
+-		aux_h = pmic_opregion_readb(pmic_reg - 1);
+-		if (aux_h < 0)
+-			return AE_ERROR;
+-		aux_h &= ~0x3;
+-		aux_h |= (raw >> 8) & 0x3;
+-		ret = pmic_opregion_writeb(pmic_reg - 1, aux_h);
+-		if (ret < 0)
+-			return AE_ERROR;
+-		return AE_OK;
+-	}
+-
+-	return AE_ERROR;
+-}
+-
+-static acpi_status pmic_dptf_pen(int pmic_reg, u32 function, u64 *value)
+-{
+-	int pen, alert0, alert0_orig;
+-
+-	if (function == ACPI_READ) {
+-		pen = pmic_opregion_readb(pmic_reg);
+-		if (pen < 0)
+-			return AE_ERROR;
+-		*value = pen >> 7;
+-		return AE_OK;
+-	}
+-
+-	if (function == ACPI_WRITE) {
+-		if (*value != 0 || *value != 1)
+-			return AE_BAD_PARAMETER;
+-		pen = pmic_opregion_readb(pmic_reg);
+-		if (pen < 0)
+-			return AE_ERROR;
+-		/* unlock a0lock */
+-		alert0_orig = pmic_opregion_readb(0xc5);
+-		alert0 = alert0_orig;
+-		alert0 &= ~0x1;
+-		if (pmic_opregion_writeb(0xc5, alert0) < 0)
+-			return AE_ERROR;
+-		pen &= 0x7f;
+-		pen |= *value << 7;
+-		if (pmic_opregion_writeb(pmic_reg, pen) < 0)
+-			return AE_ERROR;
+-		/* restore alert0 */
+-		if (pmic_opregion_writeb(0xc5, alert0_orig) < 0)
+-			return AE_ERROR;
+-		return AE_OK;
+-	}
+-
+-	return AE_ERROR;
+-}
+-
+-static bool pmic_dptf_is_tmp(int address)
+-{
+-	return (address <= 0x3c) && !(address % 12);
+-}
+-
+-static bool pmic_dptf_is_aux(int address)
+-{
+-	return (address >= 4 && address <= 0x40 && !((address - 4) % 12)) ||
+-	       (address >= 8 && address <= 0x44 && !((address - 8) % 12));
+-}
+-
+-static bool pmic_dptf_is_pen(int address)
+-{
+-	return address >= 0x48 && address <= 0x5c;
+-}
+-
+-static acpi_status
+-pmic_dptf_space_handler(u32 function, acpi_physical_address address,
+-			u32 bits, u64 *value64,
+-			void *handler_context, void *region_context)
+-{
+-	int pmic_reg;
+-
+-	if (bits != 32 || !value64)
+-		return AE_BAD_PARAMETER;
+-
+-	pmic_reg = pmic_get_reg(address, dptf_regmap, ARRAY_SIZE(dptf_regmap));
+-	if (pmic_reg == -1) {
+-		dev_err(intel_soc_pmic_dev(),
+-			"opregion address 0x%x not supported\n", (int)address);
+-		return AE_BAD_PARAMETER;
+-	}
+-
+-	if (pmic_dptf_is_tmp(address))
+-		return pmic_dptf_tmp(pmic_reg, function, value64);
+-	else if (pmic_dptf_is_aux(address))
+-		return pmic_dptf_aux(pmic_reg, function, value64);
+-	else if (pmic_dptf_is_pen(address))
+-		return pmic_dptf_pen(pmic_reg, function, value64);
+-	return AE_BAD_PARAMETER;
+-}
+-
+-static acpi_handle pmic_handle(void)
+-{
+-	return ACPI_HANDLE(intel_soc_pmic_dev());
+-}
+-
+-static void pmic_dptf_lpat(void)
+-{
+-	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+-	struct intel_pmic_opregion *opregion;
+-	union acpi_object *obj_p, *obj_e;
+-	int *lpat, i;
+-	acpi_status status;
+-
+-	opregion = devm_kmalloc(intel_soc_pmic_dev(), sizeof(*opregion),
+-				GFP_KERNEL);
+-	if (!opregion) {
+-		dev_err(intel_soc_pmic_dev(), "No mem for opregion\n");
+-		return;
+-	}
+-	intel_soc_pmic()->opregion = opregion;
+-
+-	if (!acpi_has_method(pmic_handle(), "LPAT")) {
+-		opregion->lpat = NULL;
+-		return;
+-	}
+-
+-	status = acpi_evaluate_object(pmic_handle(), "LPAT", NULL, &buffer);
+-	if (ACPI_FAILURE(status)) {
+-		dev_err(intel_soc_pmic_dev(), "evaluate LPAT failed\n");
+-		return;
+-	}
+-	obj_p = (union acpi_object *)buffer.pointer;
+-	if (!obj_p || (obj_p->type != ACPI_TYPE_PACKAGE) ||
+-	    (obj_p->package.count % 2) || (obj_p->package.count < 4)) {
+-		dev_err(intel_soc_pmic_dev(), "Invalid LPAT data\n");
+-		goto err;
+-	}
+-
+-	lpat = devm_kmalloc(intel_soc_pmic_dev(),
+-			    sizeof(*lpat) * obj_p->package.count, GFP_KERNEL);
+-	if (!lpat) {
+-		dev_err(intel_soc_pmic_dev(), "No mem for lpat\n");
+-		goto err;
+-	}
+-
+-	for (i = 0; i < obj_p->package.count; i++) {
+-		obj_e = &obj_p->package.elements[i];
+-		if (obj_e->type != ACPI_TYPE_INTEGER) {
+-			dev_err(intel_soc_pmic_dev(), "LPAT invalid data\n");
+-			goto err;
+-		}
+-		lpat[i] = obj_e->integer.value;
+-	}
+-
+-	opregion->lpat = (struct acpi_lpat *)lpat;
+-	opregion->lpat_count = obj_p->package.count / 2;
+-
+-err:
+-	kfree(buffer.pointer);
+-}
+-
+-void intel_pmic_install_handlers(struct intel_soc_pmic *pmic)
+-{
+-	acpi_status status;
+-	if (!pmic_handle())
+-		return;
+-
+-	pmic_dptf_lpat();
+-
+-	status = acpi_install_address_space_handler(pmic_handle(),
+-						    0x8d,
+-						    &pmic_power_space_handler,
+-						    NULL, NULL);
+-	if (ACPI_FAILURE(status))
+-		dev_err(intel_soc_pmic_dev(),
+-			"install power space handler failed 0x%x\n", status);
+-
+-	status = acpi_install_address_space_handler(pmic_handle(),
+-						    0x8c,
+-						    &pmic_dptf_space_handler,
+-						    NULL, NULL);
+-	if (ACPI_FAILURE(status))
+-		dev_err(intel_soc_pmic_dev(),
+-			"install DPTF space handler failed 0x%x\n", status);
+-}
+diff --git a/drivers/mfd/intel_soc_pmic_wc.c b/drivers/mfd/intel_soc_pmic_wc.c
+index 284a61d..40377b9 100644
+--- a/drivers/mfd/intel_soc_pmic_wc.c
++++ b/drivers/mfd/intel_soc_pmic_wc.c
+@@ -416,6 +416,9 @@ static struct mfd_cell whiskey_cove_dev[] = {
+ 		.num_resources = 0,
+ 		.resources = NULL,
+ 	},
++	{
++		.name = "whiskey_cove_region",
++	},
+ 	{NULL, },
+ };
+ 
+-- 
+1.9.1
+

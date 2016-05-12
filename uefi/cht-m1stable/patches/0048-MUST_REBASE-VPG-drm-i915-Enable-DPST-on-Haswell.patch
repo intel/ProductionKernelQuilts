@@ -1,0 +1,848 @@
+From 3c47c1a7e4a223f8d2b3a2e8d818e1a8053b2f36 Mon Sep 17 00:00:00 2001
+Message-Id: <3c47c1a7e4a223f8d2b3a2e8d818e1a8053b2f36.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Daisy Sun <daisy.sun@intel.com>
+Date: Fri, 3 Jan 2014 16:59:05 -0800
+Subject: [PATCH 048/312] MUST_REBASE [VPG]: drm/i915 Enable DPST on Haswell
+
+Major change is to enable DPST feature on Haswell. Plus add DPST ioctl
+and backlight protection against race condition and save/restore reg
+properly so DPST still can work after S3.
+
+Change-Id: Icb33cb067bf8827fd90805fd4089af366e444d1c
+Signed-off-by: Daisy Sun <daisy.sun@intel.com>
+
+Squashed commit messages:
+-------------------------
+
+1/ [VPG HSW-A] Enable DPST on Haswell
+
+DPST (Display Power Savings Technology) is a power savings features
+where backlight is reduced while the image is enhanced such that the
+user does not perceive any difference in the image quality. The
+backlight reduction can provide power savings.
+
+The DPST IOCTL provided in this patch will be used by the DPST user-mode
+module. The IOCTL provides methods to initialize the DPST hardware,
+manage DPST interrupts, and to apply the new backlight and image
+enhancement values.
+
+The user mode module will initialize the DPST hardware when it starts
+up. The kernel will notify user mode module of any DPST histogram
+interrupts. When the user mode module receives a notification of these
+interrupts, it will query the kernel for all the DPST histogram data.
+Using this data, the user mode module will calculate new backlight and
+image enhancement values and provides those values to the kernel to
+program into the DPST hardware.
+
+Signed-off-by: Vinit Azad <vinit.azad@intel.com>
+
+2/ MUST_REBASE [VPG]: drm/i915: DPST doesn't work after S3
+
+After S3, DPST doesn't work because BLM_HIST_CTL doesn't get restored
+and that causes DPST histogram interrupts to be disabled.
+Change the code to save BLM_HIST_CTL before suspend and restore it
+after. Also, disable Image Enhancement Table before saving BLM_HIST_CTL reg
+and enable it after applying DPST diet result to BLM_HIST_BIN.
+
+Issue: AXIA-5223
+Issue: AXIA-5238
+Change-Id: I12afb7208016cec60acfb8e2d048b1a42251af1d
+Signed-off-by: Daisy Sun <daisy.sun@intel.com>
+
+3/ MUST_REBASE [VPG]: drm/i915   Add protection against race condition
+
+1.After set i915_dpst_context() in DRM_UNLOCKED mode, this function need to be reentrant
+since it might be called from multi-process. Add mutex to protect ioctl.
+2.Add spin lock & unlock of backlight to protect i915_dpst_set_brightness()
+& intel_panel_actually_set_backlight()
+
+(cherry picked from commit 990369288d06306d8dac514b7e851b6232518840)
+
+Issue: AXIA-4355
+Signed-off-by: Daisy Sun <daisy.sun@intel.com>
+Change-Id: I24147618fd125abed61b09f140644d5735f2c386
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/Makefile       |    3 +-
+ drivers/gpu/drm/i915/i915_dma.c     |    5 +
+ drivers/gpu/drm/i915/i915_dpst.c    |  382 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.c     |    1 +
+ drivers/gpu/drm/i915/i915_drv.h     |   21 ++
+ drivers/gpu/drm/i915/i915_irq.c     |    7 +
+ drivers/gpu/drm/i915/i915_reg.h     |   17 ++
+ drivers/gpu/drm/i915/i915_suspend.c |   22 ++
+ drivers/gpu/drm/i915/intel_panel.c  |   21 +-
+ include/uapi/drm/i915_drm.h         |   78 +++++++
+ 10 files changed, 552 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/i915_dpst.c
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index cad1683..abccfc4 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -69,7 +69,8 @@ i915-y += dvo_ch7017.o \
+ 	  intel_lvds.o \
+ 	  intel_panel.o \
+ 	  intel_sdvo.o \
+-	  intel_tv.o
++	  intel_tv.o \
++	  i915_dpst.o
+ 
+ # legacy horrors
+ i915-y += i915_dma.o \
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 1c21ff6..6d856bf 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1024,6 +1024,9 @@ static int i915_getparam(struct drm_device *dev, void *data,
+ 	case I915_PARAM_CMD_PARSER_VERSION:
+ 		value = i915_cmd_parser_get_version();
+ 		break;
++	case I915_PARAM_HAS_DPST:
++		value = I915_HAS_DPST(dev);
++		break;
+ 	default:
+ 		DRM_DEBUG("Unknown parameter %d\n", param->param);
+ 		return -EINVAL;
+@@ -1604,6 +1607,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 	spin_lock_init(&dev_priv->mm.object_stat_lock);
+ 	mutex_init(&dev_priv->dpio_lock);
+ 	mutex_init(&dev_priv->modeset_restore_lock);
++	mutex_init(&dev_priv->dpst.ioctl_lock);
+ 
+ 	intel_pm_setup(dev);
+ 
+@@ -2024,6 +2028,7 @@ const struct drm_ioctl_desc i915_ioctls[] = {
+ 		i915_set_plane_180_rotation, DRM_AUTH | DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF_DRV(I915_ENABLE_PLANE_RESERVED_REG_BIT_2,
+ 		i915_enable_plane_reserved_reg_bit_2, DRM_AUTH|DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(I915_DPST_CONTEXT, i915_dpst_context, DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF_DRV(I915_GEM_ACCESS_USERDATA, i915_gem_access_userdata,
+ 							DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(I915_SET_CSC, intel_configure_csc, DRM_UNLOCKED|DRM_RENDER_ALLOW),
+diff --git a/drivers/gpu/drm/i915/i915_dpst.c b/drivers/gpu/drm/i915/i915_dpst.c
+new file mode 100644
+index 0000000..43f5375
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_dpst.c
+@@ -0,0 +1,382 @@
++/*
++ * Copyright © 2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#include <linux/sysrq.h>
++#include <linux/slab.h>
++#include "i915_drm.h"
++#include "drm_crtc.h"
++#include "i915_drv.h"
++#include "intel_drv.h"
++#include "i915_trace.h"
++#include "intel_drv.h"
++
++/*
++ * DPST (Display Power Savings Technology) is a power savings features
++ * which reduces the backlight while enhancing the image such that the
++ * user does not perceive any difference in the image quality. The backlight
++ * reduction can provide power savings
++ *
++ * The DPST IOCTL implemented in this file can be used by the DPST a user-mode
++ * module. The IOCTL provides methods to initialize the DPST hardware,
++ * manage DPST interrupts, and to apply the new backlight and image enhancement
++ * values.
++ *
++ * The user mode module will initialize the DPST hardware when it starts up.
++ * The kernel will notify user mode module of any DPST histogram interrupts.
++ * When the user mode module receives a notification of these interrupts, it
++ * will query the kernel for all the DPST histogram data. Using this data,
++ * the user mode module will calculate new backlight and image enhancement
++ * values and provides those values to the kernel to program into the DPST
++ * hardware.
++ */
++
++static struct intel_connector
++*get_intel_connector_on_edp(struct drm_device *dev)
++{
++	struct intel_connector *i_connector = NULL;
++	struct drm_connector *d_connector;
++
++	list_for_each_entry(d_connector, &dev->mode_config.connector_list, head)
++	{
++		i_connector = to_intel_connector(d_connector);
++		if (i_connector->encoder \
++				&& i_connector->encoder->type == INTEL_OUTPUT_EDP)
++			return i_connector;
++	}
++	return NULL;
++}
++
++static int
++i915_dpst_clear_hist_interrupt(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	I915_WRITE(BLM_HIST_GUARD,
++			I915_READ(BLM_HIST_GUARD) | HISTOGRAM_EVENT_STATUS);
++	return 0;
++}
++
++static int
++i915_dpst_enable_hist_interrupt(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u32 blm_hist_ctl;
++
++	dev_priv->dpst.enabled = true;
++	dev_priv->dpst.blc_adjustment = DPST_MAX_FACTOR ;
++
++	/* Enable histogram logic to collect data */
++	blm_hist_ctl = I915_READ(BLM_HIST_CTL);
++	blm_hist_ctl |= IE_HISTOGRAM_ENABLE | HSV_INTENSITY_MODE;
++	I915_WRITE(BLM_HIST_CTL, blm_hist_ctl);
++
++	/* Wait for VBLANK since the histogram enabling logic takes affect
++	 * at the next vblank */
++	intel_wait_for_vblank(dev, PIPE_A);
++
++	/* Clear pending interrupt bit. Clearing the pending interrupt bit
++	 * must be not be done at the same time as enabling the
++	 * interrupt. */
++	I915_WRITE(BLM_HIST_GUARD,
++			I915_READ(BLM_HIST_GUARD) | HISTOGRAM_EVENT_STATUS);
++
++	/* Enable histogram interrupts */
++	I915_WRITE(BLM_HIST_GUARD,
++			I915_READ(BLM_HIST_GUARD) | HISTOGRAM_INTERRUPT_ENABLE);
++
++	/* DPST interrupt in DE_IER is enabled in irq_postinstall */
++
++	return 0;
++}
++
++static int
++i915_dpst_disable_hist_interrupt(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_connector *i_connector = get_intel_connector_on_edp(dev);
++	struct intel_panel *panel;
++
++	u32 blm_hist_guard, blm_hist_ctl;
++	unsigned long spin_lock_flags;
++
++	if (NULL == i_connector)
++		return -EINVAL;
++	panel = &i_connector->panel;
++
++	dev_priv->dpst.enabled = false;
++	dev_priv->dpst.blc_adjustment = DPST_MAX_FACTOR;
++
++	/* Disable histogram interrupts. It is OK to clear pending interrupts
++	 * and disable interrupts at the same time. */
++	blm_hist_guard = I915_READ(BLM_HIST_GUARD);
++	blm_hist_guard |= HISTOGRAM_EVENT_STATUS; /* clear pending interrupts */
++	blm_hist_guard &= ~HISTOGRAM_INTERRUPT_ENABLE;
++	I915_WRITE(BLM_HIST_GUARD, blm_hist_guard);
++
++	/* Disable histogram logic */
++	blm_hist_ctl = I915_READ(BLM_HIST_CTL);
++	blm_hist_ctl &= ~IE_HISTOGRAM_ENABLE;
++	blm_hist_ctl &= ~IE_MOD_TABLE_ENABLE;
++	I915_WRITE(BLM_HIST_CTL, blm_hist_ctl);
++
++	/* DPST interrupt in DE_IER register is disabled in irq_uninstall */
++
++	/* Setting blc level to what it would be without dpst adjustment */
++
++	spin_lock_irqsave(&dev_priv->backlight_lock, spin_lock_flags);
++	intel_panel_actually_set_backlight(i_connector, panel->backlight.level);
++	spin_unlock_irqrestore(&dev_priv->backlight_lock, spin_lock_flags);
++
++	return 0;
++}
++
++static int
++i915_dpst_apply_luma(struct drm_device *dev,
++		struct dpst_initialize_context *ioctl_data)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_connector *i_connector = get_intel_connector_on_edp(dev);
++	struct intel_panel *panel;
++
++	u32 diet_factor, i;
++	u32 blm_hist_ctl;
++	unsigned long spin_lock_flags;
++
++	if (NULL == i_connector)
++		return -EINVAL;
++	panel = &i_connector->panel;
++
++	if (!dev_priv->dpst.enabled)
++		return -EINVAL;
++
++	/* Backlight settings */
++	dev_priv->dpst.blc_adjustment =
++	ioctl_data->ie_container.dpst_blc_factor;
++
++	spin_lock_irqsave(&dev_priv->backlight_lock, spin_lock_flags);
++	i915_dpst_set_brightness(dev, panel->backlight.level);
++	spin_unlock_irqrestore(&dev_priv->backlight_lock, spin_lock_flags);
++
++	/* Setup register to access image enhancement value from
++	 * index 0.*/
++	blm_hist_ctl = I915_READ(BLM_HIST_CTL);
++	blm_hist_ctl |= BIN_REG_FUNCTION_SELECT_IE;
++	blm_hist_ctl &= ~BIN_REGISTER_INDEX_MASK;
++	I915_WRITE(BLM_HIST_CTL, blm_hist_ctl);
++
++	/* Program the image enhancement data passed from user mode. */
++	for (i = 0; i < DPST_DIET_ENTRY_COUNT; i++) {
++		diet_factor = ioctl_data->ie_container.
++			dpst_ie_st.factor_present[i] * 0x200 / 10000;
++		I915_WRITE(BLM_HIST_BIN, diet_factor);
++	}
++
++	/* Enable Image Enhancement Table */
++	blm_hist_ctl = I915_READ(BLM_HIST_CTL);
++	blm_hist_ctl |= IE_MOD_TABLE_ENABLE | ENHANCEMENT_MODE_MULT;
++	I915_WRITE(BLM_HIST_CTL, blm_hist_ctl);
++
++	return 0;
++}
++
++static int
++i915_dpst_get_bin_data(struct drm_device *dev,
++		struct dpst_initialize_context *ioctl_data)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u32 blm_hist_ctl, blm_hist_bin;
++	int index;
++
++	if (!dev_priv->dpst.enabled)
++		return -EINVAL;
++
++	/* Setup register to access bin data from index 0 */
++	blm_hist_ctl = I915_READ(BLM_HIST_CTL);
++	blm_hist_ctl = blm_hist_ctl & ~(BIN_REGISTER_INDEX_MASK |
++						BIN_REG_FUNCTION_SELECT_IE);
++	I915_WRITE(BLM_HIST_CTL, blm_hist_ctl);
++
++	/* Read all bin data */
++	for (index = 0; index < HIST_BIN_COUNT; index++) {
++		blm_hist_bin = I915_READ(BLM_HIST_BIN);
++
++		if (!(blm_hist_bin & BUSY_BIT)) {
++			ioctl_data->hist_status.histogram_bins.
++				status[index] = blm_hist_bin & BIN_COUNT_MASK;
++		} else {
++			/* Engine is busy. Reset index to 0 to grab
++			 * fresh histogram data */
++			index = -1;
++			blm_hist_ctl = I915_READ(BLM_HIST_CTL);
++			blm_hist_ctl = blm_hist_ctl & ~BIN_REGISTER_INDEX_MASK;
++			I915_WRITE(BLM_HIST_CTL, blm_hist_ctl);
++		}
++	}
++
++	return 0;
++}
++
++static int
++i915_dpst_init(struct drm_device *dev,
++		struct dpst_initialize_context *ioctl_data)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_crtc *crtc;
++	struct drm_display_mode *mode = NULL;
++	u32 blm_hist_guard, gb_val;
++
++	/* Get information about current display mode */
++	crtc = intel_get_crtc_for_pipe(dev, PIPE_A);
++	if (crtc) {
++		mode = intel_crtc_mode_get(dev, crtc);
++		if (mode) {
++			gb_val = (DEFAULT_GUARDBAND_VAL *
++					mode->hdisplay * mode->vdisplay)/1000;
++
++			ioctl_data->init_data.threshold_gb = gb_val;
++			ioctl_data->init_data.image_res =
++					mode->hdisplay*mode->vdisplay;
++		}
++	}
++
++	/* Store info needed to talk to user mode */
++	dev_priv->dpst.task = current;
++	dev_priv->dpst.signal = ioctl_data->init_data.sig_num;
++
++	/* Setup guardband delays and threshold */
++	blm_hist_guard = I915_READ(BLM_HIST_GUARD);
++	blm_hist_guard |= (ioctl_data->init_data.gb_delay << 22)
++			| ioctl_data->init_data.threshold_gb;
++	I915_WRITE(BLM_HIST_GUARD, blm_hist_guard);
++
++	/* Enable histogram interrupts */
++	i915_dpst_enable_hist_interrupt(dev);
++
++	return 0;
++}
++
++
++u32
++i915_dpst_get_brightness(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_panel *panel;
++	struct intel_connector *i_connector = get_intel_connector_on_edp(dev);
++	if (NULL == i_connector)
++		return -EINVAL;
++	panel = &i_connector->panel;
++
++	if (!dev_priv->dpst.enabled)
++		return 0;
++
++	/* return the last (non-dpst) set backlight level */
++	return panel->backlight.level;
++}
++
++/* called by multi-process, be cautious to avoid race condition */
++void
++i915_dpst_set_brightness(struct drm_device *dev, u32 brightness_val)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_connector *i_connector = get_intel_connector_on_edp(dev);
++	u32 backlight_level = brightness_val;
++
++	if (NULL == i_connector)
++		return;
++
++	if (!dev_priv->dpst.enabled)
++		return;
++
++	/* Calculate the backlight after it has been reduced by "dpst
++	 * blc adjustment" percent . blc_adjustment value is stored
++	 * after multiplying by 100, so we have to divide by 100 2nd time
++	 * to get to the correct value */
++	backlight_level = ((brightness_val *
++				dev_priv->dpst.blc_adjustment)/100)/100;
++	intel_panel_actually_set_backlight(i_connector, backlight_level);
++}
++
++void
++i915_dpst_irq_handler(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* Notify user mode of the interrupt */
++	if (dev_priv->dpst.task != NULL)
++		send_sig_info(dev_priv->dpst.signal, SEND_SIG_FORCED,
++							dev_priv->dpst.task);
++}
++
++int
++i915_dpst_context(struct drm_device *dev, void *data,
++			struct drm_file *file_priv)
++{
++	struct dpst_initialize_context *ioctl_data = NULL;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	int ret = -EINVAL;
++
++	if (!data)
++		return -EINVAL;
++
++	if (!I915_HAS_DPST(dev))
++		return -EINVAL;
++
++	/* Can be called from multiple usermode, prevent race condition */
++	mutex_lock(&dev_priv->dpst.ioctl_lock);
++
++	ioctl_data = (struct dpst_initialize_context *) data;
++	switch (ioctl_data->dpst_ioctl_type) {
++	case DPST_ENABLE:
++		ret = i915_dpst_enable_hist_interrupt(dev);
++	break;
++
++	case DPST_DISABLE:
++		ret = i915_dpst_disable_hist_interrupt(dev);
++	break;
++
++	case DPST_INIT_DATA:
++		ret = i915_dpst_init(dev, ioctl_data);
++	break;
++
++	case DPST_GET_BIN_DATA:
++		ret = i915_dpst_get_bin_data(dev, ioctl_data);
++	break;
++
++	case DPST_APPLY_LUMA:
++		ret = i915_dpst_apply_luma(dev, ioctl_data);
++	break;
++
++	case DPST_RESET_HISTOGRAM_STATUS:
++		ret = i915_dpst_clear_hist_interrupt(dev);
++	break;
++
++	default:
++		DRM_ERROR("Invalid DPST ioctl type\n");
++	break;
++	}
++
++	mutex_unlock(&dev_priv->dpst.ioctl_lock);
++	return ret;
++}
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index d935ab3..0684906 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -297,6 +297,7 @@ static const struct intel_device_info intel_haswell_m_info = {
+ 	.is_mobile = 1,
+ 	.has_ddi = 1,
+ 	.has_fpga_dbg = 1,
++	.has_dpst = 1,
+ 	.ring_mask = RENDER_RING | BSD_RING | BLT_RING | VEBOX_RING,
+ 	GEN_DEFAULT_PIPEOFFSETS,
+ 	IVB_CURSOR_OFFSETS,
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 0611468..5bf23ed 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -530,6 +530,7 @@ struct intel_uncore {
+ 	func(is_preliminary) sep \
+ 	func(has_fbc) sep \
+ 	func(has_pipe_cxsr) sep \
++	func(has_dpst) sep \
+ 	func(has_hotplug) sep \
+ 	func(cursor_needs_physical) sep \
+ 	func(has_overlay) sep \
+@@ -831,6 +832,8 @@ struct i915_suspend_saved_registers {
+ 	u32 savePIPEB_LINK_N1;
+ 	u32 saveMCHBAR_RENDER_STANDBY;
+ 	u32 savePCH_PORT_HOTPLUG;
++	u32 saveBLM_HIST_GUARD;
++	u32 saveBLM_HIST_CTL;
+ };
+ 
+ struct vlv_s0ix_state {
+@@ -1454,6 +1457,15 @@ struct drm_i915_private {
+ 		struct pid *pid;
+ 	} curd;
+ 
++	/* DPST information */
++	struct {
++		struct task_struct *task;
++		u32 signal;
++		u32 blc_adjustment;
++		bool enabled;
++		struct mutex ioctl_lock;
++	} dpst;
++
+ 	/* PCH chipset type */
+ 	enum intel_pch pch_type;
+ 	unsigned short pch_id;
+@@ -1997,6 +2009,7 @@ struct drm_i915_cmd_table {
+ #define HAS_FW_BLC(dev) (INTEL_INFO(dev)->gen > 2)
+ #define HAS_PIPE_CXSR(dev) (INTEL_INFO(dev)->has_pipe_cxsr)
+ #define HAS_FBC(dev) (INTEL_INFO(dev)->has_fbc)
++#define I915_HAS_DPST(dev) (INTEL_INFO(dev)->has_dpst)
+ 
+ #define HAS_IPS(dev)		(IS_ULT(dev) || IS_BROADWELL(dev))
+ 
+@@ -2592,6 +2605,14 @@ intel_opregion_notify_adapter(struct drm_device *dev, pci_power_t state)
+ }
+ #endif
+ 
++/* i915_dpst.c */
++int i915_dpst_context(struct drm_device *dev, void *data,
++			struct drm_file *file_priv);
++u32 i915_dpst_get_brightness(struct drm_device *dev);
++void i915_dpst_set_brightness(struct drm_device *dev, u32 brightness_val);
++void i915_dpst_irq_handler(struct drm_device *dev);
++void intel_panel_actually_set_backlight(struct intel_connector *conn, u32 level);
++
+ /* intel_acpi.c */
+ #ifdef CONFIG_ACPI
+ extern void intel_register_dsm_handler(void);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index a2f79b2..0a5058d 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2112,6 +2112,9 @@ static void ivb_display_irq_handler(struct drm_device *dev, u32 de_iir)
+ 	if (de_iir & DE_GSE_IVB)
+ 		intel_opregion_asle_intr(dev);
+ 
++	if (de_iir & DE_DPST_HISTOGRAM_IVB)
++		i915_dpst_irq_handler(dev);
++
+ 	for_each_pipe(pipe) {
+ 		if (de_iir & (DE_PIPE_VBLANK_IVB(pipe)))
+ 			intel_pipe_handle_vblank(dev, pipe);
+@@ -3301,6 +3304,10 @@ static int ironlake_irq_postinstall(struct drm_device *dev)
+ 				DE_PLANEA_FLIP_DONE_IVB | DE_AUX_CHANNEL_A_IVB);
+ 		extra_mask = (DE_PIPEC_VBLANK_IVB | DE_PIPEB_VBLANK_IVB |
+ 			      DE_PIPEA_VBLANK_IVB | DE_ERR_INT_IVB);
++
++		if (I915_HAS_DPST(dev))
++			display_mask |= DE_DPST_HISTOGRAM_IVB;
++
+ 	} else {
+ 		display_mask = (DE_MASTER_IRQ_CONTROL | DE_GSE | DE_PCH_EVENT |
+ 				DE_PLANEA_FLIP_DONE | DE_PLANEB_FLIP_DONE |
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 6192368..1c3aac5 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -4509,6 +4509,7 @@ enum punit_power_well {
+ #define DE_PCH_EVENT_IVB		(1<<28)
+ #define DE_DP_A_HOTPLUG_IVB		(1<<27)
+ #define DE_AUX_CHANNEL_A_IVB		(1<<26)
++#define DE_DPST_HISTOGRAM_IVB       (1<<25)
+ #define DE_SPRITEC_FLIP_DONE_IVB	(1<<14)
+ #define DE_PLANEC_FLIP_DONE_IVB		(1<<13)
+ #define DE_PIPEC_VBLANK_IVB		(1<<10)
+@@ -5789,6 +5790,22 @@ enum punit_power_well {
+ #define  TRANS_DDI_EDP_INPUT_C_ONOFF	(6<<12)
+ #define  TRANS_DDI_BFI_ENABLE		(1<<4)
+ 
++/* DPST related registers */
++#define BLM_HIST_CTL				0x48260
++#define  IE_HISTOGRAM_ENABLE		(1<<31)
++#define  IE_MOD_TABLE_ENABLE		(1<<27)
++#define  HSV_INTENSITY_MODE			(1<<24)
++#define  ENHANCEMENT_MODE_MULT		(2<<13)
++#define  BIN_REG_FUNCTION_SELECT_IE	(1<<11)
++#define  BIN_REGISTER_INDEX_MASK	0x7F
++#define BLM_HIST_BIN				0x48264
++#define  BUSY_BIT					(1<<31)
++#define  BIN_COUNT_MASK				0x3FFFFF
++#define BLM_HIST_GUARD				0x48268
++#define  HISTOGRAM_INTERRUPT_ENABLE	(1<<31)
++#define  HISTOGRAM_EVENT_STATUS		(1<<30)
++#define HIST_BIN_COUNT				32
++
+ /* DisplayPort Transport Control */
+ #define DP_TP_CTL_A			0x64040
+ #define DP_TP_CTL_B			0x64140
+diff --git a/drivers/gpu/drm/i915/i915_suspend.c b/drivers/gpu/drm/i915/i915_suspend.c
+index 0c4f402..065a7d6 100644
+--- a/drivers/gpu/drm/i915/i915_suspend.c
++++ b/drivers/gpu/drm/i915/i915_suspend.c
+@@ -189,6 +189,22 @@ static void i915_restore_vga(struct drm_device *dev)
+ 	I915_WRITE8(VGA_DACMASK, dev_priv->regfile.saveDACMASK);
+ }
+ 
++void i915_save_dpst_regs(struct drm_i915_private *dev_priv)
++{
++	dev_priv->regfile.saveBLM_HIST_GUARD = I915_READ(BLM_HIST_GUARD);
++	dev_priv->regfile.saveBLM_HIST_CTL = I915_READ(BLM_HIST_CTL);
++
++	/* Disable image enhancement table so we do not apply invalid
++	 * data when we resume */
++	dev_priv->regfile.saveBLM_HIST_CTL &= ~IE_MOD_TABLE_ENABLE;
++}
++
++void i915_restore_dpst_regs(struct drm_i915_private *dev_priv)
++{
++	I915_WRITE(BLM_HIST_GUARD, dev_priv->regfile.saveBLM_HIST_GUARD);
++	I915_WRITE(BLM_HIST_CTL, dev_priv->regfile.saveBLM_HIST_CTL);
++}
++
+ static void i915_save_display(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -240,6 +256,9 @@ static void i915_save_display(struct drm_device *dev)
+ 	if (HAS_FBC(dev) && INTEL_INFO(dev)->gen <= 4 && !IS_G4X(dev))
+ 		dev_priv->regfile.saveFBC_CONTROL = I915_READ(FBC_CONTROL);
+ 
++	if (I915_HAS_DPST(dev))
++		i915_save_dpst_regs(dev_priv);
++
+ 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
+ 		i915_save_vga(dev);
+ }
+@@ -299,6 +318,9 @@ static void i915_restore_display(struct drm_device *dev)
+ 	if (HAS_FBC(dev) && INTEL_INFO(dev)->gen <= 4 && !IS_G4X(dev))
+ 		I915_WRITE(FBC_CONTROL, dev_priv->regfile.saveFBC_CONTROL);
+ 
++	if (I915_HAS_DPST(dev))
++			i915_restore_dpst_regs(dev_priv);
++
+ 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
+ 		i915_restore_vga(dev);
+ 	else
+diff --git a/drivers/gpu/drm/i915/intel_panel.c b/drivers/gpu/drm/i915/intel_panel.c
+index e217767..96d7c1b 100644
+--- a/drivers/gpu/drm/i915/intel_panel.c
++++ b/drivers/gpu/drm/i915/intel_panel.c
+@@ -480,7 +480,16 @@ static u32 intel_panel_get_backlight(struct intel_connector *connector)
+ 	spin_lock_irqsave(&dev_priv->backlight_lock, flags);
+ 
+ 	val = dev_priv->display.get_backlight(connector);
+-	val = intel_panel_compute_brightness(connector, val);
++
++	/* When DPST is enabled, reading the backlight register will
++	 * give the DPST adjusted backlight value. Since DPST works
++	 * without user knowing a perceived difference in the backlight,
++	 * the programmed backlight isn't the correct value to return.
++	 * So, get the user perceived backlight level from DPST. */
++	if (dev_priv->dpst.enabled)
++		val = i915_dpst_get_brightness(dev);
++	else
++		val = intel_panel_compute_brightness(connector, val);
+ 
+ 	spin_unlock_irqrestore(&dev_priv->backlight_lock, flags);
+ 
+@@ -545,7 +554,7 @@ static void vlv_set_backlight(struct intel_connector *connector, u32 level)
+ 	I915_WRITE(VLV_BLC_PWM_CTL(pipe), tmp | level);
+ }
+ 
+-static void
++void
+ intel_panel_actually_set_backlight(struct intel_connector *connector, u32 level)
+ {
+ 	struct drm_device *dev = connector->base.dev;
+@@ -586,8 +595,12 @@ void intel_panel_set_backlight(struct intel_connector *connector, u32 level,
+ 	if (panel->backlight.device)
+ 		panel->backlight.device->props.brightness = level;
+ 
+-	if (panel->backlight.enabled)
+-		intel_panel_actually_set_backlight(connector, level);
++	if (panel->backlight.enabled) {
++		if (dev_priv->dpst.enabled)
++			i915_dpst_set_brightness(dev, level);
++		else
++			intel_panel_actually_set_backlight(connector, level);
++	}
+ 
+ 	spin_unlock_irqrestore(&dev_priv->backlight_lock, flags);
+ }
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index bf2b20d..70f1aa3 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -277,6 +277,7 @@ struct csc_coeff {
+ #define DRM_I915_SET_PLANE_180_ROTATION 0x36
+ #define DRM_I915_ENABLE_PLANE_RESERVED_REG_BIT_2	0x37
+ #define DRM_I915_SET_CSC		0x39
++#define DRM_I915_DPST_CONTEXT   0x3b
+ #define DRM_I915_GEM_ACCESS_USERDATA	0x3c
+ #define DRM_I915_SET_PLANE_ALPHA	0x3d
+ 
+@@ -342,6 +343,8 @@ struct csc_coeff {
+ #define DRM_IOCTL_I915_ENABLE_PLANE_RESERVED_REG_BIT_2	\
+ 	DRM_IOW(DRM_COMMAND_BASE + DRM_I915_ENABLE_PLANE_RESERVED_REG_BIT_2, \
+ 	struct drm_i915_enable_plane_reserved_reg_bit_2)
++#define DRM_IOCTL_I915_DPST_CONTEXT	DRM_IOWR(DRM_COMMAND_BASE + \
++			DRM_I915_DPST_CONTEXT, struct dpst_initialize_context)
+ #define DRM_IOCTL_I915_GEM_ACCESS_USERDATA	\
+ 		DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_GEM_ACCESS_USERDATA, \
+ 		struct drm_i915_gem_access_userdata)
+@@ -412,6 +415,7 @@ typedef struct drm_i915_irq_wait {
+ #define I915_PARAM_HAS_EXEC_HANDLE_LUT   26
+ #define I915_PARAM_HAS_WT     	 	 27
+ #define I915_PARAM_CMD_PARSER_VERSION	 28
++#define I915_PARAM_HAS_DPST		 29
+ 
+ typedef struct drm_i915_getparam {
+ 	int param;
+@@ -1174,4 +1178,78 @@ struct drm_i915_set_plane_alpha {
+ 	int plane;
+ 	int alpha;
+ };
++
++/* Total number of DIET entries */
++#define	DPST_DIET_ENTRY_COUNT	33
++
++/* Value to reset image enhancement interrupt register */
++#define DPST_RESET_IE		0x40004000
++
++/* No dpst adjustment for backlight, i.e, 100% of the user specified
++   backlight will be applied (dpst will not reduce the backlight). */
++#define DPST_MAX_FACTOR		10000
++
++/* Threshold that will generate interrupts when crossed */
++#define DEFAULT_GUARDBAND_VAL 30
++
++struct dpst_ie {
++	enum dpst_diet_alg {
++		i915_DPST_RGB_TRANSLATOR = 0,
++		i915_DPST_YUV_ADDER,
++		i915_DPST_HSV_MULTIPLIER
++	} diet_algorithm;
++	__u32  base_lut_index;	/* Base lut index (192 for legacy mode)*/
++	__u32  factor_present[DPST_DIET_ENTRY_COUNT];
++	__u32  factor_new[DPST_DIET_ENTRY_COUNT];
++	__u32  factor_scalar;
++};
++
++struct dpst_ie_container {
++	struct dpst_ie dpst_ie_st;
++	__u32	dpst_blc_factor;
++	__u32	pipe_n;
++};
++
++struct dpst_initialize_data {
++	__u32 pipe_n;
++	__u32 threshold_gb;
++	__u32 gb_delay;
++	__u32 hist_reg_values;
++	__u32 image_res;
++	__u32 sig_num;
++};
++
++struct dpst_histogram {
++	__u16	event;
++	__u32	status[32];
++	__u32	threshold[12];
++	__u32	gb_val;
++	__u32	gb_int_delay;
++	__u32   bkl_val;
++	enum dpst_hist_mode {
++		i915_DPST_YUV_LUMA_MODE = 0,
++		i915_DPST_HSV_INTENSITY_MODE
++	} hist_mode;
++};
++
++struct dpst_histogram_status {
++	__u32	pipe_n;
++	struct dpst_histogram histogram_bins;
++};
++
++struct dpst_initialize_context {
++	enum dpst_call_type {
++		DPST_ENABLE = 1,
++		DPST_DISABLE,
++		DPST_INIT_DATA,
++		DPST_GET_BIN_DATA,
++		DPST_APPLY_LUMA,
++		DPST_RESET_HISTOGRAM_STATUS
++	} dpst_ioctl_type;
++	union {
++		struct dpst_initialize_data	init_data;
++		struct dpst_ie_container	ie_container;
++		struct dpst_histogram_status	hist_status;
++	};
++};
+ #endif /* _UAPI_I915_DRM_H_ */
+-- 
+1.7.9.5
+

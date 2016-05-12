@@ -1,0 +1,100 @@
+From 92e898a9e5990afec606e60aa83dad2290387522 Mon Sep 17 00:00:00 2001
+From: Rapaka Naveen <naveen.rapaka@intel.com>
+Date: Sat, 25 Apr 2015 03:15:15 +0530
+Subject: [PATCH] EM/PMIC: remove the unnecessary mutex to protect list
+ iteration
+
+The OTG functionality is not working at boot because of the continuous
+SMBus error code -110 from the pmic ccsm driver which fails in BQ charger
+register read/write timeout because of missing pmic interrupts.
+
+The pmic interrupt processing is unblocked by removing unneccesary mutex locks
+held at the time of processing of linked list. The list itself takes care of
+locks and additional mutex lock is not required
+
+Change-Id: Ia90062b47eaa378d80c07c1f5b0a2652d9bb8302
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1479
+Signed-off-by: Kannappan, R <r.kannappan@intel.com>
+Signed-off-by: Rapaka Naveen <naveen.rapaka@intel.com>
+---
+ drivers/power/intel_pmic_ccsm.c | 16 ++++------------
+ drivers/power/intel_pmic_ccsm.h |  1 -
+ 2 files changed, 4 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/power/intel_pmic_ccsm.c b/drivers/power/intel_pmic_ccsm.c
+index 828e478..78c09e9 100644
+--- a/drivers/power/intel_pmic_ccsm.c
++++ b/drivers/power/intel_pmic_ccsm.c
+@@ -1079,7 +1079,6 @@ static void pmic_event_worker(struct work_struct *work)
+ 
+ 	dev_dbg(chc.dev, "%s\n", __func__);
+ 
+-	mutex_lock(&chc.evt_queue_lock);
+ 	list_for_each_entry_safe(evt, tmp, &chc.evt_queue, node) {
+ 		list_del(&evt->node);
+ 
+@@ -1097,8 +1096,6 @@ static void pmic_event_worker(struct work_struct *work)
+ 						evt->battemp_int_stat);
+ 		kfree(evt);
+ 	}
+-
+-	mutex_unlock(&chc.evt_queue_lock);
+ }
+ 
+ static irqreturn_t pmic_isr(int irq, void *data)
+@@ -1164,9 +1161,7 @@ static irqreturn_t pmic_thread_handler(int id, void *data)
+ 	}
+ 
+ 	INIT_LIST_HEAD(&evt->node);
+-	mutex_lock(&chc.evt_queue_lock);
+ 	list_add_tail(&evt->node, &chc.evt_queue);
+-	mutex_unlock(&chc.evt_queue_lock);
+ 
+ 	dev_dbg(chc.dev, "%s pwrsrc=%X, spwrsrc=%x battirq=%x sbattirq=%x miscirq=%x smiscirq=%x wake thread\n",
+ 			__func__, evt->pwrsrc_int,
+@@ -1515,9 +1510,7 @@ static int pmic_check_initial_events(void)
+ 	}
+ 
+ 	INIT_LIST_HEAD(&evt->node);
+-	mutex_lock(&chc.evt_queue_lock);
+ 	list_add_tail(&evt->node, &chc.evt_queue);
+-	mutex_unlock(&chc.evt_queue_lock);
+ 	schedule_work(&chc.evt_work);
+ 
+ 	pmic_bat_zone_changed();
+@@ -1756,7 +1749,10 @@ static int pmic_chrgr_probe(struct platform_device *pdev)
+ 
+ 	INIT_WORK(&chc.evt_work, pmic_event_worker);
+ 	INIT_LIST_HEAD(&chc.evt_queue);
+-	mutex_init(&chc.evt_queue_lock);
++
++	ret = pmic_check_initial_events();
++	if (ret)
++		goto otg_req_failed;
+ 
+ 	/* register interrupt */
+ 	for (i = 0; i < chc.irq_cnt; ++i) {
+@@ -1785,10 +1781,6 @@ static int pmic_chrgr_probe(struct platform_device *pdev)
+ 		dev_warn(&pdev->dev, "Error updating register: %x\n",
+ 				chc.reg_map->pmic_mchgrirq1);
+ 
+-	ret = pmic_check_initial_events();
+-	if (ret)
+-		goto otg_req_failed;
+-
+ 	chc.batt_health = POWER_SUPPLY_HEALTH_GOOD;
+ #ifdef CONFIG_DEBUG_FS
+ 	pmic_debugfs_init();
+diff --git a/drivers/power/intel_pmic_ccsm.h b/drivers/power/intel_pmic_ccsm.h
+index 193428e..fca3149 100644
+--- a/drivers/power/intel_pmic_ccsm.h
++++ b/drivers/power/intel_pmic_ccsm.h
+@@ -399,5 +399,4 @@ struct pmic_chrgr_drv_context {
+ 	struct thermal_cooling_device *vbus_cdev;
+ 	struct list_head evt_queue;
+ 	struct work_struct evt_work;
+-	struct mutex evt_queue_lock;
+ };
+-- 
+1.9.1
+

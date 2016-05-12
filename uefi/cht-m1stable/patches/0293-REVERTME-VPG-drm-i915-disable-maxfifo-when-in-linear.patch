@@ -1,0 +1,121 @@
+From 13390580be81002de6543416df1ea64ac6548fc2 Mon Sep 17 00:00:00 2001
+Message-Id: <13390580be81002de6543416df1ea64ac6548fc2.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Yunwei Zhang <yunwei.zhang@intel.com>
+Date: Mon, 14 Jul 2014 11:01:53 -0700
+Subject: [PATCH 293/312] REVERTME [VPG]: drm/i915: disable maxfifo when in
+ linear memory.
+
+In linear memory maxfifo tends to cause flicker, issue observed
+in FADiag app. As a temp fix disable maxfifo when in linear
+memory.
+
+Issue: GMIN-2948
+Change-Id: I91603f02b6e415c46f17e1ef208a0693364e4ae2
+Signed-off-by: Yunwei Zhang <yunwei.zhang@intel.com>
+Signed-off-by: Mahesh Kumar <mahesh1.kumar@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    1 +
+ drivers/gpu/drm/i915/intel_display.c |    7 +++++--
+ drivers/gpu/drm/i915/intel_pm.c      |   14 ++++++++++++--
+ drivers/gpu/drm/i915/intel_sprite.c  |   17 ++++++++++++++++-
+ 4 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 55e5dbf..82e5e59 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1589,6 +1589,7 @@ struct drm_i915_private {
+ 
+ 	bool is_first_modeset;
+ 	bool maxfifo_enabled;
++	bool is_tiled;
+ 	bool csc_enabled;
+ 	bool gamma_enabled;
+ 	bool is_resuming;
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index d8b64d4..bfab9eb 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2706,10 +2706,13 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 		rotate = true;
+ 
+ 	if (INTEL_INFO(dev)->gen >= 4) {
+-		if (obj->tiling_mode != I915_TILING_NONE)
++		if (obj->tiling_mode != I915_TILING_NONE) {
+ 			dspcntr |= DISPPLANE_TILED;
+-		else
++			dev_priv->is_tiled = true;
++		} else {
+ 			dspcntr &= ~DISPPLANE_TILED;
++			dev_priv->is_tiled = false;
++		}
+ 	}
+ 
+ 	if (IS_G4X(dev))
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 116191c..10d87c5 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -1644,7 +1644,12 @@ static void valleyview_update_wm(struct drm_crtc *crtc)
+ 			    &planeb_wm, &cursorb_wm))
+ 		enabled |= 1 << PIPE_B;
+ 
+-	if (is_maxfifo_needed(dev_priv) & !dev_priv->maxfifo_enabled) {
++	/*
++	 * TODO: when in linear memory dont enable maxfifo. Need to check with
++	 * the hardware team on this. This solves the FADiag app flicker
++	 */
++	if (is_maxfifo_needed(dev_priv) & !dev_priv->maxfifo_enabled &
++				dev_priv->is_tiled) {
+ 		I915_WRITE(FW_BLC_SELF_VLV, FW_CSPWRDWNEN);
+ 		dev_priv->maxfifo_enabled = true;
+ 	} else if (dev_priv->maxfifo_enabled && !is_maxfifo_needed(dev_priv)) {
+@@ -3159,7 +3164,12 @@ static void valleyview_update_sprite_wm(struct drm_plane *plane,
+ 	enable.cursor_enabled = false;
+ 	enable.sprite_enabled = enabled;
+ 
+-	if (is_maxfifo_needed(dev_priv) & !dev_priv->maxfifo_enabled) {
++	/*
++	 * TODO: when in linear memory dont enable maxfifo. Need to check with
++	 * the hardware team on this. This solves the FADiag app flicker
++	 */
++	if (is_maxfifo_needed(dev_priv) & !dev_priv->maxfifo_enabled &
++			dev_priv->is_tiled) {
+ 		I915_WRITE(FW_BLC_SELF_VLV, FW_CSPWRDWNEN);
+ 		dev_priv->maxfifo_enabled = true;
+ 	} else if (dev_priv->maxfifo_enabled && !is_maxfifo_needed(dev_priv)) {
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 432a392d..5cda415 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -474,8 +474,23 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	 */
+ 	sprctl |= SP_GAMMA_ENABLE;
+ 
+-	if (obj->tiling_mode != I915_TILING_NONE)
++	if (obj->tiling_mode != I915_TILING_NONE) {
+ 		sprctl |= SP_TILED;
++		dev_priv->is_tiled = true;
++	} else {
++		sprctl &= ~SP_TILED;
++		dev_priv->is_tiled = false;
++
++		/*
++		 * TODO:In linear mode disable maxfifo, hack to the
++		 * FADiag app flicker issue.
++		 */
++		if (dev_priv->maxfifo_enabled) {
++			I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
++			dev_priv->maxfifo_enabled = false;
++			intel_wait_for_vblank(dev, pipe);
++		}
++	}
+ 
+ 	sprctl |= SP_ENABLE;
+ 
+-- 
+1.7.9.5
+

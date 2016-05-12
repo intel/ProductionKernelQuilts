@@ -1,0 +1,115 @@
+From 36bbadcfe7b7c3303538116d9b4437348562f1a6 Mon Sep 17 00:00:00 2001
+Message-Id: <36bbadcfe7b7c3303538116d9b4437348562f1a6.1421886431.git.chang-joon.lee@intel.com>
+In-Reply-To: <2a59efb195329ac28200fa6e68e1170a4cf8d03c.1421886431.git.chang-joon.lee@intel.com>
+References: <2a59efb195329ac28200fa6e68e1170a4cf8d03c.1421886431.git.chang-joon.lee@intel.com>
+From: Zhang Ning <ning.a.zhang@intel.com>
+Date: Mon, 8 Dec 2014 17:07:33 +0800
+Subject: [PATCH 05/11] FOR UPSTREAM [VPG]: drm/i915: Skip unbinding of fenced
+ objects from shrinker
+
+GFX device is being resumed (runtime) during MP3 playback, leaking power.
+Resume is happening due to invocation of GEM shrinker. If system is running
+low on memory, then Gfx driver is also expected to make a contribution
+towards freeing up some memory.
+For Tiled objects, access to fence register is required, when unbinding them
+from GTT. That's why the GFX device was being runtime resumed in the shrinker path.
+To avoid this intermediate resume of the Gfx device, due to power constraints,
+now Tiled (fenced) objects won't be considered for purge in the Shrinker path.
+
+v2: Moved the runtime pm status functions outside the
+    CONFIG_SUPPORT_LPDMA_HDMI_AUDIO switch (Zhang Ning)
+
+Issue: GMINL-4502
+Change-Id: Ia0032005ce78556b261be79835497b7b3b602899
+Signed-off-by: Zhang Ning <ning.a.zhang@intel.com>
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c  |   18 ++++++++++--------
+ drivers/gpu/drm/i915/intel_drv.h |    1 +
+ drivers/gpu/drm/i915/intel_pm.c  |    8 ++++----
+ 3 files changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index c2bba10..564a117 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2087,12 +2087,6 @@ i915_gem_shrink(struct drm_i915_private *dev_priv,
+ 	if (flags & I915_SHRINK_BOUND) {
+ 		struct list_head still_in_list;
+ 
+-	/*
+-	 * Making sure device is resumed with rpm get, since fence registers
+-	 * are accessed for bound_list.
+-	 */
+-	intel_runtime_pm_get(dev_priv);
+-
+ 		INIT_LIST_HEAD(&still_in_list);
+ 		while (count < target && !list_empty(&dev_priv->mm.bound_list)) {
+ 			struct drm_i915_gem_object *obj;
+@@ -2105,6 +2099,16 @@ i915_gem_shrink(struct drm_i915_private *dev_priv,
+ 			if (!i915_gem_object_is_purgeable(obj) && purgeable_only)
+ 				continue;
+ 
++			/*
++			 * Skip the unbinding of objects, possessing a fence
++			 * register, if the device in the suspended state.
++			 * Otherwise device has to be resumed before an access
++			 * is made to the fence register on unbinding.
++			 */
++			if (i915_is_device_suspended(dev_priv->dev) &&
++			    (obj->fence_reg != I915_FENCE_REG_NONE))
++				continue;
++
+ 			drm_gem_object_reference(&obj->base);
+ 
+ 			list_for_each_entry_safe(vma, v, &obj->vma_list, vma_link)
+@@ -2117,8 +2121,6 @@ i915_gem_shrink(struct drm_i915_private *dev_priv,
+ 			drm_gem_object_unreference(&obj->base);
+ 		}
+ 		list_splice(&still_in_list, &dev_priv->mm.bound_list);
+-	intel_runtime_pm_put(dev_priv);
+-
+ 	}
+ 
+ 	return count;
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 29a2efa..7e73229 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1150,6 +1150,7 @@ void intel_update_drrs(struct drm_device *dev);
+ void intel_disable_drrs(struct drm_device *dev);
+ extern void vlv_modify_rc6_promotion_timer(struct drm_i915_private *dev_priv,
+ 					    bool media_active);
++bool i915_is_device_suspended(struct drm_device *drm_dev);
+ 
+ /* intel_sdvo.c */
+ bool intel_sdvo_init(struct drm_device *dev, uint32_t sdvo_reg, bool is_sdvob);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 0ece8cd..14faf28 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -797,10 +797,6 @@ void intel_init_drrs_idleness_detection(struct drm_device *dev,
+ 	dev_priv->drrs.drrs_work = work;
+ }
+ 
+-#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+-
+-static struct drm_device *gdev;
+-
+ /* Check for current runtime state */
+ bool i915_is_device_active(struct drm_device *drm_dev)
+ {
+@@ -842,6 +838,10 @@ bool i915_is_device_suspending(struct drm_device *drm_dev)
+ 		return false;
+ }
+ 
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++
++static struct drm_device *gdev;
++
+ /* HDMI Audio HAD and Display interfaces */
+ bool ospm_power_is_hw_on(int hw_islands)
+ {
+-- 
+1.7.9.5
+

@@ -1,0 +1,146 @@
+From 31cc46ab1ac07bfe9e9eec35e41d91539a946cef Mon Sep 17 00:00:00 2001
+Message-Id: <31cc46ab1ac07bfe9e9eec35e41d91539a946cef.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Uma Shankar <uma.shankar@intel.com>
+Date: Wed, 5 Mar 2014 20:15:20 +0530
+Subject: [PATCH 288/312] FOR_UPSTREAM [VPG]: drm/i915: Update wm and drain
+ latency when refresh rate changes
+
+Made Valleyview specific changes. Resolved flicker issue when moving
+to higher refresh rate. Watermark and drain latency programming taken
+care of while refresh rate switch.
+
+Issue: GMIN-2466
+Change-Id: Ia4932384f7679b0c0d3a7995683329c534137705
+Signed-off-by: Uma Shankar <uma.shankar@intel.com>
+Signed-off-by: Nabendu Maiti <nabendu.bikash.maiti@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/i915_reg.h      |    1 +
+ drivers/gpu/drm/i915/intel_display.c |    1 +
+ drivers/gpu/drm/i915/intel_dp.c      |   10 ++++++++--
+ drivers/gpu/drm/i915/intel_pm.c      |   12 +++++++++++-
+ drivers/gpu/drm/i915/intel_sprite.c  |    8 ++++++++
+ 5 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index fee34d4..44703fd 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -3779,6 +3779,7 @@ enum punit_power_well {
+ #define   PIPECONF_PFIT_PF_INTERLACED_DBL_ILK	(5 << 21) /* ilk/snb only */
+ #define   PIPECONF_INTERLACE_MODE_MASK		(7 << 21)
+ #define   PIPECONF_EDP_RR_MODE_SWITCH		(1 << 20)
++#define   PIPECONF_EDP_RR_MODE_SWITCH_VLV	(1 << 14)
+ #define   PIPECONF_CXSR_DOWNCLOCK	(1<<16)
+ #define   PIPECONF_COLOR_RANGE_SELECT	(1 << 13)
+ #define   PIPECONF_BPC_MASK	(0x7 << 5)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 5261810..6a5957b 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5475,6 +5475,7 @@ static void intel_crtc_update_sarea(struct drm_crtc *crtc,
+ 		DRM_ERROR("Can't update pipe %c in SAREA\n", pipe_name(pipe));
+ 		break;
+ 	}
++	intel_update_drrs(dev);
+ }
+ 
+ /* Master function to enable/disable CRTC and corresponding power wells */
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 3355fcd..5880529 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -4555,10 +4555,16 @@ void intel_dp_set_drrs_state(struct drm_device *dev, int refresh_rate)
+ 		reg = PIPECONF(intel_crtc->config.cpu_transcoder);
+ 		val = I915_READ(reg);
+ 		if (index > DRRS_HIGH_RR) {
+-			val |= PIPECONF_EDP_RR_MODE_SWITCH;
++			if (IS_VALLEYVIEW(dev))
++				val |= PIPECONF_EDP_RR_MODE_SWITCH_VLV;
++			else
++				val |= PIPECONF_EDP_RR_MODE_SWITCH;
+ 			intel_dp_set_m2_n2(intel_crtc, &config->dp_m2_n2);
+ 		} else {
+-			val &= ~PIPECONF_EDP_RR_MODE_SWITCH;
++			if (IS_VALLEYVIEW(dev))
++				val &= ~PIPECONF_EDP_RR_MODE_SWITCH_VLV;
++			else
++				val &= ~PIPECONF_EDP_RR_MODE_SWITCH;
+ 		}
+ 		I915_WRITE(reg, val);
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index b283ce3..a4c9c7d 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -660,6 +660,8 @@ static void intel_drrs_work_fn(struct work_struct *__work)
+ 
+ 	intel_dp_set_drrs_state(work->crtc->dev,
+ 		dev_priv->drrs.connector->panel.downclock_mode->vrefresh);
++
++	intel_update_watermarks(work->crtc);
+ }
+ 
+ static void intel_cancel_drrs_work(struct drm_i915_private *dev_priv)
+@@ -698,6 +700,7 @@ void intel_disable_drrs(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_dp *intel_dp = NULL;
++	struct drm_crtc *crtc;
+ 
+ 	if (dev_priv->drrs.connector == NULL)
+ 		return;
+@@ -713,6 +716,13 @@ void intel_disable_drrs(struct drm_device *dev)
+ 		intel_dp_set_drrs_state(dev,
+ 			dev_priv->drrs.connector->panel.fixed_mode->vrefresh);
+ 	}
++
++	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
++		if (crtc) {
++			if (intel_pipe_has_type(crtc, INTEL_OUTPUT_EDP))
++				intel_update_watermarks(crtc);
++		}
++	}
+ }
+ 
+ /**
+@@ -734,7 +744,7 @@ void intel_update_drrs(struct drm_device *dev)
+ 		return;
+ 
+ 	list_for_each_entry(tmp_crtc, &dev->mode_config.crtc_list, head) {
+-		if (tmp_crtc != NULL && intel_crtc_active(tmp_crtc)) {
++		if (intel_crtc_active(tmp_crtc)) {
+ 			if (crtc) {
+ 				DRM_DEBUG_KMS(
+ 				"more than one pipe active, disabling DRRS\n");
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 3bd8dc2..61ddb08 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -479,6 +479,12 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 
+ 	sprctl |= SP_ENABLE;
+ 
++	/*
++	 * disable current DRRS work scheduled and restart
++	 * to push work by another x seconds
++	 */
++	intel_update_drrs(dev);
++
+ 	intel_update_sprite_watermarks(dplane, crtc, src_w, pixel_size, true,
+ 				       src_w != crtc_w || src_h != crtc_h);
+ 
+@@ -1080,6 +1086,8 @@ intel_post_enable_primary(struct drm_crtc *crtc)
+ 
+ 	mutex_lock(&dev->struct_mutex);
+ 	intel_update_fbc(dev);
++	intel_update_drrs(dev);
++	intel_update_watermarks(crtc);
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
+-- 
+1.7.9.5
+

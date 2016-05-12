@@ -1,0 +1,120 @@
+From 73aa62920a7e29c32d210b574fd6909ec96195e3 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Date: Wed, 8 Oct 2014 13:24:19 +0100
+Subject: [PATCH 334/351] ASoC: arizona: Poll for FLL clock OK rather than use
+ interrupts
+
+As we may change the FLL from within IRQ handler threads and our IRQs
+are marked as ONE_SHOT we need to poll for the FLL clock OK.
+
+Change-Id: I3e30a184311788c453732d2c472c40899b9ab67a
+Signed-off-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+---
+ sound/soc/codecs/arizona.c |   48 +++++++++++++++++++++++---------------------
+ 1 file changed, 25 insertions(+), 23 deletions(-)
+
+diff --git a/sound/soc/codecs/arizona.c b/sound/soc/codecs/arizona.c
+index 438eeca..7a861bf 100644
+--- a/sound/soc/codecs/arizona.c
++++ b/sound/soc/codecs/arizona.c
+@@ -2206,17 +2206,6 @@ int arizona_init_dai(struct arizona_priv *priv, int id)
+ }
+ EXPORT_SYMBOL_GPL(arizona_init_dai);
+ 
+-static irqreturn_t arizona_fll_clock_ok(int irq, void *data)
+-{
+-	struct arizona_fll *fll = data;
+-
+-	arizona_fll_dbg(fll, "clock OK\n");
+-
+-	complete(&fll->ok);
+-
+-	return IRQ_HANDLED;
+-}
+-
+ static struct {
+ 	unsigned int min;
+ 	unsigned int max;
+@@ -2499,7 +2488,6 @@ static int arizona_is_enabled_fll(struct arizona_fll *fll)
+ static int arizona_enable_fll(struct arizona_fll *fll)
+ {
+ 	struct arizona *arizona = fll->arizona;
+-	int ret;
+ 	bool use_sync = false;
+ 	int already_enabled = arizona_is_enabled_fll(fll);
+ 	struct arizona_fll_cfg cfg;
+@@ -2579,10 +2567,18 @@ static int arizona_enable_fll(struct arizona_fll *fll)
+ 				   ARIZONA_FLL1_FREERUN, 0);
+ 
+ 	if (fll_change ||  !already_enabled) {
++		int i;
++		unsigned int val = 0;
+ 		arizona_fll_dbg(fll, "Waiting for FLL lock...\n");
+-		ret = wait_for_completion_timeout(&fll->ok,
+-						  msecs_to_jiffies(250));
+-		if (ret == 0)
++		for (i = 0; i < 25; i++) {
++			regmap_read(arizona->regmap,
++				    ARIZONA_INTERRUPT_RAW_STATUS_5,
++				    &val);
++			if (val & (ARIZONA_FLL1_CLOCK_OK_STS << (fll->id - 1)))
++				break;
++			msleep(10);
++		}
++		if (i == 25)
+ 			arizona_fll_warn(fll, "Timed out waiting for lock\n");
+ 	}
+ 
+@@ -2593,6 +2589,8 @@ static void arizona_disable_fll(struct arizona_fll *fll)
+ {
+ 	struct arizona *arizona = fll->arizona;
+ 	bool change;
++	int i;
++	unsigned int val = 0;
+ 
+ 	arizona_fll_dbg(fll, "Disabling FLL\n");
+ 
+@@ -2605,6 +2603,18 @@ static void arizona_disable_fll(struct arizona_fll *fll)
+ 	regmap_update_bits(arizona->regmap, fll->base + 1,
+ 			   ARIZONA_FLL1_FREERUN, 0);
+ 
++	arizona_fll_dbg(fll, "Waiting for FLL disable...\n");
++	for (i = 0; i < 25; i++) {
++		regmap_read(arizona->regmap,
++			    ARIZONA_INTERRUPT_RAW_STATUS_5,
++			    &val);
++		if (!(val & (ARIZONA_FLL1_CLOCK_OK_STS << (fll->id - 1))))
++			break;
++		msleep(10);
++	}
++	if (i == 25)
++		arizona_fll_warn(fll, "Timed out waiting for disable\n");
++
+ 	if (change)
+ 		pm_runtime_put_autosuspend(arizona->dev);
+ }
+@@ -2687,7 +2697,6 @@ EXPORT_SYMBOL_GPL(arizona_set_fll);
+ int arizona_init_fll(struct arizona *arizona, int id, int base, int lock_irq,
+ 		     int ok_irq, struct arizona_fll *fll)
+ {
+-	int ret;
+ 	unsigned int val;
+ 
+ 	init_completion(&fll->ok);
+@@ -2713,13 +2722,6 @@ int arizona_init_fll(struct arizona *arizona, int id, int base, int lock_irq,
+ 	snprintf(fll->clock_ok_name, sizeof(fll->clock_ok_name),
+ 		 "FLL%d clock OK", id);
+ 
+-	ret = arizona_request_irq(arizona, ok_irq, fll->clock_ok_name,
+-				  arizona_fll_clock_ok, fll);
+-	if (ret != 0) {
+-		dev_err(arizona->dev, "Failed to get FLL%d clock OK IRQ: %d\n",
+-			id, ret);
+-	}
+-
+ 	regmap_update_bits(arizona->regmap, fll->base + 1,
+ 			   ARIZONA_FLL1_FREERUN, 0);
+ 
+-- 
+1.7.9.5
+

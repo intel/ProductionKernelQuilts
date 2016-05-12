@@ -1,0 +1,239 @@
+From 69c06062f55a5a6d7f9595d369fd747d8e5846bf Mon Sep 17 00:00:00 2001
+Message-Id: <69c06062f55a5a6d7f9595d369fd747d8e5846bf.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: Akashdeep Sharma <akashdeep.sharma@intel.com>
+Date: Mon, 2 Feb 2015 10:13:55 +0530
+Subject: [PATCH 05/61] MUST_REBASE [VPG]: video/adf: HDMI LPE Audio
+ Interrupts
+
+Enable/ Disable HDMI LPE Audio interrupts as requested by audio
+driver. Also, handle the same in encoder code.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5532
+Change-Id: I7c604ba1ce691b070f79c3037439d3dd36575268
+Signed-off-by: Akashdeep Sharma <akashdeep.sharma@intel.com>
+---
+ .../adf/intel/core/common/hdmi/gen_hdmi_audio.c    |   16 ++++
+ .../adf/intel/core/common/hdmi/gen_hdmi_hotplug.c  |    6 ++
+ .../video/adf/intel/core/common/intel_adf_events.c |   84 ++++++++++++++++++++
+ .../video/adf/intel/include/core/vlv/chv_dc_regs.h |   12 +++
+ drivers/video/adf/intel/include/intel_adf.h        |    2 +
+ 5 files changed, 120 insertions(+)
+
+diff --git a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_audio.c b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_audio.c
+index 6159be8..42d912b 100644
+--- a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_audio.c
++++ b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_audio.c
+@@ -27,6 +27,7 @@
+ 
+ static struct hdmi_audio_priv hdmi_priv;
+ static struct hdmi_pipe *pipe;
++static u32 hdmi_audio_interrupt_mask;
+ 
+ void adf_hdmi_audio_signal_event(enum had_event_type event)
+ {
+@@ -94,6 +95,7 @@ static int adf_hdmi_audio_set_caps(enum had_caps_list set_element,
+ 		void *capabilties)
+ {
+ 	int ret = 0;
++	u32 int_masks = 0;
+ 	struct intel_pipeline *pipeline = pipe->base.pipeline;
+ 	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
+ 	struct vlv_hdmi_port *hdmi_port;
+@@ -109,8 +111,22 @@ static int adf_hdmi_audio_set_caps(enum had_caps_list set_element,
+ 		vlv_hdmi_port_disable_audio(hdmi_port);
+ 		break;
+ 	case HAD_SET_ENABLE_AUDIO_INT:
++		if (*((u32 *)capabilties) & HDMI_AUDIO_UNDERRUN)
++			int_masks |= ADF_HDMI_AUDIO_UNDERRUN_ENABLE;
++		hdmi_audio_interrupt_mask |= int_masks;
++		intel_adf_enable_hdmi_audio_int(hdmi_audio_interrupt_mask);
+ 		break;
+ 	case HAD_SET_DISABLE_AUDIO_INT:
++		if (*((u32 *)capabilties) & HDMI_AUDIO_UNDERRUN)
++			int_masks |= ADF_HDMI_AUDIO_UNDERRUN_ENABLE;
++		hdmi_audio_interrupt_mask &= ~int_masks;
++
++		if (hdmi_audio_interrupt_mask)
++			intel_adf_enable_hdmi_audio_int(
++				hdmi_audio_interrupt_mask);
++		else
++			intel_adf_disable_hdmi_audio_int(
++				hdmi_audio_interrupt_mask);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_hotplug.c b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_hotplug.c
+index ff5a453..3a6768f 100644
+--- a/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_hotplug.c
++++ b/drivers/video/adf/intel/core/common/hdmi/gen_hdmi_hotplug.c
+@@ -612,6 +612,12 @@ int intel_adf_hdmi_handle_events(struct hdmi_pipe *hdmi_pipe, u32 events)
+ 		}
+ 	}
+ 
++	if (events & INTEL_PIPE_EVENT_AUDIO_BUFFERDONE)
++		adf_hdmi_audio_signal_event(HAD_EVENT_AUDIO_BUFFER_DONE);
++
++	if (events & INTEL_PIPE_EVENT_AUDIO_UNDERRUN)
++		adf_hdmi_audio_signal_event(HAD_EVENT_AUDIO_BUFFER_UNDERRUN);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/video/adf/intel/core/common/intel_adf_events.c b/drivers/video/adf/intel/core/common/intel_adf_events.c
+index d166668..0434292 100644
+--- a/drivers/video/adf/intel/core/common/intel_adf_events.c
++++ b/drivers/video/adf/intel/core/common/intel_adf_events.c
+@@ -24,6 +24,7 @@
+ #include <core/common/dsi/dsi_pipe.h>
+ #include <video/adf_client.h>
+ #include <video/adf_client.h>
++#include <core/vlv/chv_dc_regs.h>
+ 
+ struct intel_adf_context *context_from_hp_work(struct work_struct *work)
+ {
+@@ -355,6 +356,36 @@ u32 intel_adf_get_pipe_events(struct intel_pipe *pipe)
+ 	return events;
+ }
+ 
++/**
++ * HDMI LPE Audio events for CHV
++ */
++u32 intel_adf_get_audio_events(struct intel_pipe *pipe)
++{
++	u32 events = 0;
++	u32 lpe_stream = 0;
++	u32 iir_reg = REG_READ(VLV_IIR);
++
++	if (pipe->base.idx == PIPE_C) {
++		if (iir_reg & ADF_LPE_PIPE_C_INTERRUPT) {
++			lpe_stream = REG_READ(ADF_LPE_AUDIO_HDMI_STATUS_C);
++			if (lpe_stream & ADF_HDMI_AUDIO_UNDERRUN) {
++				REG_WRITE(ADF_LPE_AUDIO_HDMI_STATUS_C,
++						ADF_HDMI_AUDIO_UNDERRUN);
++				events |= INTEL_PIPE_EVENT_AUDIO_UNDERRUN;
++			}
++			if (lpe_stream & ADF_HDMI_AUDIO_BUFFER_DONE) {
++				REG_WRITE(ADF_LPE_AUDIO_HDMI_STATUS_C,
++						ADF_HDMI_AUDIO_BUFFER_DONE);
++				events |= INTEL_PIPE_EVENT_AUDIO_BUFFERDONE;
++			}
++		}
++		return events;
++	} else {
++		/* In case of pther pipes returning zero */
++		return 0;
++	}
++}
++
+ int intel_adf_get_events(struct intel_pipe *pipe, u32 *events)
+ {
+ 	if (!pipe || !events) {
+@@ -376,6 +407,9 @@ int intel_adf_get_events(struct intel_pipe *pipe, u32 *events)
+ 	/* Check PORT interrupts */
+ 	*events |= intel_adf_get_port_events(pipe);
+ 
++	/* Get HDMI LPE Audio events */
++	*events |= intel_adf_get_audio_events(pipe);
++
+ 	pr_debug("ADF: %s\n", __func__);
+ 	return 0;
+ }
+@@ -440,3 +474,53 @@ void intel_adf_hpd_init(struct intel_adf_context *ctx)
+ 		REG_WRITE(PORT_HOTPLUG_EN, hotplug_en);
+ 	}
+ }
++
++/**
++ * Following APIs are to enable LPE audio interrupts
++ * for CHV.
++ */
++void intel_adf_enable_lpe_pipestat(u32 int_mask)
++{
++	u32 mask;
++	pr_debug("ADF: HDMI:%s\n", __func__);
++
++	mask = int_mask;
++	mask |= (ADF_HDMI_AUDIO_UNDERRUN | ADF_HDMI_AUDIO_BUFFER_DONE);
++
++	REG_WRITE(ADF_LPE_AUDIO_HDMI_STATUS_C, mask);
++	REG_POSTING_READ(ADF_LPE_AUDIO_HDMI_STATUS_C);
++}
++
++void intel_adf_enable_hdmi_audio_int(u32 int_mask)
++{
++	u32 imr = 0;
++	pr_debug("ADF: HDMI:%s\n", __func__);
++
++	imr = REG_READ(VLV_IMR);
++	imr &= ~ADF_LPE_PIPE_C_INTERRUPT;
++	REG_WRITE(VLV_IMR, imr);
++	intel_adf_enable_lpe_pipestat(int_mask);
++}
++
++void intel_adf_disable_lpe_pipestat(u32 int_mask)
++{
++	u32 mask;
++	pr_debug("ADF: HDMI:%s\n", __func__);
++
++	mask = int_mask;
++	mask |= (ADF_HDMI_AUDIO_UNDERRUN | ADF_HDMI_AUDIO_BUFFER_DONE);
++
++	REG_WRITE(ADF_LPE_AUDIO_HDMI_STATUS_C, mask);
++	REG_POSTING_READ(ADF_LPE_AUDIO_HDMI_STATUS_C);
++}
++
++void intel_adf_disable_hdmi_audio_int(u32 int_mask)
++{
++	u32 imr = 0;
++	pr_debug("ADF: HDMI:%s\n", __func__);
++
++	imr = REG_READ(VLV_IMR);
++	imr |= ADF_LPE_PIPE_C_INTERRUPT;
++	REG_WRITE(VLV_IMR, imr);
++	intel_adf_disable_lpe_pipestat(int_mask);
++}
+diff --git a/drivers/video/adf/intel/include/core/vlv/chv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/chv_dc_regs.h
+index 3f75524..489a9b7 100644
+--- a/drivers/video/adf/intel/include/core/vlv/chv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/chv_dc_regs.h
+@@ -111,6 +111,18 @@
+ #define   SP_ENABLE                     (1<<31)
+ 
+ /* Added for HDMI LPE Audio */
++#define ADF_LPE_AUDIO_HDMI_STATUS_A \
++	(CHV_DISPLAY_BASE + 0x65064)
++#define ADF_LPE_AUDIO_HDMI_STATUS_B \
++	(CHV_DISPLAY_BASE + 0x65864)
++#define ADF_LPE_AUDIO_HDMI_STATUS_C \
++	(CHV_DISPLAY_BASE + 0x65964)
++#define ADF_LPE_PIPE_B_INTERRUPT	(1<<20)
++#define ADF_LPE_PIPE_A_INTERRUPT	(1<<21)
++#define ADF_LPE_PIPE_C_INTERRUPT	(1<<12)
++#define ADF_HDMI_AUDIO_UNDERRUN		(1UL<<31)
++#define ADF_HDMI_AUDIO_BUFFER_DONE	(1UL<<29)
++#define ADF_HDMI_AUDIO_UNDERRUN_ENABLE	(1UL<<15)
+ #define ADF_HDMI_AUDIO_LPE_C_CONFIG	0x65900
+ #define ADF_HDMI_AUDIO_LPE_B_CONFIG	0x65800
+ #endif
+diff --git a/drivers/video/adf/intel/include/intel_adf.h b/drivers/video/adf/intel/include/intel_adf.h
+index 0413f6c..78791c4 100644
+--- a/drivers/video/adf/intel/include/intel_adf.h
++++ b/drivers/video/adf/intel/include/intel_adf.h
+@@ -62,6 +62,8 @@ extern int intel_adf_map_dma_to_flip(unsigned long args);
+ extern int intel_adf_unmap_dma_to_flip(unsigned long args);
+ extern void intel_adf_hotplug_work_function(struct work_struct *work);
+ extern void intel_adf_hpd_init(struct intel_adf_context *ctx);
++void intel_adf_enable_hdmi_audio_int(u32 int_mask);
++void intel_adf_disable_hdmi_audio_int(u32 int_mask);
+ 
+ /* Color correction related */
+ extern bool intel_color_manager_apply(struct color_capabilities *color_props,
+-- 
+1.7.9.5
+

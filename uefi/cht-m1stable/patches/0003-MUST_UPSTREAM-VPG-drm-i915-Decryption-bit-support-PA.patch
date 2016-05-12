@@ -1,0 +1,169 @@
+From b9ffbe5024261273207e862fe3cf14a08d7d58df Mon Sep 17 00:00:00 2001
+Message-Id: <b9ffbe5024261273207e862fe3cf14a08d7d58df.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: kirankumar <kiran.s.kumar@intel.com>
+Date: Thu, 18 Jul 2013 16:03:09 +0530
+Subject: [PATCH 003/312] MUST_UPSTREAM [VPG]: drm/i915: Decryption bit
+ support-PAVP
+
+Adding DRM_IOCTL to enable plane reserved register bit 2. To make use of crtc_id to get pipe_id - common with the DRM subsystem.
+Based on pipe_id, sprite surface register and sprite surface live register values will be calculated.
+
+Conflicts:
+	drivers/gpu/drm/i915/i915_dma.c
+	drivers/gpu/drm/i915/intel_display.c
+	drivers/gpu/drm/i915/i915_dma.c
+	include/uapi/drm/i915_drm.h
+(cherry picked from commit ea46315f640ff111a543677edd5f5ad16c3b6601)
+
+Change-Id: Ia60bf4266c9e09e006d9cc8bb05dc4aa87ae5189
+Signed-off-by: kirankumar <kiran.s.kumar@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c      |    2 ++
+ drivers/gpu/drm/i915/i915_drv.h      |    2 ++
+ drivers/gpu/drm/i915/i915_reg.h      |    3 ++
+ drivers/gpu/drm/i915/intel_display.c |   52 ++++++++++++++++++++++++++++++++++
+ include/uapi/drm/i915_drm.h          |   10 +++++++
+ 5 files changed, 69 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index cac9265..134928b 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -2018,6 +2018,8 @@ const struct drm_ioctl_desc i915_ioctls[] = {
+ 	DRM_IOCTL_DEF_DRV(I915_REG_READ, i915_reg_read_ioctl, DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(I915_GET_RESET_STATS, i915_get_reset_stats_ioctl, DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(I915_GEM_USERPTR, i915_gem_userptr_ioctl, DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(I915_ENABLE_PLANE_RESERVED_REG_BIT_2,
++		i915_enable_plane_reserved_reg_bit_2, DRM_AUTH|DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ };
+ 
+ int i915_max_ioctl = ARRAY_SIZE(i915_ioctls);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 5484f05..2fd2098 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2602,6 +2602,8 @@ int i915_reg_read_ioctl(struct drm_device *dev, void *data,
+ 			struct drm_file *file);
+ int i915_get_reset_stats_ioctl(struct drm_device *dev, void *data,
+ 			       struct drm_file *file);
++int i915_enable_plane_reserved_reg_bit_2(struct drm_device *dev, void *data,
++					struct drm_file *file);
+ 
+ /* overlay */
+ extern struct intel_overlay_error_state *intel_overlay_capture_error_state(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index e691b30..eb17a6a 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -3601,6 +3601,9 @@ enum punit_power_well {
+ #define   PIPECONF_FORCE_BORDER	(1<<25)
+ #define   PIPECONF_INTERLACE_MASK	(7 << 21)
+ #define   PIPECONF_INTERLACE_MASK_HSW	(3 << 21)
++
++#define SURF_RESERVED_REG_BIT_2_ENABLE	(1<<2)
++
+ /* Note that pre-gen3 does not support interlaced display directly. Panel
+  * fitting must be disabled on pre-ilk for interlaced. */
+ #define   PIPECONF_PROGRESSIVE			(0 << 21)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 1112d9e..3a2f42e 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -12368,6 +12368,58 @@ int intel_modeset_vga_set_state(struct drm_device *dev, bool state)
+ 	return 0;
+ }
+ 
++int i915_enable_plane_reserved_reg_bit_2(struct drm_device *dev, void *data,
++					struct drm_file *file)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_i915_enable_plane_reserved_reg_bit_2 *rrb = data;
++	u32 enable = rrb->enable;
++	u32 val, reg1, reg2;
++	u32 pipe_id;
++
++	/* Added this code for making pipe generalization in HSW */
++	struct drm_mode_object *drmmode_obj;
++	struct intel_crtc *crtc;
++
++	if (!drm_core_check_feature(dev, DRIVER_MODESET))
++		return -ENODEV;
++
++	drmmode_obj = drm_mode_object_find(dev, rrb->crtc_id,
++			DRM_MODE_OBJECT_CRTC);
++
++	if (!drmmode_obj) {
++		DRM_ERROR("no such CRTC id\n");
++		return -EINVAL;
++	}
++
++	crtc = to_intel_crtc(obj_to_crtc(drmmode_obj));
++	pipe_id = crtc->pipe;
++
++	reg1 = SPRSURF(pipe_id);
++	reg2 = SPRSURFLIVE(pipe_id);
++
++	if (enable) {
++		/* Program bit enable if it was requested */
++		val = I915_READ(reg1);
++		val |= SURF_RESERVED_REG_BIT_2_ENABLE;
++		I915_WRITE(reg1, val);
++
++		val = I915_READ(reg2);
++		val |= SURF_RESERVED_REG_BIT_2_ENABLE;
++		I915_WRITE(reg2, val);
++	} else {
++		/* Clear the older rrb setting */
++		val = I915_READ(reg1);
++		val &= ~SURF_RESERVED_REG_BIT_2_ENABLE;
++		I915_WRITE(reg1, val);
++
++		val = I915_READ(reg2);
++		val &= ~SURF_RESERVED_REG_BIT_2_ENABLE;
++		I915_WRITE(reg2, val);
++	}
++	return 0;
++}
++
+ struct intel_display_error_state {
+ 
+ 	u32 power_well_driver;
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index ff57f07..71d2b3f 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -224,6 +224,7 @@ typedef struct _drm_i915_sarea {
+ #define DRM_I915_REG_READ		0x31
+ #define DRM_I915_GET_RESET_STATS	0x32
+ #define DRM_I915_GEM_USERPTR		0x33
++#define DRM_I915_ENABLE_PLANE_RESERVED_REG_BIT_2	0x37
+ 
+ #define DRM_IOCTL_I915_INIT		DRM_IOW( DRM_COMMAND_BASE + DRM_I915_INIT, drm_i915_init_t)
+ #define DRM_IOCTL_I915_FLUSH		DRM_IO ( DRM_COMMAND_BASE + DRM_I915_FLUSH)
+@@ -275,6 +276,9 @@ typedef struct _drm_i915_sarea {
+ #define DRM_IOCTL_I915_REG_READ			DRM_IOWR (DRM_COMMAND_BASE + DRM_I915_REG_READ, struct drm_i915_reg_read)
+ #define DRM_IOCTL_I915_GET_RESET_STATS		DRM_IOWR (DRM_COMMAND_BASE + DRM_I915_GET_RESET_STATS, struct drm_i915_reset_stats)
+ #define DRM_IOCTL_I915_GEM_USERPTR			DRM_IOWR (DRM_COMMAND_BASE + DRM_I915_GEM_USERPTR, struct drm_i915_gem_userptr)
++#define DRM_IOCTL_I915_ENABLE_PLANE_RESERVED_REG_BIT_2	\
++	DRM_IOW(DRM_COMMAND_BASE + DRM_I915_ENABLE_PLANE_RESERVED_REG_BIT_2, \
++	struct drm_i915_enable_plane_reserved_reg_bit_2)
+ 
+ /* Allow drivers to submit batchbuffers directly to hardware, relying
+  * on the security mechanisms provided by hardware.
+@@ -1066,4 +1070,10 @@ struct drm_i915_gem_userptr {
+ 	__u32 handle;
+ };
+ 
++struct drm_i915_enable_plane_reserved_reg_bit_2 {
++	__u32 enable;
++	int plane;
++	int crtc_id;
++};
++
+ #endif /* _UAPI_I915_DRM_H_ */
+-- 
+1.7.9.5
+

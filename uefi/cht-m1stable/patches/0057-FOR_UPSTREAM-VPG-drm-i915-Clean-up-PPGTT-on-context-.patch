@@ -1,0 +1,196 @@
+From dd76d370da0d03e8376061013292cdef696758bf Mon Sep 17 00:00:00 2001
+Message-Id: <dd76d370da0d03e8376061013292cdef696758bf.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: Rafael Barbalho <rafael.barbalho@intel.com>
+Date: Wed, 11 Feb 2015 14:48:20 +0000
+Subject: [PATCH 57/61] FOR_UPSTREAM [VPG]: drm/i915: Clean-up PPGTT on
+ context destruction
+
+With full PPGTT enabled an object's VMA entry into a PPGTT VM needs to be
+cleaned up so that the PPGTT PDE & PTE allocations can be freed.
+
+This problem only shows up with full PPGTT because an object's VMA is
+only cleaned-up when the object is destroyed. However, if the object has
+been shared between multiple processes this may not happen, which leads to
+references to the PPGTT still being kept the object was shared.
+
+Under android the sharing of GEM objects is a fairly common operation, thus
+the clean-up has to be more agressive.
+
+Issue: GMINL-5925
+Change-Id: I19fbc793e482acbc55ed654c20fe0d1002ccfcba
+Signed-off-by: Rafael Barbalho <rafael.barbalho@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c         |    7 ++---
+ drivers/gpu/drm/i915/i915_gem_context.c |    2 +-
+ drivers/gpu/drm/i915/i915_gem_gtt.c     |   43 ++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_gem_gtt.h     |    7 +++++
+ 4 files changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 1543cc8..6229bd1 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5001,11 +5001,12 @@ void i915_gem_vma_destroy(struct i915_vma *vma)
+ 		return;
+ 
+ 	vm = vma->vm;
++	list_del(&vma->vma_link);
+ 
+-	if (!i915_is_ggtt(vm))
++	if (!i915_is_ggtt(vm)) {
++		list_del(&vma->vm_link);
+ 		i915_ppgtt_put(i915_vm_to_ppgtt(vm));
+-
+-	list_del(&vma->vma_link);
++	}
+ 
+ 	kfree(vma);
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 3b11b08..75fca5f 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -166,7 +166,7 @@ void i915_gem_context_free(struct kref *ctx_ref)
+ 	if (i915.enable_execlists)
+ 		intel_lr_context_free(ctx);
+ 
+-	i915_ppgtt_put(ctx->ppgtt);
++	i915_ppgtt_destroy(ctx->ppgtt);
+ 
+ 	if (ctx->legacy_hw_ctx.rcs_state)
+ 		drm_gem_object_unreference(&ctx->legacy_hw_ctx.rcs_state->base);
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 3f33d53..94ec541 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -1207,6 +1207,7 @@ static int __hw_ppgtt_init(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt)
+ 	else
+ 		BUG();
+ }
++
+ int i915_ppgtt_init(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1218,6 +1219,8 @@ int i915_ppgtt_init(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt)
+ 		drm_mm_init(&ppgtt->base.mm, ppgtt->base.start,
+ 			    ppgtt->base.total);
+ 		i915_init_vm(dev_priv, &ppgtt->base);
++
++		INIT_LIST_HEAD(&ppgtt->vma_list);
+ 	}
+ 
+ 	return ret;
+@@ -1298,14 +1301,49 @@ void  i915_ppgtt_release(struct kref *kref)
+ 	/* vmas should already be unbound */
+ 	WARN_ON(!list_empty(&ppgtt->base.active_list));
+ 	WARN_ON(!list_empty(&ppgtt->base.inactive_list));
++	WARN_ON(!list_empty(&ppgtt->vma_list));
+ 
+ 	list_del(&ppgtt->base.global_link);
+ 	drm_mm_takedown(&ppgtt->base.mm);
+ 
+ 	ppgtt->base.cleanup(&ppgtt->base);
++
+ 	kfree(ppgtt);
+ }
+ 
++void
++i915_ppgtt_destroy(struct i915_hw_ppgtt *ppgtt)
++{
++	struct i915_vma *vma, *tmp;
++	struct i915_address_space *vm;
++	int ret;
++
++	if (!ppgtt)
++		return;
++
++	vm = &ppgtt->base;
++
++	/*
++	 * If this fires it means that the context reference counting went
++	 * awry.
++	 */
++	WARN_ON(!list_empty(&ppgtt->base.active_list));
++
++	if (!list_empty(&ppgtt->vma_list))
++		list_for_each_entry_safe(vma, tmp, &ppgtt->vma_list, vm_link) {
++			WARN_ON(vma->pin_count != 0);
++			/*
++			 * The object should be inactive at this point, thus
++			 * its pin_count should be 0. We will zero it anyway
++			 * make sure that the unbind call succeeds.
++			 */
++			vma->pin_count = 0;
++			ret = i915_vma_unbind(vma);
++		}
++
++	i915_ppgtt_put(ppgtt);
++}
++
+ static void
+ ppgtt_bind_vma(struct i915_vma *vma,
+ 	       enum i915_cache_level cache_level,
+@@ -2230,6 +2268,7 @@ static struct i915_vma *__i915_gem_vma_create(struct drm_i915_gem_object *obj,
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	INIT_LIST_HEAD(&vma->vma_link);
++	INIT_LIST_HEAD(&vma->vm_link);
+ 	INIT_LIST_HEAD(&vma->mm_list);
+ 	INIT_LIST_HEAD(&vma->exec_list);
+ 	vma->vm = vm;
+@@ -2263,8 +2302,10 @@ static struct i915_vma *__i915_gem_vma_create(struct drm_i915_gem_object *obj,
+ 	if (i915_is_ggtt(vm))
+ 		list_add(&vma->vma_link, &obj->vma_list);
+ 	else {
++		struct i915_hw_ppgtt *ppgtt = i915_vm_to_ppgtt(vm);
+ 		list_add_tail(&vma->vma_link, &obj->vma_list);
+-		i915_ppgtt_get(i915_vm_to_ppgtt(vm));
++		i915_ppgtt_get(ppgtt);
++		list_add_tail(&vma->vm_link, &ppgtt->vma_list);
+ 	}
+ 
+ 	return vma;
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index f1cf9bfe..4a83c36 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -128,6 +128,8 @@ struct i915_vma {
+ 
+ 	struct list_head vma_link; /* Link in the object's VMA list */
+ 
++	struct list_head vm_link; /* Link in the VM's VMA list */
++
+ 	/** This vma's place in the batchbuffer or on the eviction list */
+ 	struct list_head exec_list;
+ 
+@@ -149,6 +151,7 @@ struct i915_vma {
+ 	 * In the worst case this is 1 + 1 + 1 + 2*2 = 7. That would fit into 3
+ 	 * bits with absolutely no headroom. So use 4 bits. */
+ 	unsigned int pin_count:4;
++
+ #define DRM_I915_GEM_OBJECT_MAX_PIN_COUNT 0xf
+ 
+ 	/** Unmap an object from an address space. This usually consists of
+@@ -263,6 +266,8 @@ struct i915_hw_ppgtt {
+ 	};
+ 	dma_addr_t scratch_dma_addr;
+ 
++	struct list_head vma_list;
++
+ 	struct drm_i915_file_private *file_priv;
+ 
+ 	int (*enable)(struct i915_hw_ppgtt *ppgtt);
+@@ -284,6 +289,8 @@ int i915_ppgtt_init_hw(struct drm_device *dev);
+ void i915_ppgtt_release(struct kref *kref);
+ struct i915_hw_ppgtt *i915_ppgtt_create(struct drm_device *dev,
+ 					struct drm_i915_file_private *fpriv);
++void i915_ppgtt_destroy(struct i915_hw_ppgtt *ppgtt);
++
+ static inline void i915_ppgtt_get(struct i915_hw_ppgtt *ppgtt)
+ {
+ 	if (ppgtt)
+-- 
+1.7.9.5
+

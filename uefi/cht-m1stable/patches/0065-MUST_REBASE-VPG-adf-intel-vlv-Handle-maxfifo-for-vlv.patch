@@ -1,0 +1,283 @@
+From 627aeced25f0f4e03b679df4a1c3b3de73cbc5bf Mon Sep 17 00:00:00 2001
+Message-Id: <627aeced25f0f4e03b679df4a1c3b3de73cbc5bf.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Thu, 16 Oct 2014 08:41:44 +0530
+Subject: [PATCH 65/75] MUST_REBASE [VPG]: adf/intel/vlv: Handle maxfifo for
+ vlv
+
+Enable maxfifo when only one plane is enabled and disable when multiple
+planes are enabled. Also disable maxfifo when enabled and we try to
+modify the display control register.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+For: GMINL-3547
+Change-Id: If0861eacbc09504a40370f7a3c5850e7bea64230
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ .../video/adf/intel/core/common/dsi/gen_dsi_pipe.c |   24 ++++++++++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_dc_config.c   |   18 +++++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_pri_plane.c   |   12 ++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_sp_plane.c    |   17 +++++++++++++-
+ .../video/adf/intel/include/core/intel_dc_config.h |   13 ++++++++++-
+ .../adf/intel/include/core/vlv/vlv_dc_config.h     |    2 ++
+ drivers/video/adf/intel/intel_adf_device.c         |    8 +++----
+ 7 files changed, 88 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+index 187aef4..63d6da9 100644
+--- a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
++++ b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+@@ -230,14 +230,37 @@ static void dsi_on_post(struct intel_pipe *pipe)
+ {
+ 	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
+ 
++	/* Enable maxfifo if required */
++	if (!pipe->status.maxfifo_enabled &&
++				(vlv_num_planes_enabled(pipe) == 1)) {
++		REG_WRITE(FW_BLC_SELF_VLV, FW_CSPWRDWNEN);
++		pipe->status.maxfifo_enabled = true;
++	}
+ 	if (dsi_pipe->ops.on_post)
+ 		dsi_pipe->ops.on_post(dsi_pipe);
+ }
+ 
++static void dsi_pre_validate(struct intel_pipe *pipe,
++		struct intel_adf_post_custom_data *custom)
++{
++	if (custom->num_overlays > 1 && pipe->status.maxfifo_enabled) {
++		REG_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
++		pipe->status.maxfifo_enabled = false;
++		pipe->status.wait_vblank = true;
++		pipe->status.vsync_counter =
++				pipe->ops->get_vsync_counter(pipe, 0);
++	}
++}
++
+ static void dsi_pre_post(struct intel_pipe *pipe)
+ {
+ 	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
+ 
++	if (pipe->status.wait_vblank && pipe->status.vsync_counter ==
++			pipe->ops->get_vsync_counter(pipe, 0)) {
++		vlv_wait_for_vblank(pipe->base.idx);
++		pipe->status.wait_vblank = false;
++	}
+ 	if (dsi_pipe->ops.pre_post)
+ 		dsi_pipe->ops.pre_post(dsi_pipe);
+ }
+@@ -422,6 +445,7 @@ static struct intel_pipe_ops dsi_base_ops = {
+ 	.dpms = dsi_dpms,
+ 	.modeset = dsi_modeset,
+ 	.get_screen_size = dsi_get_screen_size,
++	.pre_validate = dsi_pre_validate,
+ 	.pre_post = dsi_pre_post,
+ 	.on_post = dsi_on_post,
+ 	.get_supported_events = dsi_get_supported_events,
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+index fd37ed5..f0e1161 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+@@ -36,6 +36,24 @@ static const struct intel_dc_attachment vlv_allowed_attachments[] = {
+ 	}
+ };
+ 
++void vlv_update_plane_status(struct intel_pipe *pipe, int plane, bool enabled)
++{
++	pipe->status.plane_status[pipe->base.idx][plane] = enabled;
++}
++
++int vlv_num_planes_enabled(struct intel_pipe *pipe)
++{
++	int cnt = 0;
++	int i, j;
++
++	for (i = 0; i < MAX_PIPES; i++)
++		for (j = 0; j < VLV_MAX_PLANES; j++)
++			if (pipe->status.plane_status[i][j])
++				cnt++;
++
++	return cnt;
++}
++
+ void vlv_dc_config_destroy(struct intel_dc_config *config)
+ {
+ 	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+index d7bebe0..dec976a 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+@@ -244,6 +244,15 @@ static int vlv_pri_calculate(struct intel_plane *plane,
+ 		regs->dspcntr |= DISPPLANE_TILED;
+ 	else
+ 		regs->dspcntr &= ~DISPPLANE_TILED;
++	/* when in maxfifo display control register cannot be modified */
++	if (intel_pipe->status.maxfifo_enabled && regs->dspcntr != dspcntr) {
++		REG_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
++		intel_pipe->status.maxfifo_enabled = false;
++		intel_pipe->status.wait_vblank = true;
++		intel_pipe->status.vsync_counter =
++				intel_pipe->ops->get_vsync_counter(intel_pipe,
++								   0);
++	}
+ 	regs->stride = buf->stride;
+ 	regs->linearoff = src_y * regs->stride + src_x * bpp;
+ 	dspaddr_offset = vlv_compute_page_offset(&src_x, &src_y,
+@@ -294,6 +303,7 @@ static void vlv_pri_flip(struct intel_plane *plane,
+ 	REG_WRITE(DSPLINOFF(pidx), regs->linearoff);
+ 	I915_MODIFY_DISPBASE(DSPSURF(pidx), regs->surfaddr);
+ 	REG_POSTING_READ(DSPSURF(pidx));
++	vlv_update_plane_status(config->pipe, VLV_PLANE, true);
+ 
+ 	return;
+ }
+@@ -316,6 +326,7 @@ static int vlv_pri_enable(struct intel_plane *plane)
+ 	}
+ 
+ 	REG_WRITE(reg, value | DISPLAY_PLANE_ENABLE);
++	vlv_update_plane_status(plane->pipe, VLV_PLANE, true);
+ 	vlv_adf_flush_disp_plane(plane->base.idx);
+ 
+ 	/*
+@@ -342,6 +353,7 @@ static int vlv_pri_disable(struct intel_plane *plane)
+ 	}
+ 
+ 	REG_WRITE(reg, value & ~DISPLAY_PLANE_ENABLE);
++	vlv_update_plane_status(plane->pipe, VLV_PLANE, false);
+ 	vlv_adf_flush_disp_plane(plane->base.idx);
+ 	REG_WRITE_BITS(VLV_DDL(plane->base.idx), 0x00, mask);
+ 	return 0;
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+index 0de2191..eb4c1af 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+@@ -333,7 +333,16 @@ static int vlv_sp_calculate(struct intel_plane *planeptr,
+ 
+ 	sprctl |= SP_ENABLE;
+ 	regs->dspcntr = sprctl;
+-
++	/* when in maxfifo display control register cannot be modified */
++	if (intel_pipe->status.maxfifo_enabled &&
++					regs->dspcntr != prev_sprctl) {
++		REG_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
++		intel_pipe->status.maxfifo_enabled = false;
++		intel_pipe->status.wait_vblank = true;
++		intel_pipe->status.vsync_counter =
++				intel_pipe->ops->get_vsync_counter(intel_pipe,
++								   0);
++	}
+ 	linear_offset = src_y * buf->stride + src_x * bpp;
+ 	sprsurf_offset = vlv_compute_page_offset(&src_x, &src_y,
+ 			buf->tiling_mode, bpp, buf->stride);
+@@ -483,6 +492,8 @@ static void vlv_sp_flip(struct intel_plane *planeptr, struct intel_buffer *buf,
+ 	REG_WRITE(SPCNTR(pipe, plane), regs->dspcntr);
+ 	I915_MODIFY_DISPBASE(SPSURF(pipe, plane), regs->surfaddr);
+ 	REG_POSTING_READ(SPSURF(pipe, plane));
++	vlv_update_plane_status(config->pipe,
++			plane ? VLV_SPRITE2 : VLV_SPRITE1, true);
+ 
+ 	return;
+ }
+@@ -503,6 +514,8 @@ static int vlv_sp_enable(struct intel_plane *planeptr)
+ 	}
+ 
+ 	REG_WRITE(reg, value | DISPLAY_PLANE_ENABLE);
++	vlv_update_plane_status(planeptr->pipe,
++			plane ? VLV_SPRITE2 : VLV_SPRITE1, true);
+ 	vlv_adf_flush_sp_plane(pipe, plane);
+ 	/*
+ 	 * TODO:No need to wait in case of mipi.
+@@ -528,6 +541,8 @@ static int vlv_sp_disable(struct intel_plane *planeptr)
+ 	}
+ 
+ 	REG_WRITE(reg, value & ~DISPLAY_PLANE_ENABLE);
++	vlv_update_plane_status(planeptr->pipe,
++			plane ? VLV_SPRITE2 : VLV_SPRITE1, false);
+ 	vlv_adf_flush_sp_plane(pipe, plane);
+ 	/* While disabling plane reset the plane DDL value */
+ 	if (plane == 0)
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 79761c7..0cd24d4 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -260,6 +260,8 @@ struct intel_pipe_ops {
+ 	u32 (*get_vsync_counter)(struct intel_pipe *pipe, u32 interval);
+ 	void (*handle_events)(struct intel_pipe *pipe, u32 events);
+ 
++	void (*pre_validate)(struct intel_pipe *pipe,
++			struct intel_adf_post_custom_data *custom);
+ 	void (*pre_post)(struct intel_pipe *pipe);
+ 	void (*on_post)(struct intel_pipe *pipe);
+ 
+@@ -285,6 +287,13 @@ struct pri_plane_regs {
+ 	unsigned long surfaddr;
+ };
+ 
++struct intel_global_status {
++	bool maxfifo_enabled;
++	bool wait_vblank;
++	u32 vsync_counter;
++	bool plane_status[2][6];
++};
++
+ struct intel_pipe {
+ 	struct intel_dc_component base;
+ 	bool primary;
+@@ -297,7 +306,9 @@ struct intel_pipe {
+ 	 * Store the computed reg values in this to apply in
+ 	 * one shot later in flip calls
+ 	 */
+-	struct pri_plane_regs regs;
++	 struct pri_plane_regs regs;
++
++	 struct intel_global_status status;
+ };
+ 
+ struct intel_dc_attachment {
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+index 083ed0c..dfa32c6 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+@@ -129,6 +129,8 @@ extern int pipe_mode_set(struct intel_pipe *pipe,
+ 			 struct drm_mode_modeinfo *mode);
+ extern int vlv_display_on(struct intel_pipe *pipe);
+ extern int vlv_display_off(struct intel_pipe *pipe);
++int vlv_num_planes_enabled(struct intel_pipe *pipe);
++void vlv_update_plane_status(struct intel_pipe *pipe, int plane, bool enabled);
+ 
+ /* vlv_debugfs */
+ extern int vlv_debugfs_init(struct vlv_dc_config *vlv_config);
+diff --git a/drivers/video/adf/intel/intel_adf_device.c b/drivers/video/adf/intel/intel_adf_device.c
+index 766ee42..fdd5507 100644
+--- a/drivers/video/adf/intel/intel_adf_device.c
++++ b/drivers/video/adf/intel/intel_adf_device.c
+@@ -496,10 +496,6 @@ static void intel_adf_device_post(struct adf_device *dev,
+ 	struct post_obj *po;
+ 	struct flip *f;
+ 
+-	/*disable unused overlay engines*/
+-	disable_unused_overlay_engines(&i_dev->active_engs,
+-		&state->post_engs);
+-
+ 	/* To forbid DSR */
+ 	for_each_post_obj(po, &state->post_intfs) {
+ 		intf = po->obj;
+@@ -517,6 +513,10 @@ static void intel_adf_device_post(struct adf_device *dev,
+ 		eng->plane->ops->flip(eng->plane, &f->buf, &f->config);
+ 	}
+ 
++	/*disable unused overlay engines*/
++	disable_unused_overlay_engines(&i_dev->active_engs,
++		&state->post_engs);
++
+ 	/*trigger pipe processing, if necessary*/
+ 	for_each_post_obj(po, &state->post_intfs) {
+ 		intf = po->obj;
+-- 
+1.7.9.5
+

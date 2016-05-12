@@ -1,0 +1,254 @@
+From 757d722cbba7639c1766eac6e192649951c63ab0 Mon Sep 17 00:00:00 2001
+Message-Id: <757d722cbba7639c1766eac6e192649951c63ab0.1417780177.git.chang-joon.lee@intel.com>
+In-Reply-To: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+References: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+From: Adam Rutkowski <adam.j.rutkowski@intel.com>
+Date: Mon, 8 Sep 2014 15:10:26 -0400
+Subject: [PATCH 25/30] REVERTME [VPG]: drm/i915: Perfmon IRQ for gen8
+
+Support for perfmon buffer interrupt on Gen 8.
+
+Patch is marked with REVERTME as Perfmon IOCTL will be removed
+once OA couters are exposed via 'perf event' framework.
+
+Issue: GMINL-3120
+Change-Id: I943295d7e9c9bf9ae8b6ed6a5578dc8ad5d0a475
+Signed-off-by: Adam Rutkowski <adam.j.rutkowski@intel.com>
+Signed-off-by: Andrzej Datczuk <andrzej.datczuk@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c     |    2 ++
+ drivers/gpu/drm/i915/i915_drv.h     |    5 ++++
+ drivers/gpu/drm/i915/i915_irq.c     |   40 +++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/i915_perfmon.c |   45 ++++++++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/i915_reg.h     |    4 ++++
+ 5 files changed, 85 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index d773aa0..e37dec2 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1871,6 +1871,8 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 
+ 	i915_perfmon_setup(dev_priv);
+ 
++	i915_perfmon_cleanup(dev_priv);
++
+ 	return 0;
+ 
+ out_power_well:
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 88d361c..0dffa71 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2353,6 +2353,11 @@ extern void intel_uncore_check_errors(struct drm_device *dev);
+ extern void intel_uncore_fini(struct drm_device *dev);
+ extern void intel_uncore_forcewake_reset(struct drm_device *dev, bool restore);
+ 
++extern void gen8_enable_oa_interrupt(struct drm_i915_private *dev_priv,
++				     uint32_t mask);
++extern void gen8_disable_oa_interrupt(struct drm_i915_private *dev_priv,
++				     uint32_t mask);
++
+ void
+ i915_enable_pipestat(struct drm_i915_private *dev_priv, enum pipe pipe,
+ 		     u32 status_mask);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index e67719b..e03f148 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1702,7 +1702,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_device *dev,
+ 				       u32 master_ctl)
+ {
+ 	struct intel_engine_cs *ring;
+-	u32 rcs, bcs, vcs;
++	u32 rcs, bcs, vcs, oacs;
+ 	uint32_t tmp = 0;
+ 	irqreturn_t ret = IRQ_NONE;
+ 
+@@ -1779,6 +1779,22 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_device *dev,
+ 			DRM_ERROR("The master control interrupt lied (GT3)!\n");
+ 	}
+ 
++	if (master_ctl &  GEN8_GT_OACS_IRQ) {
++		tmp = I915_READ(GEN8_GT_IIR(3));
++		if (tmp) {
++			I915_WRITE(GEN8_GT_IIR(3), tmp);
++			ret = IRQ_HANDLED;
++
++			oacs = tmp >> GEN8_OACS_IRQ_SHIFT;
++			if (oacs & GT_RENDER_PERFMON_BUFFER_INTERRUPT) {
++				atomic_inc(
++					&dev_priv->perfmon.buffer_interrupts);
++				wake_up_all(&dev_priv->perfmon.buffer_queue);
++			}
++		} else
++			DRM_ERROR("The master control interrupt lied (GT3)!\n");
++	}
++
+ 	return ret;
+ }
+ 
+@@ -3204,6 +3220,24 @@ int i915_disable_hdmi_audio_int(struct drm_device *dev)
+ }
+ #endif
+ 
++void gen8_enable_oa_interrupt(struct drm_i915_private *dev_priv, uint32_t mask)
++{
++	u32 imr;
++	assert_spin_locked(&dev_priv->irq_lock);
++	imr = I915_READ(GEN8_OA_IMR);
++	imr &= ~(mask << GEN8_OACS_IRQ_SHIFT);
++	I915_WRITE(GEN8_OA_IMR, imr);
++}
++
++void gen8_disable_oa_interrupt(struct drm_i915_private *dev_priv, uint32_t mask)
++{
++	u32 imr;
++	assert_spin_locked(&dev_priv->irq_lock);
++	imr = I915_READ(GEN8_OA_IMR);
++	imr |= (mask << GEN8_OACS_IRQ_SHIFT);
++	I915_WRITE(GEN8_OA_IMR, imr);
++}
++
+ static void ironlake_disable_vblank(struct drm_device *dev, int pipe)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -3930,7 +3964,9 @@ static void gen8_gt_irq_postinstall(struct drm_i915_private *dev_priv)
+ 			GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS2_IRQ_SHIFT,
+ 		0,
+ 		GT_RENDER_USER_INTERRUPT << GEN8_VECS_IRQ_SHIFT |
+-			GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VECS_IRQ_SHIFT
++			GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VECS_IRQ_SHIFT |
++			GT_RENDER_PERFMON_BUFFER_INTERRUPT <<
++				GEN8_OACS_IRQ_SHIFT
+ 		};
+ 
+ 	dev_priv->pm_irq_mask = 0xffffffff;
+diff --git a/drivers/gpu/drm/i915/i915_perfmon.c b/drivers/gpu/drm/i915/i915_perfmon.c
+index 38a69ba..5d2cba2 100644
+--- a/drivers/gpu/drm/i915/i915_perfmon.c
++++ b/drivers/gpu/drm/i915/i915_perfmon.c
+@@ -27,7 +27,6 @@
+ #include "intel_drv.h"
+ #include "linux/wait.h"
+ 
+-
+ /**
+  * intel_enable_perfmon_interrupt - enable perfmon interrupt
+  *
+@@ -38,17 +37,24 @@ static int intel_enable_perfmon_interrupt(struct drm_device *dev,
+ 	struct drm_i915_private *dev_priv = (struct drm_i915_private *) dev->dev_private;
+ 	unsigned long irqflags;
+ 
+-	if (!(IS_GEN7(dev)))
++	if (!(IS_GEN7(dev)) && !(IS_GEN8(dev)))
+ 		return -EINVAL;
+ 
+ 	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
+-
+ 	if (enable)
+-		ilk_enable_gt_irq(dev_priv,
+-				  GT_RENDER_PERFMON_BUFFER_INTERRUPT);
++		if (IS_GEN7(dev))
++			ilk_enable_gt_irq(dev_priv,
++				GT_RENDER_PERFMON_BUFFER_INTERRUPT);
++		else
++			gen8_enable_oa_interrupt(dev_priv,
++				GT_RENDER_PERFMON_BUFFER_INTERRUPT);
+ 	else
+-		ilk_disable_gt_irq(dev_priv,
+-				   GT_RENDER_PERFMON_BUFFER_INTERRUPT);
++		if (IS_GEN7(dev))
++			ilk_disable_gt_irq(dev_priv,
++				GT_RENDER_PERFMON_BUFFER_INTERRUPT);
++		else
++			gen8_disable_oa_interrupt(dev_priv,
++				GT_RENDER_PERFMON_BUFFER_INTERRUPT);
+ 
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
+ 
+@@ -69,7 +75,7 @@ static int intel_wait_perfmon_interrupt(struct drm_device *dev,
+ 	int ret = I915_PERFMON_IRQ_WAIT_OK;
+ 	int time_left = 0;
+ 
+-	if (!(IS_GEN7(dev)))
++	if (!(IS_GEN7(dev)) && !(IS_GEN8(dev)))
+ 		return -EINVAL;
+ 
+ 	time_left = wait_event_interruptible_timeout(
+@@ -88,6 +94,26 @@ static int intel_wait_perfmon_interrupt(struct drm_device *dev,
+ }
+ 
+ /**
++* intel_cancel_wait_perfmon_interrupt - wake up all threads waiting for
++* perfmon buffer interrupt.
++*
++* All threads waiting for for perfmon buffer interrupt are
++* woken up.
++*/
++static int intel_cancel_wait_perfmon_interrupt(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (!(IS_GEN7(dev)) && !(IS_GEN8(dev)))
++		return -EINVAL;
++
++	atomic_inc(&dev_priv->perfmon.buffer_interrupts);
++	wake_up_all(&dev_priv->perfmon.buffer_queue);
++
++	return 0;
++}
++
++/**
+  * i915_perfmon_ioctl - performance monitoring support
+  *
+  * Main entry point to performance monitoring support
+@@ -105,6 +131,7 @@ int i915_perfmon_ioctl(struct drm_device *dev, void *data,
+ 				dev,
+ 				perfmon->data.set_irqs.enable);
+ 		break;
++
+ 	case I915_PERFMON_WAIT_BUFFER_IRQS:
+ 		if (perfmon->data.wait_irqs.timeout >
+ 				I915_PERFMON_WAIT_IRQ_MAX_TIMEOUT_MS)
+@@ -117,7 +144,7 @@ int i915_perfmon_ioctl(struct drm_device *dev, void *data,
+ 		break;
+ 
+ 	case I915_PERFMON_CANCEL_WAIT_BUFFER_IRQS:
+-		ret = -ENODEV;
++		ret = intel_cancel_wait_perfmon_interrupt(dev);
+ 		break;
+ 
+ 	case I915_PERFMON_OPEN:
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index ca6d835..03059fb 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -4784,6 +4784,7 @@ enum punit_power_well {
+ #define  GEN8_DE_PIPE_B_IRQ		(1<<17)
+ #define  GEN8_DE_PIPE_A_IRQ		(1<<16)
+ #define  GEN8_DE_PIPE_IRQ(pipe)		(1<<(16+pipe))
++#define  GEN8_GT_OACS_IRQ		(1<<7)
+ #define  GEN8_GT_VECS_IRQ		(1<<6)
+ #define  GEN8_GT_PM_IRQ			(1<<4)
+ #define  GEN8_GT_VCS2_IRQ		(1<<3)
+@@ -4801,6 +4802,7 @@ enum punit_power_well {
+ #define GEN8_VCS2_IRQ_SHIFT 16
+ #define GEN8_VCS1_IRQ_SHIFT 0
+ #define GEN8_VECS_IRQ_SHIFT 0
++#define GEN8_OACS_IRQ_SHIFT 19
+ 
+ #define GEN8_DE_PIPE_ISR(pipe) (0x44400 + (0x10 * (pipe)))
+ #define GEN8_DE_PIPE_IMR(pipe) (0x44404 + (0x10 * (pipe)))
+@@ -4841,6 +4843,8 @@ enum punit_power_well {
+ #define GEN8_PCU_IIR 0x444e8
+ #define GEN8_PCU_IER 0x444ec
+ 
++#define GEN8_OA_IMR  0x2b20
++
+ #define ILK_DISPLAY_CHICKEN2	0x42004
+ /* Required on all Ironlake and Sandybridge according to the B-Spec. */
+ #define  ILK_ELPIN_409_SELECT	(1 << 25)
+-- 
+1.7.9.5
+

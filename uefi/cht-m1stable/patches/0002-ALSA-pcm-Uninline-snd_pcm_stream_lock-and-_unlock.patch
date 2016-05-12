@@ -1,0 +1,198 @@
+From 006958fc9679d7a91d4b2e6be8b20b98467af6c4 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Mon, 1 Sep 2014 11:19:37 +0200
+Subject: [PATCH 2/4] ALSA: pcm: Uninline snd_pcm_stream_lock() and _unlock()
+
+The previous commit for the non-atomic PCM ops added more codes to
+snd_pcm_stream_lock() and its variants.  Since they are inlined
+functions, it resulted in a significant code size bloat.  For reducing
+the size bloat, this patch changes the inline functions to the normal
+function calls.  The export of rwlock and rwsem are removed as well,
+since they are referred only in pcm_native.c now.
+
+Change-Id: I1b8f5a84baff7a8619a0bbd296564f7f624829db
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Vinod Koul <vinod.koul@intel.com>
+---
+ include/sound/pcm.h     | 81 ++++++++-----------------------------------------
+ sound/core/pcm_native.c | 64 +++++++++++++++++++++++++++++++++++---
+ 2 files changed, 72 insertions(+), 73 deletions(-)
+
+diff --git a/include/sound/pcm.h b/include/sound/pcm.h
+index 899fe10..8fd4cfe 100644
+--- a/include/sound/pcm.h
++++ b/include/sound/pcm.h
+@@ -496,9 +496,6 @@ int snd_pcm_notify(struct snd_pcm_notify *notify, int nfree);
+  *  Native I/O
+  */
+ 
+-extern rwlock_t snd_pcm_link_rwlock;
+-extern struct rw_semaphore snd_pcm_link_rwsem;
+-
+ int snd_pcm_info(struct snd_pcm_substream *substream, struct snd_pcm_info *info);
+ int snd_pcm_info_user(struct snd_pcm_substream *substream,
+ 		      struct snd_pcm_info __user *info);
+@@ -542,72 +539,18 @@ static inline int snd_pcm_stream_linked(struct snd_pcm_substream *substream)
+ 	return substream->group != &substream->self_group;
+ }
+ 
+-static inline void snd_pcm_stream_lock(struct snd_pcm_substream *substream)
+-{
+-	if (substream->pcm->nonatomic) {
+-		down_read(&snd_pcm_link_rwsem);
+-		mutex_lock(&substream->self_group.mutex);
+-	} else {
+-		read_lock(&snd_pcm_link_rwlock);
+-		spin_lock(&substream->self_group.lock);
+-	}
+-}
+-
+-static inline void snd_pcm_stream_unlock(struct snd_pcm_substream *substream)
+-{
+-	if (substream->pcm->nonatomic) {
+-		mutex_unlock(&substream->self_group.mutex);
+-		up_read(&snd_pcm_link_rwsem);
+-	} else {
+-		spin_unlock(&substream->self_group.lock);
+-		read_unlock(&snd_pcm_link_rwlock);
+-	}
+-}
+-
+-static inline void snd_pcm_stream_lock_irq(struct snd_pcm_substream *substream)
+-{
+-	if (substream->pcm->nonatomic) {
+-		down_read(&snd_pcm_link_rwsem);
+-		mutex_lock(&substream->self_group.mutex);
+-	} else {
+-		read_lock_irq(&snd_pcm_link_rwlock);
+-		spin_lock(&substream->self_group.lock);
+-	}
+-}
+-
+-static inline void snd_pcm_stream_unlock_irq(struct snd_pcm_substream *substream)
+-{
+-	if (substream->pcm->nonatomic) {
+-		mutex_unlock(&substream->self_group.mutex);
+-		up_read(&snd_pcm_link_rwsem);
+-	} else {
+-		spin_unlock(&substream->self_group.lock);
+-		read_unlock_irq(&snd_pcm_link_rwlock);
+-	}
+-}
+-
+-#define snd_pcm_stream_lock_irqsave(substream, flags) \
+-do { \
+-	if ((substream)->pcm->nonatomic) {			  \
+-		(flags) = 0; /* XXX for avoid warning */	  \
+-		down_read(&snd_pcm_link_rwsem);			  \
+-		mutex_lock(&(substream)->self_group.mutex);	  \
+-	} else {						  \
+-		read_lock_irqsave(&snd_pcm_link_rwlock, (flags)); \
+-		spin_lock(&(substream)->self_group.lock);	  \
+-	}							  \
+-} while (0)
+-
+-#define snd_pcm_stream_unlock_irqrestore(substream, flags) \
+-do { \
+-	if ((substream)->pcm->nonatomic) {			       \
+-		mutex_unlock(&(substream)->self_group.mutex);	       \
+-		up_read(&snd_pcm_link_rwsem);			       \
+-	} else {						       \
+-		spin_unlock(&(substream)->self_group.lock);	       \
+-		read_unlock_irqrestore(&snd_pcm_link_rwlock, (flags)); \
+-	}							       \
+-} while (0)
++void snd_pcm_stream_lock(struct snd_pcm_substream *substream);
++void snd_pcm_stream_unlock(struct snd_pcm_substream *substream);
++void snd_pcm_stream_lock_irq(struct snd_pcm_substream *substream);
++void snd_pcm_stream_unlock_irq(struct snd_pcm_substream *substream);
++unsigned long _snd_pcm_stream_lock_irqsave(struct snd_pcm_substream *substream);
++#define snd_pcm_stream_lock_irqsave(substream, flags)		 \
++	do {							 \
++		typecheck(unsigned long, flags);		 \
++		flags = _snd_pcm_stream_lock_irqsave(substream); \
++	} while (0)
++void snd_pcm_stream_unlock_irqrestore(struct snd_pcm_substream *substream,
++				      unsigned long flags);
+ 
+ #define snd_pcm_group_for_each_entry(s, substream) \
+ 	list_for_each_entry(s, &substream->group->substreams, link_list)
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+index 5483b67..ade71ac 100644
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -74,11 +74,67 @@ static int snd_pcm_open(struct file *file, struct snd_pcm *pcm, int stream);
+  *
+  */
+ 
+-DEFINE_RWLOCK(snd_pcm_link_rwlock);
+-EXPORT_SYMBOL(snd_pcm_link_rwlock);
++static DEFINE_RWLOCK(snd_pcm_link_rwlock);
++static DECLARE_RWSEM(snd_pcm_link_rwsem);
+ 
+-DECLARE_RWSEM(snd_pcm_link_rwsem);
+-EXPORT_SYMBOL(snd_pcm_link_rwsem);
++void snd_pcm_stream_lock(struct snd_pcm_substream *substream)
++{
++	if (substream->pcm->nonatomic) {
++		down_read(&snd_pcm_link_rwsem);
++		mutex_lock(&substream->self_group.mutex);
++	} else {
++		read_lock(&snd_pcm_link_rwlock);
++		spin_lock(&substream->self_group.lock);
++	}
++}
++EXPORT_SYMBOL_GPL(snd_pcm_stream_lock);
++
++void snd_pcm_stream_unlock(struct snd_pcm_substream *substream)
++{
++	if (substream->pcm->nonatomic) {
++		mutex_unlock(&substream->self_group.mutex);
++		up_read(&snd_pcm_link_rwsem);
++	} else {
++		spin_unlock(&substream->self_group.lock);
++		read_unlock(&snd_pcm_link_rwlock);
++	}
++}
++EXPORT_SYMBOL_GPL(snd_pcm_stream_unlock);
++
++void snd_pcm_stream_lock_irq(struct snd_pcm_substream *substream)
++{
++	if (!substream->pcm->nonatomic)
++		local_irq_disable();
++	snd_pcm_stream_lock(substream);
++}
++EXPORT_SYMBOL_GPL(snd_pcm_stream_lock_irq);
++
++void snd_pcm_stream_unlock_irq(struct snd_pcm_substream *substream)
++{
++	snd_pcm_stream_unlock(substream);
++	if (!substream->pcm->nonatomic)
++		local_irq_enable();
++}
++EXPORT_SYMBOL_GPL(snd_pcm_stream_unlock_irq);
++
++unsigned long _snd_pcm_stream_lock_irqsave(struct snd_pcm_substream *substream)
++{
++	unsigned long flags = 0;
++	if (!substream->pcm->nonatomic)
++		local_irq_save(flags);
++	snd_pcm_stream_lock(substream);
++	return flags;
++}
++EXPORT_SYMBOL_GPL(_snd_pcm_stream_lock_irqsave);
++
++void snd_pcm_stream_unlock_irqrestore(struct snd_pcm_substream *substream,
++				      unsigned long flags)
++{
++	snd_pcm_stream_unlock(substream);
++	if (!substream->pcm->nonatomic)
++		local_irq_restore(flags);
++}
++EXPORT_SYMBOL_GPL(snd_pcm_stream_unlock_irqrestore);
+ 
+ static inline mm_segment_t snd_enter_user(void)
+ {
+-- 
+1.9.1
+

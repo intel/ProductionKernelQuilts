@@ -1,0 +1,66 @@
+From 6381c1789cc434bb34f596e19a6f45805828eb15 Mon Sep 17 00:00:00 2001
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date: Thu, 9 Oct 2014 13:01:14 -0700
+Subject: [PATCH 4/4] soc_dts: Process bad soc temp read data
+
+When the SOC temp read gives a value more than tjmax (90C), simply return
+error to the caller. For close to critical (software max, at 85C),
+confirm the value three times with variation less or equal to 2C.
+
+Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+---
+ drivers/thermal/intel_soc_dts_thermal.c |   21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/drivers/thermal/intel_soc_dts_thermal.c b/drivers/thermal/intel_soc_dts_thermal.c
+index 9013505..efb81dc 100644
+--- a/drivers/thermal/intel_soc_dts_thermal.c
++++ b/drivers/thermal/intel_soc_dts_thermal.c
+@@ -21,6 +21,7 @@
+ #include <linux/thermal.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/iosf_mbi.h>
++#include <linux/delay.h>
+ 
+ #define SOC_DTS_OFFSET_ENABLE	0xB0
+ #define SOC_DTS_OFFSET_TEMP	0xB1
+@@ -256,9 +257,12 @@ static int sys_get_curr_temp(struct thermal_zone_device *tzd,
+ 	int status;
+ 	u32 out;
+ 	struct soc_sensor_entry *aux_entry;
++	int retry_count = 0;
++	unsigned long last_temp = 0;
+ 
+ 	aux_entry = tzd->devdata;
+ 
++read_temp_again:
+ 	status = iosf_mbi_read(BT_MBI_UNIT_PMC, BT_MBI_BUNIT_READ,
+ 					SOC_DTS_OFFSET_TEMP, &out);
+ 	if (status)
+@@ -268,6 +272,23 @@ static int sys_get_curr_temp(struct thermal_zone_device *tzd,
+ 	out -= SOC_DTS_TJMAX_ENCODING;
+ 	*temp = aux_entry->tj_max - out * 1000;
+ 
++	if (*temp > aux_entry->tj_max) {
++		pr_err("Ignore junk temp %lu \n", *temp);
++		return -EAGAIN; /* Let user space retry if required */
++	}
++
++	if ((*temp >= (aux_entry->tj_max - crit_offset)) &&
++						retry_count++ < 2) {
++		if (!last_temp)
++			last_temp = *temp;
++		else {
++			if (abs(last_temp - *temp) > 2000)
++				return -EINVAL;
++		}
++		udelay(100);
++		goto read_temp_again;
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+1.7.9.5
+

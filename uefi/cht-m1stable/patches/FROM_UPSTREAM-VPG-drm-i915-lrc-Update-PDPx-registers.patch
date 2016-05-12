@@ -1,0 +1,101 @@
+From 7f2686c245527fbc2c3e3b8d5f382b0fb29733c6 Mon Sep 17 00:00:00 2001
+From: Michel Thierry <michel.thierry@intel.com>
+Date: Fri, 31 Jul 2015 10:07:26 +0100
+Subject: [PATCH 5/7] FROM_UPSTREAM [VPG]: drm/i915/lrc: Update PDPx registers
+ with lri commands
+
+A safer way to update the PDPx registers is sending lri commands, added
+in the ring before the batchbuffer start. Otherwise, the ctx must be
+idle before trying to change anything (but the ring-tail) in the ctx image.
+An example where the ctx won't be idle is lite-restore.
+
+This patch depends on 5b7e4c9ce ("drm/i915/gtt: Mark TLBS dirty for
+gen8+").
+
+v2: Combine lri writes (and save 8 commands). (Mika)
+
+Note for future forklift: this patch was added in upstream after the
+ring/req changes (v3). As these changes are not in v3.14, this
+is v2, which uses intel_engine_cs as input parameter.
+If gen8_emit_bb_start and friends are ever updated to receive
+drm_i915_gem_request as input, replace this patch with the upstreamed v3.
+
+Change-Id: I19c00ebdb2f32e45eecae9c541868ce1bbc4b4e7
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-11653
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 7a01a0a292c25a85cd36efcd5920d2f1caccbb2b
+Upstream-as-of-tag: drm-intel-next-2015-07-03
+Cc: Dave Gordon <david.s.gordon@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+Reviewed-on: https://android.intel.com:443/445186
+---
+ drivers/gpu/drm/i915/intel_lrc.c | 44 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 92f47ed..c408ea6 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -2504,12 +2504,56 @@ static int gen8_init_render_ring(struct intel_engine_cs *ring)
+ 	return init_workarounds_ring(ring);
+ }
+ 
++static int intel_logical_ring_emit_pdps(struct intel_engine_cs *ring,
++					struct intel_context *ctx)
++{
++	struct i915_hw_ppgtt *ppgtt = ctx->ppgtt;
++	struct intel_ringbuffer *ringbuf = ctx->engine[ring->id].ringbuf;
++	const int num_lri_cmds = GEN8_LEGACY_PDPES * 2;
++	int i, ret;
++
++	ret = intel_logical_ring_begin(ringbuf, num_lri_cmds * 2 + 2);
++	if (ret)
++		return ret;
++
++	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(num_lri_cmds));
++	for (i = GEN8_LEGACY_PDPES - 1; i >= 0; i--) {
++		const dma_addr_t pd_daddr = i915_page_dir_dma_addr(ppgtt, i);
++
++		intel_logical_ring_emit(ringbuf, GEN8_RING_PDP_UDW(ring, i));
++		intel_logical_ring_emit(ringbuf, upper_32_bits(pd_daddr));
++		intel_logical_ring_emit(ringbuf, GEN8_RING_PDP_LDW(ring, i));
++		intel_logical_ring_emit(ringbuf, lower_32_bits(pd_daddr));
++	}
++
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++	intel_logical_ring_advance(ringbuf);
++
++	return 0;
++}
++
+ static int gen8_emit_bb_start(struct intel_ringbuffer *ringbuf,
+ 			      u64 offset, unsigned flags)
+ {
++	struct intel_engine_cs *ring = ringbuf->ring;
++	struct intel_context *ctx = ringbuf->FIXME_lrc_ctx;
+ 	bool ppgtt = !(flags & I915_DISPATCH_SECURE);
+ 	int ret;
+ 
++	/* Don't rely in hw updating PDPs, specially in lite-restore.
++	 * Ideally, we should set Force PD Restore in ctx descriptor,
++	 * but we can't. Force Restore would be a second option, but
++	 * it is unsafe in case of lite-restore (because the ctx is
++	 * not idle). */
++	if (ctx->ppgtt &&
++	    (intel_ring_flag(ring) & ctx->ppgtt->pd_dirty_rings)) {
++		ret = intel_logical_ring_emit_pdps(ring, ctx);
++		if (ret)
++			return ret;
++
++		ctx->ppgtt->pd_dirty_rings &= ~intel_ring_flag(ring);
++	}
++
+ 	ret = intel_logical_ring_begin(ringbuf, 4);
+ 	if (ret)
+ 		return ret;
+-- 
+1.9.1
+

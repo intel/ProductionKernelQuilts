@@ -1,0 +1,178 @@
+From 7de3af6604e9d88ccd4139821f76f5dd0aa72fea Mon Sep 17 00:00:00 2001
+From: Dima Zavin <dima@android.com>
+Date: Tue, 18 Oct 2011 16:59:54 -0700
+Subject: [PATCH 014/634] ARM: smp: implement arch_trigger_all_cpus_backtrace
+ using IPI
+
+Based on a rough patch by frank.rowand@am.sony.com
+
+Since ARM doesn't have an NMI (fiq's are not always available),
+send an IPI to all other CPUs (current cpu prints the stack directly)
+to capture a backtrace.
+
+Change-Id: I8b163c8cec05d521b433ae133795865e8a33d4e2
+Signed-off-by: Dima Zavin <dima@android.com>
+---
+ arch/arm/include/asm/hardirq.h |  2 +-
+ arch/arm/include/asm/irq.h     |  3 +++
+ arch/arm/include/asm/smp.h     |  2 ++
+ arch/arm/kernel/process.c      | 12 +++++++++
+ arch/arm/kernel/smp.c          | 58 ++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/include/asm/hardirq.h b/arch/arm/include/asm/hardirq.h
+index fe3ea77..5df33e3 100644
+--- a/arch/arm/include/asm/hardirq.h
++++ b/arch/arm/include/asm/hardirq.h
+@@ -5,7 +5,7 @@
+ #include <linux/threads.h>
+ #include <asm/irq.h>
+ 
+-#define NR_IPI	8
++#define NR_IPI	9
+ 
+ typedef struct {
+ 	unsigned int __softirq_pending;
+diff --git a/arch/arm/include/asm/irq.h b/arch/arm/include/asm/irq.h
+index 53c15de..809203a 100644
+--- a/arch/arm/include/asm/irq.h
++++ b/arch/arm/include/asm/irq.h
+@@ -35,6 +35,9 @@ extern void (*handle_arch_irq)(struct pt_regs *);
+ extern void set_handle_irq(void (*handle_irq)(struct pt_regs *));
+ #endif
+ 
++void arch_trigger_all_cpu_backtrace(void);
++#define arch_trigger_all_cpu_backtrace arch_trigger_all_cpu_backtrace
++
+ #endif
+ 
+ #endif
+diff --git a/arch/arm/include/asm/smp.h b/arch/arm/include/asm/smp.h
+index 4157aec..2a655ca 100644
+--- a/arch/arm/include/asm/smp.h
++++ b/arch/arm/include/asm/smp.h
+@@ -87,6 +87,8 @@ extern void arch_send_wakeup_ipi_mask(const struct cpumask *mask);
+ 
+ extern int register_ipi_completion(struct completion *completion, int cpu);
+ 
++extern void smp_send_all_cpu_backtrace(void);
++
+ struct smp_operations {
+ #ifdef CONFIG_SMP
+ 	/*
+diff --git a/arch/arm/kernel/process.c b/arch/arm/kernel/process.c
+index d41e83e..b04c91f 100644
+--- a/arch/arm/kernel/process.c
++++ b/arch/arm/kernel/process.c
+@@ -60,6 +60,18 @@ static const char *isa_modes[] = {
+   "ARM" , "Thumb" , "Jazelle", "ThumbEE"
+ };
+ 
++#ifdef CONFIG_SMP
++void arch_trigger_all_cpu_backtrace(void)
++{
++	smp_send_all_cpu_backtrace();
++}
++#else
++void arch_trigger_all_cpu_backtrace(void)
++{
++	dump_stack();
++}
++#endif
++
+ extern void call_with_stack(void (*fn)(void *), void *arg, void *sp);
+ typedef void (*phys_reset_t)(unsigned long);
+ 
+diff --git a/arch/arm/kernel/smp.c b/arch/arm/kernel/smp.c
+index 8cd3724..0bd8b58 100644
+--- a/arch/arm/kernel/smp.c
++++ b/arch/arm/kernel/smp.c
+@@ -69,6 +69,7 @@ enum ipi_msg_type {
+ 	IPI_CPU_STOP,
+ 	IPI_IRQ_WORK,
+ 	IPI_COMPLETION,
++	IPI_CPU_BACKTRACE,
+ };
+ 
+ static DECLARE_COMPLETION(cpu_running);
+@@ -480,6 +481,7 @@ static const char *ipi_types[NR_IPI] = {
+ 	S(IPI_CPU_STOP, "CPU stop interrupts"),
+ 	S(IPI_IRQ_WORK, "IRQ work interrupts"),
+ 	S(IPI_COMPLETION, "completion interrupts"),
++	S(IPI_CPU_BACKTRACE, "CPU backtrace"),
+ };
+ 
+ void show_ipi_list(struct seq_file *p, int prec)
+@@ -552,6 +554,58 @@ static void ipi_complete(unsigned int cpu)
+ 	complete(per_cpu(cpu_completion, cpu));
+ }
+ 
++static cpumask_t backtrace_mask;
++static DEFINE_RAW_SPINLOCK(backtrace_lock);
++
++/* "in progress" flag of arch_trigger_all_cpu_backtrace */
++static unsigned long backtrace_flag;
++
++void smp_send_all_cpu_backtrace(void)
++{
++	unsigned int this_cpu = smp_processor_id();
++	int i;
++
++	if (test_and_set_bit(0, &backtrace_flag))
++		/*
++		 * If there is already a trigger_all_cpu_backtrace() in progress
++		 * (backtrace_flag == 1), don't output double cpu dump infos.
++		 */
++		return;
++
++	cpumask_copy(&backtrace_mask, cpu_online_mask);
++	cpu_clear(this_cpu, backtrace_mask);
++
++	pr_info("Backtrace for cpu %d (current):\n", this_cpu);
++	dump_stack();
++
++	pr_info("\nsending IPI to all other CPUs:\n");
++	smp_cross_call(&backtrace_mask, IPI_CPU_BACKTRACE);
++
++	/* Wait for up to 10 seconds for all other CPUs to do the backtrace */
++	for (i = 0; i < 10 * 1000; i++) {
++		if (cpumask_empty(&backtrace_mask))
++			break;
++		mdelay(1);
++	}
++
++	clear_bit(0, &backtrace_flag);
++	smp_mb__after_clear_bit();
++}
++
++/*
++ * ipi_cpu_backtrace - handle IPI from smp_send_all_cpu_backtrace()
++ */
++static void ipi_cpu_backtrace(unsigned int cpu, struct pt_regs *regs)
++{
++	if (cpu_isset(cpu, backtrace_mask)) {
++		raw_spin_lock(&backtrace_lock);
++		pr_warning("IPI backtrace for cpu %d\n", cpu);
++		show_regs(regs);
++		raw_spin_unlock(&backtrace_lock);
++		cpu_clear(cpu, backtrace_mask);
++	}
++}
++
+ /*
+  * Main handler for inter-processor interrupts
+  */
+@@ -616,6 +670,10 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
+ 		irq_exit();
+ 		break;
+ 
++	case IPI_CPU_BACKTRACE:
++		ipi_cpu_backtrace(cpu, regs);
++		break;
++
+ 	default:
+ 		printk(KERN_CRIT "CPU%u: Unknown IPI message 0x%x\n",
+ 		       cpu, ipinr);
+-- 
+1.9.1
+

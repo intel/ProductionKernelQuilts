@@ -1,0 +1,195 @@
+From 7e078e3383ab6b4db5c7d93bbd18c46bae7390e0 Mon Sep 17 00:00:00 2001
+From: Frode Isaksen <frodex.isaksen@intel.com>
+Date: Tue, 26 May 2015 12:54:05 +0200
+Subject: [PATCH] HSU: fix memory leak caused by 'devm_gpiod_get_index'
+
+Fix memory leak when runtime suspending, caused by
+'devm_gpiod_get_index' allocating a small memory block,
+(see 'devres_alloc') that is not freed until module unloaded
+- which will never happen.
+The memory leak may grow huge, since 'devm_gpiod_get_index'
+is called for each runtime suspend cycle.
+Replace 'devm_gpiod_get_index' by 'devm_gpiod_get_index',
+and use opaque strcutures instead of GPIO numbers as
+recommended in 'gpio/consumer.h'.
+Also, reduce severity of the 'pin X switch back to native mode' log,
+since this is shown each time runtime resuming.
+
+Change-Id: I25dd9c2c8f8cd3251b6b0e035de75692df91de30
+https://jira01.devtools.intel.com/browse/IMINAN-37254
+Signed-off-by: Frode Isaksen <frodex.isaksen@intel.com>
+---
+ drivers/pinctrl/pinctrl-cherryview.c |  2 +-
+ drivers/tty/serial/hsu/hsu.h         | 12 ++++-----
+ drivers/tty/serial/hsu/hsu_plat.c    | 51 +++++++++++++++++-------------------
+ 3 files changed, 31 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/pinctrl/pinctrl-cherryview.c b/drivers/pinctrl/pinctrl-cherryview.c
+index 8b6199abaa7a..bf26c27fb1ea 100644
+--- a/drivers/pinctrl/pinctrl-cherryview.c
++++ b/drivers/pinctrl/pinctrl-cherryview.c
+@@ -803,7 +803,7 @@ static void chv_gpio_free(struct gpio_chip *chip, unsigned offset)
+ 		/*clear GPIOEn bit to let Pad mode take effect*/
+ 		value = chv_readl(reg) & (~CV_GPIO_EN);
+ 		chv_writel(value, reg);
+-		dev_info(&cg->pdev->dev,
++		dev_dbg(&cg->pdev->dev,
+ 			"pin %d switch back to native mode\n", offset);
+ 	}
+ }
+diff --git a/drivers/tty/serial/hsu/hsu.h b/drivers/tty/serial/hsu/hsu.h
+index 56d94a88b39e..510fe5f5a2c9 100644
+--- a/drivers/tty/serial/hsu/hsu.h
++++ b/drivers/tty/serial/hsu/hsu.h
+@@ -59,12 +59,12 @@ enum hsu_wake_src {
+ struct uart_hsu_port;
+ 
+ struct hsu_port_pin_cfg {
+-	int wake_gpio;
+-	int wake_src;
+-	int rx_gpio;
+-	int tx_gpio;
+-	int rts_gpio;
+-	int cts_gpio;
++	struct gpio_desc *wake_gpio;
++	enum hsu_wake_src wake_src;
++	struct gpio_desc *rx_gpio;
++	struct gpio_desc *tx_gpio;
++	struct gpio_desc *rts_gpio;
++	struct gpio_desc *cts_gpio;
+ };
+ 
+ struct hsu_port_cfg {
+diff --git a/drivers/tty/serial/hsu/hsu_plat.c b/drivers/tty/serial/hsu/hsu_plat.c
+index 5956f623cf35..d7311f491dba 100644
+--- a/drivers/tty/serial/hsu/hsu_plat.c
++++ b/drivers/tty/serial/hsu/hsu_plat.c
+@@ -49,29 +49,26 @@ static irqreturn_t wakeup_irq(int irq, void *data)
+ static int cht_hw_set_rts(struct uart_hsu_port *up, int value)
+ {
+ 	struct hsu_port_pin_cfg *pin_cfg = &up->port_cfg->pin_cfg;
+-	struct gpio_desc *gpio;
+ 
+ 	if (!pin_cfg || pin_cfg->wake_src == no_wake)
+ 		return 0;
+ 
+ 	if (value) {
+ 		if (!pin_cfg->rts_gpio) {
+-			gpio = devm_gpiod_get_index(up->dev, "hsu_rts",
++			pin_cfg->rts_gpio = gpiod_get_index(up->dev, "hsu_rts",
+ 					hsu_rts_idx);
+-			if (!IS_ERR(gpio))
+-				pin_cfg->rts_gpio = desc_to_gpio(gpio);
+ 		}
+ 
+ 		if (pin_cfg->rts_gpio) {
+-			gpio_direction_output(pin_cfg->rts_gpio, 1);
++			gpiod_direction_output(pin_cfg->rts_gpio, 1);
+ 			if (!in_interrupt())
+ 				usleep_range(up->byte_delay,
+ 						up->byte_delay + 1);
+ 		}
+ 	} else
+ 		if (pin_cfg->rts_gpio) {
+-			gpio_free(pin_cfg->rts_gpio);
+-			pin_cfg->rts_gpio = 0;
++			gpiod_put(pin_cfg->rts_gpio);
++			pin_cfg->rts_gpio = NULL;
+ 		}
+ 
+ 	return 0;
+@@ -80,7 +77,6 @@ static int cht_hw_set_rts(struct uart_hsu_port *up, int value)
+ static int cht_hsu_hw_suspend(struct uart_hsu_port *up)
+ {
+ 	struct hsu_port_pin_cfg *pin_cfg = &up->port_cfg->pin_cfg;
+-	struct gpio_desc *gpio;
+ 	int ret;
+ 
+ 	if (!pin_cfg || pin_cfg->wake_src == no_wake)
+@@ -89,38 +85,36 @@ static int cht_hsu_hw_suspend(struct uart_hsu_port *up)
+ 	switch (pin_cfg->wake_src) {
+ 	case rxd_wake:
+ 		if (!pin_cfg->rx_gpio) {
+-			gpio = devm_gpiod_get_index(up->dev, "hsu_rxd",
++			pin_cfg->rx_gpio = gpiod_get_index(up->dev, "hsu_rxd",
+ 					hsu_rxd_idx);
+-			if (!IS_ERR(gpio))
+-				pin_cfg->rx_gpio = desc_to_gpio(gpio);
+ 		}
+ 		pin_cfg->wake_gpio = pin_cfg->rx_gpio;
+ 		break;
+ 	case cts_wake:
+ 		if (!pin_cfg->cts_gpio) {
+-			gpio = devm_gpiod_get_index(up->dev, "hsu_cts",
++			pin_cfg->cts_gpio =gpiod_get_index(up->dev, "hsu_cts",
+ 					hsu_cts_idx);
+-			if (!IS_ERR(gpio))
+-				pin_cfg->cts_gpio = desc_to_gpio(gpio);
+ 		}
+ 		pin_cfg->wake_gpio = pin_cfg->cts_gpio;
+ 		break;
++	case no_wake:
+ 	default:
+-		pin_cfg->wake_gpio = -1;
++		pin_cfg->wake_gpio = NULL;
+ 		break;
+ 	}
+-	dev_dbg(up->dev, "wake_gpio=%d\n", pin_cfg->wake_gpio);
++	dev_dbg(up->dev, "wake_gpio=%d\n",
++			pin_cfg->wake_gpio ? desc_to_gpio(pin_cfg->wake_gpio) : -1);
+ 
+-	if (pin_cfg->wake_gpio != -1) {
+-		gpio_direction_input(pin_cfg->wake_gpio);
+-		ret = request_irq(gpio_to_irq(pin_cfg->wake_gpio), wakeup_irq,
++	if (pin_cfg->wake_gpio) {
++		gpiod_direction_input(pin_cfg->wake_gpio);
++		ret = request_irq(gpiod_to_irq(pin_cfg->wake_gpio), wakeup_irq,
+ 				IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_EDGE_RISING,
+ 				"hsu_wake_irq", up);
+ 		if (ret)
+ 			dev_err(up->dev, "failed to register 'hsu_wake_irq'\n");
+ 
+ 		if (pin_cfg->rts_gpio && pin_cfg->wake_src == rxd_wake)
+-			gpio_direction_output(pin_cfg->rts_gpio, 0);
++			gpiod_direction_output(pin_cfg->rts_gpio, 0);
+ 	}
+ 
+ 	return 0;
+@@ -133,24 +127,27 @@ static int cht_hsu_hw_resume(struct uart_hsu_port *up)
+ 	if (!pin_cfg || pin_cfg->wake_src == no_wake)
+ 		return 0;
+ 
+-	if (pin_cfg->wake_gpio != -1) {
+-		free_irq(gpio_to_irq(pin_cfg->wake_gpio), up);
+-		pin_cfg->wake_gpio = -1;
++	if (pin_cfg->wake_gpio) {
++		free_irq(gpiod_to_irq(pin_cfg->wake_gpio), up);
++		pin_cfg->wake_gpio = NULL;
+ 	}
+ 
+ 	switch (pin_cfg->wake_src) {
+ 	case rxd_wake:
+ 		if (pin_cfg->rx_gpio) {
+-			gpio_free(pin_cfg->rx_gpio);
+-			pin_cfg->rx_gpio = 0;
++			gpiod_put(pin_cfg->rx_gpio);
++			pin_cfg->rx_gpio = NULL;
+ 		}
+ 		break;
+ 	case cts_wake:
+ 		if (pin_cfg->cts_gpio) {
+-			gpio_free(pin_cfg->cts_gpio);
+-			pin_cfg->cts_gpio = 0;
++			gpiod_put(pin_cfg->cts_gpio);
++			pin_cfg->cts_gpio = NULL;
+ 		}
+ 		break;
++	case no_wake:
++	default:
++		break;
+ 	}
+ 
+ 	return 0;
+-- 
+1.9.1
+

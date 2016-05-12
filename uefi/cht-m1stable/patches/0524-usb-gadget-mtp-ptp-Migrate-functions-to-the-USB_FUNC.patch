@@ -1,0 +1,409 @@
+From 5c7bec56707f2e7adbd031e6dc7826d5e21d617d Mon Sep 17 00:00:00 2001
+From: Badhri Jagan Sridharan <Badhri@google.com>
+Date: Mon, 17 Nov 2014 21:11:23 -0800
+Subject: [PATCH 524/634] usb: gadget: mtp/ptp: Migrate functions to the
+ USB_FUNCTION interface
+
+This patch adds support to use mtp/ptp gadget functions
+through the DECLARE_USB_FUNCTION_INIT interface.
+
+enabling USB_CONFIGFS_F_MTP config compiles f_mtp.c
+thereby providing support for MTP gadget
+
+enabling USB_CONFIGFS_F_PTP config compiles f_ptp.c
+thereby providing support for PTP gadget
+
+Signed-off-by: Badhri Jagan Sridharan <badhri@google.com>
+Change-Id: I38d7b570e8886d155ef10cd2c839b2232dcb3158
+---
+ drivers/usb/gadget/Kconfig  |  20 +++++
+ drivers/usb/gadget/Makefile |   4 +
+ drivers/usb/gadget/f_mtp.c  | 178 +++++++++++++++++++++++++++++++++++++++++++-
+ drivers/usb/gadget/f_mtp.h  |  18 +++++
+ drivers/usb/gadget/f_ptp.c  |  38 ++++++++++
+ 5 files changed, 254 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/usb/gadget/f_mtp.h
+ create mode 100644 drivers/usb/gadget/f_ptp.c
+
+diff --git a/drivers/usb/gadget/Kconfig b/drivers/usb/gadget/Kconfig
+index 0e496e7..fccadf7 100644
+--- a/drivers/usb/gadget/Kconfig
++++ b/drivers/usb/gadget/Kconfig
+@@ -550,6 +550,12 @@ config USB_F_MASS_STORAGE
+ config USB_F_FS
+ 	tristate
+ 
++config USB_F_MTP
++	tristate
++
++config USB_F_PTP
++        tristate
++
+ choice
+ 	tristate "USB Gadget Drivers"
+ 	default USB_ETH
+@@ -722,6 +728,20 @@ config USB_CONFIGFS_F_FS
+ 	  implemented in kernel space (for instance Ethernet, serial or
+ 	  mass storage) and other are implemented in user space.
+ 
++config USB_CONFIGFS_F_MTP
++        boolean "MTP gadget"
++        depends on USB_CONFIGFS
++        select USB_F_MTP
++        help
++          USB gadget MTP support
++
++config USB_CONFIGFS_F_PTP
++        boolean "PTP gadget"
++        depends on USB_CONFIGFS && USB_CONFIGFS_F_MTP
++        select USB_F_PTP
++        help
++          USB gadget PTP support
++
+ config USB_ZERO
+ 	tristate "Gadget Zero (DEVELOPMENT)"
+ 	select USB_LIBCOMPOSITE
+diff --git a/drivers/usb/gadget/Makefile b/drivers/usb/gadget/Makefile
+index 98af79e..b2b05d5 100644
+--- a/drivers/usb/gadget/Makefile
++++ b/drivers/usb/gadget/Makefile
+@@ -64,6 +64,10 @@ usb_f_mass_storage-y		:= f_mass_storage.o storage_common.o
+ obj-$(CONFIG_USB_F_MASS_STORAGE)+= usb_f_mass_storage.o
+ usb_f_fs-y			:= f_fs.o
+ obj-$(CONFIG_USB_F_FS)		+= usb_f_fs.o
++usb_f_mtp-y			:= f_mtp.o
++obj-$(CONFIG_USB_F_MTP)		+= usb_f_mtp.o
++usb_f_ptp-y			:= f_ptp.o
++obj-$(CONFIG_USB_F_PTP)		+= usb_f_ptp.o
+ 
+ #
+ # USB gadget drivers
+diff --git a/drivers/usb/gadget/f_mtp.c b/drivers/usb/gadget/f_mtp.c
+index 620aeaa..82f6b2e 100644
+--- a/drivers/usb/gadget/f_mtp.c
++++ b/drivers/usb/gadget/f_mtp.c
+@@ -35,9 +35,14 @@
+ #include <linux/usb_usual.h>
+ #include <linux/usb/ch9.h>
+ #include <linux/usb/f_mtp.h>
++#include <linux/configfs.h>
++#include <linux/usb/composite.h>
++
++#include "configfs.h"
+ 
+ #define MTP_BULK_BUFFER_SIZE       16384
+ #define INTR_BUFFER_SIZE           28
++#define MAX_INST_NAME_LEN          40
+ 
+ /* String IDs */
+ #define INTERFACE_STRING_INDEX	0
+@@ -66,8 +71,9 @@
+ /* constants for device status */
+ #define MTP_RESPONSE_OK             0x2001
+ #define MTP_RESPONSE_DEVICE_BUSY    0x2019
++#define DRIVER_NAME "mtp"
+ 
+-static const char mtp_shortname[] = "mtp_usb";
++static const char mtp_shortname[] = DRIVER_NAME "_usb";
+ 
+ struct mtp_dev {
+ 	struct usb_function function;
+@@ -280,6 +286,12 @@ struct mtp_data_header {
+ 	__le32	transaction_id;
+ };
+ 
++struct mtp_instance {
++	struct usb_function_instance func_inst;
++	const char *name;
++	struct mtp_dev *dev;
++};
++
+ /* temporary variable used between mtp_open() and mtp_gadget_bind() */
+ static struct mtp_dev *_mtp_dev;
+ 
+@@ -456,7 +468,7 @@ static int mtp_create_bulk_endpoints(struct mtp_dev *dev,
+ 	return 0;
+ 
+ fail:
+-	printk(KERN_ERR "mtp_bind() could not allocate requests\n");
++	pr_err("mtp_bind() could not allocate requests\n");
+ 	return -1;
+ }
+ 
+@@ -1099,6 +1111,13 @@ mtp_function_bind(struct usb_configuration *c, struct usb_function *f)
+ 		return id;
+ 	mtp_interface_desc.bInterfaceNumber = id;
+ 
++	if (mtp_string_defs[INTERFACE_STRING_INDEX].id == 0) {
++		ret = usb_string_id(c->cdev);
++		if (ret < 0)
++			return ret;
++		mtp_string_defs[INTERFACE_STRING_INDEX].id = ret;
++		mtp_interface_desc.iInterface = ret;
++	}
+ 	/* allocate endpoints */
+ 	ret = mtp_create_bulk_endpoints(dev, &mtp_fullspeed_in_desc,
+ 			&mtp_fullspeed_out_desc, &mtp_intr_desc);
+@@ -1126,6 +1145,7 @@ mtp_function_unbind(struct usb_configuration *c, struct usb_function *f)
+ 	struct usb_request *req;
+ 	int i;
+ 
++	mtp_string_defs[INTERFACE_STRING_INDEX].id = 0;
+ 	while ((req = mtp_req_get(dev, &dev->tx_idle)))
+ 		mtp_request_free(req, dev->ep_in);
+ 	for (i = 0; i < RX_REQ_MAX; i++)
+@@ -1213,7 +1233,7 @@ static int mtp_bind_config(struct usb_configuration *c, bool ptp_config)
+ 	}
+ 
+ 	dev->cdev = c->cdev;
+-	dev->function.name = "mtp";
++	dev->function.name = DRIVER_NAME;
+ 	dev->function.strings = mtp_strings;
+ 	if (ptp_config) {
+ 		dev->function.fs_descriptors = fs_ptp_descs;
+@@ -1230,12 +1250,16 @@ static int mtp_bind_config(struct usb_configuration *c, bool ptp_config)
+ 	return usb_add_function(c, &dev->function);
+ }
+ 
+-static int mtp_setup(void)
++static int __mtp_setup(struct mtp_instance *fi_mtp)
+ {
+ 	struct mtp_dev *dev;
+ 	int ret;
+ 
+ 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++
++	if (fi_mtp != NULL)
++		fi_mtp->dev = dev;
++
+ 	if (!dev)
+ 		return -ENOMEM;
+ 
+@@ -1273,6 +1297,17 @@ err1:
+ 	return ret;
+ }
+ 
++static int mtp_setup(void)
++{
++	return __mtp_setup(NULL);
++}
++
++static int mtp_setup_configfs(struct mtp_instance *fi_mtp)
++{
++	return __mtp_setup(fi_mtp);
++}
++
++
+ static void mtp_cleanup(void)
+ {
+ 	struct mtp_dev *dev = _mtp_dev;
+@@ -1285,3 +1320,138 @@ static void mtp_cleanup(void)
+ 	_mtp_dev = NULL;
+ 	kfree(dev);
+ }
++
++static struct mtp_instance *to_mtp_instance(struct config_item *item)
++{
++	return container_of(to_config_group(item), struct mtp_instance,
++		func_inst.group);
++}
++
++static void mtp_attr_release(struct config_item *item)
++{
++	struct mtp_instance *fi_mtp = to_mtp_instance(item);
++	usb_put_function_instance(&fi_mtp->func_inst);
++}
++
++static struct configfs_item_operations mtp_item_ops = {
++	.release        = mtp_attr_release,
++};
++
++static struct config_item_type mtp_func_type = {
++	.ct_item_ops    = &mtp_item_ops,
++	.ct_owner       = THIS_MODULE,
++};
++
++
++static struct mtp_instance *to_fi_mtp(struct usb_function_instance *fi)
++{
++	return container_of(fi, struct mtp_instance, func_inst);
++}
++
++static int mtp_set_inst_name(struct usb_function_instance *fi, const char *name)
++{
++	struct mtp_instance *fi_mtp;
++	char *ptr;
++	int name_len;
++
++	name_len = strlen(name) + 1;
++	if (name_len > MAX_INST_NAME_LEN)
++		return -ENAMETOOLONG;
++
++	ptr = kstrndup(name, name_len, GFP_KERNEL);
++	if (!ptr)
++		return -ENOMEM;
++
++	fi_mtp = to_fi_mtp(fi);
++	fi_mtp->name = ptr;
++
++	return 0;
++}
++
++static void mtp_free_inst(struct usb_function_instance *fi)
++{
++	struct mtp_instance *fi_mtp;
++
++	fi_mtp = to_fi_mtp(fi);
++	kfree(fi_mtp->name);
++	mtp_cleanup();
++	kfree(fi_mtp);
++}
++
++struct usb_function_instance *alloc_inst_mtp_ptp(bool mtp_config)
++{
++	struct mtp_instance *fi_mtp;
++	int ret = 0;
++
++	fi_mtp = kzalloc(sizeof(*fi_mtp), GFP_KERNEL);
++	if (!fi_mtp)
++		return ERR_PTR(-ENOMEM);
++	fi_mtp->func_inst.set_inst_name = mtp_set_inst_name;
++	fi_mtp->func_inst.free_func_inst = mtp_free_inst;
++
++	if (mtp_config) {
++		ret = mtp_setup_configfs(fi_mtp);
++		if (ret) {
++			kfree(fi_mtp);
++			pr_err("Error setting MTP\n");
++			return ERR_PTR(ret);
++		}
++	} else
++		fi_mtp->dev = _mtp_dev;
++
++	config_group_init_type_name(&fi_mtp->func_inst.group,
++					"", &mtp_func_type);
++
++	return  &fi_mtp->func_inst;
++}
++EXPORT_SYMBOL_GPL(alloc_inst_mtp_ptp);
++
++static struct usb_function_instance *mtp_alloc_inst(void)
++{
++		return alloc_inst_mtp_ptp(true);
++}
++
++static int mtp_ctrlreq_configfs(struct usb_function *f,
++				const struct usb_ctrlrequest *ctrl)
++{
++	return mtp_ctrlrequest(f->config->cdev, ctrl);
++}
++
++static void mtp_free(struct usb_function *f)
++{
++	/*NO-OP: no function specific resource allocation in mtp_alloc*/
++}
++
++struct usb_function *function_alloc_mtp_ptp(struct usb_function_instance *fi,
++					bool mtp_config)
++{
++	struct mtp_instance *fi_mtp = to_fi_mtp(fi);
++	struct mtp_dev *dev = fi_mtp->dev;
++
++	dev->function.name = DRIVER_NAME;
++	dev->function.strings = mtp_strings;
++	if (mtp_config) {
++		dev->function.fs_descriptors = fs_mtp_descs;
++		dev->function.hs_descriptors = hs_mtp_descs;
++	} else {
++		dev->function.fs_descriptors = fs_ptp_descs;
++		dev->function.hs_descriptors = hs_ptp_descs;
++	}
++	dev->function.bind = mtp_function_bind;
++	dev->function.unbind = mtp_function_unbind;
++	dev->function.set_alt = mtp_function_set_alt;
++	dev->function.disable = mtp_function_disable;
++	dev->function.setup = mtp_ctrlreq_configfs;
++	dev->function.free_func = mtp_free;
++
++	return &dev->function;
++}
++EXPORT_SYMBOL_GPL(function_alloc_mtp_ptp);
++
++static struct usb_function *mtp_alloc(struct usb_function_instance *fi)
++{
++	return function_alloc_mtp_ptp(fi, true);
++}
++
++DECLARE_USB_FUNCTION_INIT(mtp, mtp_alloc_inst, mtp_alloc);
++MODULE_LICENSE("GPL");
+diff --git a/drivers/usb/gadget/f_mtp.h b/drivers/usb/gadget/f_mtp.h
+new file mode 100644
+index 0000000..7adb1ff
+--- /dev/null
++++ b/drivers/usb/gadget/f_mtp.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ * Author: Badhri Jagan Sridharan <badhri@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++extern struct usb_function_instance *alloc_inst_mtp_ptp(bool mtp_config);
++extern struct usb_function *function_alloc_mtp_ptp(
++			struct usb_function_instance *fi, bool mtp_config);
+diff --git a/drivers/usb/gadget/f_ptp.c b/drivers/usb/gadget/f_ptp.c
+new file mode 100644
+index 0000000..da3e4d5
+--- /dev/null
++++ b/drivers/usb/gadget/f_ptp.c
+@@ -0,0 +1,38 @@
++/*
++ * Gadget Function Driver for PTP
++ *
++ * Copyright (C) 2014 Google, Inc.
++ * Author: Badhri Jagan Sridharan <badhri@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/types.h>
++
++#include <linux/configfs.h>
++#include <linux/usb/composite.h>
++
++#include "f_mtp.h"
++
++static struct usb_function_instance *ptp_alloc_inst(void)
++{
++	return alloc_inst_mtp_ptp(false);
++}
++
++static struct usb_function *ptp_alloc(struct usb_function_instance *fi)
++{
++	return function_alloc_mtp_ptp(fi, false);
++}
++
++DECLARE_USB_FUNCTION_INIT(ptp, ptp_alloc_inst, ptp_alloc);
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Badhri Jagan Sridharan");
+-- 
+1.9.1
+

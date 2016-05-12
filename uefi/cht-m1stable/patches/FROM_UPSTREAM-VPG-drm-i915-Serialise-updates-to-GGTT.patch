@@ -1,0 +1,108 @@
+From 36b2293abe41075ba173cf718a882e624b9a7e20 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 23 Oct 2015 18:43:32 +0100
+Subject: [PATCH 6/7] FROM_UPSTREAM [VPG]: drm/i915: Serialise updates to GGTT
+ with access through GGTT on Braswell
+
+When accessing through the GTT from one CPU whilst concurrently updating
+the GGTT PTEs in another thread, the hardware likes to return random
+data. As we have strong serialisation prevent us from modifying the PTE
+of an active GTT mmapping, we have to conclude that it whilst modifying
+other PTE's that error occurs. (I have not looked for any pattern such
+as modifying PTE within the same page or cacheline as active PTE -
+though checking whether revoking neighbouring objects should be enough
+to test that theory.) The corruption also seems restricted to Braswell
+and disappears with maxcpus=0. This patch stops all access through the
+GTT by other CPUs when we update any PTE by stopping the machine around
+the GGTT update.
+
+Note that splitting up the 64 bit write into two 32 bit writes was
+tried and found to fail too.
+
+Forklift note: this is the least intrusive port to 3.14, we still have
+vma vfuns on each vma (instead of address space as in more modern kernels);
+also there's no return code in ggtt_bind_vma, but stop_machine needs one,
+so fake it to keep the compiler happy.
+
+Change-Id: I9d8c950ff18034bcc473541f745fbf6544662406
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-11653
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 5bab6f60cb4d1417ad7c599166bcfec87529c1a2
+Upstream-as-of-tag: drm-intel-next-2015-11-20-rebased
+Testcase: igt/gem_concurrent_blit
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=89079
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+[danvet: Add note about 2x 32bits failing too.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+Reviewed-on: https://android.intel.com:443/444091
+---
+ drivers/gpu/drm/i915/Kconfig        |  1 +
+ drivers/gpu/drm/i915/i915_gem_gtt.c | 25 +++++++++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/Kconfig b/drivers/gpu/drm/i915/Kconfig
+index 47a675a..a41b67a 100644
+--- a/drivers/gpu/drm/i915/Kconfig
++++ b/drivers/gpu/drm/i915/Kconfig
+@@ -10,6 +10,7 @@ config DRM_I915
+ 	# the shmem_readpage() which depends upon tmpfs
+ 	select SHMEM
+ 	select TMPFS
++	select STOP_MACHINE
+ 	select DRM_KMS_HELPER
+ 	# i915 depends on ACPI_VIDEO when ACPI is enabled
+ 	# but for select to work, need to select ACPI_VIDEO's dependencies, ick
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index a4fd648..2d89933 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include <linux/seq_file.h>
++#include <linux/stop_machine.h>
+ #include <drm/drmP.h>
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+@@ -2196,6 +2197,27 @@ static void ggtt_bind_vma(struct i915_vma *vma,
+ 	}
+ }
+ 
++struct ggtt_bind_vma__cb {
++	struct i915_vma *vma;
++	enum i915_cache_level cache_level;
++	u32 flags;
++};
++
++static int ggtt_bind_vma__cb(void *_arg)
++{
++	struct ggtt_bind_vma__cb *arg = _arg;
++	ggtt_bind_vma(arg->vma, arg->cache_level, arg->flags);
++	return 0;
++}
++
++static void ggtt_bind_vma__BKL(struct i915_vma *vma,
++			      enum i915_cache_level cache_level,
++			      u32 flags)
++{
++	struct ggtt_bind_vma__cb arg = { vma, cache_level, flags };
++	stop_machine(ggtt_bind_vma__cb, &arg, NULL);
++}
++
+ static void ggtt_unbind_vma(struct i915_vma *vma)
+ {
+ 	struct drm_device *dev = vma->vm->dev;
+@@ -2748,6 +2770,9 @@ static struct i915_vma *__i915_gem_vma_create(struct drm_i915_gem_object *obj,
+ 		if (i915_is_ggtt(vm)) {
+ 			vma->unbind_vma = ggtt_unbind_vma;
+ 			vma->bind_vma = ggtt_bind_vma;
++
++			if (IS_CHERRYVIEW(vm->dev))
++				vma->bind_vma = ggtt_bind_vma__BKL;
+ 		} else {
+ 			vma->unbind_vma = ppgtt_unbind_vma;
+ 			vma->bind_vma = ppgtt_bind_vma;
+-- 
+1.9.1
+

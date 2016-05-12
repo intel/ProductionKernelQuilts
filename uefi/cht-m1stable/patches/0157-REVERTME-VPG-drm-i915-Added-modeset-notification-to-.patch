@@ -1,0 +1,129 @@
+From 44edbdab170eb711e4422f864a1aceaf65a8c6cb Mon Sep 17 00:00:00 2001
+Message-Id: <44edbdab170eb711e4422f864a1aceaf65a8c6cb.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Vidya Srinivas <vidya.srinivas@intel.com>
+Date: Mon, 7 Jul 2014 22:00:03 +0530
+Subject: [PATCH 157/312] REVERTME [VPG]: drm/i915: Added modeset notification
+ to HAD.
+
+The following changes have been ported:
+	drm/i915: Added modeset notification to HAD (ChangeID - I3342bf3a6381b103819c7e1f2145a6ab31c6e606)
+	Description: Forward ported from 3.4 kernel
+	Modeset event is sent from Display driver to HDMI Audio driver
+	when a new mode is selected during extended video mode scenario.
+
+	drm/i915: Fixed HDMI Audio 5.1 channel playback (ChangeID - I912556c024dc4bb1a734e53f184a11398837b8a3)
+	Description: Forward ported from 3.4 kernel
+	Fixed synchronization issue between HAD and display driver related to
+	EDID exchange. HAD driver requested EDID value before display driver actually
+	gets it. Resolved by modifying the notification sequence.
+
+	drm/i915: Fixed Interoperability with DVI issue (ChangeID - I6a333599b455afebd3a1c29dcd670359689d37d0)
+	This patch fixes the DVI audio issue. The audio is disabled when DVI connector is hot plugged.
+	Author: Alok Pandey <alok.pandey@intel.com>
+
+	This patch is a REVERTME as HDMI audio design might change.
+
+Issue: GMIN-1458
+Change-Id: I16152551ca5dd6951824e99984dcfba4d6b42e35
+Signed-off-by: Uma Shankar <uma.shankar@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |    2 ++
+ drivers/gpu/drm/i915/intel_hdmi.c    |   41 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index d95c4d5..5631c10 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2679,6 +2679,8 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 	if (IS_VALLEYVIEW(dev) && intel_pipe_has_type(crtc,
+ 		INTEL_OUTPUT_HDMI)) {
+ 		dev_priv->tmds_clock_speed = intel_crtc->config.port_clock;
++		mid_hdmi_audio_signal_event(dev_priv->dev,
++			HAD_EVENT_MODE_CHANGING);
+ 	}
+ #endif
+ 
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index 85c7b77..b0c6875 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1040,6 +1040,9 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 	struct edid *edid;
+ 	enum intel_display_power_domain power_domain;
+ 	enum drm_connector_status status = connector_status_disconnected;
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++	bool inform_audio = false;
++#endif
+ 
+ 	DRM_DEBUG_KMS("[CONNECTOR:%d:%s]\n",
+ 		      connector->base.id, connector->name);
+@@ -1050,6 +1053,16 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 	intel_hdmi->has_hdmi_sink = false;
+ 	intel_hdmi->has_audio = false;
+ 	intel_hdmi->rgb_quant_range_selectable = false;
++
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++	if (IS_VALLEYVIEW(dev)) {
++		/* Need to inform audio about the event */
++		if (intel_hdmi->has_audio)
++			inform_audio = true;
++		intel_hdmi->has_audio = false;
++	}
++#endif
++
+ 	edid = drm_get_edid(connector,
+ 			    intel_gmbus_get_adapter(dev_priv,
+ 						    intel_hdmi->ddc_bus));
+@@ -1068,10 +1081,33 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 	}
+ 
+ 	if (status == connector_status_connected) {
++		/*
++		* If HDMI status is conencted, the event to audio will be
++		* sent on basis of current audio status,
++		* but if its disconnected, the
++		* status will be sent based on previous audio status
++		*/
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++		if ((status != i915_hdmi_state) && (IS_VALLEYVIEW(dev))) {
++			if (intel_hdmi->has_audio)
++				i915_notify_had = 1;
++		}
++#endif
+ 		if (intel_hdmi->force_audio != HDMI_AUDIO_AUTO)
+ 			intel_hdmi->has_audio =
+ 				(intel_hdmi->force_audio == HDMI_AUDIO_ON);
+ 		intel_encoder->type = INTEL_OUTPUT_HDMI;
++	} else {
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++		if ((status != i915_hdmi_state) && (IS_VALLEYVIEW(dev))) {
++			/* Send a disconnect event to audio */
++			if (inform_audio) {
++				DRM_DEBUG_DRIVER("Sending event to audio");
++				mid_hdmi_audio_signal_event(dev_priv->dev,
++					HAD_EVENT_HOT_UNPLUG);
++			}
++		}
++#endif
+ 	}
+ 
+ 	if (IS_ENABLED(CONFIG_SWITCH)) {
+@@ -1090,6 +1126,11 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 
+ 	intel_display_power_put(dev_priv, power_domain);
+ 
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++	if (IS_VALLEYVIEW(dev))
++		i915_hdmi_state = status;
++#endif
++
+ 	return status;
+ }
+ 
+-- 
+1.7.9.5
+

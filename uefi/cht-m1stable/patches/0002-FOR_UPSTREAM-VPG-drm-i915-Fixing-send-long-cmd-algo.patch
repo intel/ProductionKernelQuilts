@@ -1,0 +1,96 @@
+From 4701fab3030e53a1d3acded5a8ef5cbe69429163 Mon Sep 17 00:00:00 2001
+Message-Id: <4701fab3030e53a1d3acded5a8ef5cbe69429163.1426664743.git.chang-joon.lee@intel.com>
+In-Reply-To: <6cf4814be6b971f0e7141f9bb9a3acd992d576bf.1426664743.git.chang-joon.lee@intel.com>
+References: <6cf4814be6b971f0e7141f9bb9a3acd992d576bf.1426664743.git.chang-joon.lee@intel.com>
+From: vkorjani <vikas.korjani@intel.com>
+Date: Wed, 4 Mar 2015 11:14:37 +0530
+Subject: [PATCH 2/3] FOR_UPSTREAM [VPG]: drm/i915: Fixing send long cmd algo.
+
+Current code we check for ctrl/data fifo !full before sending
+every packet of long cmd,  however this may cause FIFO overflow
+as fifo !full means fifo has 4byte of space in worst case and
+while writing more than 1 dword (4 bytes) in FIFO it may overflow.
+In the same sequence wait_for check, introduces min delay of
+1.5ms(approx.) for every packet. and some panel may need as high as
+100 , 200 packets which introduces huge delay and effect KPI numbers.
+
+Correct algorithm is to check and wait for fifo not full before
+sending each dword of packet. which will ensure fifo never overflows.
+This patch does same and replaces wait_for with wait_for_atomic.
+
+Issue: IRDA-3305
+Change-Id: I73828b96020962c8ba5a0d806f4bc32968712509
+Signed-off-by: vkorjani <vikas.korjani@intel.com>
+Signed-off-by: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+---
+ drivers/gpu/drm/i915/intel_dsi_cmd.c |   34 +++++++++++++++++++++++++---------
+ 1 file changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_dsi_cmd.c b/drivers/gpu/drm/i915/intel_dsi_cmd.c
+index cc615ac..d2c7787 100644
+--- a/drivers/gpu/drm/i915/intel_dsi_cmd.c
++++ b/drivers/gpu/drm/i915/intel_dsi_cmd.c
+@@ -146,7 +146,8 @@ static int dsi_vc_send_short(struct intel_dsi *intel_dsi, int channel,
+ 		mask = LP_CTRL_FIFO_FULL;
+ 	}
+ 
+-	if (wait_for((I915_READ(MIPI_GEN_FIFO_STAT(pipe)) & mask) == 0, 50)) {
++	if (wait_for_atomic((I915_READ(MIPI_GEN_FIFO_STAT(pipe)) &
++					mask) == 0, 5)) {
+ 		DRM_ERROR("Timeout waiting for HS/LP CTRL FIFO !full\n");
+ 		print_stat(intel_dsi);
+ 	}
+@@ -191,10 +192,6 @@ static int dsi_vc_send_long(struct intel_dsi *intel_dsi, int channel,
+ 		data_mask = LP_DATA_FIFO_FULL;
+ 	}
+ 
+-	if (wait_for((I915_READ(MIPI_GEN_FIFO_STAT(pipe)) &
+-				data_mask) == 0, 50))
+-		DRM_ERROR("Timeout for HS/LP DATA FIFO to be !FULL\n");
+-
+ 	for (i = 0; i < len; i += n) {
+ 		u32 val = 0;
+ 		n = min_t(int, len - i, 4);
+@@ -202,16 +199,35 @@ static int dsi_vc_send_long(struct intel_dsi *intel_dsi, int channel,
+ 		for (j = 0; j < n; j++)
+ 			val |= *data++ << 8 * j;
+ 
++		/*
++		 * check for data fifo !full, once that is set, write 4
++		 * dwords, then continue.
++		 * calculated time for the data FIFO to have at least 4 bytes of
++		 * free space is 297.600 usec for 5Mhz escape clock with ctrl
++		 * FIFO size of 8 dwords.
++		 * Number of bytes for DSI header packet = 64
++		 * Number of bytes for DSI footer = 14 bytes
++		 * Number of bytes for entry code = 8 bytes
++		 * Number of bytes read from data FIFO = 4 bytes
++		 * Total = 90 bytes
++		 * Number of bits = 720 bits
++		 * Number of Tlpx(considering spaced one hot encoding)
++		 * = 1440 Tlpx
++		 * Number of Tlps including Escape seqence = 1488 Tlps
++		 * Time taken in usec @ 5Mhz Esc clock = 297.6 usec
++		 */
++		if (wait_for_atomic((I915_READ(MIPI_GEN_FIFO_STAT(pipe)) &
++						data_mask) == 0, 5))
++			DRM_ERROR("Timeout for HS/LP DATA FIFO to be !FULL\n");
++
+ 		I915_WRITE(data_reg, val);
+-		/* XXX: check for data fifo full, once that is set, write 4
+-		 * dwords, then wait for not set, then continue. */
+ 	}
+ 	ctrl = len << LONG_PACKET_WORD_COUNT_SHIFT;
+ 	ctrl |= channel << VIRTUAL_CHANNEL_SHIFT;
+ 	ctrl |= data_type << DATA_TYPE_SHIFT;
+ 
+-	if (wait_for((I915_READ(MIPI_GEN_FIFO_STAT(pipe)) &
+-					ctrl_mask) == 0, 50))
++	if (wait_for_atomic((I915_READ(MIPI_GEN_FIFO_STAT(pipe)) &
++					ctrl_mask) == 0, 5))
+ 		DRM_ERROR("Timeout for HS/LP CTRL FIFO to be !FULL\n");
+ 
+ 	I915_WRITE(ctrl_reg, ctrl);
+-- 
+1.7.9.5
+

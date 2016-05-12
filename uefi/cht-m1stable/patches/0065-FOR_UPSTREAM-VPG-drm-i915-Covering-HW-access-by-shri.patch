@@ -1,0 +1,149 @@
+From 526795e10500060a1aa3682bfef5804a678f4c51 Mon Sep 17 00:00:00 2001
+Message-Id: <526795e10500060a1aa3682bfef5804a678f4c51.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Sagar Kamble <sagar.a.kamble@intel.com>
+Date: Tue, 7 Oct 2014 13:40:11 +0530
+Subject: [PATCH 65/71] FOR_UPSTREAM [VPG]: drm/i915: Covering HW access by
+ shrinker call and add request with RPM get and put
+
+Following warning is hit since Gfx was in suspended state. Covering the vma_unbind with RPM get/put
+will overcome this warning.
+
+Backtrace-0.03: kernel assert_device_not_suspended.isra.7+0x4b
+Backtrace-0.04: kernel vlv_read32+0x32
+Backtrace-0.05: kernel ?_gen6_write32+0x6a
+Backtrace-0.06: kernel i915_gem_write_fence+0x4e0
+Backtrace-0.07: kernel i915_gem_object_update_fence+0x9a
+Backtrace-0.08: kernel i915_gem_object_put_fence+0x72
+Backtrace-0.09: kernel i915_vma_unbind+0x6b
+Backtrace-0.10: kernel __i915_gem_shrink+0x1d4
+Backtrace-0.11: kernel i915_gem_inactive_scan+0x8a
+Backtrace-0.12: kernel shrink_slab_node+0x14b
+Backtrace-0.13: kernel shrink_slab+0x78
+Backtrace-0.14: kernel balance_pgdat+0x3a1
+Backtrace-0.15: kernel kswapd+0x15b
+
+v2:
+Faced another similar issue of Gfx access when suspended. Fixing by covering __i915_add_request with
+RPM get/put. Following is the callstack.
+<7>[  177.878729]  [<ffffffff815ba36b>] assert_device_not_suspended.isra.8+0x4b/0x50
+<7>[  177.886822]  [<ffffffff815bc1c8>] gen6_write32+0x38/0x130
+<7>[  177.892870]  [<ffffffff815b3527>] ring_write_tail+0x27/0x30
+<7>[  177.899114]  [<ffffffff815b5554>] __intel_ring_advance+0x64/0x80
+<7>[  177.905841]  [<ffffffff815b561a>] gen6_add_request+0xaa/0xc0
+<7>[  177.912183]  [<ffffffff8159453a>] __i915_add_request+0x19a/0x2e0
+<7>[  177.918911]  [<ffffffff815b6abb>] intel_ring_idle+0x4b/0x60
+<7>[  177.925155]  [<ffffffff81595a6b>] i915_gpu_idle+0x5b/0x70
+<7>[  177.931203]  [<ffffffff8158c335>] i915_gem_evict_everything+0x95/0x160
+<7>[  177.938518]  [<ffffffff81598505>] i915_gem_shrink_all+0x15/0x30
+<7>[  177.945155]  [<ffffffff815985ab>] i915_gem_shrinker_oom+0x8b/0x1d0
+<7>[  177.952082]  [<ffffffff810ecbb3>] notifier_call_chain+0x53/0xa0
+<7>[  177.958715]  [<ffffffff810ecd9d>] __blocking_notifier_call_chain+0x4d/0x70
+<7>[  177.966417]  [<ffffffff810ecdd6>] blocking_notifier_call_chain+0x16/0x20
+<7>[  177.973925]  [<ffffffff8119502b>] out_of_memory+0x3b/0x300
+<7>[  177.980073]  [<ffffffff81199f71>] __alloc_pages_nodemask+0x951/0x9f0
+<7>[  177.987203]  [<ffffffff81193170>] filemap_fault+0x1a0/0x420
+<7>[  177.993453]  [<ffffffff811b6a33>] __do_fault+0x73/0x500
+<7>[  177.999312]  [<ffffffff811ba607>] handle_mm_fault+0x237/0xd30
+
+v3:
+Fixed RPM put in return path in __i915_add_request.
+
+Issue: GMINL-2131
+Change-Id: I3f4629ebcadccb2283cd943d2a896debcd8b8719
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Signed-off-by: Sagar Kamble <sagar.a.kamble@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c |   27 +++++++++++++++++++++------
+ 1 file changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index cf7895c..820057e 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2042,6 +2042,12 @@ __i915_gem_shrink(struct drm_i915_private *dev_priv, long target,
+ 	}
+ 	list_splice(&still_in_list, &dev_priv->mm.unbound_list);
+ 
++	/*
++	 * Making sure device is resumed with rpm get, since fence registers
++	 * are accessed for bound_list.
++	 */
++	intel_runtime_pm_get(dev_priv);
++
+ 	INIT_LIST_HEAD(&still_in_list);
+ 	while (count < target && !list_empty(&dev_priv->mm.bound_list)) {
+ 		struct i915_vma *vma, *v;
+@@ -2066,6 +2072,8 @@ __i915_gem_shrink(struct drm_i915_private *dev_priv, long target,
+ 	}
+ 	list_splice(&still_in_list, &dev_priv->mm.bound_list);
+ 
++	intel_runtime_pm_put(dev_priv);
++
+ 	return count;
+ }
+ 
+@@ -2396,7 +2404,7 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	struct drm_i915_gem_request *request;
+ 	struct intel_ringbuffer *ringbuf;
+ 	u32 request_ring_position, request_start;
+-	int ret;
++	int ret = 0;
+ 
+ 	request = ring->preallocated_lazy_request;
+ 	if (WARN_ON(request == NULL))
+@@ -2409,6 +2417,9 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 		ringbuf = ring->buffer;
+ 
+ 	request_start = intel_ring_get_tail(ringbuf);
++
++	intel_runtime_pm_get(dev_priv);
++
+ 	/*
+ 	 * Emit any outstanding flushes - execbuf can fail to emit the flush
+ 	 * after having emitted the batchbuffer command. Hence we need to fix
+@@ -2419,11 +2430,11 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	if (i915.enable_execlists) {
+ 		ret = logical_ring_flush_all_caches(ringbuf);
+ 		if (ret)
+-			return ret;
++			goto end;
+ 	} else {
+ 		ret = intel_ring_flush_all_caches(ring);
+ 		if (ret)
+-			return ret;
++			goto end;
+ 	}
+ 
+ 	/* Record the position of the start of the request so that
+@@ -2436,11 +2447,11 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	if (i915.enable_execlists) {
+ 		ret = ring->emit_request(ringbuf);
+ 		if (ret)
+-			return ret;
++			goto end;
+ 	} else {
+ 		ret = ring->add_request(ring);
+ 		if (ret)
+-			return ret;
++			goto end;
+ 	}
+ 
+ 	request->seqno = intel_ring_get_seqno(ring);
+@@ -2493,7 +2504,11 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 
+ 	if (out_seqno)
+ 		*out_seqno = request->seqno;
+-	return 0;
++
++end:
++	intel_runtime_pm_put(dev_priv);
++
++	return ret;
+ }
+ 
+ static inline void
+-- 
+1.7.9.5
+

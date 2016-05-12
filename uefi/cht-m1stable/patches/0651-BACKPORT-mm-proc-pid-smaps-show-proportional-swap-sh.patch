@@ -1,0 +1,231 @@
+From 900d7b7aeddc6c6e668680684f76020dea16fd0e Mon Sep 17 00:00:00 2001
+From: Minchan Kim <minchan@kernel.org>
+Date: Tue, 8 Sep 2015 15:00:24 -0700
+Subject: [PATCH 651/687] BACKPORT: mm: /proc/pid/smaps:: show proportional
+ swap share of the mapping
+
+We want to know per-process workingset size for smart memory management
+on userland and we use swap(ex, zram) heavily to maximize memory
+efficiency so workingset includes swap as well as RSS.
+
+On such system, if there are lots of shared anonymous pages, it's really
+hard to figure out exactly how many each process consumes memory(ie, rss
++ wap) if the system has lots of shared anonymous memory(e.g, android).
+
+This patch introduces SwapPss field on /proc/<pid>/smaps so we can get
+more exact workingset size per process.
+
+Bongkyu tested it. Result is below.
+
+1. 50M used swap
+SwapTotal: 461976 kB
+SwapFree: 411192 kB
+
+$ adb shell cat /proc/*/smaps | grep "SwapPss:" | awk '{sum += $2} END {print sum}';
+48236
+$ adb shell cat /proc/*/smaps | grep "Swap:" | awk '{sum += $2} END {print sum}';
+141184
+
+2. 240M used swap
+SwapTotal: 461976 kB
+SwapFree: 216808 kB
+
+$ adb shell cat /proc/*/smaps | grep "SwapPss:" | awk '{sum += $2} END {print sum}';
+230315
+$ adb shell cat /proc/*/smaps | grep "Swap:" | awk '{sum += $2} END {print sum}';
+1387744
+
+[akpm@linux-foundation.org: simplify kunmap_atomic() call]
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Reported-by: Bongkyu Kim <bongkyu.kim@lge.com>
+Tested-by: Bongkyu Kim <bongkyu.kim@lge.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Sergey Senozhatsky <sergey.senozhatsky.work@gmail.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Jerome Marchand <jmarchan@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Bug: 26190646
+Change-Id: Idf92d682fdef432bdd66e530a7e7cdff8f375db1
+Signed-off-by: Thierry Strudel <tstrudel@google.com>
+---
+ Documentation/filesystems/proc.txt | 18 +++++++++++-----
+ fs/proc/task_mmu.c                 | 20 +++++++++++++++---
+ include/linux/swap.h               |  6 ++++++
+ mm/swapfile.c                      | 42 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 78 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/filesystems/proc.txt b/Documentation/filesystems/proc.txt
+index 90adc37..44ba60d 100644
+--- a/Documentation/filesystems/proc.txt
++++ b/Documentation/filesystems/proc.txt
+@@ -417,6 +417,7 @@ Private_Dirty:         0 kB
+ Referenced:          892 kB
+ Anonymous:             0 kB
+ Swap:                  0 kB
++SwapPss:               0 kB
+ KernelPageSize:        4 kB
+ MMUPageSize:           4 kB
+ Locked:              374 kB
+@@ -427,16 +428,23 @@ the first of these lines shows the same information as is displayed for the
+ mapping in /proc/PID/maps.  The remaining lines show the size of the mapping
+ (size), the amount of the mapping that is currently resident in RAM (RSS), the
+ process' proportional share of this mapping (PSS), the number of clean and
+-dirty private pages in the mapping.  Note that even a page which is part of a
+-MAP_SHARED mapping, but has only a single pte mapped, i.e.  is currently used
+-by only one process, is accounted as private and not as shared.  "Referenced"
+-indicates the amount of memory currently marked as referenced or accessed.
++dirty private pages in the mapping.
++
++The "proportional set size" (PSS) of a process is the count of pages it has
++in memory, where each page is divided by the number of processes sharing it.
++So if a process has 1000 pages all to itself, and 1000 shared with one other
++process, its PSS will be 1500.
++Note that even a page which is part of a MAP_SHARED mapping, but has only
++a single pte mapped, i.e.  is currently used by only one process, is accounted
++as private and not as shared.
++"Referenced" indicates the amount of memory currently marked as referenced or
++accessed.
+ "Anonymous" shows the amount of memory that does not belong to any file.  Even
+ a mapping associated with a file may contain anonymous pages: when MAP_PRIVATE
+ and a page is modified, the file page is replaced by a private anonymous copy.
+ "Swap" shows how much would-be-anonymous memory is also used, but out on
+ swap.
+-
++"SwapPss" shows proportional swap share of this mapping.
+ "VmFlags" field deserves a separate description. This member represents the kernel
+ flags associated with the particular virtual memory area in two letter encoded
+ manner. The codes are the following:
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index cb0e247..2341a22 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -491,6 +491,7 @@ struct mem_size_stats {
+ 	unsigned long swap;
+ 	unsigned long nonlinear;
+ 	u64 pss;
++	u64 swap_pss;
+ };
+ 
+ 
+@@ -508,9 +509,20 @@ static void smaps_pte_entry(pte_t ptent, unsigned long addr,
+ 	} else if (is_swap_pte(ptent)) {
+ 		swp_entry_t swpent = pte_to_swp_entry(ptent);
+ 
+-		if (!non_swap_entry(swpent))
+-			mss->swap += ptent_size;
+-		else if (is_migration_entry(swpent))
++		if (!non_swap_entry(swpent)) {
++			int mapcount;
++
++			mss->swap += PAGE_SIZE;
++			mapcount = swp_swapcount(swpent);
++			if (mapcount >= 2) {
++				u64 pss_delta = (u64)PAGE_SIZE << PSS_SHIFT;
++
++				do_div(pss_delta, mapcount);
++				mss->swap_pss += pss_delta;
++			} else {
++				mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
++			}
++		} else if (is_migration_entry(swpent))
+ 			page = migration_entry_to_page(swpent);
+ 	} else if (pte_file(ptent)) {
+ 		if (pte_to_pgoff(ptent) != pgoff)
+@@ -662,6 +674,7 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
+ 		   "Anonymous:      %8lu kB\n"
+ 		   "AnonHugePages:  %8lu kB\n"
+ 		   "Swap:           %8lu kB\n"
++		   "SwapPss:        %8lu kB\n"
+ 		   "KernelPageSize: %8lu kB\n"
+ 		   "MMUPageSize:    %8lu kB\n"
+ 		   "Locked:         %8lu kB\n",
+@@ -676,6 +689,7 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
+ 		   mss.anonymous >> 10,
+ 		   mss.anonymous_thp >> 10,
+ 		   mss.swap >> 10,
++		   (unsigned long)(mss.swap_pss >> (10 + PSS_SHIFT)),
+ 		   vma_kernel_pagesize(vma) >> 10,
+ 		   vma_mmu_pagesize(vma) >> 10,
+ 		   (vma->vm_flags & VM_LOCKED) ?
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 46ba0c6..8a75353 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -430,6 +430,7 @@ extern unsigned int count_swap_pages(int, int);
+ extern sector_t map_swap_page(struct page *, struct block_device **);
+ extern sector_t swapdev_block(int, pgoff_t);
+ extern int page_swapcount(struct page *);
++extern int swp_swapcount(swp_entry_t entry);
+ extern struct swap_info_struct *page_swap_info(struct page *);
+ extern int reuse_swap_page(struct page *);
+ extern int try_to_free_swap(struct page *);
+@@ -531,6 +532,11 @@ static inline int page_swapcount(struct page *page)
+ 	return 0;
+ }
+ 
++static inline int swp_swapcount(swp_entry_t entry)
++{
++	return 0;
++}
++
+ #define reuse_swap_page(page)	(page_mapcount(page) == 1)
+ 
+ static inline int try_to_free_swap(struct page *page)
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 4a7f7e6..bc85e8f 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -898,6 +898,48 @@ int page_swapcount(struct page *page)
+ }
+ 
+ /*
++ * How many references to @entry are currently swapped out?
++ * This considers COUNT_CONTINUED so it returns exact answer.
++ */
++int swp_swapcount(swp_entry_t entry)
++{
++	int count, tmp_count, n;
++	struct swap_info_struct *p;
++	struct page *page;
++	pgoff_t offset;
++	unsigned char *map;
++
++	p = swap_info_get(entry);
++	if (!p)
++		return 0;
++
++	count = swap_count(p->swap_map[swp_offset(entry)]);
++	if (!(count & COUNT_CONTINUED))
++		goto out;
++
++	count &= ~COUNT_CONTINUED;
++	n = SWAP_MAP_MAX + 1;
++
++	offset = swp_offset(entry);
++	page = vmalloc_to_page(p->swap_map + offset);
++	offset &= ~PAGE_MASK;
++	VM_BUG_ON(page_private(page) != SWP_CONTINUED);
++
++	do {
++		page = list_entry(page->lru.next, struct page, lru);
++		map = kmap_atomic(page);
++		tmp_count = map[offset];
++		kunmap_atomic(map);
++
++		count += (tmp_count & ~COUNT_CONTINUED) * n;
++		n *= (SWAP_CONT_MAX + 1);
++	} while (tmp_count & COUNT_CONTINUED);
++out:
++	spin_unlock(&p->lock);
++	return count;
++}
++
++/*
+  * We can write to an anon page without COW if there are no other references
+  * to it.  And as a side-effect, free up its swap: because the old content
+  * on disk will never be read, and seeking back there to write new content
+-- 
+1.9.1
+

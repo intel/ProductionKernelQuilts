@@ -1,0 +1,203 @@
+From 8d628df8453cb77ee7f6f24b150ecdd4c8131ea6 Mon Sep 17 00:00:00 2001
+From: Philippe Longepe <philippe.longepe@intel.com>
+Date: Fri, 5 Feb 2016 15:13:56 +0100
+Subject: [PATCH] IO RW highly impacted by a pm qos latency notifier
+
+Revert a work around that was added to the mmc driver in order
+to stay above C2 when starting a transaction.
+This work around has a high impact in power and performance
+for IO RW benchmarks:
+
+iozone RW:
+With Revert 1400 IOPS
+Without this revert 1000 IOPS
+
+Change-Id: I1c6e5b9ed0ebd481b1bffa4362b99a61183f8082
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-19068
+Signed-off-by: Philippe Longepe <philippe.longepe@intel.com>
+Reviewed-on: https://android.intel.com:443/467759
+---
+ drivers/mmc/core/core.c       | 24 +-----------------------
+ drivers/mmc/host/sdhci-acpi.c | 31 -------------------------------
+ include/linux/mmc/host.h      |  3 ---
+ 3 files changed, 1 insertion(+), 57 deletions(-)
+
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index d2f6100..acbf616 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -24,8 +24,6 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/pm_wakeup.h>
+-#include <linux/pm_qos.h>
+-#include <linux/intel_mid_pm.h>
+ #include <linux/suspend.h>
+ #include <linux/fault-inject.h>
+ #include <linux/random.h>
+@@ -248,21 +246,6 @@ void mmc_request_done(struct mmc_host *host, struct mmc_request *mrq)
+ 
+ EXPORT_SYMBOL(mmc_request_done);
+ 
+-static void mmc_qos_update(struct mmc_host *host, struct mmc_request *mrq,
+-				s32 new_value)
+-{
+-	if (!host || !host->qos || !mrq)
+-		return;
+-
+-	if (host->card && mmc_card_mmc(host->card) && mrq->data) {
+-		/* qos fixup only needed for write transactions */
+-		if (mrq->data->flags & MMC_DATA_WRITE)
+-			pm_qos_update_request(host->qos, new_value);
+-	} else {
+-		pm_qos_update_request(host->qos, new_value);
+-	}
+-}
+-
+ static void
+ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
+ {
+@@ -328,7 +311,6 @@ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
+ 	}
+ 	mmc_host_clk_hold(host);
+ 	led_trigger_event(host->led, LED_FULL);
+-	mmc_qos_update(host, mrq, CSTATE_EXIT_LATENCY_C2);
+ 	host->ops->request(host, mrq);
+ }
+ 
+@@ -492,7 +474,6 @@ static int mmc_wait_for_data_req_done(struct mmc_host *host,
+ 			    mmc_card_removed(host->card)) {
+ 				err = host->areq->err_check(host->card,
+ 							    host->areq);
+-				mmc_qos_update(host, mrq, PM_QOS_DEFAULT_VALUE);
+ 				break; /* return err */
+ 			} else {
+ 				pr_info("%s: req failed (CMD%u): %d, retrying...\n",
+@@ -542,11 +523,8 @@ static void mmc_wait_for_req_done(struct mmc_host *host,
+ 			}
+ 		}
+ 		if (!cmd->error || !cmd->retries ||
+-		    mmc_card_removed(host->card)) {
+-			if (!mmc_op_cmdq_execute_task(cmd->opcode))
+-				mmc_qos_update(host, mrq, PM_QOS_DEFAULT_VALUE);
++		    mmc_card_removed(host->card))
+ 			break;
+-		}
+ 
+ 		pr_debug("%s: req failed (CMD%u): %d, retrying...\n",
+ 			 mmc_hostname(host), cmd->opcode, cmd->error);
+diff --git a/drivers/mmc/host/sdhci-acpi.c b/drivers/mmc/host/sdhci-acpi.c
+index 98b640c..0e4558b 100644
+--- a/drivers/mmc/host/sdhci-acpi.c
++++ b/drivers/mmc/host/sdhci-acpi.c
+@@ -36,7 +36,6 @@
+ #include <linux/acpi.h>
+ #include <linux/pm.h>
+ #include <linux/pm_runtime.h>
+-#include <linux/pm_qos.h>
+ #include <linux/delay.h>
+ 
+ #include <linux/mmc/host.h>
+@@ -119,13 +118,6 @@ static const struct sdhci_acpi_chip sdhci_acpi_chip_int = {
+ };
+ 
+ /*
+- * This probe slot routine is being added to address an issue on the host
+- * controller's IP where hangs will occur of the platform enters a C state
+- * below C2 while there is an outstanding write transaction. This is observed
+- * on Baytrail based platforms, and should only be enabled on platforms with
+- * host controller IP blocks that exhibit this.  We're calling based on the
+- * ACPI-ID of the IP block.
+- *
+  * Intel SDHCI host controller can support up to 4Mbytes request size in ADMA
+  * mode, which is much larger than the default 512KBytes. Change to 4Mbytes
+  * per the performance requirements
+@@ -139,9 +131,6 @@ static int sdhci_acpi_probe_slot(struct platform_device *pdev)
+ 		return 0;
+ 
+ 	host = c->host;
+-	host->mmc->qos = kzalloc(sizeof(struct pm_qos_request), GFP_KERNEL);
+-	pm_qos_add_request(host->mmc->qos, PM_QOS_CPU_DMA_LATENCY,
+-					PM_QOS_DEFAULT_VALUE);
+ 
+ 	/* change to 4Mbytes */
+ 	host->mmc->max_req_size = 4 * 1024 * 1024;
+@@ -152,7 +141,6 @@ static int sdhci_acpi_probe_slot(struct platform_device *pdev)
+ static int sdhci_acpi_sdio_probe_slot(struct platform_device *pdev)
+ {
+ 	struct sdhci_acpi_host *c = platform_get_drvdata(pdev);
+-	struct sdhci_host *host;
+ 
+ 	if (!c || !c->host)
+ 		return 0;
+@@ -177,22 +165,6 @@ static int sdhci_acpi_sd_probe_slot(struct platform_device *pdev)
+ 	return sdhci_acpi_probe_slot(pdev);
+ }
+ 
+-static int sdhci_acpi_remove_slot(struct platform_device *pdev)
+-{
+-	struct sdhci_acpi_host *c = platform_get_drvdata(pdev);
+-	struct sdhci_host *host;
+-
+-	if (!c || !c->host)
+-		return 0;
+-
+-	host = c->host;
+-
+-	if (host->mmc && host->mmc->qos)
+-		kfree(host->mmc->qos);
+-
+-	return 0;
+-}
+-
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_emmc = {
+ 	.chip    = &sdhci_acpi_chip_int,
+ 	.caps    = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE | MMC_CAP_HW_RESET
+@@ -204,7 +176,6 @@ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_emmc = {
+ 	.quirks2 = SDHCI_QUIRK2_TUNING_POLL | SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
+ 	.pm_caps = MMC_PM_TUNING_AFTER_RTRESUME,
+ 	.probe_slot = sdhci_acpi_probe_slot,
+-	.remove_slot = sdhci_acpi_remove_slot,
+ };
+ 
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sdio = {
+@@ -215,7 +186,6 @@ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sdio = {
+ 	.flags   = SDHCI_ACPI_RUNTIME_PM,
+ 	.pm_caps = MMC_PM_KEEP_POWER,
+ 	.probe_slot = sdhci_acpi_sdio_probe_slot,
+-	.remove_slot = sdhci_acpi_remove_slot,
+ };
+ 
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sd = {
+@@ -223,7 +193,6 @@ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sd = {
+ 	.flags   = SDHCI_ACPI_SD_CD | SDHCI_ACPI_RUNTIME_PM,
+ 	.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
+ 	.probe_slot = sdhci_acpi_sd_probe_slot,
+-	.remove_slot = sdhci_acpi_remove_slot,
+ };
+ 
+ struct sdhci_acpi_uid_slot {
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index df33e6e..be53e67 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -15,7 +15,6 @@
+ #include <linux/sched.h>
+ #include <linux/device.h>
+ #include <linux/fault-inject.h>
+-#include <linux/pm_qos.h>
+ 
+ #include <linux/mmc/core.h>
+ #include <linux/mmc/card.h>
+@@ -381,8 +380,6 @@ struct mmc_host {
+ 	} embedded_sdio_data;
+ #endif
+ 
+-	struct pm_qos_request *qos;
+-
+ 	unsigned long		private[0] ____cacheline_aligned;
+ };
+ 
+-- 
+1.9.1
+

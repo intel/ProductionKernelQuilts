@@ -1,0 +1,249 @@
+From 09f95c75000b33e6ade9d341665e78f7787faed1 Mon Sep 17 00:00:00 2001
+Message-Id: <09f95c75000b33e6ade9d341665e78f7787faed1.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Vidya Srinivas <vidya.srinivas@intel.com>
+Date: Sun, 27 Jul 2014 23:33:03 +0530
+Subject: [PATCH 155/312] FOR_UPSTREAM [VPG]: drm/i915: Fix for sleeping
+ function called from atomic context
+
+Patch fixes the issue - Calls to sleep function from atomic context.
+DPST brightness call was within the atomic context. This function further
+goes down to PWM driver where PM functions (might sleep context) are invoked.
+
+Issue: GMIN-2491
+Change-Id: I9f1dcd0b74e91ee2d07502545f5ba98cd3f8e89a
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+Signed-off-by: Deepak, M <m.deepak@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c    |    2 +-
+ drivers/gpu/drm/i915/i915_dpst.c   |   15 ++++++---------
+ drivers/gpu/drm/i915/i915_drv.h    |    6 +++---
+ drivers/gpu/drm/i915/intel_panel.c |   25 ++++++++++---------------
+ 4 files changed, 20 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index b293deca..a51451d 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1602,10 +1602,10 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 
+ 	spin_lock_init(&dev_priv->irq_lock);
+ 	spin_lock_init(&dev_priv->gpu_error.lock);
+-	spin_lock_init(&dev_priv->backlight_lock);
+ 	spin_lock_init(&dev_priv->uncore.lock);
+ 	spin_lock_init(&dev_priv->mm.object_stat_lock);
+ 	spin_lock_init(&dev_priv->mmio_flip_lock);
++	mutex_init(&dev_priv->backlight_lock);
+ 	mutex_init(&dev_priv->dpio_lock);
+ 	mutex_init(&dev_priv->new_dpio_lock);
+ 	mutex_init(&dev_priv->modeset_restore_lock);
+diff --git a/drivers/gpu/drm/i915/i915_dpst.c b/drivers/gpu/drm/i915/i915_dpst.c
+index f153a7b..e294ed4c 100644
+--- a/drivers/gpu/drm/i915/i915_dpst.c
++++ b/drivers/gpu/drm/i915/i915_dpst.c
+@@ -126,7 +126,6 @@ i915_dpst_disable_hist_interrupt(struct drm_device *dev)
+ 	struct intel_panel *panel = &dev_priv->dpst.connector->panel;
+ 
+ 	u32 blm_hist_guard, blm_hist_ctl;
+-	unsigned long spin_lock_flags;
+ 
+ 	dev_priv->dpst.enabled = false;
+ 	dev_priv->dpst.blc_adjustment = DPST_MAX_FACTOR;
+@@ -147,10 +146,10 @@ i915_dpst_disable_hist_interrupt(struct drm_device *dev)
+ 	/* DPST interrupt in DE_IER register is disabled in irq_uninstall */
+ 
+ 	/* Setting blc level to what it would be without dpst adjustment */
+-	spin_lock_irqsave(&dev_priv->backlight_lock, spin_lock_flags);
++	mutex_lock(&dev_priv->backlight_lock);
+ 	intel_panel_actually_set_backlight(dev_priv->dpst.connector
+ 			, panel->backlight.level);
+-	spin_unlock_irqrestore(&dev_priv->backlight_lock, spin_lock_flags);
++	mutex_unlock(&dev_priv->backlight_lock);
+ 
+ 	return 0;
+ }
+@@ -190,7 +189,6 @@ i915_dpst_apply_luma(struct drm_device *dev,
+ 
+ 	u32 diet_factor, i;
+ 	u32 blm_hist_ctl;
+-	unsigned long spin_lock_flags;
+ 
+ 	/* This is an invalid call if we are disabled by the user
+ 	 * If pipe_mismatch is true, the luma data is calculated from the
+@@ -233,9 +231,9 @@ i915_dpst_apply_luma(struct drm_device *dev,
+ 
+ 	/* Avoid warning messages */
+ 	mutex_lock(&dev->mode_config.mutex);
+-	spin_lock_irqsave(&dev_priv->backlight_lock, spin_lock_flags);
++	mutex_lock(&dev_priv->backlight_lock);
+ 	i915_dpst_set_brightness(dev, panel->backlight.level);
+-	spin_unlock_irqrestore(&dev_priv->backlight_lock, spin_lock_flags);
++	mutex_unlock(&dev_priv->backlight_lock);
+ 	mutex_unlock(&dev->mode_config.mutex);
+ 
+ 	/* Enable Image Enhancement Table */
+@@ -268,7 +266,6 @@ i915_dpst_restore_luma(struct drm_device *dev)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_panel *panel = &dev_priv->dpst.connector->panel;
+ 	u32 blm_hist_ctl;
+-	unsigned long spin_lock_flags;
+ 
+ 	/* Only restore if valid settings were previously saved */
+ 	if (!dev_priv->dpst.saved.is_valid)
+@@ -278,9 +275,9 @@ i915_dpst_restore_luma(struct drm_device *dev)
+ 
+ 	/* Avoid warning messages */
+ 	mutex_lock(&dev->mode_config.mutex);
+-	spin_lock_irqsave(&dev_priv->backlight_lock, spin_lock_flags);
++	mutex_lock(&dev_priv->backlight_lock);
+ 	i915_dpst_set_brightness(dev, panel->backlight.level);
+-	spin_unlock_irqrestore(&dev_priv->backlight_lock, spin_lock_flags);
++	mutex_unlock(&dev_priv->backlight_lock);
+ 	mutex_unlock(&dev->mode_config.mutex);
+ 
+ 	/* IE mod table entries are saved in the hardware even if the table
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index c3b9720..5648b3f 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1474,6 +1474,9 @@ struct drm_i915_private {
+ 	struct mutex dpio_lock;
+ 	struct mutex new_dpio_lock;
+ 
++	/* backlight registers and fields in struct intel_panel */
++	struct mutex backlight_lock;
++
+ 	/** Cached value of IMR to avoid reads in updating the bitfield */
+ 	union {
+ 		u32 irq_mask;
+@@ -1505,9 +1508,6 @@ struct drm_i915_private {
+ 	/* overlay */
+ 	struct intel_overlay *overlay;
+ 
+-	/* backlight registers and fields in struct intel_panel */
+-	spinlock_t backlight_lock;
+-
+ 	/* LVDS info */
+ 	bool no_aux_handshake;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_panel.c b/drivers/gpu/drm/i915/intel_panel.c
+index d25c15f..ae256f2 100644
+--- a/drivers/gpu/drm/i915/intel_panel.c
++++ b/drivers/gpu/drm/i915/intel_panel.c
+@@ -475,9 +475,8 @@ static u32 intel_panel_get_backlight(struct intel_connector *connector)
+ 	struct drm_device *dev = connector->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	u32 val;
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&dev_priv->backlight_lock, flags);
++	mutex_lock(&dev_priv->backlight_lock);
+ 
+ 	val = dev_priv->display.get_backlight(connector);
+ 
+@@ -491,7 +490,7 @@ static u32 intel_panel_get_backlight(struct intel_connector *connector)
+ 	else
+ 		val = intel_panel_compute_brightness(connector, val);
+ 
+-	spin_unlock_irqrestore(&dev_priv->backlight_lock, flags);
++	mutex_unlock(&dev_priv->backlight_lock);
+ 
+ 	DRM_DEBUG_DRIVER("get backlight PWM = %d\n", val);
+ 	return val;
+@@ -575,13 +574,12 @@ void intel_panel_set_backlight(struct intel_connector *connector, u32 level,
+ 	struct intel_panel *panel = &connector->panel;
+ 	enum pipe pipe = intel_get_pipe_from_connector(connector);
+ 	u32 freq;
+-	unsigned long flags;
+ 	u64 n;
+ 
+ 	if (!panel->backlight.present || pipe == INVALID_PIPE)
+ 		return;
+ 
+-	spin_lock_irqsave(&dev_priv->backlight_lock, flags);
++	mutex_lock(&dev_priv->backlight_lock);
+ 
+ 	WARN_ON(panel->backlight.max == 0);
+ 
+@@ -602,7 +600,7 @@ void intel_panel_set_backlight(struct intel_connector *connector, u32 level,
+ 			intel_panel_actually_set_backlight(connector, level);
+ 	}
+ 
+-	spin_unlock_irqrestore(&dev_priv->backlight_lock, flags);
++	mutex_unlock(&dev_priv->backlight_lock);
+ }
+ 
+ static void pch_disable_backlight(struct intel_connector *connector)
+@@ -656,7 +654,6 @@ void intel_panel_disable_backlight(struct intel_connector *connector)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_panel *panel = &connector->panel;
+ 	enum pipe pipe = intel_get_pipe_from_connector(connector);
+-	unsigned long flags;
+ 
+ 	if (!panel->backlight.present || pipe == INVALID_PIPE)
+ 		return;
+@@ -672,12 +669,12 @@ void intel_panel_disable_backlight(struct intel_connector *connector)
+ 		return;
+ 	}
+ 
+-	spin_lock_irqsave(&dev_priv->backlight_lock, flags);
++	mutex_lock(&dev_priv->backlight_lock);
+ 
+ 	panel->backlight.enabled = false;
+ 	dev_priv->display.disable_backlight(connector);
+ 
+-	spin_unlock_irqrestore(&dev_priv->backlight_lock, flags);
++	mutex_unlock(&dev_priv->backlight_lock);
+ }
+ 
+ static void bdw_enable_backlight(struct intel_connector *connector)
+@@ -862,14 +859,13 @@ void intel_panel_enable_backlight(struct intel_connector *connector)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_panel *panel = &connector->panel;
+ 	enum pipe pipe = intel_get_pipe_from_connector(connector);
+-	unsigned long flags;
+ 
+ 	if (!panel->backlight.present || pipe == INVALID_PIPE)
+ 		return;
+ 
+ 	DRM_DEBUG_KMS("pipe %c\n", pipe_name(pipe));
+ 
+-	spin_lock_irqsave(&dev_priv->backlight_lock, flags);
++	mutex_lock(&dev_priv->backlight_lock);
+ 
+ 	WARN_ON(panel->backlight.max == 0);
+ 
+@@ -885,7 +881,7 @@ void intel_panel_enable_backlight(struct intel_connector *connector)
+ 	dev_priv->display.enable_backlight(connector);
+ 	panel->backlight.enabled = true;
+ 
+-	spin_unlock_irqrestore(&dev_priv->backlight_lock, flags);
++	mutex_unlock(&dev_priv->backlight_lock);
+ }
+ 
+ #if IS_ENABLED(CONFIG_BACKLIGHT_CLASS_DEVICE)
+@@ -1133,7 +1129,6 @@ int intel_panel_setup_backlight(struct drm_connector *connector)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_connector *intel_connector = to_intel_connector(connector);
+ 	struct intel_panel *panel = &intel_connector->panel;
+-	unsigned long flags;
+ 	int ret;
+ 
+ 	if (!dev_priv->vbt.backlight.present) {
+@@ -1142,9 +1137,9 @@ int intel_panel_setup_backlight(struct drm_connector *connector)
+ 	}
+ 
+ 	/* set level and max in panel struct */
+-	spin_lock_irqsave(&dev_priv->backlight_lock, flags);
++	mutex_lock(&dev_priv->backlight_lock);
+ 	ret = dev_priv->display.setup_backlight(intel_connector);
+-	spin_unlock_irqrestore(&dev_priv->backlight_lock, flags);
++	mutex_unlock(&dev_priv->backlight_lock);
+ 
+ 	if (ret) {
+ 		DRM_DEBUG_KMS("failed to setup backlight for connector %s\n",
+-- 
+1.7.9.5
+

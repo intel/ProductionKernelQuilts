@@ -1,0 +1,131 @@
+From d287d0ee950c0abf5e581a4fec375bad7d81c1ab Mon Sep 17 00:00:00 2001
+Message-Id: <d287d0ee950c0abf5e581a4fec375bad7d81c1ab.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Mon, 27 Jan 2014 21:35:05 +0530
+Subject: [PATCH 114/312] FROM_UPSTREAM [VPG]: drm/i915: Disable/Enable PM
+ Intrrupts based on the current freq
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When current delay is already at max delay, Let's disable the PM UP
+THRESHOLD INTRRUPTS, so that we will not get further interrupts until
+current delay is less than max delay, Also request for the PM DOWN
+THRESHOLD INTRRUPTS to indicate the decrease in clock freq. and
+viceversa for PM DOWN THRESHOLD INTRRUPTS.
+
+v2: Use bool variables (Daniel)
+
+v3: Fix Interrupt masking bit (Deepak)
+
+v4: Use existing symbolic constants in i915_reg.h (Daniel)
+
+v5: Add pm interrupt mask after new_delay calculation (Ville)
+
+Issue: VIZ-3386
+Change-Id: I0e36c2c47d00e1c563cb6309e9bec26976457939
+Upstream-Repo: git://people.freedesktop.org/~danvet/drm-intel
+Upstream-commit: 2754436913b94626a5414d82f0996489628c513d
+Signed-off-by: Deepak S <deepak.s@intel.com>
+[danvet: Pass new_delay by value as suggested by Ville. Also appease
+checkpatch.]
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-on: https://android.intel.com/164314
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h |    3 +++
+ drivers/gpu/drm/i915/i915_irq.c |   38 ++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_pm.c |    3 +++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9f3b835..9d99581 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -946,6 +946,9 @@ struct intel_gen6_power_mgmt {
+ 
+ 	bool use_RC0_residency_for_turbo;
+ 
++	bool rp_up_masked;
++	bool rp_down_masked;
++
+ 	int last_adj;
+ 	enum { LOW_POWER, BETWEEN, HIGH_POWER } power;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index dad6857..4e5dbf1 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1339,6 +1339,43 @@ static u32 vlv_calc_delay_from_C0_counters(struct drm_i915_private *dev_priv)
+ 	return new_delay;
+ }
+ 
++void gen6_set_pm_mask(struct drm_i915_private *dev_priv,
++			     u32 pm_iir, int new_delay)
++{
++	if (pm_iir & GEN6_PM_RP_UP_THRESHOLD) {
++		if (new_delay >= dev_priv->rps.max_freq_softlimit) {
++			/* Mask UP THRESHOLD Interrupts */
++			I915_WRITE(GEN6_PMINTRMSK,
++				   I915_READ(GEN6_PMINTRMSK) |
++				   GEN6_PM_RP_UP_THRESHOLD);
++			dev_priv->rps.rp_up_masked = true;
++		}
++		if (dev_priv->rps.rp_down_masked) {
++			/* UnMask DOWN THRESHOLD Interrupts */
++			I915_WRITE(GEN6_PMINTRMSK,
++				   I915_READ(GEN6_PMINTRMSK) &
++				   ~GEN6_PM_RP_DOWN_THRESHOLD);
++			dev_priv->rps.rp_down_masked = false;
++		}
++	} else if (pm_iir & GEN6_PM_RP_DOWN_THRESHOLD) {
++		if (new_delay <= dev_priv->rps.min_freq_softlimit) {
++			/* Mask DOWN THRESHOLD Interrupts */
++			I915_WRITE(GEN6_PMINTRMSK,
++				   I915_READ(GEN6_PMINTRMSK) |
++				   GEN6_PM_RP_DOWN_THRESHOLD);
++			dev_priv->rps.rp_down_masked = true;
++		}
++
++		if (dev_priv->rps.rp_up_masked) {
++			/* UnMask UP THRESHOLD Interrupts */
++			I915_WRITE(GEN6_PMINTRMSK,
++				   I915_READ(GEN6_PMINTRMSK) &
++				   ~GEN6_PM_RP_UP_THRESHOLD);
++			dev_priv->rps.rp_up_masked = false;
++		}
++	}
++}
++
+ static void gen6_pm_rps_work(struct work_struct *work)
+ {
+ 	struct drm_i915_private *dev_priv =
+@@ -1413,6 +1450,7 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 			    dev_priv->rps.min_freq_softlimit,
+ 			    dev_priv->rps.max_freq_softlimit);
+ 
++	gen6_set_pm_mask(dev_priv, pm_iir, new_delay);
+ 	dev_priv->rps.last_adj = new_delay - dev_priv->rps.cur_freq;
+ 
+ 	if (IS_VALLEYVIEW(dev_priv->dev))
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 2c4ca2f..67d5253 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4334,6 +4334,9 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 
+ 	valleyview_set_rps(dev_priv->dev, dev_priv->rps.efficient_freq);
+ 
++	dev_priv->rps.rp_up_masked = false;
++	dev_priv->rps.rp_down_masked = false;
++
+ 	/* enable WA for RC6+turbo to work together */
+ 	dev_priv->rps.use_RC0_residency_for_turbo = true;
+ 
+-- 
+1.7.9.5
+

@@ -1,0 +1,155 @@
+From 14432b8bc63116b0fd320a7de49177655a57cfa7 Mon Sep 17 00:00:00 2001
+Message-Id: <14432b8bc63116b0fd320a7de49177655a57cfa7.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: Gaurav K Singh <gaurav.k.singh@intel.com>
+Date: Tue, 13 Jan 2015 15:27:42 +0530
+Subject: [PATCH 41/95] MUST_REBASE [VPG]: video/adf/intel: Pixel Clock
+ changes for DSI dual link
+
+For dual link MIPI Panels, each port needs half of pixel clock. Pixel overlap
+can be enabled if needed by panel, then in that case, pixel clock will be
+increased for extra pixels.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+For: GMINL-5276
+Change-Id: Ic582ce01c431d050fe4c38f5fcbd20df40e245ec
+Signed-off-by: Gaurav K Singh <gaurav.k.singh@intel.com>
+---
+ drivers/video/adf/intel/core/common/dsi/dsi_vbt.h  |    3 ++-
+ .../core/common/dsi/panels/intel_dsi_panel_vbt.c   |   26 ++++++++++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_pipeline.c    |    8 ++++++
+ .../adf/intel/include/core/common/dsi/dsi_config.h |    8 ++++++
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |    4 +++
+ 5 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/dsi_vbt.h b/drivers/video/adf/intel/core/common/dsi/dsi_vbt.h
+index 59b253c..b9921a3 100644
+--- a/drivers/video/adf/intel/core/common/dsi/dsi_vbt.h
++++ b/drivers/video/adf/intel/core/common/dsi/dsi_vbt.h
+@@ -80,7 +80,8 @@ struct mipi_config {
+ #define DUAL_LINK_PIXEL_ALT	2
+ 	u16 dual_link:2;
+ 	u16 lane_cnt:2;
+-	u16 rsvd3:12;
++	u16 pixel_overlap:3;
++	u16 rsvd3:9;
+ 
+ 	u16 rsvd4;
+ 
+diff --git a/drivers/video/adf/intel/core/common/dsi/panels/intel_dsi_panel_vbt.c b/drivers/video/adf/intel/core/common/dsi/panels/intel_dsi_panel_vbt.c
+index e4548dd..48d6da40 100644
+--- a/drivers/video/adf/intel/core/common/dsi/panels/intel_dsi_panel_vbt.c
++++ b/drivers/video/adf/intel/core/common/dsi/panels/intel_dsi_panel_vbt.c
+@@ -648,12 +648,28 @@ static int panel_generic_init(struct dsi_pipe *pipe)
+ 	intel_dsi->video_frmt_cfg_bits =
+ 		mipi_config->bta_enabled ? DISABLE_VIDEO_BTA : 0;
+ 	intel_dsi->dual_link = mipi_config->dual_link;
++	intel_dsi->pixel_overlap = mipi_config->pixel_overlap;
+ 
+ 	if (intel_dsi->dual_link)
+ 		intel_dsi->ports = ((1 << PORT_A) | (1 << PORT_C));
+ 
+ 	pclk = mode->clock;
+ 
++	/* In dual link mode each port needs half of pixel clock */
++	if (intel_dsi->dual_link) {
++		pclk = pclk / 2;
++
++		/*
++		 * we can enable pixel_overlap if needed by panel. In this
++		 * case we need to increase the pixel clock for extra pixels
++		 */
++		if (intel_dsi->dual_link == DSI_DUAL_LINK_FRONT_BACK) {
++			pclk += DIV_ROUND_UP(mode->vtotal *
++						intel_dsi->pixel_overlap *
++						60, 1000);
++		}
++	}
++
+ 	/* Burst Mode Ratio
+ 	 * Target ddr frequency from VBT / non burst ddr freq
+ 	 * multiply by 100 to preserve remainder
+@@ -850,6 +866,16 @@ static int panel_generic_init(struct dsi_pipe *pipe)
+ 						"disabled" : "enabled");
+ 	pr_info("ADF: %s: Mode %s\n", __func__,
+ 		intel_dsi->operation_mode ? "command" : "video");
++
++	if (intel_dsi->dual_link == DSI_DUAL_LINK_FRONT_BACK)
++		pr_info("ADF %s: Dual link: DSI_DUAL_LINK_FRONT_BACK\n",
++								__func__);
++	else if (intel_dsi->dual_link == DSI_DUAL_LINK_PIXEL_ALTN)
++		pr_info("ADF %s: Dual link: DSI_DUAL_LINK_PIXEL_ALTN\n",
++								__func__);
++	else
++		pr_info("ADF %s: Dual link: NONE\n", __func__);
++
+ 	pr_info("ADF: %s: Pixel Format %d\n", __func__,
+ 		intel_dsi->pixel_format);
+ 	pr_info("ADF: %s: TLPX %d\n", __func__, intel_dsi->escape_clk_div);
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+index 0ba0bfc..22a6997 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+@@ -149,6 +149,14 @@ u32 vlv_port_enable(struct intel_pipeline *pipeline,
+ 	u32 temp;
+ 
+ 	if (disp->type == INTEL_PIPE_DSI) {
++		if (intel_dsi->dual_link == DSI_DUAL_LINK_FRONT_BACK) {
++			temp = REG_READ(VLV_CHICKEN_3);
++			temp &= ~PIXEL_OVERLAP_CNT_MASK |
++					intel_dsi->pixel_overlap <<
++					PIXEL_OVERLAP_CNT_SHIFT;
++			REG_WRITE(VLV_CHICKEN_3, temp);
++		}
++
+ 		for_each_dsi_port(port, intel_dsi->ports) {
+ 			dsi_port = &disp->port.dsi_port[port];
+ 
+diff --git a/drivers/video/adf/intel/include/core/common/dsi/dsi_config.h b/drivers/video/adf/intel/include/core/common/dsi/dsi_config.h
+index 11cd96d..d7d7023 100644
+--- a/drivers/video/adf/intel/include/core/common/dsi/dsi_config.h
++++ b/drivers/video/adf/intel/include/core/common/dsi/dsi_config.h
+@@ -60,6 +60,12 @@ enum {
+ #define ENABLE_CSC			(0x1 << 1)
+ #define ENABLE_GAMMA_CSC		(ENABLE_GAMMA | ENABLE_CSC)
+ 
++
++/* Dual Link support */
++#define DSI_DUAL_LINK_NONE		0
++#define DSI_DUAL_LINK_FRONT_BACK	1
++#define DSI_DUAL_LINK_PIXEL_ALTN	2
++
+ struct dsi_registers {
+ 	u32 vgacntr_reg;
+ 
+@@ -172,6 +178,8 @@ struct dsi_context {
+ 	/* dual link support */
+ 	u8 dual_link;
+ 
++	u8 pixel_overlap;
++
+ 	/* number of DSI lanes */
+ 	unsigned int lane_count;
+ 
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index b0ac184..f19e6b1 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -5254,6 +5254,10 @@ extern int chv_cursor_offsets[];
+ #define GEN6_RC6pp_THRESHOLD			0xA0C0
+ #define GEN6_PMINTRMSK				0xA168
+ 
++#define VLV_CHICKEN_3				(VLV_DISPLAY_BASE + 0x7040C)
++#define PIXEL_OVERLAP_CNT_MASK			(3 << 30)
++#define PIXEL_OVERLAP_CNT_SHIFT		30
++
+ #define GEN6_PMISR				0x44020
+ #define GEN6_PMIMR				0x44024 /* rps_lock */
+ #define GEN6_PMIIR				0x44028
+-- 
+1.7.9.5
+

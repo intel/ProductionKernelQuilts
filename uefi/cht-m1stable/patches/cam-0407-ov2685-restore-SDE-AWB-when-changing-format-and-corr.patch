@@ -1,0 +1,186 @@
+From ea22a4f2ff796a55834f8164ca3def4382da771e Mon Sep 17 00:00:00 2001
+From: Shuguang Gong <shuguang.gong@intel.com>
+Date: Tue, 26 May 2015 10:07:06 +0800
+Subject: [PATCH 407/462] ov2685: restore SDE/AWB when changing format and
+ correct SDE settings
+
+1. The format can be configured more times before closing device.
+This will clear previous SDE/AWB settings during format changing.
+SDE/AWB have to be restored to keep same with previous effect
+since v4l2 will not force to set sensor again even it gets request
+from ISP.
+2. Otherwise, the green effect settings need to be corrected
+
+Change-Id: I9c6927a24d31f04b3d385a3db20f9fd53d0adb89
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-37459
+Signed-off-by: Shuguang Gong <shuguang.gong@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/57397
+Validation-Android: Wei Tao <wei.tao@intel.com>
+Approver: Tian Shu Qiu <tian.shu.qiu@intel.com>
+Integrator: WeiX Meng <weix.meng@intel.com>
+Build: WeiX Meng <weix.meng@intel.com>
+Reviewed-by: WeiX Meng <weix.meng@intel.com>
+Maintainer: WeiX Meng <weix.meng@intel.com>
+---
+ .../camera/drivers/media/i2c/ov2685.c              | 62 +++++++++++++++++-----
+ .../camera/drivers/media/i2c/ov2685.h              | 10 ++--
+ 2 files changed, 52 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov2685.c b/drivers/external_drivers/camera/drivers/media/i2c/ov2685.c
+index 5431b4e..bc56309 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov2685.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov2685.c
+@@ -353,13 +353,13 @@ static int ov2685_g_wb(struct v4l2_subdev *sd, s32 *value)
+ 	return 0;
+ }
+ 
+-static int ov2685_s_wb(struct v4l2_subdev *sd, int value)
++static int __ov2685_s_wb(struct v4l2_subdev *sd, int wb)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+ 	struct ov2685_device *dev = to_ov2685_sensor(sd);
+ 	int ret;
+ 
+-	switch (value) {
++	switch (wb) {
+ 	case V4L2_WHITE_BALANCE_MANUAL:
+ 		ret = ov2685_write_reg_array(client, ov2685_AWB_manual);
+ 		break;
+@@ -380,17 +380,29 @@ static int ov2685_s_wb(struct v4l2_subdev *sd, int value)
+ 		ret = ov2685_write_reg_array(client, ov2685_AWB_sunny);
+ 		break;
+ 	default:
+-		dev_err(&client->dev, "ov2685_s_wb: %d\n", value);
+-		return -EINVAL;
++		dev_err(&client->dev, "invalid wb mode: %d with err: %d\n", wb, -ERANGE);
++		return -ERANGE;
+ 	}
+ 
+ 	if (ret)
+ 		return ret;
+ 
+-	dev->wb_mode = value;
++	dev->wb_mode = wb;
+ 	return 0;
+ }
+ 
++static int ov2685_s_wb(struct v4l2_subdev *sd, int wb)
++{
++	struct ov2685_device *dev = to_ov2685_sensor(sd);
++	int ret;
++
++	if (dev->wb_mode == wb)
++		return 0;
++
++	ret = __ov2685_s_wb(sd, wb);
++	return ret;
++}
++
+ static int ov2685_get_sysclk(struct v4l2_subdev *sd, int *sysclk)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+@@ -705,15 +717,12 @@ static int ov2685_s_ae_lock(struct v4l2_subdev *sd, int value)
+ 	dev->ae_lock = value;
+ 	return 0;
+ }
+-static int ov2685_s_color_effect(struct v4l2_subdev *sd, int effect)
++static int __ov2685_s_color_effect(struct v4l2_subdev *sd, int effect)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+ 	struct ov2685_device *dev = to_ov2685_sensor(sd);
+ 	int ret = 0;
+ 
+-	if (dev->color_effect == effect)
+-		return 0;
+-
+ 	switch (effect) {
+ 	case V4L2_COLORFX_NONE:
+ 		ret = ov2685_write_reg_array(client, ov2685_normal_effect);
+@@ -734,7 +743,8 @@ static int ov2685_s_color_effect(struct v4l2_subdev *sd, int effect)
+ 		ret = ov2685_write_reg_array(client, ov2685_green_effect);
+ 		break;
+ 	default:
+-		dev_err(&client->dev, "invalid color effect.\n");
++		dev_err(&client->dev, "invalid color effect: %d with err: %d\n",
++				effect, -ERANGE);
+ 		return -ERANGE;
+ 	}
+ 
+@@ -744,7 +754,17 @@ static int ov2685_s_color_effect(struct v4l2_subdev *sd, int effect)
+ 	dev->color_effect = effect;
+ 	return 0;
+ }
++static int ov2685_s_color_effect(struct v4l2_subdev *sd, int effect)
++{
++	struct ov2685_device *dev = to_ov2685_sensor(sd);
++	int ret;
++
++	if (dev->color_effect == effect)
++		return 0;
+ 
++	ret = __ov2685_s_color_effect(sd, effect);
++	return ret;
++}
+ static int ov2685_g_color_effect(struct v4l2_subdev *sd, int *effect)
+ {
+ 	struct ov2685_device *dev = to_ov2685_sensor(sd);
+@@ -1155,8 +1175,24 @@ static int ov2685_s_mbus_fmt(struct v4l2_subdev *sd,
+ 	fmt->width = ov2685_res[res_index].width;
+ 	fmt->height = ov2685_res[res_index].height;
+ 	fmt->code = V4L2_MBUS_FMT_UYVY8_1X16;
+-	dev->color_effect = V4L2_COLORFX_NONE;
+-	dev->wb_mode = V4L2_WHITE_BALANCE_AUTO;
++
++	/* Restore color effect. Not to set NONE since
++	 * it had been set in resolution setting.
++	 */
++	if (dev->color_effect != V4L2_COLORFX_NONE) {
++		ret = __ov2685_s_color_effect(sd, dev->color_effect);
++		if (ret)
++			return ret;
++	}
++	/* Restore AWB. Not to set AUTO since it had been
++	 * set in resolutin setting and reset to AUTO will
++	 * clear previous color effect.
++	 */
++	if (dev->wb_mode != V4L2_WHITE_BALANCE_AUTO) {
++		ret = __ov2685_s_wb(sd, dev->wb_mode);
++		if (ret)
++			return ret;
++	}
+ 	dev->ae_lock = AE_UNLOCK;
+ 	dev->hot_pixel = HOT_PIXEL_OFF;
+ 
+@@ -1294,7 +1330,7 @@ static int ov2685_s_ctrl(struct v4l2_ctrl *ctrl)
+ 		ret = ov2685_s_ae_lock(&dev->sd, ctrl->val);
+ 		break;
+ 	case V4L2_CID_COLORFX:
+-		dev_dbg(&client->dev, "%s: CID_3A_LOCK:%d.\n",
++		dev_dbg(&client->dev, "%s: CID_COLORFX:%d.\n",
+ 			__func__, ctrl->val);
+ 		ret = ov2685_s_color_effect(&dev->sd, ctrl->val);
+ 		break;
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov2685.h b/drivers/external_drivers/camera/drivers/media/i2c/ov2685.h
+index 9bbf56c..9da183d 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov2685.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov2685.h
+@@ -462,13 +462,9 @@ static struct ov2685_reg const ov2685_blue_effect[] = {
+ 
+ static struct ov2685_reg const ov2685_green_effect[] = {
+ 	{OV2685_8BIT, 0x3208 , 0x00},
+-	{OV2685_8BIT, 0x5180 , 0xf6},
+-	{OV2685_8BIT, 0x5195 , 0x04},
+-	{OV2685_8BIT, 0x5196 , 0x90},
+-	{OV2685_8BIT, 0x5197 , 0x04},
+-	{OV2685_8BIT, 0x5198 , 0x00},
+-	{OV2685_8BIT, 0x5199 , 0x09},
+-	{OV2685_8BIT, 0x519a , 0x20},
++	{OV2685_8BIT, 0x5600 , 0x1c},
++	{OV2685_8BIT, 0x5603 , 0x60},
++	{OV2685_8BIT, 0x5604 , 0x60},
+ 	{OV2685_8BIT, 0x3208 , 0x10},
+ 	{OV2685_8BIT, 0x3208 , 0xa0},
+ 	{OV2685_TOK_TERM, 0, 0}
+-- 
+1.9.1
+

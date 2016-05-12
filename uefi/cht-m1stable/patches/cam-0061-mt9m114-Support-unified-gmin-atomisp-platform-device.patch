@@ -1,0 +1,122 @@
+From c4246a7e76118099d19f67d165988e8e05bb3e6b Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Wed, 4 Jun 2014 14:32:51 -0700
+Subject: [PATCH 061/117] mt9m114: Support unified gmin atomisp platform device
+
+When available, use the gmin-style unified platform instead of the
+sensor-specific one.  Requires moving a little bit of logic (timings,
+basically, which are uniform across platforms anyway) from the
+original platform driver.
+
+Tested on a T100 as far as probing and initializing the device, but
+CSI data transfer could not be exercised.
+
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ .../x86/platform/intel-mid/atomisp_gmin_platform.c |  3 +-
+ .../camera/drivers/media/i2c/mt9m114.c             | 47 ++++++++++++++++++++--
+ .../camera/drivers/media/i2c/mt9m114.h             |  2 -
+ 3 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+index ab2233c..7b1987b 100644
+--- a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
++++ b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+@@ -210,8 +210,9 @@ static const struct gmin_cfg_var t100_vars[] = {
+ 	{ "INT33F0:00_CamType",  "2" },
+ 	{ "INT33F0:00_CsiPort",  "0" },
+ 	{ "INT33F0:00_CsiLanes", "1" },
+-	{ "INT33F0:00_CsiFmt",   "-1" },
++	{ "INT33F0:00_CsiFmt",   "0" },
+ 	{ "INT33F0:00_CsiBayer", "0" },
++	{ "INT33F0:00_CamClk",   "1" },
+ 	{},
+ };
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+index c7a83d2..8c650a7 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+@@ -463,14 +463,55 @@ static int mt9m114_init_common(struct v4l2_subdev *sd)
+ 
+ static int power_ctrl(struct v4l2_subdev *sd, bool flag)
+ {
++	int ret;
+ 	struct mt9m114_device *dev = to_mt9m114_sensor(sd);
+-	return dev->platform_data->power_ctrl(sd, flag);
++
++	if (!dev || !dev->platform_data)
++		return -ENODEV;
++
++	/* Non-gmin platforms use the legacy callback */
++	if (dev->platform_data->power_ctrl)
++		return dev->platform_data->power_ctrl(sd, flag);
++
++	if (flag) {
++		ret = dev->platform_data->v1p8_ctrl(sd, 1);
++		if (ret == 0) {
++			ret = dev->platform_data->v2p8_ctrl(sd, 1);
++			if (ret)
++				ret = dev->platform_data->v1p8_ctrl(sd, 0);
++		}
++		msleep(20);
++	} else {
++		ret = dev->platform_data->v1p8_ctrl(sd, 0);
++		ret = dev->platform_data->v2p8_ctrl(sd, 0);
++	}
++
++	return ret;
+ }
+ 
+ static int gpio_ctrl(struct v4l2_subdev *sd, bool flag)
+ {
++	int ret;
+ 	struct mt9m114_device *dev = to_mt9m114_sensor(sd);
+-	return dev->platform_data->gpio_ctrl(sd, flag);
++
++	if (!dev || !dev->platform_data)
++		return -ENODEV;
++
++	/* Non-gmin platforms use the legacy callback */
++	if (dev->platform_data->gpio_ctrl)
++		return dev->platform_data->gpio_ctrl(sd, flag);
++
++	if (flag) {
++		ret = dev->platform_data->gpio0_ctrl(sd, 0);
++		ret |= dev->platform_data->gpio1_ctrl(sd, 1);
++		usleep_range(1000, 2000);
++		ret |= dev->platform_data->gpio0_ctrl(sd, 1);
++	} else {
++		ret = dev->platform_data->gpio1_ctrl(sd, 0);
++		ret |= dev->platform_data->gpio0_ctrl(sd, 0);
++	}
++
++	return ret;
+ }
+ 
+ static int power_up(struct v4l2_subdev *sd)
+@@ -1519,7 +1560,7 @@ static int mt9m114_probe(struct i2c_client *client,
+ 		 * directly and configure via ACPI/EFIvars instead
+ 		 */
+ 		ret = mt9m114_s_config(&dev->sd, client->irq,
+-				       mt9m114_platform_data(NULL));
++				       gmin_camera_platform_data());
+ 		if (ret)
+ 			goto out_free;
+ 	}
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h
+index 587d68a..f27883f 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h
+@@ -207,8 +207,6 @@ struct misensor_fwreg {
+ 	u32	val7;
+ };
+ 
+-void *mt9m114_platform_data(void *info);
+-
+ struct regval_list {
+ 	u16 reg_num;
+ 	u8 value;
+-- 
+1.9.3
+

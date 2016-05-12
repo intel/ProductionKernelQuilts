@@ -1,0 +1,163 @@
+From de3e610681f2e88f23f54bbfc67a3225ca1010a3 Mon Sep 17 00:00:00 2001
+From: Dong Chuanxiao <chuanxiao.dong@intel.com>
+Date: Fri, 19 Jul 2013 08:58:27 +0800
+Subject: [PATCH 2/3] mmc: add a busy check for erase/sanitize
+
+BZ: 41648
+
+Sanitize is a new feaure introduced from eMMC Spec v4.5.
+It can improve eMMC device performance in general.
+
+When doing Sanitize, the eMMC device may need a long time
+to be finished, so add a busy check in mmc_swith so that
+there won't have timeout errors
+
+Org-Change-Id: I8bfa31c9f69089fef414c8877578a427e34c731e
+Change-Id: I4497ec331df61b08d57b1fa647ffb22fe020b135
+Signed-off-by: Ning Feiyi <feiyix.ning@intel.com>
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+
+Conflicts:
+
+	drivers/mmc/card/block.c
+	drivers/mmc/core/core.c
+
+Signed-off-by: Eric Ernst <eric.ernst@intel.com>
+---
+ drivers/mmc/card/block.c |   10 +++++++
+ drivers/mmc/core/core.c  |   73 +++++++++++++++++++++++++++-------------------
+ include/linux/mmc/core.h |    2 ++
+ 3 files changed, 55 insertions(+), 30 deletions(-)
+
+Index: linux/drivers/mmc/card/block.c
+===================================================================
+--- linux.orig/drivers/mmc/card/block.c	2014-08-17 16:43:06.621731687 -0700
++++ linux/drivers/mmc/card/block.c	2014-08-17 16:43:06.615731687 -0700
+@@ -1055,6 +1055,16 @@
+ 			goto out;
+ 	}
+ 
++
++
++	if (mmc_can_sanitize(card)) {
++		err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
++				 EXT_CSD_SANITIZE_START, 1, 0, false, false);
++		/* send status cmd to check */
++		if (!err)
++			err = mmc_busy_wait(card->host);
++	}
++
+ out_retry:
+ 	if (err && !mmc_blk_reset(md, card->host, type))
+ 		goto retry;
+Index: linux/drivers/mmc/core/core.c
+===================================================================
+--- linux.orig/drivers/mmc/core/core.c	2014-08-17 16:43:06.621731687 -0700
++++ linux/drivers/mmc/core/core.c	2014-08-17 16:43:31.423732351 -0700
+@@ -140,6 +140,47 @@
+ 
+ #endif /* CONFIG_FAIL_MMC_REQUEST */
+ 
++int mmc_busy_wait(struct mmc_host *host)
++{
++	unsigned long timeout;
++	struct mmc_command cmd = {0};
++	struct mmc_card *card;
++	int err;
++
++	if (!host || !host->card)
++		return 0;
++
++	card = host->card;
++	timeout = jiffies + msecs_to_jiffies(MMC_CORE_TIMEOUT_MS);
++	do {
++		memset(&cmd, 0, sizeof(struct mmc_command));
++		cmd.opcode = MMC_SEND_STATUS;
++		cmd.arg = card->rca << 16;
++		cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
++		/* Do not retry else we can't see errors */
++		err = mmc_wait_for_cmd(host, &cmd, 0);
++		if (err || (cmd.resp[0] & 0xFDF92000)) {
++			pr_err("error %d requesting status %#x\n",
++				err, cmd.resp[0]);
++			return -EIO;
++		}
++
++		/* Timeout if the device never becomes ready for data and
++		 * never leaves the program state.
++		 */
++		if (time_after(jiffies, timeout)) {
++			pr_err("%s: Card stuck in programming state! %s\n",
++				mmc_hostname(host), __func__);
++			return -EIO;
++		}
++
++	} while (!(cmd.resp[0] & R1_READY_FOR_DATA) ||
++		 (R1_CURRENT_STATE(cmd.resp[0]) == R1_STATE_PRG));
++
++	return 0;
++}
++EXPORT_SYMBOL(mmc_busy_wait);
++
+ /**
+  *	mmc_request_done - finish processing an MMC request
+  *	@host: MMC host which completed request
+@@ -1894,7 +1935,6 @@
+ {
+ 	struct mmc_command cmd = {0};
+ 	unsigned int qty = 0;
+-	unsigned long timeout;
+ 	unsigned int fr, nr;
+ 	int err;
+ 
+@@ -1982,37 +2022,10 @@
+ 		goto out;
+ 	}
+ 
+-	if (mmc_host_is_spi(card->host) &&
+-			!(card->host->caps2 & MMC_CAP2_POLL_R1B_BUSY))
++	if (mmc_host_is_spi(card->host))
+ 		goto out;
+ 
+-	timeout = jiffies + msecs_to_jiffies(MMC_CORE_TIMEOUT_MS);
+-	do {
+-		memset(&cmd, 0, sizeof(struct mmc_command));
+-		cmd.opcode = MMC_SEND_STATUS;
+-		cmd.arg = card->rca << 16;
+-		cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
+-		/* Do not retry else we can't see errors */
+-		err = mmc_wait_for_cmd(card->host, &cmd, 0);
+-		if (err || (cmd.resp[0] & 0xFDF92000)) {
+-			pr_err("error %d requesting status %#x\n",
+-				err, cmd.resp[0]);
+-			err = -EIO;
+-			goto out;
+-		}
+-
+-		/* Timeout if the device never becomes ready for data and
+-		 * never leaves the program state.
+-		 */
+-		if (time_after(jiffies, timeout)) {
+-			pr_err("%s: Card stuck in programming state! %s\n",
+-				mmc_hostname(card->host), __func__);
+-			err =  -EIO;
+-			goto out;
+-		}
+-
+-	} while (!(cmd.resp[0] & R1_READY_FOR_DATA) ||
+-		 (R1_CURRENT_STATE(cmd.resp[0]) == R1_STATE_PRG));
++	err = mmc_busy_wait(card->host);
+ out:
+ 
+ 	trace_mmc_blk_erase_end(arg, fr, nr);
+Index: linux/include/linux/mmc/core.h
+===================================================================
+--- linux.orig/include/linux/mmc/core.h	2014-08-17 16:43:06.621731687 -0700
++++ linux/include/linux/mmc/core.h	2014-08-17 16:43:06.617731687 -0700
+@@ -212,4 +212,6 @@
+ extern u32 mmc_vddrange_to_ocrmask(int vdd_min, int vdd_max);
+ extern int mmc_of_parse_voltage(struct device_node *np, u32 *mask);
+ 
++extern int mmc_busy_wait(struct mmc_host *host);
++
+ #endif /* LINUX_MMC_CORE_H */

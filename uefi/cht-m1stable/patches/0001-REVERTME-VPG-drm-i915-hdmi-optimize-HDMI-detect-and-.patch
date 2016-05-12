@@ -1,0 +1,293 @@
+From e293659a31a2970805251d9fed030ac809a9a6d0 Mon Sep 17 00:00:00 2001
+Message-Id: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+From: Shashank Sharma <shashank.sharma@intel.com>
+Date: Fri, 22 Nov 2013 12:28:56 +0530
+Subject: [PATCH 01/30] REVERTME [VPG]: drm/i915/hdmi: optimize HDMI detect
+ and get_modes
+
+Multiple detect and read modes calls come from user space for
+different connectors, but its not really required to detect
+and read mode every time. For hot pluggable displays, its
+required only when there is a hot-plug.
+
+This patch contains:
+1. A logic to optimize those multiple calls, by re-using
+   data from previous detect and get_mode calls.
+2. Store HDMI EDID, and re-use it in read modes.
+3. Read live status reg to suppress spurious interrupts
+
+Revertme, since there are new patches being worked for upstream but they
+are not yet ready.
+
+Change-Id: I4ef632601d63d32a099633b0026171a966b27033
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-3418
+Signed-off-by: Shashank Sharma <shashank.sharma@intel.com>
+Signed-off-by: Nabendu Maiti <nabendu.bikash.maiti@intel.com>
+---
+ drivers/gpu/drm/drm_crtc.c         |    3 +-
+ drivers/gpu/drm/i915/intel_drv.h   |    8 +++
+ drivers/gpu/drm/i915/intel_hdmi.c  |  116 ++++++++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_modes.c |   12 ++++
+ include/drm/drm_crtc.h             |    3 +-
+ 5 files changed, 135 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index 878a44f..bba3b60 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -811,12 +811,13 @@ EXPORT_SYMBOL(drm_crtc_index);
+  *
+  * Remove @mode from @connector's mode list, then free it.
+  */
+-static void drm_mode_remove(struct drm_connector *connector,
++void drm_mode_remove(struct drm_connector *connector,
+ 			    struct drm_display_mode *mode)
+ {
+ 	list_del(&mode->head);
+ 	drm_mode_destroy(connector->dev, mode);
+ }
++EXPORT_SYMBOL(drm_mode_remove);
+ 
+ /**
+  * drm_connector_init - Init a preallocated connector
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index c75142b..68e0403 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -572,6 +572,11 @@ struct cxsr_latency {
+ #define to_intel_framebuffer(x) container_of(x, struct intel_framebuffer, base)
+ #define to_intel_plane(x) container_of(x, struct intel_plane, base)
+ 
++/* HDMI bits are shared with the DP bits */
++#define   HDMIB_HOTPLUG_LIVE_STATUS             (1 << 29)
++#define   HDMIC_HOTPLUG_LIVE_STATUS             (1 << 28)
++#define   HDMID_HOTPLUG_LIVE_STATUS             (1 << 27)
++
+ struct intel_hdmi {
+ 	u32 hdmi_reg;
+ 	int ddc_bus;
+@@ -583,6 +588,8 @@ struct intel_hdmi {
+ 	enum panel_fitter pfit;
+ 	struct intel_connector *attached_connector;
+ 	bool rgb_quant_range_selectable;
++	struct edid *edid;
++	u32 edid_mode_count;
+ 	void (*write_infoframe)(struct drm_encoder *encoder,
+ 				enum hdmi_infoframe_type type,
+ 				const void *frame, ssize_t len);
+@@ -998,6 +1005,7 @@ bool intel_is_dual_link_lvds(struct drm_device *dev);
+ int intel_connector_update_modes(struct drm_connector *connector,
+ 				 struct edid *edid);
+ int intel_ddc_get_modes(struct drm_connector *c, struct i2c_adapter *adapter);
++void intel_cleanup_modes(struct drm_connector *connector);
+ void intel_attach_force_audio_property(struct drm_connector *connector);
+ void intel_attach_broadcast_rgb_property(struct drm_connector *connector);
+ void intel_attach_force_pfit_property(struct drm_connector *connector);
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index 20e14b2..30afc01 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -997,6 +997,46 @@ bool intel_hdmi_compute_config(struct intel_encoder *encoder,
+ 	return true;
+ }
+ 
++static int hdmi_live_status(struct drm_device *dev,
++			struct intel_hdmi *intel_hdmi)
++{
++	u32 bit = 0;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_digital_port *intel_dig_port =
++					hdmi_to_dig_port(intel_hdmi);
++
++	DRM_DEBUG_KMS("Reading Live status");
++	switch (intel_dig_port->port) {
++	case PORT_B:
++		bit = HDMIB_HOTPLUG_LIVE_STATUS;
++		break;
++	case PORT_C:
++		bit = HDMIC_HOTPLUG_LIVE_STATUS;
++		break;
++	case PORT_D:
++		bit = HDMID_HOTPLUG_LIVE_STATUS;
++		break;
++	default:
++		DRM_ERROR("No valid HDMI port\n");
++	}
++
++	/* Return results of connector connection status */
++	return ((I915_READ(PORT_HOTPLUG_STAT) & bit) ?
++		connector_status_connected : connector_status_disconnected);
++}
++
++void intel_hdmi_reset(struct drm_connector *connector)
++{
++	struct intel_hdmi *intel_hdmi = intel_attached_hdmi(connector);
++
++	/* Clean previous detects and modes */
++	intel_hdmi->edid_mode_count = 0;
++	intel_cleanup_modes(connector);
++	kfree(intel_hdmi->edid);
++	intel_hdmi->edid = NULL;
++	connector->status = connector_status_disconnected;
++}
++
+ static enum drm_connector_status
+ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ {
+@@ -1024,6 +1064,18 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 	power_domain = intel_display_port_power_domain(intel_encoder);
+ 	intel_display_power_get(dev_priv, power_domain);
+ 
++	/* If its force detection, dont read EDID again */
++	if (force) {
++		status = connector->status;
++		goto det_out;
++	}
++
++	/* Suppress spurious IRQ, if current status is same as live status */
++	if (connector->status == hdmi_live_status(dev, intel_hdmi)) {
++		status = connector->status;
++		goto det_out;
++	}
++
+ 	intel_hdmi->has_hdmi_sink = false;
+ 	intel_hdmi->has_audio = false;
+ 	intel_hdmi->rgb_quant_range_selectable = false;
+@@ -1050,8 +1102,23 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 			intel_hdmi->has_audio = drm_detect_monitor_audio(edid);
+ 			intel_hdmi->rgb_quant_range_selectable =
+ 				drm_rgb_quant_range_selectable(edid);
++
++			/*
++			 * Free previously saved EDID and save new one
++			 * for read modes. kfree is NULL protected
++			 */
++			kfree(intel_hdmi->edid);
++			intel_hdmi->edid = edid;
++		} else {
++			DRM_ERROR("No digital form EDID? Using stored one\n");
++			kfree(edid);
++			goto det_out;
+ 		}
+-		kfree(edid);
++	} else {
++
++		/* HDMI is disconneted, so remove saved old EDID */
++		kfree(intel_hdmi->edid);
++		intel_hdmi->edid = NULL;
+ 	}
+ 
+ 	if (status == connector_status_connected) {
+@@ -1097,6 +1164,7 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 	}
+ #endif
+ 
++det_out:
+ 	intel_display_power_put(dev_priv, power_domain);
+ 
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+@@ -1109,11 +1177,14 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 
+ static int intel_hdmi_get_modes(struct drm_connector *connector)
+ {
++	int count = 0;
++	struct drm_display_mode *mode = NULL;
+ 	struct intel_encoder *intel_encoder = intel_attached_encoder(connector);
+ 	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(&intel_encoder->base);
+ 	struct drm_i915_private *dev_priv = connector->dev->dev_private;
+ 	enum intel_display_power_domain power_domain;
+-	int ret;
++	struct edid *edid = intel_hdmi->edid;
++	int ret = 0;
+ 
+ 	/* We should parse the EDID data and find out if it's an HDMI sink so
+ 	 * we can send audio to it.
+@@ -1122,10 +1193,45 @@ static int intel_hdmi_get_modes(struct drm_connector *connector)
+ 	power_domain = intel_display_port_power_domain(intel_encoder);
+ 	intel_display_power_get(dev_priv, power_domain);
+ 
+-	ret = intel_ddc_get_modes(connector,
+-				   intel_gmbus_get_adapter(dev_priv,
+-							   intel_hdmi->ddc_bus));
++	/* No need to read modes if no connection */
++	if (connector->status != connector_status_connected)
++		goto e_out;
++
++	/*
++	 * Need not to read modes again if previously read modes are
++	 * available and display is consistent
++	 */
++	if (connector->status) {
++		list_for_each_entry(mode, &connector->modes, head) {
++			if (mode) {
++				mode->status = MODE_OK;
++				count++;
++			}
++		}
++
++		/* If modes are available, no need to read again */
++		if (count) {
++			ret = count;
++			goto e_out;
++		}
++	}
++
++	/*
++	 * EDID was saved in detect, re-use that if available, avoid
++	 * reading EDID everytime. If __unlikely(EDID not available),
++	 * read now
++	 */
++	if (edid) {
++		drm_mode_connector_update_edid_property(connector, edid);
++		ret = drm_add_edid_modes(connector, edid);
++		drm_edid_to_eld(connector, edid);
++	} else {
++		ret = intel_ddc_get_modes(connector,
++			   intel_gmbus_get_adapter(dev_priv,
++			   intel_hdmi->ddc_bus));
++	}
+ 
++e_out:
+ 	intel_display_power_put(dev_priv, power_domain);
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/i915/intel_modes.c b/drivers/gpu/drm/i915/intel_modes.c
+index 2bbe39b..f005f25 100644
+--- a/drivers/gpu/drm/i915/intel_modes.c
++++ b/drivers/gpu/drm/i915/intel_modes.c
+@@ -72,6 +72,18 @@ int intel_ddc_get_modes(struct drm_connector *connector,
+ 	return ret;
+ }
+ 
++void intel_cleanup_modes(struct drm_connector *connector)
++{
++	struct drm_display_mode *mode = NULL;
++	struct drm_display_mode *t = NULL;
++
++	list_for_each_entry_safe(mode, t, &connector->probed_modes, head)
++		drm_mode_remove(connector, mode);
++
++	list_for_each_entry_safe(mode, t, &connector->modes, head)
++		drm_mode_remove(connector, mode);
++}
++
+ static const struct drm_prop_enum_list force_audio_names[] = {
+ 	{ HDMI_AUDIO_OFF_DVI, "force-dvi" },
+ 	{ HDMI_AUDIO_OFF, "off" },
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 03c7719..91676459 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -1128,7 +1128,8 @@ extern int drm_format_plane_cpp(uint32_t format, int plane);
+ extern int drm_format_horz_chroma_subsampling(uint32_t format);
+ extern int drm_format_vert_chroma_subsampling(uint32_t format);
+ extern const char *drm_get_format_name(uint32_t format);
+-
++extern void drm_mode_remove(struct drm_connector *connector,
++				struct drm_display_mode *mode);
+ /* Helpers */
+ 
+ static inline struct drm_plane *drm_plane_find(struct drm_device *dev,
+-- 
+1.7.9.5
+

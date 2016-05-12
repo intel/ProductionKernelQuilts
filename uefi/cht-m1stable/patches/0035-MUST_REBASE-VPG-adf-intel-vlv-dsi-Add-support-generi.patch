@@ -1,0 +1,195 @@
+From 6f7de08f15333545b47f330d22cd5468b762c2ae Mon Sep 17 00:00:00 2001
+Message-Id: <6f7de08f15333545b47f330d22cd5468b762c2ae.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Shobhit Kumar <shobhit.kumar@intel.com>
+Date: Fri, 26 Sep 2014 23:28:46 +0530
+Subject: [PATCH 35/75] MUST_REBASE [VPG]: adf/intel/vlv/dsi: Add support
+ generic I2C seq element
+
+For some panel backlight control is needed over I2C. Add the backlight
+enable/disable support over I2C generic sequence
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I77786a678d4d64f03b011ce637de47c65a8b5a12
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ drivers/video/adf/intel/core/common/dsi/dsi_vbt.h  |    5 ++
+ .../core/common/dsi/panels/intel_dsi_panel_vbt.c   |   86 +++++++++++++++++++-
+ .../adf/intel/include/core/common/dsi/dsi_panel.h  |    2 +
+ 3 files changed, 92 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/dsi_vbt.h b/drivers/video/adf/intel/core/common/dsi/dsi_vbt.h
+index 6253609..46bc0d3 100644
+--- a/drivers/video/adf/intel/core/common/dsi/dsi_vbt.h
++++ b/drivers/video/adf/intel/core/common/dsi/dsi_vbt.h
+@@ -194,6 +194,10 @@ enum mipi_seq {
+ 	MIPI_SEQ_DISPLAY_ON,
+ 	MIPI_SEQ_DISPLAY_OFF,
+ 	MIPI_SEQ_DEASSERT_RESET,
++	MIPI_SEQ_BACKLIGHT_ON,
++	MIPI_SEQ_BACKLIGHT_OFF,
++	MIPI_SEQ_TEAR_ON,
++	MIPI_SEQ_TEAR_OFF,
+ 	MIPI_SEQ_MAX
+ };
+ 
+@@ -202,6 +206,7 @@ enum mipi_seq_element {
+ 	MIPI_SEQ_ELEM_SEND_PKT,
+ 	MIPI_SEQ_ELEM_DELAY,
+ 	MIPI_SEQ_ELEM_GPIO,
++	MIPI_SEQ_ELEM_I2C,
+ 	MIPI_SEQ_ELEM_STATUS,
+ 	MIPI_SEQ_ELEM_MAX
+ };
+diff --git a/drivers/video/adf/intel/core/common/dsi/panels/intel_dsi_panel_vbt.c b/drivers/video/adf/intel/core/common/dsi/panels/intel_dsi_panel_vbt.c
+index c4a1749..680b4de 100644
+--- a/drivers/video/adf/intel/core/common/dsi/panels/intel_dsi_panel_vbt.c
++++ b/drivers/video/adf/intel/core/common/dsi/panels/intel_dsi_panel_vbt.c
+@@ -33,6 +33,7 @@
+ #include <core/common/dsi/dsi_pipe.h>
+ #include <core/common/dsi/dsi_panel.h>
+ #include <core/vlv/vlv_dc_regs.h>
++#include <linux/i2c.h>
+ #include "intel_dsi.h"
+ #include "intel_dsi_cmd.h"
+ #include "dsi_vbt.h"
+@@ -196,12 +197,70 @@ static u8 *mipi_exec_gpio(struct dsi_pipe *dsi_pipe, u8 *data)
+ 	return data;
+ }
+ 
++static u8 *mipi_exec_i2c(struct dsi_pipe *dsi_pipe, u8 *data)
++{
++	struct i2c_adapter *adapter;
++	int ret;
++	u8 reg_offset, payload_size, retries = 5;
++	struct i2c_msg msg;
++	u8 *transmit_buffer = NULL;
++
++	u8 flag = *data++;
++	u8 index = *data++;
++	u8 bus_number = *data++;
++	u16 slave_add = *(u16 *)(data);
++	data = data + 2;
++	reg_offset = *data++;
++	payload_size = *data++;
++
++	adapter = i2c_get_adapter(bus_number);
++
++	if (!adapter) {
++		DRM_ERROR("i2c_get_adapter(%u) failed, index:%u flag: %u\n",
++				(bus_number + 1), index, flag);
++		goto out;
++	}
++
++	transmit_buffer = kmalloc(1 + payload_size, GFP_TEMPORARY);
++
++	if (!transmit_buffer)
++		goto out;
++
++	transmit_buffer[0] = reg_offset;
++	memcpy(&transmit_buffer[1], data, (size_t)payload_size);
++
++	msg.addr   = slave_add;
++	msg.flags  = 0;
++	msg.len    = 2;
++	msg.buf    = &transmit_buffer[0];
++
++	do {
++		ret =  i2c_transfer(adapter, &msg, 1);
++		if (ret == -EAGAIN)
++			usleep_range(1000, 2500);
++		else if (ret != 1) {
++			DRM_ERROR("i2c transfer failed %d\n", ret);
++			break;
++		}
++	} while (retries--);
++
++	if (retries == 0)
++		DRM_ERROR("i2c transfer failed");
++
++out:
++	kfree(transmit_buffer);
++
++	data = data + payload_size;
++	return data;
++}
++
+ typedef u8 * (*fn_mipi_elem_exec)(struct dsi_pipe *dsi_pipe, u8 *data);
+ static const fn_mipi_elem_exec exec_elem[] = {
+ 	NULL, /* reserved */
+ 	mipi_exec_send_packet,
+ 	mipi_exec_delay,
+ 	mipi_exec_gpio,
++	mipi_exec_i2c,
+ 	NULL, /* status read; later */
+ };
+ 
+@@ -217,7 +276,10 @@ static const char * const seq_name[] = {
+ 	"MIPI_SEQ_INIT_OTP",
+ 	"MIPI_SEQ_DISPLAY_ON",
+ 	"MIPI_SEQ_DISPLAY_OFF",
+-	"MIPI_SEQ_DEASSERT_RESET"
++	"MIPI_SEQ_DEASSERT_RESET",
++	"MIPI_BACKLIGHT_ON",
++	"MIPI_BACKLIGHT_OFF",
++	"MIPI_TEAR_ON",
+ };
+ 
+ static void generic_exec_sequence(struct dsi_pipe *dsi_pipe, char *sequence)
+@@ -613,6 +675,26 @@ static int generic_disable(struct dsi_pipe *interface)
+ 	return 0;
+ }
+ 
++int generic_enable_bklt(struct dsi_pipe *interface)
++{
++	struct dsi_vbt *dsi = interface->config.dsi;
++	char *sequence = dsi->sequence[MIPI_SEQ_BACKLIGHT_ON];
++	pr_err("ADF: %s\n", __func__);
++
++	generic_exec_sequence(interface, sequence);
++	return 0;
++}
++
++int generic_disable_bklt(struct dsi_pipe *interface)
++{
++	struct dsi_vbt *dsi = interface->config.dsi;
++	char *sequence = dsi->sequence[MIPI_SEQ_BACKLIGHT_OFF];
++	pr_err("ADF: %s\n", __func__);
++
++	generic_exec_sequence(interface, sequence);
++	return 0;
++}
++
+ static int generic_detect(struct dsi_pipe *interface)
+ {
+ 	pr_debug("ADF: %s\n", __func__);
+@@ -707,6 +789,8 @@ struct panel_ops generic_ops = {
+ 		.detect = generic_detect,
+ 		.power_on = generic_enable,
+ 		.power_off = generic_disable,
++		.enable_backlight = generic_enable_bklt,
++		.disable_backlight = generic_disable_bklt,
+ 		.set_brightness = generic_set_brightness,
+ 		.drv_ic_init = generic_send_otp_cmds,
+ 		.drv_set_panel_mode = generic_set_mode,
+diff --git a/drivers/video/adf/intel/include/core/common/dsi/dsi_panel.h b/drivers/video/adf/intel/include/core/common/dsi/dsi_panel.h
+index 99134bc..b42b786 100644
+--- a/drivers/video/adf/intel/include/core/common/dsi/dsi_panel.h
++++ b/drivers/video/adf/intel/include/core/common/dsi/dsi_panel.h
+@@ -78,6 +78,8 @@ struct panel_ops {
+ 	int (*drv_ic_init)(struct dsi_pipe *intf);
+ 	int (*drv_set_panel_mode)(struct dsi_pipe *intf);
+ 	int (*disable_panel_power)(struct dsi_pipe *intf);
++	int (*enable_backlight)(struct dsi_pipe *intf);
++	int (*disable_backlight)(struct dsi_pipe *intf);
+ };
+ 
+ struct dsi_panel {
+-- 
+1.7.9.5
+

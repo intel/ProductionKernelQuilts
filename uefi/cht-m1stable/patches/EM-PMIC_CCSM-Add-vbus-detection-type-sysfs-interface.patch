@@ -1,0 +1,203 @@
+From 75150c55a9b7ee0ff9839fe8bde05845c89f941c Mon Sep 17 00:00:00 2001
+From: Albin B <albin.bala.krishnan@intel.com>
+Date: Thu, 17 Dec 2015 17:29:17 +0530
+Subject: [PATCH 2/4] [EM/PMIC_CCSM]: Add vbus detection type sysfs interface
+
+Create vbus detection type sysfs interface in pmic_ccsm driver under
+misc device.
+
+Change-Id: I51ee8732a29e9320e65884f6a5bdc9af7fb611a8
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-15528
+Signed-off-by: Albin B <albin.bala.krishnan@intel.com>
+Reviewed-on: https://android.intel.com:443/450219
+---
+ drivers/power/intel_pmic_ccsm.c          | 97 ++++++++++++++++++++++++++++++++
+ drivers/power/intel_pmic_ccsm.h          |  9 +++
+ include/linux/mfd/intel_soc_pmic_wcove.h |  2 +-
+ 3 files changed, 107 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/power/intel_pmic_ccsm.c b/drivers/power/intel_pmic_ccsm.c
+index 41c8acc..8500bcc 100644
+--- a/drivers/power/intel_pmic_ccsm.c
++++ b/drivers/power/intel_pmic_ccsm.c
+@@ -41,6 +41,8 @@
+ #include <linux/mfd/intel_soc_pmic.h>
+ #include <linux/extcon.h>
+ #include <linux/wakelock.h>
++#include <linux/sysfs.h>
++#include <linux/miscdevice.h>
+ #include "intel_pmic_ccsm.h"
+ 
+ /* Macros */
+@@ -1811,6 +1813,91 @@ static int get_pmic_model(const char *name)
+ 	return INTEL_PMIC_UNKNOWN;
+ }
+ 
++static ssize_t pmic_ccsm_set_vbus_det_type(struct device *dev,
++						struct device_attribute *attr,
++						const char *buf,
++						size_t count)
++{
++	u8 data;
++	int ret = -EINVAL;
++
++	if (!strncmp(buf, VBUSDET_TYPE_EDGE_TEXT, count - 1))
++		data = VBUSDETCTRL_VBUSDETTYPE_EDGE;
++	else if (!strncmp(buf, VBUSDET_TYPE_LEVEL_TEXT, count - 1))
++		data = VBUSDETCTRL_VBUSDETTYPE_LEVEL;
++	else
++		goto error;
++
++	ret = intel_soc_pmic_update(chc.reg_map->pmic_vbusdetctrl, data,
++					VBUSDETCTRL_VBUSDETTYPE_MASK);
++	if (ret < 0) {
++		dev_err(chc.dev,
++			"%s Error in updating vbus detecting type(%d)\n",
++			__func__, data);
++		goto update_error;
++	}
++	return count;
++
++error:
++	dev_err(chc.dev, "%s Wrong input data{%s}\n", __func__, buf);
++update_error:
++	return ret;
++}
++
++static ssize_t pmic_ccsm_get_vbus_det_type(struct device *dev,
++						struct device_attribute *attr,
++						char *buf)
++{
++	u8 val;
++	u8 type;
++	size_t count = 0;
++
++	if (pmic_read_reg(chc.reg_map->pmic_vbusdetctrl, &val))
++		return -EIO;
++
++	type = val & VBUSDETCTRL_VBUSDETTYPE_MASK;
++	if (type ==  VBUSDETCTRL_VBUSDETTYPE_EDGE) {
++		count = snprintf(buf, VBUSDET_TYPE_TEXT_MAX_LEN,
++					"%s\n", VBUSDET_TYPE_EDGE_TEXT);
++	} else if (type == VBUSDETCTRL_VBUSDETTYPE_LEVEL) {
++		count = snprintf(buf, VBUSDET_TYPE_TEXT_MAX_LEN,
++					"%s\n", VBUSDET_TYPE_LEVEL_TEXT);
++	}
++
++	return count;
++}
++
++static DEVICE_ATTR(vbus_det_type, S_IWUSR | S_IRUGO,
++	pmic_ccsm_get_vbus_det_type, pmic_ccsm_set_vbus_det_type);
++
++static const struct attribute *pmic_ccsm_attrs[] = {
++	&dev_attr_vbus_det_type.attr,
++	NULL,
++};
++
++static void pmic_ccsm_sysfs_init(struct pmic_chrgr_drv_context *info)
++{
++	int ret;
++
++	info->misc_dev.minor = MISC_DYNAMIC_MINOR;
++	info->misc_dev.name = "pmic";
++	info->misc_dev.mode = (S_IWUSR | S_IRUGO);
++	ret = misc_register(&info->misc_dev);
++	if (ret) {
++		dev_err(info->dev,
++				"Error(%d) in registering misc class", ret);
++		return;
++	}
++
++	/* create sysfs file for vbus_det_type */
++	ret = sysfs_create_files(&info->misc_dev.this_device->kobj,
++					pmic_ccsm_attrs);
++	if (ret) {
++		dev_err(info->dev, "cannot create sysfs entry\n");
++		misc_deregister(&info->misc_dev);
++	}
++}
++
+ /* vbus control cooling device callbacks */
+ static int vbus_get_max_state(struct thermal_cooling_device *tcd,
+ 				unsigned long *state)
+@@ -2180,6 +2267,9 @@ static int pmic_chrgr_probe(struct platform_device *pdev)
+ 		goto cdev_reg_fail;
+ 	}
+ 
++	/* Register and create sysfs interfaces */
++	pmic_ccsm_sysfs_init(&chc);
++
+ 	return 0;
+ 
+ cdev_reg_fail:
+@@ -2227,6 +2317,13 @@ static int pmic_chrgr_remove(struct platform_device *pdev)
+ 	struct pmic_chrgr_drv_context *chc = platform_get_drvdata(pdev);
+ 
+ 	if (chc) {
++
++		if (!IS_ERR_OR_NULL(chc->misc_dev.this_device)) {
++			sysfs_remove_files(&chc->misc_dev.this_device->kobj,
++						pmic_ccsm_attrs);
++			misc_deregister(&chc->misc_dev);
++		}
++
+ 		if (IS_ERR_OR_NULL(chc->vbus_cdev))
+ 			ret = PTR_ERR(chc->vbus_cdev);
+ 		else
+diff --git a/drivers/power/intel_pmic_ccsm.h b/drivers/power/intel_pmic_ccsm.h
+index a20520d..c8607e5 100644
+--- a/drivers/power/intel_pmic_ccsm.h
++++ b/drivers/power/intel_pmic_ccsm.h
+@@ -91,6 +91,10 @@
+ #define SHRT_GND_DET			(1 << 3)
+ #define SHRT_FLT_DET			(1 << 4)
+ 
++#define VBUSDETCTRL_VBUSDETTYPE_LEVEL	0
++#define VBUSDETCTRL_VBUSDETTYPE_EDGE	(1 << 1)
++#define VBUSDETCTRL_VBUSDETTYPE_MASK	(1 << 1)
++
+ #define PMIC_CHRGR_INT0_MASK		0xB1
+ #define PMIC_CHRGR_CCSM_INT0_MASK	0xB0
+ #define PMIC_CHRGR_EXT_CHRGR_INT_MASK	0x01
+@@ -282,6 +286,10 @@
+ 
+ #define PMIC_CCSM_IRQ_MAX 6
+ 
++#define VBUSDET_TYPE_TEXT_MAX_LEN	8
++#define VBUSDET_TYPE_EDGE_TEXT		"edge"
++#define VBUSDET_TYPE_LEVEL_TEXT		"level"
++
+ enum pmic_models {
+ 	INTEL_PMIC_UNKNOWN = 0,
+ 	INTEL_PMIC_BCOVE,
+@@ -439,5 +447,6 @@ struct pmic_chrgr_drv_context {
+ 	struct notifier_block cable_nb;
+ 	struct work_struct extcon_work;
+ 	struct list_head cable_evt_list;
++	struct miscdevice misc_dev;
+ 	spinlock_t cable_event_queue_lock;
+ };
+diff --git a/include/linux/mfd/intel_soc_pmic_wcove.h b/include/linux/mfd/intel_soc_pmic_wcove.h
+index 2c28ae9..a95c508 100644
+--- a/include/linux/mfd/intel_soc_pmic_wcove.h
++++ b/include/linux/mfd/intel_soc_pmic_wcove.h
+@@ -28,7 +28,6 @@ extern struct i2c_adapter *wcove_pmic_i2c_adapter;
+ #define WC_LOWBATTDET0_ADDR	0x6E23
+ #define WC_LOWBATTDET1_ADDR	0x6E24
+ #define WC_BATTDETCTRL_ADDR	0x6EF0
+-#define WC_VBUSDETCTRL_ADDR	0x6E25
+ #define WC_VDCINDETCTRL_ADDR	0x6E25
+ #define WC_CHGRIRQ0_ADDR	0x6E0A
+ #define WC_MCHGRIRQ0_ADDR	0x6E17
+@@ -48,6 +47,7 @@ extern struct i2c_adapter *wcove_pmic_i2c_adapter;
+ #define WC_MTHRMIRQ2_ADDR	0x6E13
+ #define WC_STHRMIRQ2_ADDR	0x4F1B
+ 
++#define WC_VBUSDETCTRL_ADDR	0x5E1D
+ #define WC_USBPATH_ADDR		0x5E19
+ #define WC_USBPHYCTRL_ADDR	0x5E07
+ #define WC_USBIDCTRL_ADDR	0x5E05
+-- 
+1.9.1
+

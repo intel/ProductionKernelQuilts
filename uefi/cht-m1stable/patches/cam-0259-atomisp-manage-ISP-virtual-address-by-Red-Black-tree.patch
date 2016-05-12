@@ -1,0 +1,1603 @@
+From ad4dfdb2d462e065831b142f550cf0a9da1977b6 Mon Sep 17 00:00:00 2001
+From: "Guoqing,Zhang" <guoqingx.zhang@intel.com>
+Date: Fri, 12 Dec 2014 15:27:09 +0800
+Subject: [PATCH 259/269] atomisp: manage ISP virtual address by Red-Black tree
+
+This patch changes to use Red-Black tree to manage ISP virtual
+memory space instead of linked list because Red-Black tree has
+much better search performance than linked list, time complexity
+ is log2N compared to N.
+
+In general, there are two types of memory objects, allocated and
+free. This patch creates 2 Red-Black trees to maintain these two
+types of memory, one is free_rbtree to organize all the free
+memory objects in size, the other one is allocated_rbtree to
+organize all the allocated memory objects in its address.
+
+HMM code will maintain above two Red-Black trees and any memory
+operation(allocation/free/store/load) will begin with searching
+in a specific tree instead of the big linked list we have before.
+
+Change-Id: Ie8426c4dc0ea72f0e7ec036c93d54cbc60ae3e10
+Orig-Change-Id: Ia276fba9cb92291655b678d27bf672ac8f2e4f5a
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-19906
+Signed-off-by: Guoqing,Zhang <guoqingx.zhang@intel.com>
+Signed-off-by: Bin Han <bin.b.han@intel.com>
+Reviewed-on: https://android.intel.com:443/311222
+Reviewed-on: https://icggerrit.ir.intel.com/38872
+Approver: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Tuukka Toivonen <tuukka.toivonen@intel.com>
+Reviewed-by: Hongyu Yi <hongyu.yi@intel.com>
+Integrator: Wei Tao <wei.tao@intel.com>
+Build: Wei Tao <wei.tao@intel.com>
+Maintainer: Wei Tao <wei.tao@intel.com>
+---
+ .../drivers/media/pci/atomisp2/Makefile.common     |   2 -
+ .../atomisp2/atomisp_driver/atomisp_compat_css20.c |   2 +-
+ .../media/pci/atomisp2/atomisp_driver/hmm/hmm.c    |  98 ++-
+ .../media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c | 688 ++++++++++++++++-----
+ .../pci/atomisp2/atomisp_driver/include/hmm/hmm.h  |   1 -
+ .../atomisp2/atomisp_driver/include/hmm/hmm_bo.h   | 220 +++----
+ .../atomisp2/atomisp_driver/include/hmm/hmm_pool.h |   1 -
+ 7 files changed, 671 insertions(+), 341 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/Makefile.common b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/Makefile.common
+index 70a94dd..43a0b07 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/Makefile.common
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/Makefile.common
+@@ -80,8 +80,6 @@ atomisp-$(postfix)-objs := \
+ 		atomisp_driver/mmu/sh_mmu_mrfld.o \
+ 		atomisp_driver/hmm/hmm.o \
+ 		atomisp_driver/hmm/hmm_bo.o \
+-		atomisp_driver/hmm/hmm_bo_dev.o \
+-		atomisp_driver/hmm/hmm_vm.o \
+ 		atomisp_driver/hmm/hmm_reserved_pool.o \
+ 		atomisp_driver/hmm/hmm_dynamic_pool.o \
+ 		atomisp_driver/hrt/hive_isp_css_mm_hrt.o \
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+index c401330..09ba331 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+@@ -25,7 +25,7 @@
+ 
+ #include "mmu/isp_mmu.h"
+ #include "mmu/sh_mmu_mrfld.h"
+-#include "hmm/hmm_bo_dev.h"
++#include "hmm/hmm_bo.h"
+ #include "hmm/hmm.h"
+ 
+ #include "atomisp_compat.h"
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm.c
+index c2f0faa..7519acf 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm.c
+@@ -33,7 +33,6 @@
+ #include "hmm/hmm.h"
+ #include "hmm/hmm_pool.h"
+ #include "hmm/hmm_bo.h"
+-#include "hmm/hmm_bo_dev.h"
+ 
+ #include "atomisp_internal.h"
+ #include "asm/cacheflush.h"
+@@ -235,20 +234,12 @@ ia_css_ptr hmm_alloc(size_t bytes, enum hmm_bo_type type,
+ 	pgnr = size_to_pgnr_ceil(bytes);
+ 
+ 	/*Buffer object structure init*/
+-	bo = hmm_bo_create(&bo_device, pgnr);
++	bo = hmm_bo_alloc(&bo_device, pgnr);
+ 	if (!bo) {
+ 		dev_err(atomisp_dev, "hmm_bo_create failed.\n");
+ 		goto create_bo_err;
+ 	}
+ 
+-	/*Allocate virtual address in ISP virtual space*/
+-	ret = hmm_bo_alloc_vm(bo);
+-	if (ret) {
+-		dev_err(atomisp_dev,
+-			    "hmm_bo_alloc_vm failed.\n");
+-		goto alloc_vm_err;
+-	}
+-
+ 	/*Allocate pages for memory*/
+ 	ret = hmm_bo_alloc_pages(bo, type, from_highmem, userptr, cached);
+ 	if (ret) {
+@@ -266,13 +257,11 @@ ia_css_ptr hmm_alloc(size_t bytes, enum hmm_bo_type type,
+ 
+ 	hmm_mem_stat.tol_cnt += pgnr;
+ 
+-	return bo->vm_node->start;
++	return bo->start;
+ 
+ bind_err:
+ 	hmm_bo_free_pages(bo);
+ alloc_page_err:
+-	hmm_bo_free_vm(bo);
+-alloc_vm_err:
+ 	hmm_bo_unref(bo);
+ create_bo_err:
+ 	return 0;
+@@ -297,8 +286,6 @@ void hmm_free(ia_css_ptr virt)
+ 
+ 	hmm_bo_free_pages(bo);
+ 
+-	hmm_bo_free_vm(bo);
+-
+ 	hmm_bo_unref(bo);
+ }
+ 
+@@ -317,7 +304,7 @@ static inline int hmm_check_bo(struct hmm_buffer_object *bo, unsigned int ptr)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (!hmm_bo_vm_allocated(bo)) {
++	if (!hmm_bo_allocated(bo)) {
+ 		dev_err(atomisp_dev,
+ 			    "buffer object has no virtual address"
+ 			    " space allocated.\n");
+@@ -330,23 +317,20 @@ static inline int hmm_check_bo(struct hmm_buffer_object *bo, unsigned int ptr)
+ /*Read function in ISP memory management*/
+ static int load_and_flush_by_kmap(ia_css_ptr virt, void *data, unsigned int bytes)
+ {
+-	unsigned int ptr;
+ 	struct hmm_buffer_object *bo;
+ 	unsigned int idx, offset, len;
+ 	char *src, *des;
+ 	int ret;
+ 
+-	ptr = (unsigned int)virt;
+-
+-	bo = hmm_bo_device_search_in_range(&bo_device, ptr);
+-	ret = hmm_check_bo(bo, ptr);
++	bo = hmm_bo_device_search_in_range(&bo_device, virt);
++	ret = hmm_check_bo(bo, virt);
+ 	if (ret)
+ 		return ret;
+ 
+ 	des = (char *)data;
+ 	while (bytes) {
+-		idx = (ptr - bo->vm_node->start) >> PAGE_SHIFT;
+-		offset = (ptr - bo->vm_node->start) - (idx << PAGE_SHIFT);
++		idx = (virt - bo->start) >> PAGE_SHIFT;
++		offset = (virt - bo->start) - (idx << PAGE_SHIFT);
+ 
+ 		src = (char *)kmap(bo->page_obj[idx].page);
+ 		if (!src) {
+@@ -366,7 +350,7 @@ static int load_and_flush_by_kmap(ia_css_ptr virt, void *data, unsigned int byte
+ 			bytes = 0;
+ 		}
+ 
+-		ptr += len;	/* update ptr for next loop */
++		virt += len;	/* update virt for next loop */
+ 
+ 		if (des) {
+ 
+@@ -390,20 +374,17 @@ static int load_and_flush_by_kmap(ia_css_ptr virt, void *data, unsigned int byte
+ static int load_and_flush(ia_css_ptr virt, void *data, unsigned int bytes)
+ {
+ 	struct hmm_buffer_object *bo;
+-	unsigned int ptr;
+ 	int ret;
+ 
+-	ptr = (unsigned int)virt;
+-
+-	bo = hmm_bo_device_search_in_range(&bo_device, ptr);
+-	ret = hmm_check_bo(bo, ptr);
++	bo = hmm_bo_device_search_in_range(&bo_device, virt);
++	ret = hmm_check_bo(bo, virt);
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (bo->status & HMM_BO_VMAPED || bo->status & HMM_BO_VMAPED_CACHED) {
+ 		void *src = bo->vmap_addr;
+ 
+-		src += (virt - bo->vm_node->start);
++		src += (virt - bo->start);
+ #ifdef USE_SSSE3
+ 		_ssse3_memcpy(data, src, bytes);
+ #else
+@@ -414,9 +395,11 @@ static int load_and_flush(ia_css_ptr virt, void *data, unsigned int bytes)
+ 	} else {
+ 		void *vptr;
+ 
+-		vptr = hmm_vmap(virt, true);
++		vptr = hmm_bo_vmap(bo, true);
+ 		if (!vptr)
+ 			return load_and_flush_by_kmap(virt, data, bytes);
++		else
++			vptr = vptr + (virt - bo->start);
+ 
+ #ifdef USE_SSSE3
+ 		_ssse3_memcpy(data, vptr, bytes);
+@@ -424,7 +407,7 @@ static int load_and_flush(ia_css_ptr virt, void *data, unsigned int bytes)
+ 		memcpy(data, vptr, bytes);
+ #endif
+ 		clflush_cache_range(vptr, bytes);
+-		hmm_vunmap(virt);
++		hmm_bo_vunmap(bo);
+ 	}
+ 
+ 	return 0;
+@@ -450,23 +433,20 @@ int hmm_flush(ia_css_ptr virt, unsigned int bytes)
+ /*Write function in ISP memory management*/
+ int hmm_store(ia_css_ptr virt, const void *data, unsigned int bytes)
+ {
+-	unsigned int ptr;
+ 	struct hmm_buffer_object *bo;
+ 	unsigned int idx, offset, len;
+ 	char *src, *des;
+ 	int ret;
+ 
+-	ptr = (unsigned int)virt;
+-
+-	bo = hmm_bo_device_search_in_range(&bo_device, ptr);
+-	ret = hmm_check_bo(bo, ptr);
++	bo = hmm_bo_device_search_in_range(&bo_device, virt);
++	ret = hmm_check_bo(bo, virt);
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (bo->status & HMM_BO_VMAPED || bo->status & HMM_BO_VMAPED_CACHED) {
+ 		void *dst = bo->vmap_addr;
+ 
+-		dst += (virt - bo->vm_node->start);
++		dst += (virt - bo->start);
+ #ifdef USE_SSSE3
+ 		_ssse3_memcpy(dst, data, bytes);
+ #else
+@@ -477,23 +457,25 @@ int hmm_store(ia_css_ptr virt, const void *data, unsigned int bytes)
+ 	} else {
+ 		void *vptr;
+ 
+-		vptr = hmm_vmap(virt, true);
++		vptr = hmm_bo_vmap(bo, true);
+ 		if (vptr) {
++			vptr = vptr + (virt - bo->start);
++
+ #ifdef USE_SSSE3
+ 			_ssse3_memcpy(vptr, data, bytes);
+ #else
+ 			memcpy(vptr, data, bytes);
+ #endif
+ 			clflush_cache_range(vptr, bytes);
+-			hmm_vunmap(virt);
++			hmm_bo_vunmap(bo);
+ 			return 0;
+ 		}
+ 	}
+ 
+ 	src = (char *)data;
+ 	while (bytes) {
+-		idx = (ptr - bo->vm_node->start) >> PAGE_SHIFT;
+-		offset = (ptr - bo->vm_node->start) - (idx << PAGE_SHIFT);
++		idx = (virt - bo->start) >> PAGE_SHIFT;
++		offset = (virt - bo->start) - (idx << PAGE_SHIFT);
+ 
+ 		if (in_atomic())
+ 			des = (char *)kmap_atomic(bo->page_obj[idx].page);
+@@ -517,7 +499,7 @@ int hmm_store(ia_css_ptr virt, const void *data, unsigned int bytes)
+ 			bytes = 0;
+ 		}
+ 
+-		ptr += len;
++		virt += len;
+ 
+ #ifdef USE_SSSE3
+ 		_ssse3_memcpy(des, src, len);
+@@ -557,7 +539,7 @@ int hmm_set(ia_css_ptr virt, int c, unsigned int bytes)
+ 	if (bo->status & HMM_BO_VMAPED || bo->status & HMM_BO_VMAPED_CACHED) {
+ 		void *dst = bo->vmap_addr;
+ 
+-		dst += (virt - bo->vm_node->start);
++		dst += (virt - bo->start);
+ 		memset(dst, c, bytes);
+ 
+ 		if (bo->status & HMM_BO_VMAPED_CACHED)
+@@ -565,18 +547,19 @@ int hmm_set(ia_css_ptr virt, int c, unsigned int bytes)
+ 	} else {
+ 		void *vptr;
+ 
+-		vptr = hmm_vmap(virt, true);
++		vptr = hmm_bo_vmap(bo, true);
+ 		if (vptr) {
++			vptr = vptr + (virt - bo->start);
+ 			memset((void *)vptr, c, bytes);
+ 			clflush_cache_range(vptr, bytes);
+-			hmm_vunmap(virt);
++			hmm_bo_vunmap(bo);
+ 			return 0;
+ 		}
+ 	}
+ 
+ 	while (bytes) {
+-		idx = (virt - bo->vm_node->start) >> PAGE_SHIFT;
+-		offset = (virt - bo->vm_node->start) - (idx << PAGE_SHIFT);
++		idx = (virt - bo->start) >> PAGE_SHIFT;
++		offset = (virt - bo->start) - (idx << PAGE_SHIFT);
+ 
+ 		des = (char *)kmap(bo->page_obj[idx].page);
+ 		if (!des) {
+@@ -610,20 +593,19 @@ int hmm_set(ia_css_ptr virt, int c, unsigned int bytes)
+ /*Virtual address to physical address convert*/
+ phys_addr_t hmm_virt_to_phys(ia_css_ptr virt)
+ {
+-	unsigned int ptr = (unsigned int)virt;
+ 	unsigned int idx, offset;
+ 	struct hmm_buffer_object *bo;
+ 
+-	bo = hmm_bo_device_search_in_range(&bo_device, ptr);
++	bo = hmm_bo_device_search_in_range(&bo_device, virt);
+ 	if (!bo) {
+ 		dev_err(atomisp_dev,
+-			    "can not find buffer object contains "
+-			    "address 0x%x\n", ptr);
++			"can not find buffer object contains address 0x%x\n",
++			virt);
+ 		return -1;
+ 	}
+ 
+-	idx = (ptr - bo->vm_node->start) >> PAGE_SHIFT;
+-	offset = (ptr - bo->vm_node->start) - (idx << PAGE_SHIFT);
++	idx = (virt - bo->start) >> PAGE_SHIFT;
++	offset = (virt - bo->start) - (idx << PAGE_SHIFT);
+ 
+ 	return page_to_phys(bo->page_obj[idx].page) + offset;
+ }
+@@ -635,8 +617,8 @@ int hmm_mmap(struct vm_area_struct *vma, ia_css_ptr virt)
+ 	bo = hmm_bo_device_search_start(&bo_device, virt);
+ 	if (!bo) {
+ 		dev_err(atomisp_dev,
+-			    "can not find buffer object start with "
+-			    "address 0x%x\n", virt);
++			"can not find buffer object start with address 0x%x\n",
++			virt);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -659,7 +641,7 @@ void *hmm_vmap(ia_css_ptr virt, bool cached)
+ 
+ 	ptr = hmm_bo_vmap(bo, cached);
+ 	if (ptr)
+-		return ptr + (virt - bo->vm_node->start);
++		return ptr + (virt - bo->start);
+ 	else
+ 		return NULL;
+ }
+@@ -744,7 +726,7 @@ ia_css_ptr hmm_host_vaddr_to_hrt_vaddr(const void *ptr)
+ 
+ 	bo = hmm_bo_device_search_vmap_start(&bo_device, ptr);
+ 	if (bo)
+-		return bo->vm_node->start;
++		return bo->start;
+ 
+ 	dev_err(atomisp_dev,
+ 		"can not find buffer object whose kernel virtual address is %p\n",
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c
+index 0af87da..a1728b8 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c
+@@ -41,19 +41,15 @@
+ #include <asm/current.h>
+ #include <linux/sched.h>
+ 
+-#include "atomisp_internal.h"
+-
+-#include "hmm/hmm_vm.h"
+-#include "hmm/hmm_bo.h"
+-#include "hmm/hmm_pool.h"
+-#include "hmm/hmm_bo_dev.h"
+-#include "hmm/hmm_common.h"
+-
+ #ifdef CONFIG_ION
+ #include <linux/ion.h>
+-#include <linux/scatterlist.h>
+ #endif
+ 
++#include "atomisp_internal.h"
++#include "hmm/hmm_common.h"
++#include "hmm/hmm_pool.h"
++#include "hmm/hmm_bo.h"
++
+ static unsigned int order_to_nr(unsigned int order)
+ {
+ 	return 1U << order;
+@@ -64,110 +60,426 @@ static unsigned int nr_to_order_bottom(unsigned int nr)
+ 	return fls(nr) - 1;
+ }
+ 
+-static void free_bo_internal(struct hmm_buffer_object *bo)
++struct hmm_buffer_object *__bo_alloc(struct kmem_cache *bo_cache)
+ {
+-	kfree(bo);
++	struct hmm_buffer_object *bo;
++
++	bo = kmem_cache_alloc(bo_cache, GFP_KERNEL);
++	if (!bo)
++		dev_err(atomisp_dev, "%s: __bo_alloc failed!\n", __func__);
++
++	return bo;
+ }
+ 
+-/*
+- * use these functions to dynamically alloc hmm_buffer_object.
+- * hmm_bo_init will called for that allocated buffer object, and
+- * the release callback is set to kfree.
+- */
+-struct hmm_buffer_object *hmm_bo_create(struct hmm_bo_device *bdev, int pgnr)
++static int __bo_init(struct hmm_bo_device *bdev, struct hmm_buffer_object *bo,
++					unsigned int pgnr)
++{
++	check_bodev_null_return(bdev, -EINVAL);
++	var_equal_return(hmm_bo_device_inited(bdev), 0, -EINVAL,
++			"hmm_bo_device not inited yet.\n");
++	/* prevent zero size buffer object */
++	if (pgnr == 0) {
++		dev_err(atomisp_dev, "0 size buffer is not allowed.\n");
++		return -EINVAL;
++	}
++
++	memset(bo, 0, sizeof(*bo));
++	mutex_init(&bo->mutex);
++
++	/* init the bo->list HEAD as an element of entire_bo_list */
++	INIT_LIST_HEAD(&bo->list);
++
++	bo->bdev = bdev;
++	bo->vmap_addr = NULL;
++	bo->status = HMM_BO_FREE;
++	bo->start = bdev->start;
++	bo->pgnr = pgnr;
++	bo->end = bo->start + pgnr_to_size(pgnr);
++	bo->prev = NULL;
++	bo->next = NULL;
++
++	return 0;
++}
++
++struct hmm_buffer_object *__bo_search_and_remove_from_free_rbtree(
++				struct rb_node *node, unsigned int pgnr)
+ {
++	struct hmm_buffer_object *this, *ret_bo, *temp_bo;
++
++	this = rb_entry(node, struct hmm_buffer_object, node);
++	if (this->pgnr == pgnr ||
++		(this->pgnr > pgnr && this->node.rb_left == NULL)) {
++		goto remove_bo_and_return;
++	} else {
++		if (this->pgnr < pgnr) {
++			if (!this->node.rb_right)
++				return NULL;
++			ret_bo = __bo_search_and_remove_from_free_rbtree(
++				this->node.rb_right, pgnr);
++		} else {
++			ret_bo = __bo_search_and_remove_from_free_rbtree(
++				this->node.rb_left, pgnr);
++		}
++		if (!ret_bo) {
++			if (this->pgnr > pgnr)
++				goto remove_bo_and_return;
++			else
++				return NULL;
++		}
++		return ret_bo;
++	}
++
++remove_bo_and_return:
++	/* NOTE: All nodes on free rbtree have a 'prev' that points to NULL.
++	 * 1. check if 'this->next' is NULL:
++	 *	yes: erase 'this' node and rebalance rbtree, return 'this'.
++	 */
++	if (this->next == NULL) {
++		rb_erase(&this->node, &this->bdev->free_rbtree);
++		return this;
++	}
++	/* NOTE: if 'this->next' is not NULL, always return 'this->next' bo.
++	 * 2. check if 'this->next->next' is NULL:
++	 *	yes: change the related 'next/prev' pointer,
++	 *		return 'this->next' but the rbtree stays unchanged.
++	 */
++	temp_bo = this->next;
++	this->next = temp_bo->next;
++	if (temp_bo->next)
++		temp_bo->next->prev = this;
++	temp_bo->next = NULL;
++	temp_bo->prev = NULL;
++	return temp_bo;
++}
++
++struct hmm_buffer_object *__bo_search_by_addr(struct rb_root *root,
++							ia_css_ptr start)
++{
++	struct rb_node *n = root->rb_node;
++	struct hmm_buffer_object *bo;
++
++	do {
++		bo = rb_entry(n, struct hmm_buffer_object, node);
++
++		if (bo->start > start) {
++			if (n->rb_left == NULL)
++				return NULL;
++			n = n->rb_left;
++		} else if (bo->start < start) {
++			if (n->rb_right == NULL)
++				return NULL;
++			n = n->rb_right;
++		} else {
++			return bo;
++		}
++	} while (n);
++
++	return NULL;
++}
++
++struct hmm_buffer_object *__bo_search_by_addr_in_range(struct rb_root *root,
++					unsigned int start)
++{
++	struct rb_node *n = root->rb_node;
+ 	struct hmm_buffer_object *bo;
++
++	do {
++		bo = rb_entry(n, struct hmm_buffer_object, node);
++
++		if (bo->start > start) {
++			if (n->rb_left == NULL)
++				return NULL;
++			n = n->rb_left;
++		} else {
++			if (bo->end > start)
++				return bo;
++			if (n->rb_right == NULL)
++				return NULL;
++			n = n->rb_right;
++		}
++	} while (n);
++
++	return NULL;
++}
++
++static void __bo_insert_to_free_rbtree(struct rb_root *root,
++					struct hmm_buffer_object *bo)
++{
++	struct rb_node **new = &(root->rb_node);
++	struct rb_node *parent = NULL;
++	struct hmm_buffer_object *this;
++	unsigned int pgnr = bo->pgnr;
++
++	while (*new) {
++		parent = *new;
++		this = container_of(*new, struct hmm_buffer_object, node);
++
++		if (pgnr < this->pgnr) {
++			new = &((*new)->rb_left);
++		} else if (pgnr > this->pgnr) {
++			new = &((*new)->rb_right);
++		} else {
++			bo->prev = this;
++			bo->next = this->next;
++			if (this->next)
++				this->next->prev = bo;
++			this->next = bo;
++			bo->status = (bo->status & ~HMM_BO_MASK) | HMM_BO_FREE;
++			return;
++		}
++	}
++
++	bo->status = (bo->status & ~HMM_BO_MASK) | HMM_BO_FREE;
++
++	rb_link_node(&bo->node, parent, new);
++	rb_insert_color(&bo->node, root);
++}
++
++static void __bo_insert_to_alloc_rbtree(struct rb_root *root,
++					struct hmm_buffer_object *bo)
++{
++	struct rb_node **new = &(root->rb_node);
++	struct rb_node *parent = NULL;
++	struct hmm_buffer_object *this;
++	unsigned int start = bo->start;
++
++	while (*new) {
++		parent = *new;
++		this = container_of(*new, struct hmm_buffer_object, node);
++
++		if (start < this->start)
++			new = &((*new)->rb_left);
++		else
++			new = &((*new)->rb_right);
++	}
++
++	kref_init(&bo->kref);
++	bo->status = (bo->status & ~HMM_BO_MASK) | HMM_BO_ALLOCED;
++
++	rb_link_node(&bo->node, parent, new);
++	rb_insert_color(&bo->node, root);
++}
++
++struct hmm_buffer_object *__bo_break_up(struct hmm_bo_device *bdev,
++					struct hmm_buffer_object *bo,
++					unsigned int pgnr)
++{
++	struct hmm_buffer_object *new_bo;
++	unsigned long flags;
+ 	int ret;
+ 
+-	bo = kmalloc(sizeof(*bo), GFP_KERNEL);
+-	if (!bo) {
+-		dev_err(atomisp_dev, "out of memory for bo\n");
++	new_bo = __bo_alloc(bdev->bo_cache);
++	if (!new_bo) {
++		dev_err(atomisp_dev, "%s: __bo_alloc failed!\n", __func__);
+ 		return NULL;
+ 	}
+-
+-	ret = hmm_bo_init(bdev, bo, pgnr, free_bo_internal);
++	ret = __bo_init(bdev, new_bo, pgnr);
+ 	if (ret) {
+-		dev_err(atomisp_dev, "hmm_bo_init failed\n");
+-		kfree(bo);
++		dev_err(atomisp_dev, "%s: __bo_init failed!\n", __func__);
++		kmem_cache_free(bdev->bo_cache, new_bo);
+ 		return NULL;
+ 	}
+ 
+-	return bo;
++	new_bo->start = bo->start;
++	new_bo->end = new_bo->start + pgnr_to_size(pgnr);
++	bo->start = new_bo->end;
++	bo->pgnr = bo->pgnr - pgnr;
++
++	spin_lock_irqsave(&bdev->list_lock, flags);
++	list_add_tail(&new_bo->list, &bo->list);
++	spin_unlock_irqrestore(&bdev->list_lock, flags);
++
++	return new_bo;
++}
++
++static void __bo_take_off_handling(struct hmm_buffer_object *bo)
++{
++	struct hmm_bo_device *bdev = bo->bdev;
++	/* There are 4 situations when we take off a known bo from free rbtree:
++	 * 1. if bo->next && bo->prev == NULL, bo is a rbtree node
++	 *	and does not have a linked list after bo, to take off this bo,
++	 *	we just need erase bo directly and rebalance the free rbtree
++	 */
++	if (bo->prev == NULL && bo->next == NULL) {
++		rb_erase(&bo->node, &bdev->free_rbtree);
++	/* 2. when bo->next != NULL && bo->prev == NULL, bo is a rbtree node,
++	 *	and has a linked list,to take off this bo we need erase bo
++	 *	first, then, insert bo->next into free rbtree and rebalance
++	 *	the free rbtree
++	 */
++	} else if (bo->prev == NULL && bo->next != NULL) {
++		bo->next->prev = NULL;
++		rb_erase(&bo->node, &bdev->free_rbtree);
++		__bo_insert_to_free_rbtree(&bdev->free_rbtree, bo->next);
++		bo->next = NULL;
++	/* 3. when bo->prev != NULL && bo->next == NULL, bo is not a rbtree
++	 *	node, bo is the last element of the linked list after rbtree
++	 *	node, to take off this bo, we just need set the "prev/next"
++	 *	pointers to NULL, the free rbtree stays unchaged
++	 */
++	} else if (bo->prev != NULL && bo->next == NULL) {
++		bo->prev->next = NULL;
++		bo->prev = NULL;
++	/* 4. when bo->prev != NULL && bo->next != NULL ,bo is not a rbtree
++	 *	node, bo is in the middle of the linked list after rbtree node,
++	 *	to take off this bo, we just set take the "prev/next" pointers
++	 *	to NULL, the free rbtree stays unchaged
++	 */
++	} else {
++		bo->next->prev = bo->prev;
++		bo->prev->next = bo->next;
++		bo->next = NULL;
++		bo->prev = NULL;
++	}
++}
++
++struct hmm_buffer_object *__bo_merge(struct hmm_buffer_object *bo,
++					struct hmm_buffer_object *next_bo)
++{
++	struct hmm_bo_device *bdev;
++	unsigned long flags;
++
++	bdev = bo->bdev;
++	next_bo->start = bo->start;
++	next_bo->pgnr = next_bo->pgnr + bo->pgnr;
++
++	spin_lock_irqsave(&bdev->list_lock, flags);
++	list_del(&bo->list);
++	spin_unlock_irqrestore(&bdev->list_lock, flags);
++
++	kmem_cache_free(bo->bdev->bo_cache, bo);
++
++	return next_bo;
+ }
+ 
+ /*
+- * use this function to initialize pre-allocated hmm_buffer_object.
+- * as hmm_buffer_object may be used as an embedded object in an upper
+- * level object, a release callback must be provided. if it is
+- * embedded in upper level object, set release call back to release
+- * function of that object. if no upper level object, set release
+- * callback to NULL.
+- *
+- * bo->kref is inited to 1.
++ * hmm_bo_device functions.
+  */
+-int hmm_bo_init(struct hmm_bo_device *bdev,
+-		struct hmm_buffer_object *bo,
+-		unsigned int pgnr, void (*release) (struct hmm_buffer_object *))
++int hmm_bo_device_init(struct hmm_bo_device *bdev,
++				struct isp_mmu_client *mmu_driver,
++				unsigned int vaddr_start,
++				unsigned int size)
+ {
++	struct hmm_buffer_object *bo;
+ 	unsigned long flags;
++	int ret;
+ 
+-	if (bdev == NULL) {
+-		dev_warn(atomisp_dev, "NULL hmm_bo_device.\n");
+-		return -EINVAL;
++	check_bodev_null_return(bdev, -EINVAL);
++
++	ret = isp_mmu_init(&bdev->mmu, mmu_driver);
++	if (ret) {
++		dev_err(atomisp_dev, "isp_mmu_init failed.\n");
++		return ret;
+ 	}
+ 
+-	/* hmm_bo_device must be already inited */
+-	var_equal_return(hmm_bo_device_inited(bdev), 0, -EINVAL,
+-			   "hmm_bo_device not inited yet.\n");
++	bdev->start = vaddr_start;
++	bdev->pgnr = size_to_pgnr_ceil(size);
++	bdev->size = pgnr_to_size(bdev->pgnr);
+ 
+-	/* prevent zero size buffer object */
+-	if (pgnr == 0) {
+-		dev_err(atomisp_dev, "0 size buffer is not allowed.\n");
++	spin_lock_init(&bdev->list_lock);
++	mutex_init(&bdev->rbtree_mutex);
++#ifdef CONFIG_ION
++	/*
++	 * TODO:
++	 * The ion_dev should be defined by ION driver. But ION driver does
++	 * not implement it yet, will fix it when it is ready.
++	 */
++	if (!ion_dev) {
++		isp_mmu_exit(&bdev->mmu);
+ 		return -EINVAL;
+ 	}
+ 
+-	memset(bo, 0, sizeof(*bo));
++	bdev->iclient = ion_client_create(ion_dev, "atomisp");
++	if (IS_ERR_OR_NULL(bdev->iclient)) {
++		ret = PTR_ERR(bdev->iclient);
++		if (!bdev->iclient) {
++			isp_mmu_exit(&bdev->mmu);
++			return -EINVAL;
++		}
++	}
++#endif
+ 
+-	kref_init(&bo->kref);
++	bdev->flag = HMM_BO_DEVICE_INITED;
+ 
+-	mutex_init(&bo->mutex);
++	INIT_LIST_HEAD(&bdev->entire_bo_list);
++	bdev->allocated_rbtree = RB_ROOT;
++	bdev->free_rbtree = RB_ROOT;
+ 
+-	INIT_LIST_HEAD(&bo->list);
++	bdev->bo_cache = kmem_cache_create("bo_cache",
++				sizeof(struct hmm_buffer_object), 0, 0, NULL);
+ 
+-	bo->pgnr = pgnr;
+-	bo->bdev = bdev;
+-	bo->vmap_addr = NULL;
+-	bo->release = release;
++	bo = __bo_alloc(bdev->bo_cache);
++	if (!bo) {
++		dev_err(atomisp_dev, "%s: __bo_alloc failed!\n", __func__);
++		isp_mmu_exit(&bdev->mmu);
++		return -ENOMEM;
++	}
+ 
+-	if (!bo->release)
+-		dev_warn(atomisp_dev, "no release callback specified.\n");
++	ret = __bo_init(bdev, bo, bdev->pgnr);
++	if (ret) {
++		dev_err(atomisp_dev, "%s: __bo_init failed!\n", __func__);
++		kmem_cache_free(bdev->bo_cache, bo);
++		isp_mmu_exit(&bdev->mmu);
++		return -EINVAL;
++	}
+ 
+-	/*
+-	 * add to active_bo_list
+-	 */
+ 	spin_lock_irqsave(&bdev->list_lock, flags);
+-	list_add_tail(&bo->list, &bdev->active_bo_list);
+-	bo->status |= HMM_BO_ACTIVE;
++	list_add_tail(&bo->list, &bdev->entire_bo_list);
+ 	spin_unlock_irqrestore(&bdev->list_lock, flags);
+ 
++	__bo_insert_to_free_rbtree(&bdev->free_rbtree, bo);
++
+ 	return 0;
+ }
+ 
+-static void hmm_bo_release(struct hmm_buffer_object *bo)
++struct hmm_buffer_object *hmm_bo_alloc(struct hmm_bo_device *bdev,
++					unsigned int pgnr)
+ {
+-	struct hmm_bo_device *bdev;
+-	unsigned long flags;
++	struct hmm_buffer_object *bo, *new_bo;
++	struct rb_root *root = &bdev->free_rbtree;
+ 
+-	check_bo_null_return_void(bo);
++	check_bodev_null_return(bdev, NULL);
++	var_equal_return(hmm_bo_device_inited(bdev), 0, NULL,
++			"hmm_bo_device not inited yet.\n");
+ 
+-	bdev = bo->bdev;
++	if (pgnr == 0) {
++		dev_err(atomisp_dev, "0 size buffer is not allowed.\n");
++		return NULL;
++	}
+ 
+-	/*
+-	 * remove it from buffer device's buffer object list.
+-	 */
+-	spin_lock_irqsave(&bdev->list_lock, flags);
+-	list_del(&bo->list);
+-	spin_unlock_irqrestore(&bdev->list_lock, flags);
++	mutex_lock(&bdev->rbtree_mutex);
++	bo = __bo_search_and_remove_from_free_rbtree(root->rb_node, pgnr);
++	if (!bo) {
++		dev_err(atomisp_dev, "%s: Out of Memory! hmm_bo_alloc failed",
++			__func__);
++		return NULL;
++	}
++
++	if (bo->pgnr > pgnr) {
++		new_bo = __bo_break_up(bdev, bo, pgnr);
++		if (!new_bo)
++			dev_err(atomisp_dev, "%s: __bo_break_up failed!\n",
++				__func__);
++
++		__bo_insert_to_alloc_rbtree(&bdev->allocated_rbtree, new_bo);
++		__bo_insert_to_free_rbtree(&bdev->free_rbtree, bo);
++
++		mutex_unlock(&bdev->rbtree_mutex);
++		return new_bo;
++	}
++
++	__bo_insert_to_alloc_rbtree(&bdev->allocated_rbtree, bo);
++
++	mutex_unlock(&bdev->rbtree_mutex);
++	return bo;
++}
++
++void hmm_bo_release(struct hmm_buffer_object *bo)
++{
++	struct hmm_bo_device *bdev = bo->bdev;
++	struct hmm_buffer_object *next_bo, *prev_bo;
++
++	mutex_lock(&bdev->rbtree_mutex);
+ 
+ 	/*
+ 	 * FIX ME:
+@@ -180,137 +492,175 @@ static void hmm_bo_release(struct hmm_buffer_object *bo)
+ 	 * so, if this happened, something goes wrong.
+ 	 */
+ 	if (bo->status & HMM_BO_MMAPED) {
+-		dev_err(atomisp_dev, "destroy bo which is MMAPED, do nothing\n");
+-		goto err;
++		dev_dbg(atomisp_dev, "destroy bo which is MMAPED, do nothing\n");
++		mutex_unlock(&bdev->rbtree_mutex);
++		return;
+ 	}
+ 
+ 	if (bo->status & HMM_BO_BINDED) {
+-		dev_warn(atomisp_dev,
+-			     "the bo is still binded, unbind it first...\n");
++		dev_warn(atomisp_dev, "the bo is still binded, unbind it first...\n");
+ 		hmm_bo_unbind(bo);
+ 	}
++
+ 	if (bo->status & HMM_BO_PAGE_ALLOCED) {
+-		dev_warn(atomisp_dev,
+-			     "the pages is not freed, free pages first\n");
++		dev_warn(atomisp_dev, "the pages is not freed, free pages first\n");
+ 		hmm_bo_free_pages(bo);
+ 	}
+-	if (bo->status & HMM_BO_VM_ALLOCED) {
+-		dev_warn(atomisp_dev,
+-			     "the vm is still not freed, free vm first...\n");
+-		hmm_bo_free_vm(bo);
+-	}
+ 	if (bo->status & HMM_BO_VMAPED || bo->status & HMM_BO_VMAPED_CACHED) {
+ 		dev_warn(atomisp_dev, "the vunmap is not done, do it...\n");
+ 		hmm_bo_vunmap(bo);
+ 	}
+ 
+-	if (bo->release)
+-		bo->release(bo);
+-err:
+-	return;
+-}
++	rb_erase(&bo->node, &bdev->allocated_rbtree);
+ 
+-int hmm_bo_activated(struct hmm_buffer_object *bo)
+-{
+-	check_bo_null_return(bo, 0);
++	prev_bo = list_entry(bo->list.prev, struct hmm_buffer_object, list);
++	next_bo = list_entry(bo->list.next, struct hmm_buffer_object, list);
++
++	if (prev_bo->end == bo->start &&
++		(prev_bo->status & HMM_BO_MASK) == HMM_BO_FREE) {
++		__bo_take_off_handling(prev_bo);
++		bo = __bo_merge(prev_bo, bo);
++	}
+ 
+-	return bo->status & HMM_BO_ACTIVE;
++	if (next_bo->start == bo->end &&
++		(next_bo->status & HMM_BO_MASK) == HMM_BO_FREE) {
++		__bo_take_off_handling(next_bo);
++		bo = __bo_merge(bo, next_bo);
++	}
++
++	__bo_insert_to_free_rbtree(&bdev->free_rbtree, bo);
++
++	mutex_unlock(&bdev->rbtree_mutex);
++	return;
+ }
+ 
+-void hmm_bo_unactivate(struct hmm_buffer_object *bo)
++void hmm_bo_device_exit(struct hmm_bo_device *bdev)
+ {
+-	struct hmm_bo_device *bdev;
++	struct hmm_buffer_object *bo;
+ 	unsigned long flags;
+ 
+-	check_bo_null_return_void(bo);
+-
+-	check_bo_status_no_goto(bo, HMM_BO_ACTIVE, status_err);
++	dev_dbg(atomisp_dev, "%s: entering!\n", __func__);
+ 
+-	bdev = bo->bdev;
++	check_bodev_null_return_void(bdev);
+ 
+-	spin_lock_irqsave(&bdev->list_lock, flags);
+-	list_del(&bo->list);
+-	list_add_tail(&bo->list, &bdev->free_bo_list);
+-	bo->status &= (~HMM_BO_ACTIVE);
+-	spin_unlock_irqrestore(&bdev->list_lock, flags);
++	/*
++	 * release all allocated bos even they a in use
++	 * and all bos will be merged into a big bo
++	 */
++	while (!RB_EMPTY_ROOT(&bdev->allocated_rbtree))
++		hmm_bo_release(
++			rbtree_node_to_hmm_bo(bdev->allocated_rbtree.rb_node));
+ 
+-	return;
++	dev_dbg(atomisp_dev, "%s: finished releasing all allocated bos!\n",
++		__func__);
+ 
+-status_err:
+-	dev_err(atomisp_dev, "buffer object already unactivated.\n");
+-	return;
+-}
++	/* free all bos to release all ISP virtual memory */
++	while (!list_empty(&bdev->entire_bo_list)) {
++		bo = list_to_hmm_bo(bdev->entire_bo_list.next);
+ 
+-int hmm_bo_alloc_vm(struct hmm_buffer_object *bo)
+-{
+-	struct hmm_bo_device *bdev;
++		spin_lock_irqsave(&bdev->list_lock, flags);
++		list_del(&bo->list);
++		spin_lock_irqsave(&bdev->list_lock, flags);
+ 
+-	check_bo_null_return(bo, -EINVAL);
++		kmem_cache_free(bdev->bo_cache, bo);
++	}
+ 
+-	mutex_lock(&bo->mutex);
++	dev_dbg(atomisp_dev, "%s: finished to free all bos!\n", __func__);
+ 
+-	check_bo_status_no_goto(bo, HMM_BO_VM_ALLOCED, status_err);
++	kmem_cache_destroy(bdev->bo_cache);
+ 
+-	bdev = bo->bdev;
+-	bo->vm_node = hmm_vm_alloc_node(&bdev->vaddr_space, bo->pgnr);
+-	if (unlikely(!bo->vm_node)) {
+-		dev_err(atomisp_dev, "hmm_vm_alloc_node err.\n");
+-		goto null_vm;
+-	}
++	isp_mmu_exit(&bdev->mmu);
++#ifdef CONFIG_ION
++	if (bdev->iclient != NULL)
++		ion_client_destroy(bdev->iclient);
++#endif
++}
+ 
+-	bo->status |= HMM_BO_VM_ALLOCED;
++int hmm_bo_device_inited(struct hmm_bo_device *bdev)
++{
++	check_bodev_null_return(bdev, -EINVAL);
+ 
+-	mutex_unlock(&bo->mutex);
++	return bdev->flag == HMM_BO_DEVICE_INITED;
++}
+ 
+-	return 0;
+-null_vm:
+-	mutex_unlock(&bo->mutex);
+-	return -ENOMEM;
++int hmm_bo_allocated(struct hmm_buffer_object *bo)
++{
++	check_bo_null_return(bo, 0);
+ 
+-status_err:
+-	mutex_unlock(&bo->mutex);
+-	dev_err(atomisp_dev, "buffer object already has vm allocated.\n");
+-	return -EINVAL;
++	return bo->status & HMM_BO_ALLOCED;
+ }
+ 
+-void hmm_bo_free_vm(struct hmm_buffer_object *bo)
++struct hmm_buffer_object *hmm_bo_device_search_start(
++	struct hmm_bo_device *bdev, ia_css_ptr vaddr)
+ {
+-	struct hmm_bo_device *bdev;
++	struct hmm_buffer_object *bo;
+ 
+-	check_bo_null_return_void(bo);
++	check_bodev_null_return(bdev, NULL);
+ 
+-	mutex_lock(&bo->mutex);
++	mutex_lock(&bdev->rbtree_mutex);
++	bo = __bo_search_by_addr(&bdev->allocated_rbtree, vaddr);
++	if (!bo) {
++		dev_err(atomisp_dev, "%s can not find bo with addr: 0x%x\n",
++			__func__, vaddr);
++		mutex_unlock(&bdev->rbtree_mutex);
++		return NULL;
++	}
++	mutex_unlock(&bdev->rbtree_mutex);
+ 
+-	check_bo_status_yes_goto(bo, HMM_BO_VM_ALLOCED, status_err);
++	return bo;
++}
+ 
+-	bdev = bo->bdev;
++struct hmm_buffer_object *hmm_bo_device_search_in_range(
++	struct hmm_bo_device *bdev, unsigned int vaddr)
++{
++	struct hmm_buffer_object *bo;
+ 
+-	bo->status &= (~HMM_BO_VM_ALLOCED);
+-	hmm_vm_free_node(bo->vm_node);
+-	bo->vm_node = NULL;
+-	mutex_unlock(&bo->mutex);
++	check_bodev_null_return(bdev, NULL);
+ 
+-	return;
++	mutex_lock(&bdev->rbtree_mutex);
++	bo = __bo_search_by_addr_in_range(&bdev->allocated_rbtree, vaddr);
++	if (!bo) {
++		dev_err(atomisp_dev, "%s can not find bo contain addr: 0x%x\n",
++			__func__, vaddr);
++		mutex_unlock(&bdev->rbtree_mutex);
++		return NULL;
++	}
++	mutex_unlock(&bdev->rbtree_mutex);
+ 
+-status_err:
+-	mutex_unlock(&bo->mutex);
+-	dev_err(atomisp_dev, "buffer object has no vm allocated.\n");
++	return bo;
+ }
+ 
+-int hmm_bo_vm_allocated(struct hmm_buffer_object *bo)
++struct hmm_buffer_object *hmm_bo_device_search_vmap_start(
++	struct hmm_bo_device *bdev, const void *vaddr)
+ {
+-	int ret;
++	struct list_head *pos;
++	struct hmm_buffer_object *bo;
++	unsigned long flags;
+ 
+-	check_bo_null_return(bo, 0);
++	check_bodev_null_return(bdev, NULL);
+ 
+-	ret = (bo->status & HMM_BO_VM_ALLOCED);
++	spin_lock_irqsave(&bdev->list_lock, flags);
++	list_for_each(pos, &bdev->entire_bo_list) {
++		bo = list_to_hmm_bo(pos);
++		/* pass bo which has no vm_node allocated */
++		if ((bo->status & HMM_BO_MASK) == HMM_BO_FREE)
++			continue;
++		if (bo->vmap_addr == vaddr)
++			goto found;
++	}
++	spin_unlock_irqrestore(&bdev->list_lock, flags);
++	return NULL;
++found:
++	spin_unlock_irqrestore(&bdev->list_lock, flags);
++	return bo;
+ 
+-	return ret;
+ }
+ 
++
+ static void free_private_bo_pages(struct hmm_buffer_object *bo,
+-				  struct hmm_pool *dypool,
+-				  struct hmm_pool *repool, int free_pgnr)
++				struct hmm_pool *dypool,
++				struct hmm_pool *repool,
++				int free_pgnr)
+ {
+ 	int i, ret;
+ 
+@@ -360,8 +710,10 @@ static void free_private_bo_pages(struct hmm_buffer_object *bo,
+ }
+ 
+ /*Allocate pages which will be used only by ISP*/
+-static int alloc_private_pages(struct hmm_buffer_object *bo, int from_highmem,
+-				bool cached, struct hmm_pool *dypool,
++static int alloc_private_pages(struct hmm_buffer_object *bo,
++				int from_highmem,
++				bool cached,
++				struct hmm_pool *dypool,
+ 				struct hmm_pool *repool)
+ {
+ 	int ret;
+@@ -612,6 +964,7 @@ static int __get_pfnmap_pages(struct task_struct *tsk, struct mm_struct *mm,
+ 			nr_pages--;
+ 		} while (nr_pages && start < vma->vm_end);
+ 	} while (nr_pages);
++
+ 	return i;
+ }
+ 
+@@ -816,31 +1169,29 @@ int hmm_bo_alloc_pages(struct hmm_buffer_object *bo,
+ 	check_bo_null_return(bo, -EINVAL);
+ 
+ 	mutex_lock(&bo->mutex);
+-
+ 	check_bo_status_no_goto(bo, HMM_BO_PAGE_ALLOCED, status_err);
+ 
+ 	/*
+ 	 * TO DO:
+ 	 * add HMM_BO_USER type
+ 	 */
+-	if (type == HMM_BO_PRIVATE)
++	if (type == HMM_BO_PRIVATE) {
+ 		ret = alloc_private_pages(bo, from_highmem,
+ 				cached, &dynamic_pool, &reserved_pool);
+-	else if (type == HMM_BO_USER)
++	} else if (type == HMM_BO_USER) {
+ 		ret = alloc_user_pages(bo, userptr, cached);
+ #ifdef CONFIG_ION
+-	else if (type == HMM_BO_ION)
++	} else if (type == HMM_BO_ION) {
+ 		/*
+ 		 * TODO:
+ 		 * Add cache flag when ION support it
+ 		 */
+ 		ret = alloc_ion_pages(bo, userptr);
+ #endif
+-	else {
++	} else {
+ 		dev_err(atomisp_dev, "invalid buffer type.\n");
+ 		ret = -EINVAL;
+ 	}
+-
+ 	if (ret)
+ 		goto alloc_err;
+ 
+@@ -949,14 +1300,14 @@ int hmm_bo_bind(struct hmm_buffer_object *bo)
+ 	mutex_lock(&bo->mutex);
+ 
+ 	check_bo_status_yes_goto(bo,
+-				   HMM_BO_PAGE_ALLOCED | HMM_BO_VM_ALLOCED,
++				   HMM_BO_PAGE_ALLOCED | HMM_BO_ALLOCED,
+ 				   status_err1);
+ 
+ 	check_bo_status_no_goto(bo, HMM_BO_BINDED, status_err2);
+ 
+ 	bdev = bo->bdev;
+ 
+-	virt = bo->vm_node->start;
++	virt = bo->start;
+ 
+ 	for (i = 0; i < bo->pgnr; i++) {
+ 		ret =
+@@ -978,8 +1329,8 @@ int hmm_bo_bind(struct hmm_buffer_object *bo)
+ 	 * meaning updating 1 PTE, but the MMU fetches 4 PTE at one time,
+ 	 * so the additional 3 PTEs are invalid.
+ 	 */
+-	if (bo->vm_node->start != 0x0)
+-		isp_mmu_flush_tlb_range(&bdev->mmu, bo->vm_node->start,
++	if (bo->start != 0x0)
++		isp_mmu_flush_tlb_range(&bdev->mmu, bo->start,
+ 						(bo->pgnr << PAGE_SHIFT));
+ 
+ 	bo->status |= HMM_BO_BINDED;
+@@ -990,8 +1341,8 @@ int hmm_bo_bind(struct hmm_buffer_object *bo)
+ 
+ map_err:
+ 	/* unbind the physical pages with related virtual address space */
+-	virt = bo->vm_node->start;
+-	for (; i > 0; i--) {
++	virt = bo->start;
++	for ( ; i > 0; i--) {
+ 		isp_mmu_unmap(&bdev->mmu, virt, 1);
+ 		virt += pgnr_to_size(1);
+ 	}
+@@ -1027,12 +1378,12 @@ void hmm_bo_unbind(struct hmm_buffer_object *bo)
+ 
+ 	check_bo_status_yes_goto(bo,
+ 				   HMM_BO_PAGE_ALLOCED |
+-				   HMM_BO_VM_ALLOCED |
++				   HMM_BO_ALLOCED |
+ 				   HMM_BO_BINDED, status_err);
+ 
+ 	bdev = bo->bdev;
+ 
+-	virt = bo->vm_node->start;
++	virt = bo->start;
+ 
+ 	for (i = 0; i < bo->pgnr; i++) {
+ 		isp_mmu_unmap(&bdev->mmu, virt, 1);
+@@ -1043,7 +1394,7 @@ void hmm_bo_unbind(struct hmm_buffer_object *bo)
+ 	 * flush TLB as the address mapping has been removed and
+ 	 * related TLBs should be invalidated.
+ 	 */
+-	isp_mmu_flush_tlb_range(&bdev->mmu, bo->vm_node->start,
++	isp_mmu_flush_tlb_range(&bdev->mmu, bo->start,
+ 				(bo->pgnr << PAGE_SHIFT));
+ 
+ 	bo->status &= (~HMM_BO_BINDED);
+@@ -1104,7 +1455,8 @@ void *hmm_bo_vmap(struct hmm_buffer_object *bo, bool cached)
+ 	for (i = 0; i < bo->pgnr; i++)
+ 		pages[i] = bo->page_obj[i].page;
+ 
+-	bo->vmap_addr = vmap(pages, bo->pgnr, VM_MAP, cached ? PAGE_KERNEL : PAGE_KERNEL_NOCACHE);
++	bo->vmap_addr = vmap(pages, bo->pgnr, VM_MAP,
++		cached ? PAGE_KERNEL : PAGE_KERNEL_NOCACHE);
+ 	if (unlikely(!bo->vmap_addr)) {
+ 		atomisp_kernel_free(pages);
+ 		mutex_unlock(&bo->mutex);
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm.h
+index 686d74f..6b9fb1b 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm.h
+@@ -29,7 +29,6 @@
+ #include <linux/slab.h>
+ #include <linux/mm.h>
+ 
+-#include "hmm/hmm_bo.h"
+ #include "hmm/hmm_pool.h"
+ #include "ia_css_types.h"
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo.h
+index a36d94e..dffd6e9 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo.h
+@@ -29,9 +29,17 @@
+ #include <linux/list.h>
+ #include <linux/spinlock.h>
+ #include <linux/mutex.h>
+-#include <linux/kref.h>
+-#include "hmm_common.h"
+-#include "hmm/hmm_vm.h"
++#include "mmu/isp_mmu.h"
++#include "hmm/hmm_common.h"
++#include "ia_css_types.h"
++
++#define	check_bodev_null_return(bdev, exp)	\
++		check_null_return(bdev, exp, \
++			"NULL hmm_bo_device.\n")
++
++#define	check_bodev_null_return_void(bdev)	\
++		check_null_return_void(bdev, \
++			"NULL hmm_bo_device.\n")
+ 
+ #define	check_bo_status_yes_goto(bo, _status, label) \
+ 	var_not_equal_goto((bo->status & (_status)), (_status), \
+@@ -44,6 +52,10 @@
+ 			label, \
+ 			"HMM buffer status contains %s.\n", \
+ 			#_status)
++
++#define rbtree_node_to_hmm_bo(root_node)	\
++	container_of((root_node), struct hmm_buffer_object, node)
++
+ #define	list_to_hmm_bo(list_ptr)	\
+ 	list_entry((list_ptr), struct hmm_buffer_object, list)
+ 
+@@ -59,21 +71,12 @@
+ #define	HMM_MAX_ORDER		3
+ #define	HMM_MIN_ORDER		0
+ 
+-struct hmm_bo_device;
++#define	ISP_VM_START	0x0
++#define	ISP_VM_SIZE	(0x7FFFFFFF)	/* 2G address space */
++#define	ISP_PTR_NULL	NULL
++
++#define	HMM_BO_DEVICE_INITED	0x1
+ 
+-/*
+- * buffer object type.
+- *
+- *	HMM_BO_PRIVATE:
+- *	pages are allocated by driver itself.
+- *	HMM_BO_SHARE:
+- *	pages are allocated by other component. currently: video driver.
+- *	HMM_BO_USER:
+- *	pages are allocated in user space process.
+- *	HMM_BO_ION:
+- *	pages are allocated through ION.
+- *
+- */
+ enum hmm_bo_type {
+ 	HMM_BO_PRIVATE,
+ 	HMM_BO_SHARE,
+@@ -90,7 +93,9 @@ enum hmm_page_type {
+ 	HMM_PAGE_TYPE_GENERAL,
+ };
+ 
+-#define	HMM_BO_VM_ALLOCED	0x1
++#define	HMM_BO_MASK		0x1
++#define	HMM_BO_FREE		0x0
++#define	HMM_BO_ALLOCED	0x1
+ #define	HMM_BO_PAGE_ALLOCED	0x2
+ #define	HMM_BO_BINDED		0x4
+ #define	HMM_BO_MMAPED		0x8
+@@ -100,6 +105,31 @@ enum hmm_page_type {
+ #define	HMM_BO_MEM_TYPE_USER     0x1
+ #define	HMM_BO_MEM_TYPE_PFN      0x2
+ 
++struct hmm_bo_device {
++	struct isp_mmu		mmu;
++
++	/* start/pgnr/size is used to record the virtual memory of this bo */
++	unsigned int start;
++	unsigned int pgnr;
++	unsigned int size;
++
++	/* list lock is used to protect the entire_bo_list */
++	spinlock_t	list_lock;
++#ifdef CONFIG_ION
++	struct ion_client	*iclient;
++#endif
++	int flag;
++
++	/* linked list for entire buffer object */
++	struct list_head entire_bo_list;
++	/* rbtree for maintain entire allocated vm */
++	struct rb_root allocated_rbtree;
++	/* rbtree for maintain entire free vm */
++	struct rb_root free_rbtree;
++	struct mutex rbtree_mutex;
++	struct kmem_cache *bo_cache;
++};
++
+ struct hmm_page_object {
+ 	struct page		*page;
+ 	enum hmm_page_type	type;
+@@ -108,100 +138,55 @@ struct hmm_page_object {
+ struct hmm_buffer_object {
+ 	struct hmm_bo_device	*bdev;
+ 	struct list_head	list;
+-	struct kref		kref;
++	struct kref	kref;
+ 
+ 	/* mutex protecting this BO */
+ 	struct mutex		mutex;
+ 	enum hmm_bo_type	type;
+ 	struct hmm_page_object	*page_obj;	/* physical pages */
+-	unsigned int		pgnr;	/* page number */
+-	int			from_highmem;
+-	int			mmap_count;
+-	struct hmm_vm_node	*vm_node;
++	int		from_highmem;
++	int		mmap_count;
+ #ifdef CONFIG_ION
+ 	struct ion_handle	*ihandle;
+ #endif
+-	int			status;
+-	int         mem_type;
++	int		status;
++	int		mem_type;
+ 	void		*vmap_addr; /* kernel virtual address by vmap */
++
++	struct rb_node	node;
++	unsigned int	start;
++	unsigned int	end;
++	unsigned int	pgnr;
+ 	/*
+-	 * release callback for releasing buffer object.
+-	 *
+-	 * usually set to the release function to release the
+-	 * upper level buffer object which has hmm_buffer_object
+-	 * embedded in. if the hmm_buffer_object is dynamically
+-	 * created by hmm_bo_create, release will set to kfree.
+-	 *
++	 * When insert a bo which has the same pgnr with an existed
++	 * bo node in the free_rbtree, using "prev & next" pointer
++	 * to maintain a bo linked list instead of insert this bo
++	 * into free_rbtree directly, it will make sure each node
++	 * in free_rbtree has different pgnr.
++	 * "prev & next" default is NULL.
+ 	 */
+-	void (*release)(struct hmm_buffer_object *bo);
++	struct hmm_buffer_object	*prev;
++	struct hmm_buffer_object	*next;
+ };
+ 
++struct hmm_buffer_object *hmm_bo_alloc(struct hmm_bo_device *bdev,
++				unsigned int pgnr);
++
++void hmm_bo_release(struct hmm_buffer_object *bo);
++
++int hmm_bo_device_init(struct hmm_bo_device *bdev,
++				struct isp_mmu_client *mmu_driver,
++				unsigned int vaddr_start, unsigned int size);
++
+ /*
+- * use this function to initialize pre-allocated hmm_buffer_object.
+- *
+- * the hmm_buffer_object use reference count to manage its life cycle.
+- *
+- * bo->kref is inited to 1.
+- *
+- * use hmm_bo_ref/hmm_bo_unref increase/decrease the reference count,
+- * and hmm_bo_unref will free resource of buffer object (but not the
+- * buffer object itself as it can be both pre-allocated or dynamically
+- * allocated) when reference reaches 0.
+- *
+- * see detailed description of hmm_bo_ref/hmm_bo_unref below.
+- *
+- * as hmm_buffer_object may be used as an embedded object in an upper
+- * level object, a release callback must be provided. if it is
+- * embedded in upper level object, set release call back to release
+- * function of that object. if no upper level object, set release
+- * callback to NULL.
+- *
+- * ex:
+- *	struct hmm_buffer_object bo;
+- *	hmm_bo_init(bdev, &bo, pgnr, NULL);
+- *
+- * or
+- *	struct my_buffer_object {
+- *		struct hmm_buffer_object bo;
+- *		...
+- *	};
+- *
+- *	void my_buffer_release(struct hmm_buffer_object *bo)
+- *	{
+- *		struct my_buffer_object *my_bo =
+- *			container_of(bo, struct my_buffer_object, bo);
+- *
+- *		...	// release resource in my_buffer_object
+- *
+- *		kfree(my_bo);
+- *	}
+- *
+- *	struct my_buffer_object *my_bo =
+- *		kmalloc(sizeof(*my_bo), GFP_KERNEL);
+- *
+- *	hmm_bo_init(bdev, &my_bo->bo, pgnr, my_buffer_release);
+- *	...
+- *
+- *	hmm_bo_unref(&my_bo->bo);
++ * clean up all hmm_bo_device related things.
+  */
+-int hmm_bo_init(struct hmm_bo_device *bdev,
+-		struct hmm_buffer_object *bo,
+-		unsigned int pgnr,
+-		void (*release)(struct hmm_buffer_object *));
++void hmm_bo_device_exit(struct hmm_bo_device *bdev);
+ 
+ /*
+- * use these functions to dynamically alloc hmm_buffer_object.
+- *
+- * hmm_bo_init will called for that allocated buffer object, and
+- * the release callback is set to kfree.
+- *
+- * ex:
+- *	hmm_buffer_object *bo = hmm_bo_create(bdev, pgnr);
+- *	...
+- *	hmm_bo_unref(bo);
++ * whether the bo device is inited or not.
+  */
+-struct hmm_buffer_object *hmm_bo_create(struct hmm_bo_device *bdev,
+-		int pgnr);
++int hmm_bo_device_inited(struct hmm_bo_device *bdev);
+ 
+ /*
+  * increse buffer object reference.
+@@ -245,24 +230,15 @@ void hmm_bo_unref(struct hmm_buffer_object *bo);
+ 
+ 
+ /*
+- * put buffer object to unactivated status, meaning put it into
+- * bo->bdev->free_bo_list, but not destroy it.
+- *
+- * this can be used to instead of hmm_bo_destroy if there are
+- * lots of petential hmm_bo_init/hmm_bo_destroy operations with
+- * the same buffer object size. using this with hmm_bo_device_get_bo
+- * can improve performace as lots of memory allocation/free are
+- * avoided..
++ * allocate/free physical pages for the bo. will try to alloc mem
++ * from highmem if from_highmem is set, and type indicate that the
++ * pages will be allocated by using video driver (for share buffer)
++ * or by ISP driver itself.
+  */
+-void hmm_bo_unactivate(struct hmm_buffer_object *bo);
+-int hmm_bo_activated(struct hmm_buffer_object *bo);
+ 
+-/*
+- * allocate/free virtual address space for the bo.
+- */
+-int hmm_bo_alloc_vm(struct hmm_buffer_object *bo);
+-void hmm_bo_free_vm(struct hmm_buffer_object *bo);
+-int hmm_bo_vm_allocated(struct hmm_buffer_object *bo);
++
++int hmm_bo_allocated(struct hmm_buffer_object *bo);
++
+ 
+ /*
+  * allocate/free physical pages for the bo. will try to alloc mem
+@@ -320,4 +296,28 @@ int hmm_bo_mmap(struct vm_area_struct *vma,
+ extern struct hmm_pool	dynamic_pool;
+ extern struct hmm_pool	reserved_pool;
+ 
++/*
++ * find the buffer object by its virtual address vaddr.
++ * return NULL if no such buffer object found.
++ */
++struct hmm_buffer_object *hmm_bo_device_search_start(
++		struct hmm_bo_device *bdev, ia_css_ptr vaddr);
++
++/*
++ * find the buffer object by its virtual address.
++ * it does not need to be the start address of one bo,
++ * it can be an address within the range of one bo.
++ * return NULL if no such buffer object found.
++ */
++struct hmm_buffer_object *hmm_bo_device_search_in_range(
++		struct hmm_bo_device *bdev, ia_css_ptr vaddr);
++
++/*
++ * find the buffer object with kernel virtual address vaddr.
++ * return NULL if no such buffer object found.
++ */
++struct hmm_buffer_object *hmm_bo_device_search_vmap_start(
++		struct hmm_bo_device *bdev, const void *vaddr);
++
++
+ #endif
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_pool.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_pool.h
+index 57c3cf9..304037b 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_pool.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_pool.h
+@@ -30,7 +30,6 @@
+ #include <linux/mutex.h>
+ #include <linux/kref.h>
+ #include "hmm_common.h"
+-#include "hmm/hmm_vm.h"
+ #include "hmm/hmm_bo.h"
+ 
+ #define ALLOC_PAGE_FAIL_NUM		5
+-- 
+1.9.1
+

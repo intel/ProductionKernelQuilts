@@ -1,0 +1,111 @@
+From 291cb018d209e2acc3d5aa5686a58420b15cb115 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Arve=20Hj=C3=B8nnev=C3=A5g?= <arve@android.com>
+Date: Mon, 4 Mar 2013 17:41:34 -0800
+Subject: [PATCH 259/634] usb: gadget: android: Fixes and hacks to make android
+ usb gadget compile on 3.9
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Arve Hjønnevåg <arve@android.com>
+---
+ drivers/usb/gadget/android.c | 36 ++++++++++++++++++++++++++++--------
+ 1 file changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/gadget/android.c b/drivers/usb/gadget/android.c
+index e7a3807..eb23eac 100644
+--- a/drivers/usb/gadget/android.c
++++ b/drivers/usb/gadget/android.c
+@@ -34,6 +34,7 @@
+ #include "f_audio_source.c"
+ #include "f_mass_storage.c"
+ #include "u_serial.c"
++#define USB_FACM_INCLUDED
+ #include "f_acm.c"
+ #include "f_mtp.c"
+ #include "f_accessory.c"
+@@ -149,7 +150,7 @@ static struct usb_configuration android_config_driver = {
+ 	.unbind		= android_unbind_config,
+ 	.bConfigurationValue = 1,
+ 	.bmAttributes	= USB_CONFIG_ATT_ONE | USB_CONFIG_ATT_SELFPOWER,
+-	.bMaxPower	= 0xFA, /* 500ma */
++	.MaxPower	= 500, /* 500ma */
+ };
+ 
+ static void android_work(struct work_struct *data)
+@@ -366,22 +367,41 @@ static void functionfs_release_dev_callback(struct ffs_data *ffs_data)
+ #define MAX_ACM_INSTANCES 4
+ struct acm_function_config {
+ 	int instances;
++	unsigned char port_num[MAX_ACM_INSTANCES];
+ };
+ 
+ static int
+ acm_function_init(struct android_usb_function *f,
+ 		struct usb_composite_dev *cdev)
+ {
+-	f->config = kzalloc(sizeof(struct acm_function_config), GFP_KERNEL);
+-	if (!f->config)
++	int i;
++	int ret;
++	struct acm_function_config *config;
++
++	config = kzalloc(sizeof(struct acm_function_config), GFP_KERNEL);
++	if (!config)
+ 		return -ENOMEM;
++	f->config = config;
+ 
+-	return gserial_setup(cdev->gadget, MAX_ACM_INSTANCES);
++	for (i = 0; i < MAX_ACM_INSTANCES; i++) {
++		ret = gserial_alloc_line(&config->port_num[i]);
++		if (ret)
++			goto err_alloc_line;
++	}
++	return 0;
++err_alloc_line:
++	while (i-- > 0)
++		gserial_free_line(config->port_num[i]);
++	return ret;
+ }
+ 
+ static void acm_function_cleanup(struct android_usb_function *f)
+ {
+-	gserial_cleanup();
++	int i;
++	struct acm_function_config *config = f->config;
++
++	for (i = 0; i < MAX_ACM_INSTANCES; i++)
++		gserial_free_line(config->port_num[i]);
+ 	kfree(f->config);
+ 	f->config = NULL;
+ }
+@@ -1312,7 +1332,7 @@ static int android_usb_unbind(struct usb_composite_dev *cdev)
+ }
+ 
+ /* HACK: android needs to override setup for accessory to work */
+-static int (*composite_setup)(struct usb_gadget *gadget, const struct usb_ctrlrequest *c);
++static int (*composite_setup_func)(struct usb_gadget *gadget, const struct usb_ctrlrequest *c);
+ 
+ static int
+ android_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c)
+@@ -1343,7 +1363,7 @@ android_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c)
+ 		value = acc_ctrlrequest(cdev, c);
+ 
+ 	if (value < 0)
+-		value = composite_setup(gadget, c);
++		value = composite_setup_func(gadget, c);
+ 
+ 	spin_lock_irqsave(&cdev->lock, flags);
+ 	if (!dev->connected) {
+@@ -1442,7 +1462,7 @@ static int __init init(void)
+ 	}
+ 
+ 	/* HACK: exchange composite's setup with ours */
+-	composite_setup = android_usb_driver.gadget_driver.setup;
++	composite_setup_func = android_usb_driver.gadget_driver.setup;
+ 	android_usb_driver.gadget_driver.setup = android_setup;
+ 
+ 	return 0;
+-- 
+1.9.1
+

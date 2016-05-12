@@ -1,0 +1,208 @@
+From 720965332ede647ae14f1d1b16838291025a7db6 Mon Sep 17 00:00:00 2001
+From: raosrini <srinidhi.rao@intel.com>
+Date: Fri, 20 Feb 2015 11:44:01 +0530
+Subject: [PATCH] EM/FG: remove wait before entering suspend in intel_fg_uiface
+
+TI PMIC dolar lake TC supports Software Fuel Gauge and the
+intel_fg_uiface driver exposes sysfs entries related to
+coulomb counter, Vbat etc. which will be read by user space
+FG daemon and it will write back the estimated SoC value to
+intel_fg_uiface driver.
+While waiting for the write back ACK from user space FG daemon,
+the intel_fg_uiface driver will wait on a wait queue. But if
+kernel tries to enter suspend mode while this wait is active,
+it might result in kernel crash. Hence the wait should be
+released in the suspend call.
+This patch also reads the BattID from ACPI instead of using
+hardcoded value.
+
+Change-Id: Ibcf7793616d45f35dd737c0a1f249e483c7bee2d
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1057
+Signed-off-by: raosrini <srinidhi.rao@intel.com>
+---
+ arch/x86/include/asm/intel_em_config.h |  9 +++++++++
+ drivers/platform/x86/intel_em_config.c |  2 +-
+ drivers/power/intel_fg_uiface.c        | 19 +++++++++++++++++--
+ drivers/power/intel_fuel_gauge.c       | 22 ++++++++++++++--------
+ include/linux/power/intel_fuel_gauge.h |  2 ++
+ 5 files changed, 43 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/include/asm/intel_em_config.h b/arch/x86/include/asm/intel_em_config.h
+index 0b385a8..949523e 100644
+--- a/arch/x86/include/asm/intel_em_config.h
++++ b/arch/x86/include/asm/intel_em_config.h
+@@ -55,6 +55,15 @@ struct em_config_oem1_data {
+ 
+ #ifdef CONFIG_ACPI
+ /*
++ * em_config_get_oem0_data - This function fetches OEM0 table .
++ * @data : Pointer to OEM0 data structure in which data should be filled.
++ *
++ * Returns number bytes fetched (+ve) on success or 0 on error.
++ *
++ */
++int em_config_get_oem0_data(struct em_config_oem0_data *data);
++
++/*
+  * em_config_get_oem1_data - This function fetches OEM1 table .
+  * @data : Pointer to OEM1 data structure in which data should be filled.
+  *
+diff --git a/drivers/platform/x86/intel_em_config.c b/drivers/platform/x86/intel_em_config.c
+index 3d23d66..7e65b3e 100644
+--- a/drivers/platform/x86/intel_em_config.c
++++ b/drivers/platform/x86/intel_em_config.c
+@@ -48,7 +48,7 @@ static int em_config_get_acpi_table(char *name, void *data, int data_size)
+ 	return ret;
+ }
+ 
+-static int em_config_get_oem0_data(struct em_config_oem0_data *data)
++int em_config_get_oem0_data(struct em_config_oem0_data *data)
+ {
+ 	return em_config_get_acpi_table(EM_CONFIG_OEM0_NAME,
+ 				data, sizeof(struct em_config_oem0_data));
+diff --git a/drivers/power/intel_fg_uiface.c b/drivers/power/intel_fg_uiface.c
+index 7f7ba34..6f541e6 100644
+--- a/drivers/power/intel_fg_uiface.c
++++ b/drivers/power/intel_fg_uiface.c
+@@ -55,6 +55,7 @@ struct fg_iface_info {
+ 	int calib_cc;
+ 	wait_queue_head_t wait;
+ 	bool uevent_ack;
++	bool suspended;
+ 
+ 	struct miscdevice intel_fg_misc_device;
+ };
+@@ -388,13 +389,19 @@ static int intel_fg_iface_algo_process(struct fg_algo_ip_params *ip,
+ 	/*Wait for user space to write back*/
+ 	info_ptr->uevent_ack = false;
+ 	mutex_unlock(&info_ptr->lock);
++
++	if (info_ptr->suspended) {
++		dev_err(&info_ptr->pdev->dev, "Error SUSPENDED\n");
++		return -ESHUTDOWN;
++	}
++
+ 	/*
+ 	 * Since we need to wait for user space event and since the user space
+ 	 * scheduling depends on the system load and other high priority tasks,
+-	 * hence, the safe margin to wait for timeout would be 12secs
++	 * hence, the safe margin to wait for timeout would be 9secs
+ 	 */
+ 	ret = wait_event_timeout(info_ptr->wait,
+-			info_ptr->uevent_ack == true, 12 * HZ);
++			info_ptr->uevent_ack == true, 9 * HZ);
+ 	if (0 == ret) {
+ 		dev_err(&info_ptr->pdev->dev,
+ 				"\n Error TIMEOUT waiting for user space write back");
+@@ -449,6 +456,7 @@ static int intel_fg_iface_probe(struct platform_device *pdev)
+ 	info->pdev = pdev;
+ 	mutex_init(&info->lock);
+ 	info_ptr = info;
++	info_ptr->suspended = false;
+ 
+ 	init_waitqueue_head(&info->wait);
+ 
+@@ -471,11 +479,18 @@ static int intel_fg_iface_remove(struct platform_device *pdev)
+ #ifdef CONFIG_PM
+ static int intel_fg_iface_suspend(struct device *dev)
+ {
++	/* Force ACK uevent to avoid blocking as user space freezing */
++	info_ptr->suspended = true;
++	mutex_lock(&info_ptr->lock);
++	info_ptr->uevent_ack = true;
++	wake_up(&info_ptr->wait);
++	mutex_unlock(&info_ptr->lock);
+ 	return 0;
+ }
+ 
+ static int intel_fg_iface_resume(struct device *dev)
+ {
++	info_ptr->suspended = false;
+ 	return 0;
+ }
+ #else
+diff --git a/drivers/power/intel_fuel_gauge.c b/drivers/power/intel_fuel_gauge.c
+index 9d17b24..b725fe2 100644
+--- a/drivers/power/intel_fuel_gauge.c
++++ b/drivers/power/intel_fuel_gauge.c
+@@ -43,6 +43,7 @@
+ #include <linux/reboot.h>
+ #include <linux/notifier.h>
+ #include <linux/power/intel_fuel_gauge.h>
++#include <asm/intel_em_config.h>
+ #include <linux/power/battery_id.h>
+ 
+ #define DRIVER_NAME	"intel_fuel_gauge"
+@@ -371,7 +372,7 @@ static int intel_fuel_gauge_get_property(struct power_supply *psup,
+ 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
+ 		break;
+ 	case POWER_SUPPLY_PROP_MODEL_NAME:
+-		val->strval = "INTN0001";
++		val->strval = fg_info->batt_params.battid;
+ 		break;
+ 	default:
+ 		mutex_unlock(&fg_info->lock);
+@@ -471,8 +472,8 @@ static void intel_fuel_gauge_algo_init(struct intel_fg_info *fg_info)
+ 		fg_info->algo_sec->init_done = true;
+ 	}
+ 		fg_info->batt_params.boot_flag = false;
+-
+-	schedule_delayed_work(&fg_info->fg_worker, 20 * HZ);
++	/* Schedule worker in 5s to update FG status during bootup.*/
++	schedule_delayed_work(&fg_info->fg_worker, 5 * HZ);
+ }
+ 
+ int intel_fg_register_input(struct intel_fg_input *input)
+@@ -595,7 +596,8 @@ EXPORT_SYMBOL(intel_fg_unregister_algo);
+ static int intel_fuel_gauge_probe(struct platform_device *pdev)
+ {
+ 	struct intel_fg_info *fg_info;
+-	struct ps_batt_chg_prof bat_prof;
++	struct em_config_oem0_data oem0_data;
++	int ret = 0;
+ 
+ 	fg_info = devm_kzalloc(&pdev->dev, sizeof(*fg_info), GFP_KERNEL);
+ 	if (!fg_info) {
+@@ -611,11 +613,15 @@ static int intel_fuel_gauge_probe(struct platform_device *pdev)
+ 	INIT_DELAYED_WORK(&fg_info->fg_worker, &intel_fg_worker);
+ 	fg_info->batt_params.status = POWER_SUPPLY_STATUS_DISCHARGING;
+ 
+-	if (get_batt_prop(&bat_prof) < 0)
+-		fg_info->batt_params.is_valid_battery = false;
+-	else
++	if (em_config_get_oem0_data(&oem0_data)) {
+ 		fg_info->batt_params.is_valid_battery = true;
+-
++		strncpy(fg_info->batt_params.battid, oem0_data.batt_id,
++				BATTID_STR_LEN);
++	} else {
++		fg_info->batt_params.is_valid_battery = false;
++		strncpy(fg_info->batt_params.battid, "unknown",
++				BATTID_STR_LEN);
++	}
+ 	wake_lock_init(&fg_info->wake_ui.wakelock, WAKE_LOCK_SUSPEND,
+ 				"intel_fg_wakelock");
+ 
+diff --git a/include/linux/power/intel_fuel_gauge.h b/include/linux/power/intel_fuel_gauge.h
+index 5d50f69..9e06947 100644
+--- a/include/linux/power/intel_fuel_gauge.h
++++ b/include/linux/power/intel_fuel_gauge.h
+@@ -25,6 +25,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/power_supply.h>
+ #include <linux/mutex.h>
++#include <linux/power/battery_id.h>
+ 
+ struct fg_algo_ip_params {
+ 	int vbatt;
+@@ -59,6 +60,7 @@ struct fg_batt_params {
+ 	int status;
+ 	bool boot_flag;
+ 	bool is_valid_battery;
++	char battid[BATTID_STR_LEN + 1];
+ };
+ 
+ struct fg_algo_params {
+-- 
+1.9.1
+

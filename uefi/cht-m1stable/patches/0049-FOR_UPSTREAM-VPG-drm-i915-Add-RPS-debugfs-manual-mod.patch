@@ -1,0 +1,289 @@
+From eefdfd13a2faffd595d9db02f88af7159be5eee6 Mon Sep 17 00:00:00 2001
+Message-Id: <eefdfd13a2faffd595d9db02f88af7159be5eee6.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Jeff McGee <jeff.mcgee@intel.com>
+Date: Mon, 16 Dec 2013 14:30:22 -0600
+Subject: [PATCH 049/312] FOR_UPSTREAM [VPG]: drm/i915: Add RPS debugfs manual
+ mode
+
+RPS manual mode disables/ignores load-based inputs and allows render
+performance state to be controlled externally. The enabling of manual
+mode and setting of desired frequency is done through debugfs.
+
+i915_rps_manual:
+'0' - RPS controlled normally using load metrics.
+'1' - RPS controlled manually via i915_cur_freq writes.
+
+i915_cur_freq:
+u64 - Value is the current gpu frequency request in MHz. Writes
+      accepted only if i915_rps_manual = 1.
+
+Supports Gen6+ except Valleyview and Broadwell.
+
+Conflicts:
+	drivers/gpu/drm/i915/intel_pm.c
+
+For: APDEV-723
+OTC-Tracker: VIZ-3345
+Change-Id: I45cc217d5f706b0b79e9c2d26ba3dbbfa306d0a7
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+
+Conflicts:
+
+	drivers/gpu/drm/i915/intel_pm.c
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |  111 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h     |    2 +
+ drivers/gpu/drm/i915/i915_irq.c     |    6 ++
+ drivers/gpu/drm/i915/intel_pm.c     |   42 +++++++++++--
+ 4 files changed, 156 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index b8c6892..13c3b15 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -3661,6 +3661,115 @@ DEFINE_SIMPLE_ATTRIBUTE(i915_min_freq_fops,
+ 			i915_min_freq_get, i915_min_freq_set,
+ 			"%llu\n");
+ 
++static int i915_cur_freq_get(void *data, u64 *val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if ((INTEL_INFO(dev)->gen < 6) ||
++	     IS_VALLEYVIEW(dev) ||
++	     IS_BROADWELL(dev))
++		return -ENODEV;
++
++	flush_delayed_work(&dev_priv->rps.delayed_resume_work);
++
++	*val = dev_priv->rps.cur_freq * GT_FREQUENCY_MULTIPLIER;
++
++	return 0;
++}
++
++static int i915_cur_freq_set(void *data, u64 val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u64 freq = val;
++	int ret;
++
++	if ((INTEL_INFO(dev)->gen < 6) ||
++	     IS_VALLEYVIEW(dev) ||
++	     IS_BROADWELL(dev))
++		return -ENODEV;
++
++	flush_delayed_work(&dev_priv->rps.delayed_resume_work);
++
++	ret = mutex_lock_interruptible(&dev_priv->rps.hw_lock);
++	if (ret)
++		return ret;
++
++	/* Must be in manual mode to guarantee setting will persist. */
++	if (!dev_priv->rps.manual_mode) {
++		mutex_unlock(&dev_priv->rps.hw_lock);
++		return -EINVAL;
++	}
++
++	do_div(val, GT_FREQUENCY_MULTIPLIER);
++
++	if (val < dev_priv->rps.min_freq_softlimit || val > dev_priv->rps.max_freq_softlimit) {
++		mutex_unlock(&dev_priv->rps.hw_lock);
++		return -EINVAL;
++	}
++
++	DRM_DEBUG_DRIVER("Setting current freq to %llu\n", freq);
++
++	gen6_set_rps(dev, val);
++
++	mutex_unlock(&dev_priv->rps.hw_lock);
++
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(i915_cur_freq_fops,
++			i915_cur_freq_get, i915_cur_freq_set,
++			"%llu\n");
++
++static int i915_rps_manual_get(void *data, u64 *val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if ((INTEL_INFO(dev)->gen < 6) ||
++	     IS_VALLEYVIEW(dev) ||
++	     IS_BROADWELL(dev))
++		return -ENODEV;
++
++	flush_delayed_work(&dev_priv->rps.delayed_resume_work);
++
++	*val = dev_priv->rps.manual_mode;
++
++	return 0;
++}
++
++static int i915_rps_manual_set(void *data, u64 val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int ret;
++
++	if ((INTEL_INFO(dev)->gen < 6) ||
++	     IS_VALLEYVIEW(dev) ||
++	     IS_BROADWELL(dev))
++		return -ENODEV;
++
++	flush_delayed_work(&dev_priv->rps.delayed_resume_work);
++
++	DRM_DEBUG_DRIVER("Setting RPS mode to %s\n",
++			 val ? "manual" : "normal");
++
++	ret = mutex_lock_interruptible(&dev_priv->rps.hw_lock);
++	if (ret)
++		return ret;
++
++	gen6_set_rps_mode(dev, val);
++
++	mutex_unlock(&dev_priv->rps.hw_lock);
++
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(i915_rps_manual_fops,
++			i915_rps_manual_get, i915_rps_manual_set,
++			"%llu\n");
++
+ static int
+ i915_cache_sharing_get(void *data, u64 *val)
+ {
+@@ -3833,6 +3942,8 @@ static const struct i915_debugfs_files {
+ 	{"i915_wedged", &i915_wedged_fops},
+ 	{"i915_max_freq", &i915_max_freq_fops},
+ 	{"i915_min_freq", &i915_min_freq_fops},
++	{"i915_cur_freq", &i915_cur_freq_fops},
++	{"i915_rps_manual", &i915_rps_manual_fops},
+ 	{"i915_cache_sharing", &i915_cache_sharing_fops},
+ 	{"i915_ring_stop", &i915_ring_stop_fops},
+ 	{"i915_ring_missed_irq", &i915_ring_missed_irq_fops},
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 5bf23ed..f37108e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -924,6 +924,7 @@ struct intel_gen6_power_mgmt {
+ 	int last_adj;
+ 	enum { LOW_POWER, BETWEEN, HIGH_POWER } power;
+ 
++	bool manual_mode;
+ 	bool enabled;
+ 	struct delayed_work delayed_resume_work;
+ 
+@@ -2638,6 +2639,7 @@ extern bool intel_fbc_enabled(struct drm_device *dev);
+ extern void intel_disable_fbc(struct drm_device *dev);
+ extern bool ironlake_set_drps(struct drm_device *dev, u8 val);
+ extern void intel_init_pch_refclk(struct drm_device *dev);
++extern void gen6_set_rps_mode(struct drm_device *dev, bool manual);
+ extern void gen6_set_rps(struct drm_device *dev, u8 val);
+ extern void valleyview_set_rps(struct drm_device *dev, u8 val);
+ extern int valleyview_rps_max_freq(struct drm_i915_private *dev_priv);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 0a5058d..8880a2c 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1250,6 +1250,12 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 
+ 	mutex_lock(&dev_priv->rps.hw_lock);
+ 
++	/* May have just entered manual mode. */
++	if (dev_priv->rps.manual_mode) {
++		mutex_unlock(&dev_priv->rps.hw_lock);
++		return;
++	}
++
+ 	adj = dev_priv->rps.last_adj;
+ 	if (pm_iir & GEN6_PM_RP_UP_THRESHOLD) {
+ 		if (adj > 0)
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index aa77d52..faa4451 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3334,7 +3334,8 @@ void gen6_set_rps(struct drm_device *dev, u8 val)
+ 	 * write the limits value.
+ 	 */
+ 	if (val != dev_priv->rps.cur_freq) {
+-		gen6_set_rps_thresholds(dev_priv, val);
++		if (!dev_priv->rps.manual_mode)
++			gen6_set_rps_thresholds(dev_priv, val);
+ 
+ 		if (IS_HASWELL(dev) || IS_BROADWELL(dev))
+ 			I915_WRITE(GEN6_RPNSWREQ,
+@@ -3404,12 +3405,44 @@ static void vlv_set_rps_idle(struct drm_i915_private *dev_priv)
+ 		   gen6_rps_pm_mask(dev_priv, dev_priv->rps.cur_freq));
+ }
+ 
++void gen6_set_rps_mode(struct drm_device *dev, bool manual)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u8 delay;
++
++	if ((INTEL_INFO(dev)->gen < 6) ||
++	     IS_VALLEYVIEW(dev) ||
++	     IS_BROADWELL(dev)) {
++		DRM_DEBUG_DRIVER("RPS mode change not supported\n");
++		return;
++	}
++
++	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
++
++	dev_priv->rps.manual_mode = manual;
++
++	/* Manual mode disables/ignores load-based inputs and allows render
++	 * performance state to be controlled externally. */
++	if (manual) {
++		I915_WRITE(GEN6_RP_CONTROL,
++			   GEN6_RP_MEDIA_HW_NORMAL_MODE);
++		delay = (I915_READ(GEN6_GT_PERF_STATUS) & 0xff00) >> 8;
++	} else {
++		/* Force a reset */
++		dev_priv->rps.power = HIGH_POWER;
++		dev_priv->rps.cur_freq = 0;
++		delay = dev_priv->rps.min_freq_softlimit;
++	}
++
++	gen6_set_rps(dev, delay);
++}
++
+ void gen6_rps_idle(struct drm_i915_private *dev_priv)
+ {
+ 	struct drm_device *dev = dev_priv->dev;
+ 
+ 	mutex_lock(&dev_priv->rps.hw_lock);
+-	if (dev_priv->rps.enabled) {
++	if (dev_priv->rps.enabled && !dev_priv->rps.manual_mode) {
+ 		if (IS_VALLEYVIEW(dev))
+ 			vlv_set_rps_idle(dev_priv);
+ 		else
+@@ -3424,7 +3457,7 @@ void gen6_rps_boost(struct drm_i915_private *dev_priv)
+ 	struct drm_device *dev = dev_priv->dev;
+ 
+ 	mutex_lock(&dev_priv->rps.hw_lock);
+-	if (dev_priv->rps.enabled) {
++	if (dev_priv->rps.enabled && !dev_priv->rps.manual_mode) {
+ 		if (IS_VALLEYVIEW(dev))
+ 			valleyview_set_rps(dev_priv->dev, dev_priv->rps.max_freq_softlimit);
+ 		else
+@@ -3783,8 +3816,7 @@ static void gen6_enable_rps(struct drm_device *dev)
+ 		dev_priv->rps.max_freq = pcu_mbox & 0xff;
+ 	}
+ 
+-	dev_priv->rps.power = HIGH_POWER; /* force a reset */
+-	gen6_set_rps(dev_priv->dev, dev_priv->rps.min_freq_softlimit);
++	gen6_set_rps_mode(dev, dev_priv->rps.manual_mode);
+ 
+ 	gen6_enable_rps_interrupts(dev);
+ 
+-- 
+1.7.9.5
+

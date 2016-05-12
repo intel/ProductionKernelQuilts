@@ -1,0 +1,124 @@
+From 9aaf8a558bd06f4d590ddee731c67a1a4ef190ec Mon Sep 17 00:00:00 2001
+Message-Id: <9aaf8a558bd06f4d590ddee731c67a1a4ef190ec.1421830309.git.chang-joon.lee@intel.com>
+In-Reply-To: <49dde4951ccd12ce81e60aed3b24793e0ac12fed.1421830308.git.chang-joon.lee@intel.com>
+References: <49dde4951ccd12ce81e60aed3b24793e0ac12fed.1421830308.git.chang-joon.lee@intel.com>
+From: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+Date: Wed, 3 Dec 2014 14:54:41 +0530
+Subject: [PATCH 16/17] REVERTME [VPG]: drm/i915: send one frame after
+ enabling mipi cmd mode
+
+If MIPI is operated in command mode, and after display reset. if
+not even one frame is sent after enabling the pipe and then if it
+is disabled, pipe is getting stuck. This patch will fix this issue
+by sending one frame after enabling the pipe.
+
+REVERTME:
+There should not be a case where there is mode set and no frames
+are sent. Need to find out why the user space was doing this and
+avoid it.
+
+Issue: GMINL-1644
+Change-Id: I5e3a59b47216aebdefc900f56f06388a06b54599
+Signed-off-by: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |   45 ++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_drv.h     |    6 +++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 0b9521c..45a989b 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5372,6 +5372,7 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct intel_encoder *encoder;
++	struct intel_dsi *intel_dsi;
+ 	int pipe = intel_crtc->pipe;
+ 	int plane = intel_crtc->plane;
+ 	bool is_dsi;
+@@ -5475,6 +5476,24 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
+ 
+ 	/* Underruns don't raise interrupts, so check manually. */
+ 	i9xx_check_fifo_underruns(dev);
++
++	for_each_encoder_on_crtc(dev, crtc, encoder) {
++		if (encoder->type != INTEL_OUTPUT_DSI)
++			continue;
++
++		intel_dsi = enc_to_intel_dsi(&encoder->base);
++		if (is_cmd_mode(intel_dsi)) {
++			/*
++			 * save the current pipe counter. During disable use
++			 * this variable to check if at least one frame has
++			 * been sent. If no frame is sent and MIPI is disabled
++			 * in command mode, then pipe gets stuck.
++			 */
++			intel_crtc->hw_frm_cnt_at_enable =
++					I915_READ(PIPEFRAME(pipe));
++		}
++		break;
++	}
+ }
+ 
+ static void i9xx_set_pll_dividers(struct intel_crtc *crtc)
+@@ -5615,6 +5634,7 @@ static void i9xx_crtc_disable(struct drm_crtc *crtc)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct intel_encoder *encoder;
++	struct intel_dsi *intel_dsi;
+ 	int pipe = intel_crtc->pipe;
+ 	bool all_pipe_disabled;
+ 	u32 val;
+@@ -5622,6 +5642,31 @@ static void i9xx_crtc_disable(struct drm_crtc *crtc)
+ 	if (!intel_crtc->active)
+ 		return;
+ 
++	for_each_encoder_on_crtc(dev, crtc, encoder) {
++		if (encoder->type != INTEL_OUTPUT_DSI)
++			continue;
++
++		intel_dsi = enc_to_intel_dsi(&encoder->base);
++		if (is_cmd_mode(intel_dsi) &&
++			(intel_crtc->hw_frm_cnt_at_enable ==
++					I915_READ(PIPEFRAME(pipe)))) {
++
++			intel_dsi_update_panel_fb(encoder);
++
++			/*
++			 * wait for ~2 frames for TE interrupt and sending one
++			 * frame.
++			 */
++			msleep(40);
++
++			if (intel_crtc->hw_frm_cnt_at_enable ==
++					I915_READ(PIPEFRAME(pipe)))
++				DRM_ERROR("Pipe is stuck for DSI cmd mode.");
++		}
++
++		break;
++	}
++
+ 	/*
+ 	 * Gen2 reports pipe underruns whenever all planes are disabled.
+ 	 * So diasble underrun reporting before all the planes get disabled.
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 7691165..7e7eb34 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -497,6 +497,12 @@ struct intel_crtc {
+ 	struct clrmgr_status *color_status;
+ 
+ 	struct intel_mmio_flip mmio_flip;
++
++	/*
++	 * save the frame counter at enable sequence to make sure one frame has
++	 * been sent before disable sequence.
++	 */
++	u32 hw_frm_cnt_at_enable;
+ };
+ 
+ struct intel_plane_wm_parameters {
+-- 
+1.7.9.5
+

@@ -1,0 +1,1145 @@
+From ab12d2a07dcf4f4bd4d3b7e2840f2e461b850d78 Mon Sep 17 00:00:00 2001
+Message-Id: <ab12d2a07dcf4f4bd4d3b7e2840f2e461b850d78.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date: Fri, 20 Dec 2013 10:45:02 +0000
+Subject: [PATCH 49/71] REVERTME [VPG]: drm/i915: Adding HW Native Sync
+ support
+
+Original Author: Satyanantha RamaGopal M <rama.gopal.m.satyanantha@intel.com>
+
+v1: Added support for native sync for batch buffers. Each ring has a timeline
+that tracks sequence numbers. When a caller submits a batch buffer they
+can request that a fence is returned. The fence will be signalled when the
+batch buffer completes or if TDR is triggered.
+
+At present the KMD cannot accept incoming fences. This feature will
+require much of the scheduler functionality so for the moment incoming
+fences are handled in user mode.
+
+User interrupts are enabled while there are active fences so that the
+timeline can be signalled after every batch buffer completion in case
+anyone is waiting on a fence.
+
+The DRM_IOCTL_I915_GEM_EXECBUFFER2 IOCTL has been modified to have
+read/write access so it can return a file descriptor to user space.
+Added I915_EXEC_WAIT_FENCE and I915_EXEC_REQUEST_FENCE flags that
+can be passed in the flags field of an exec IOCTL.
+
+Added a write of the seqno to the hardware status page before each
+batchbuffer dispatch. It is cleared immediately after the batch buffer
+completes. TDR uses this to detect which batch buffer has hung, i.e.
+if it sees a non-zero seqno in the HWS page then it knows that the batch
+buffer didn't complete and it can mark the sync fence as timed out.
+
+The GPU must be idled whenever the seqno wraps as the timelines do not
+cope with wrapping.
+
+Port to 3.10 Kernel.
+
+v2: kernel config option for native sync support is created; it is dependent
+on the CONFIG_SYNC define used by the sync framework. This prevents the
+problem of it using the sync API for configurations that have not
+selected CONFIG_SYNC.
+
+v3: Port to 3.14 Kernel and address review comments (Akash)
+Replace direct typecasting with container_of() macros in intel_sync.c and
+cleanup unused variables.
+
+v4: Port to 3.14 forklift kernel and integrate with execlists v2.
+
+v5: Integrate with execlists v4.
+
+This is REVERTME because a better solution which completely integrates
+with GPU Scheduler will be used going forward.
+
+For: GMIN-853
+Tracked-On: https://jira01.devtools.intel.com/browse/GMIN-854
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+Signed-off-by: Arun Siluvery <arun.siluvery@linux.intel.com>
+Change-Id: I95ec32340e19b9e3a011cdab9c03c82c92c9af51
+---
+ drivers/gpu/drm/i915/Kconfig               |   16 +
+ drivers/gpu/drm/i915/Makefile              |    2 +
+ drivers/gpu/drm/i915/i915_gem.c            |    3 +
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   21 ++
+ drivers/gpu/drm/i915/i915_irq.c            |    6 +
+ drivers/gpu/drm/i915/intel_lrc.c           |   82 +++--
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |   14 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |   12 +-
+ drivers/gpu/drm/i915/intel_sync.c          |  464 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_sync.h          |  166 ++++++++++
+ include/uapi/drm/i915_drm.h                |   16 +-
+ 11 files changed, 770 insertions(+), 32 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/intel_sync.c
+ create mode 100644 drivers/gpu/drm/i915/intel_sync.h
+
+diff --git a/drivers/gpu/drm/i915/Kconfig b/drivers/gpu/drm/i915/Kconfig
+index ba367f4..47a675a 100644
+--- a/drivers/gpu/drm/i915/Kconfig
++++ b/drivers/gpu/drm/i915/Kconfig
+@@ -82,6 +82,22 @@ config DRM_I915_UMS
+ 
+ 	  If in doubt, say "N".
+ 
++config DRM_I915_SYNC
++	bool "Enable Native sync support"
++	depends on DRM_I915 && SYNC
++	default y
++	help
++	  Choose this option if you require Native sync support within the i915
++	  driver;
++
++	  i915 driver implements a synchronization timeline and users can
++	  request a fence when they submit work to the GPU. A fence is a
++	  collection of synchronization points and it will be signalled when
++	  the work is completed. Since GPU Scheduler is not yet available this
++	  requires userspace support to actually make use of this functionality.
++
++	  If in doubt, say "Y".
++
+ config SUPPORT_LPDMA_HDMI_AUDIO
+ 	bool "Enable LP DMA HDMI audio"
+ 	depends on DRM_I915
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index 2e60739..5fd6671 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -82,4 +82,6 @@ i915-y += i915_dma.o \
+ 
+ obj-$(CONFIG_DRM_I915)  += i915.o
+ 
++obj-$(CONFIG_DRM_I915_SYNC)  += intel_sync.o
++
+ CFLAGS_i915_trace_points.o := -I$(src)
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index efdeb4a..f5300cc 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -30,6 +30,7 @@
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+ #include "i915_trace.h"
++#include "intel_sync.h"
+ #include "intel_drv.h"
+ #include <linux/oom.h>
+ #include <linux/shmem_fs.h>
+@@ -2290,6 +2291,8 @@ i915_gem_init_seqno(struct drm_device *dev, u32 seqno)
+ 			ring->semaphore.sync_seqno[j] = 0;
+ 	}
+ 
++	i915_sync_reset_timelines(dev_priv);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 44e8bcc..306920c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -30,6 +30,7 @@
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+ #include "i915_trace.h"
++#include "intel_sync.h"
+ #include "intel_drv.h"
+ #include <linux/dma_remapping.h>
+ 
+@@ -1051,6 +1052,9 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 	int instp_mode;
+ 	u32 instp_mask;
+ 	int i, ret = 0;
++	u32 seqno;
++	int sync_err = 0;
++	void *handle = NULL;
+ 
+ 	if (args->num_cliprects != 0) {
+ 		if (ring != &dev_priv->ring[RCS]) {
+@@ -1095,6 +1099,18 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 		}
+ 	}
+ 
++	ret = intel_ring_alloc_seqno(ring);
++	if (ret)
++		goto error;
++
++	seqno = ring->outstanding_lazy_seqno;
++	handle = i915_sync_prepare_request(args, ring, seqno);
++	if (handle && IS_ERR(handle)) {
++		ret = PTR_ERR(handle);
++		if (ret)
++			goto error;
++	}
++
+ 	ret = i915_gem_execbuffer_move_to_gpu(ring, vmas);
+ 	if (ret)
+ 		goto error;
+@@ -1183,12 +1199,17 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 			return ret;
+ 	}
+ 
++	sync_err = i915_sync_finish_request(handle, args, ring);
++
+ 	trace_i915_gem_ring_dispatch(ring, intel_ring_get_seqno(ring), flags);
+ 
+ 	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
+ 
+ error:
++	if (ret || sync_err)
++		i915_sync_cancel_request(handle, args, ring);
++
+ 	kfree(cliprects);
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 74b34f2..bdb1213 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -35,6 +35,7 @@
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+ #include "i915_trace.h"
++#include "intel_sync.h"
+ #include "intel_drv.h"
+ 
+ static const u32 hpd_ibx[] = {
+@@ -1249,6 +1250,8 @@ static void notify_ring(struct drm_device *dev,
+ 
+ 	wake_up_all(&ring->irq_queue);
+ 	i915_queue_hangcheck(dev);
++
++	i915_sync_timeline_advance(ring);
+ }
+ 
+ static u32 vlv_c0_residency(struct drm_i915_private *dev_priv,
+@@ -3612,6 +3615,9 @@ static void gen5_gt_irq_postinstall(struct drm_device *dev)
+ 	if (IS_GEN7(dev))
+ 		gt_irqs |= GT_RENDER_PERFMON_BUFFER_INTERRUPT;
+ 
++	if (IS_VALLEYVIEW(dev))
++		dev_priv->gt_irq_mask &= ~(I915_SYNC_USER_INTERRUPTS);
++
+ 	gt_irqs |= GT_RENDER_USER_INTERRUPT;
+ 	if (IS_GEN5(dev)) {
+ 		gt_irqs |= GT_RENDER_PIPECTL_NOTIFY_INTERRUPT |
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index fd73bbc..6b236ff 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -135,6 +135,7 @@
+ #include <drm/drmP.h>
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
++#include "intel_sync.h"
+ 
+ #define GEN8_LR_CONTEXT_RENDER_SIZE (20 * PAGE_SIZE)
+ #define GEN8_LR_CONTEXT_OTHER_SIZE (2 * PAGE_SIZE)
+@@ -573,6 +574,32 @@ static int logical_ring_invalidate_all_caches(struct intel_ringbuffer *ringbuf)
+ 	return 0;
+ }
+ 
++static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
++				    struct intel_context *ctx)
++{
++	if (ring->outstanding_lazy_seqno)
++		return 0;
++
++	if (ring->preallocated_lazy_request == NULL) {
++		struct drm_i915_gem_request *request;
++
++		request = kmalloc(sizeof(*request), GFP_KERNEL);
++		if (request == NULL)
++			return -ENOMEM;
++
++		/* Hold a reference to the context this request belongs to
++		 * (we will need it when the time comes to emit/retire the
++		 * request).
++		 */
++		request->ctx = ctx;
++		i915_gem_context_reference(request->ctx);
++
++		ring->preallocated_lazy_request = request;
++	}
++
++	return i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
++}
++
+ static int execlists_move_to_gpu(struct intel_ringbuffer *ringbuf,
+ 				 struct list_head *vmas)
+ {
+@@ -634,6 +661,8 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	int instp_mode;
+ 	u32 instp_mask;
+ 	int ret;
++	u32 seqno;
++	void *handle = NULL;
+ 
+ 	instp_mode = args->flags & I915_EXEC_CONSTANTS_MASK;
+ 	instp_mask = I915_EXEC_CONSTANTS_MASK;
+@@ -678,7 +707,15 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 
+ 	if (args->flags & I915_EXEC_GEN7_SOL_RESET) {
+ 		DRM_DEBUG("sol reset is gen7 only\n");
+-		return -EINVAL;
++		return ret;
++	}
++
++	seqno = ring->outstanding_lazy_seqno;
++	handle = gen8_sync_prepare_request(args, ringbuf, seqno);
++	if (handle && IS_ERR(handle)) {
++		ret = PTR_ERR(handle);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	ret = execlists_move_to_gpu(ringbuf, vmas);
+@@ -704,6 +741,10 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	if (ret)
+ 		return ret;
+ 
++	ret = gen8_sync_finish_request(handle, args, ringbuf);
++	if (ret)
++		i915_sync_cancel_request(handle, args, ring);
++
+ 	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
+ 
+@@ -770,32 +811,6 @@ void intel_logical_ring_advance_and_submit(struct intel_ringbuffer *ringbuf)
+ 	execlists_context_queue(ring, ctx, ringbuf->tail);
+ }
+ 
+-static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
+-				    struct intel_context *ctx)
+-{
+-	if (ring->outstanding_lazy_seqno)
+-		return 0;
+-
+-	if (ring->preallocated_lazy_request == NULL) {
+-		struct drm_i915_gem_request *request;
+-
+-		request = kmalloc(sizeof(*request), GFP_KERNEL);
+-		if (request == NULL)
+-			return -ENOMEM;
+-
+-		/* Hold a reference to the context this request belongs to
+-		 * (we will need it when the time comes to emit/retire the
+-		 * request).
+-		 */
+-		request->ctx = ctx;
+-		i915_gem_context_reference(request->ctx);
+-
+-		ring->preallocated_lazy_request = request;
+-	}
+-
+-	return i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
+-}
+-
+ static int logical_ring_wait_request(struct intel_ringbuffer *ringbuf,
+ 				     int bytes)
+ {
+@@ -895,7 +910,6 @@ static int logical_ring_wrap_buffer(struct intel_ringbuffer *ringbuf)
+ 
+ 	if (ringbuf->space < rem) {
+ 		int ret = logical_ring_wait_for_space(ringbuf, rem);
+-
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -1198,6 +1212,10 @@ void intel_logical_ring_cleanup(struct intel_engine_cs *ring)
+ 
+ 	intel_logical_ring_stop(ring);
+ 	WARN_ON((I915_READ_MODE(ring) & MODE_IDLE) == 0);
++
++	i915_sync_timeline_advance(ring);
++	i915_sync_timeline_destroy(ring);
++
+ 	ring->preallocated_lazy_request = NULL;
+ 	ring->outstanding_lazy_seqno = 0;
+ 
+@@ -1232,6 +1250,14 @@ static int logical_ring_init(struct drm_device *dev, struct intel_engine_cs *rin
+ 	if (ret)
+ 		return ret;
+ 
++	/* Create a timeline for HW Native Sync support*/
++	ret = i915_sync_timeline_create(ring->dev, ring->name, ring);
++	if (ret) {
++		DRM_ERROR("Sync timeline creation failed for ring %s\n",
++			ring->name);
++		return ret;
++	}
++
+ 	if (ring->init) {
+ 		ret = ring->init(ring);
+ 		if (ret)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 6e71dca..9d56e97 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -31,6 +31,7 @@
+ #include "i915_drv.h"
+ #include <drm/i915_drm.h>
+ #include "i915_trace.h"
++#include "intel_sync.h"
+ #include "intel_drv.h"
+ 
+ bool
+@@ -1651,6 +1652,14 @@ static int intel_init_ring_buffer(struct drm_device *dev,
+ 		goto error;
+ 	}
+ 
++	/* Create a timeline for HW Native Sync support*/
++	ret = i915_sync_timeline_create(ring->dev, ring->name, ring);
++	if (ret) {
++		DRM_ERROR("Sync timeline creation failed for ring %s\n",
++			ring->name);
++		return ret;
++	}
++
+ 	/* Workaround an erratum on the i830 which causes a hang if
+ 	 * the TAIL pointer points to within the last 2 cachelines
+ 	 * of the buffer.
+@@ -1686,6 +1695,9 @@ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring)
+ 	intel_stop_ring_buffer(ring);
+ 	WARN_ON(!IS_GEN2(ring->dev) && (I915_READ_MODE(ring) & MODE_IDLE) == 0);
+ 
++	i915_sync_timeline_advance(ring);
++	i915_sync_timeline_destroy(ring);
++
+ 	intel_destroy_ringbuffer_obj(ringbuf);
+ 	ring->preallocated_lazy_request = NULL;
+ 	ring->outstanding_lazy_seqno = 0;
+@@ -1845,7 +1857,7 @@ int intel_ring_idle(struct intel_engine_cs *ring)
+ 	return i915_wait_seqno(ring, seqno);
+ }
+ 
+-static int
++int
+ intel_ring_alloc_seqno(struct intel_engine_cs *ring)
+ {
+ 	if (ring->outstanding_lazy_seqno)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 126369f..957147e 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -95,7 +95,9 @@ struct intel_ringbuffer {
+ 	u32 last_retired_head;
+ };
+ 
+-struct  intel_engine_cs {
++struct i915_sync_timeline;
++
++struct intel_engine_cs {
+ 	const char	*name;
+ 	enum intel_ring_id {
+ 		RCS = 0x0,
+@@ -247,6 +249,11 @@ struct  intel_engine_cs {
+ 	 * to encode the command length in the header).
+ 	 */
+ 	u32 (*get_cmd_length_mask)(u32 cmd_header);
++
++#ifdef CONFIG_DRM_I915_SYNC
++	struct i915_sync_timeline *timeline;
++	u32 active_seqno; /* Contains the failing seqno on ring timeout. */
++#endif
+ };
+ 
+ bool intel_ring_initialized(struct intel_engine_cs *ring);
+@@ -310,6 +317,8 @@ intel_write_status_page(struct intel_engine_cs *ring,
+ #define I915_GEM_HWS_INDEX		0x20
+ #define I915_GEM_HWS_SCRATCH_INDEX	0x30
+ #define I915_GEM_HWS_SCRATCH_ADDR (I915_GEM_HWS_SCRATCH_INDEX << MI_STORE_DWORD_INDEX_SHIFT)
++#define I915_GEM_ACTIVE_SEQNO_INDEX     0x34
++#define I915_GEM_PGFLIP_INDEX           0x35
+ 
+ void intel_destroy_ringbuffer_obj(struct intel_ringbuffer *ringbuf);
+ int intel_alloc_ringbuffer_obj(struct drm_device *dev,
+@@ -317,6 +326,7 @@ int intel_alloc_ringbuffer_obj(struct drm_device *dev,
+ 
+ void intel_stop_ring_buffer(struct intel_engine_cs *ring);
+ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring);
++int __must_check intel_ring_alloc_seqno(struct intel_engine_cs *ring);
+ 
+ int __must_check intel_ring_begin(struct intel_engine_cs *ring, int n);
+ int __must_check intel_ring_cacheline_align(struct intel_engine_cs *ring);
+diff --git a/drivers/gpu/drm/i915/intel_sync.c b/drivers/gpu/drm/i915/intel_sync.c
+new file mode 100644
+index 0000000..1c19e0b
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_sync.c
+@@ -0,0 +1,464 @@
++/**************************************************************************
++ * Copyright © 2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ *
++ * Authors:
++ *      Satyanantha RamaGopal M <rama.gopal.m.satyanantha@intel.com>
++ *      Ian Lister <ian.lister@intel.com>
++ *      Tvrtko Ursulin <tvrtko.ursulin@intel.com>
++ */
++#include <linux/device.h>
++#include "drmP.h"
++#include "uapi/drm/drm.h"
++#include "i915_drm.h"
++#include "i915_drv.h"
++#include "intel_drv.h"
++#include "intel_sync.h"
++
++static int i915_sync_pt_has_signaled(struct sync_pt *sync_pt)
++{
++	struct drm_i915_private *dev_priv = NULL;
++	struct i915_sync_pt *pt = container_of(sync_pt,
++					       struct i915_sync_pt, pt);
++	struct i915_sync_timeline *obj =
++		(struct i915_sync_timeline *)sync_pt->parent;
++
++	dev_priv = (struct drm_i915_private *)obj->pvt.dev->dev_private;
++
++	/* On ring timeout fail the status of pending sync_pts.
++	 * This callback is synchronous with the thread which calls
++	 * sync_timeline_signal. If this has been signaled due to
++	 * an error then ring->active_seqno will be set to the
++	 * failing seqno (otherwise it will be 0). Compare the
++	 * sync point seqno with the failing seqno to detect errors.
++	 */
++	if (!obj->pvt.ring)
++		return -ENODEV;
++	else if (pt->pvt.value == obj->pvt.ring->active_seqno)
++		return -ETIMEDOUT;
++	else if (pt->pvt.value == 0)
++		/* It hasn't yet been assigned a sequence number
++		 * which means it can't have finished.
++		 */
++		return 0;
++	else if (pt->pvt.cycle != obj->pvt.cycle) {
++		/* The seqno has wrapped so complete this point */
++		return 1;
++	} else
++		/* This shouldn't require locking as it is synchronous
++		 * with the timeline signal function which is the only updater
++		 * of these fields
++		 */
++		return (obj->pvt.value >= pt->pvt.value) ? 1 : 0;
++
++	return 0;
++}
++
++static int i915_sync_pt_compare(struct sync_pt *a, struct sync_pt *b)
++{
++	struct i915_sync_pt *pt_a = container_of(a, struct i915_sync_pt, pt);
++	struct i915_sync_pt *pt_b = container_of(b, struct i915_sync_pt, pt);
++
++	if (pt_a->pvt.value == pt_b->pvt.value)
++		return 0;
++	else
++		return (pt_a->pvt.value > pt_b->pvt.value) ? 1 : -1;
++}
++
++static int i915_sync_fill_driver_data(struct sync_pt *sync_pt,
++				    void *data, int size)
++{
++	struct i915_sync_pt *pt = container_of(sync_pt,
++					       struct i915_sync_pt, pt);
++
++	if (size < sizeof(pt->pvt))
++		return -ENOMEM;
++
++	memcpy(data, &pt->pvt, sizeof(pt->pvt));
++
++	return sizeof(pt->pvt);
++}
++
++static
++struct sync_pt *i915_sync_pt_create(struct i915_sync_timeline *obj,
++						u32 value, u32 cycle)
++{
++	struct i915_sync_pt *pt;
++	struct intel_engine_cs *ring;
++
++	if (!obj)
++		return NULL;
++
++	ring = obj->pvt.ring;
++
++	/* Enable user interrupts for the lifetime of the sync point. */
++	if (!ring->irq_get(ring))
++		return NULL;
++
++	pt = (struct i915_sync_pt *)
++		sync_pt_create(&obj->obj, sizeof(struct i915_sync_pt));
++
++	if (pt) {
++		pt->pvt.value = value;
++		pt->pvt.cycle = cycle;
++	} else
++		ring->irq_put(ring);
++
++	return (struct sync_pt *)pt;
++}
++
++static struct sync_pt *i915_sync_pt_dup(struct sync_pt *sync_pt)
++{
++	struct i915_sync_pt *pt = container_of(sync_pt,
++					       struct i915_sync_pt, pt);
++	struct sync_pt *new_pt;
++	struct i915_sync_timeline *obj =
++		(struct i915_sync_timeline *)sync_pt->parent;
++
++	new_pt = (struct sync_pt *)i915_sync_pt_create(obj, pt->pvt.value,
++								pt->pvt.cycle);
++	return new_pt;
++}
++
++static void i915_sync_pt_free(struct sync_pt *sync_pt)
++{
++	struct i915_sync_timeline *obj =
++		(struct i915_sync_timeline *)sync_pt->parent;
++	struct intel_engine_cs *ring = obj->pvt.ring;
++
++	/* User interrupts can be disabled when sync point is freed. */
++	ring->irq_put(ring);
++}
++
++struct sync_timeline_ops i915_sync_timeline_ops = {
++	.driver_name = "i915_sync",
++	.dup = i915_sync_pt_dup,
++	.has_signaled = i915_sync_pt_has_signaled,
++	.compare = i915_sync_pt_compare,
++	.fill_driver_data = i915_sync_fill_driver_data,
++	.free_pt = i915_sync_pt_free,
++};
++
++int i915_sync_timeline_create(struct drm_device *dev,
++				const char *name,
++				struct intel_engine_cs *ring)
++{
++	struct i915_sync_timeline *obj = (struct i915_sync_timeline *)
++		sync_timeline_create(&i915_sync_timeline_ops,
++				     sizeof(struct i915_sync_timeline),
++				     name);
++
++	if (!obj)
++		return -EINVAL;
++
++	obj->pvt.dev = dev;
++	obj->pvt.ring = ring;
++
++	/* Start the timeline from seqno 0 as this is a special value
++	 * that is never assigned to a batch buffer.
++	 */
++	obj->pvt.value = 0;
++
++	ring->timeline = obj;
++
++	return 0;
++}
++
++void i915_sync_timeline_destroy(struct intel_engine_cs *ring)
++{
++	if (ring->timeline) {
++		sync_timeline_destroy(&ring->timeline->obj);
++		ring->timeline = NULL;
++	}
++}
++
++void i915_sync_timeline_signal(struct i915_sync_timeline *obj, u32 value)
++{
++	/* Update the timeline to notify it that
++	 * the monotonic seqno counter has advanced.
++	 */
++	if (obj) {
++		obj->pvt.value = value;
++		sync_timeline_signal(&obj->obj);
++	}
++}
++
++void i915_sync_reset_timelines(struct drm_i915_private *dev_priv)
++{
++	unsigned int i;
++
++	/* Reset all ring timelines to zero. */
++	for (i = 0; i < I915_NUM_RINGS; i++) {
++		struct intel_engine_cs *sync_ring = &dev_priv->ring[i];
++
++		if (sync_ring && sync_ring->timeline)
++			sync_ring->timeline->pvt.cycle++;
++
++		i915_sync_timeline_signal(sync_ring->timeline, 0);
++	}
++}
++
++static int i915_write_active_seqno(struct intel_engine_cs *ring, u32 seqno)
++{
++	int ret;
++
++	ret = intel_ring_begin(ring, 4);
++	if (ret)
++		return ret;
++
++	intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
++	intel_ring_emit(ring, I915_GEM_ACTIVE_SEQNO_INDEX <<
++			MI_STORE_DWORD_INDEX_SHIFT);
++	intel_ring_emit(ring, seqno);
++	intel_ring_emit(ring, MI_NOOP);
++	intel_ring_advance(ring);
++
++	return 0;
++}
++
++void *i915_sync_prepare_request(struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring, u32 seqno)
++{
++	int ret;
++	struct sync_pt *pt;
++
++	BUG_ON(!ring->timeline);
++
++	/* Write the current seqno to the HWS page so that
++	 * we can identify the cause of any hangs.
++	 */
++	ret = i915_write_active_seqno(ring, seqno);
++	if (ret) {
++		DRM_DEBUG_DRIVER("Failed to store seqno for %d (%d)\n",
++				 ring->id, ret);
++		return ERR_PTR(ret);
++	}
++
++	/* Fence was not requested, nothing more to do. */
++	if (!(args->flags & I915_EXEC_REQUEST_FENCE))
++		return NULL;
++
++	/* Caller has requested a sync fence.
++	 * User interrupts will be enabled to make sure that
++	 * the timeline is signalled on completion.
++	 */
++	pt = i915_sync_pt_create(ring->timeline, seqno,
++				ring->timeline->pvt.cycle);
++	if (!pt)
++		DRM_DEBUG_DRIVER("Failed to create sync point for %d/%u\n",
++					ring->id, seqno);
++
++	return (void *)pt;
++}
++
++static int gen8_write_active_seqno(struct intel_ringbuffer *ringbuf, u32 seqno)
++{
++	int ret;
++	struct intel_engine_cs *ring = ringbuf->ring;
++
++	ret = intel_logical_ring_begin(ringbuf, 4);
++	if (ret)
++		return ret;
++
++	intel_logical_ring_emit(ringbuf, MI_STORE_DWORD_INDEX);
++	intel_logical_ring_emit(ringbuf,
++				(ring->status_page.gfx_addr +
++				 (I915_GEM_ACTIVE_SEQNO_INDEX <<
++				  MI_STORE_DWORD_INDEX_SHIFT)));
++	intel_logical_ring_emit(ringbuf, seqno);
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++	intel_logical_ring_advance(ringbuf);
++
++	return 0;
++}
++
++void *gen8_sync_prepare_request(struct drm_i915_gem_execbuffer2 *args,
++				struct intel_ringbuffer *ringbuf,
++				u32 seqno)
++{
++	int ret;
++	struct sync_pt *pt;
++	struct intel_engine_cs *ring = ringbuf->ring;
++
++	BUG_ON(!ring->timeline);
++
++	/* Write the current seqno to the HWS page so that
++	 * we can identify the cause of any hangs.
++	 */
++	ret = gen8_write_active_seqno(ringbuf, seqno);
++	if (ret) {
++		DRM_DEBUG_DRIVER("Failed to store seqno for %d (%d)\n",
++				 ring->id, ret);
++		return ERR_PTR(ret);
++	}
++
++	/* Fence was not requested, nothing more to do. */
++	if (!(args->flags & I915_EXEC_REQUEST_FENCE))
++		return NULL;
++
++	/* Caller has requested a sync fence.
++	 * User interrupts will be enabled to make sure that
++	 * the timeline is signalled on completion.
++	 */
++	pt = i915_sync_pt_create(ring->timeline, seqno,
++				ring->timeline->pvt.cycle);
++	if (!pt)
++		DRM_DEBUG_DRIVER("Failed to create sync point for %d/%u\n",
++					ring->id, seqno);
++
++	return (void *)pt;
++}
++
++int i915_sync_finish_request(void *handle,
++				struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring)
++{
++	struct sync_pt *pt = (struct sync_pt *)handle;
++	int err;
++	int fd = -1;
++	struct sync_fence *fence;
++
++	/* Clear the active seqno. */
++	if (i915_write_active_seqno(ring, 0))
++		DRM_DEBUG_DRIVER("Failed to clear seqno for %d\n", ring->id);
++
++	/* Fence was not requested, nothing more to do. */
++	if (!pt)
++		return 0;
++
++	fd = get_unused_fd();
++	if (fd < 0) {
++		DRM_DEBUG_DRIVER("Unable to get file descriptor for fence\n");
++		err = fd;
++		goto err;
++	}
++
++	fence = sync_fence_create("I915", pt);
++	if (!fence) {
++		DRM_DEBUG_DRIVER("Fence creation failed\n");
++		err = -ENOMEM;
++		goto err_fd;
++	}
++
++	sync_fence_install(fence, fd);
++
++	/* Return the fence through the rsvd2 field */
++	args->rsvd2 = (__u64)fd;
++
++	return 0;
++
++err_fd:
++	put_unused_fd(fd);
++	fd = err;
++err:
++	args->rsvd2 = (__u64)fd;
++
++	return err;
++}
++
++int gen8_sync_finish_request(void *handle,
++			     struct drm_i915_gem_execbuffer2 *args,
++			     struct intel_ringbuffer *ringbuf)
++{
++	struct sync_pt *pt = (struct sync_pt *)handle;
++	int err;
++	int fd = -1;
++	struct sync_fence *fence;
++	struct intel_engine_cs *ring = ringbuf->ring;
++
++	/* Clear the active seqno. */
++	if (gen8_write_active_seqno(ringbuf, 0))
++		DRM_DEBUG_DRIVER("Failed to clear seqno for %d\n", ring->id);
++
++	/* Fence was not requested, nothing more to do. */
++	if (!pt)
++		return 0;
++
++	fd = get_unused_fd();
++	if (fd < 0) {
++		DRM_DEBUG_DRIVER("Unable to get file descriptor for fence\n");
++		err = fd;
++		goto err;
++	}
++
++	fence = sync_fence_create("I915", pt);
++	if (!fence) {
++		DRM_DEBUG_DRIVER("Fence creation failed\n");
++		err = -ENOMEM;
++		goto err_fd;
++	}
++
++	sync_fence_install(fence, fd);
++
++	/* Return the fence through the rsvd2 field */
++	args->rsvd2 = (__u64)fd;
++
++	return 0;
++
++err_fd:
++	put_unused_fd(fd);
++	fd = err;
++err:
++	args->rsvd2 = (__u64)fd;
++
++	return err;
++}
++
++void i915_sync_cancel_request(void *handle,
++				struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring)
++{
++	struct sync_pt *pt = (struct sync_pt *)handle;
++
++	if (pt && !IS_ERR(pt))
++		sync_pt_free(pt);
++}
++
++void i915_sync_timeline_advance(struct intel_engine_cs *ring)
++{
++	if (ring->timeline)
++		i915_sync_timeline_signal(ring->timeline,
++			ring->get_seqno(ring, false));
++}
++
++void i915_sync_hung_ring(struct intel_engine_cs *ring)
++{
++	/* Sample the active seqno to see if this request
++	 * failed during a batch buffer execution.
++	 */
++	ring->active_seqno = intel_read_status_page(ring,
++				I915_GEM_ACTIVE_SEQNO_INDEX);
++
++	if (ring->active_seqno) {
++		/* Clear it in the HWS to avoid seeing it more than once. */
++		intel_write_status_page(ring, I915_GEM_ACTIVE_SEQNO_INDEX, 0);
++
++		/* Signal the timeline. This will cause it to query the
++		 * signaled state of any waiting sync points.
++		 * If any match with ring->active_seqno then they
++		 * will be marked with an error state.
++		 */
++		i915_sync_timeline_signal(ring->timeline, ring->active_seqno);
++
++		/* Clear the active_seqno so it isn't seen twice. */
++		ring->active_seqno = 0;
++	}
++}
+diff --git a/drivers/gpu/drm/i915/intel_sync.h b/drivers/gpu/drm/i915/intel_sync.h
+new file mode 100644
+index 0000000..295216e
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_sync.h
+@@ -0,0 +1,166 @@
++/*
++ * Copyright © 2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ *
++ * Authors:
++ *      Satyanantha RamaGopal M <rama.gopal.m.satyanantha@intel.com>
++ *      Ian Lister <ian.lister@intel.com>
++ *      Tvrtko Ursulin <tvrtko.ursulin@intel.com>
++ */
++#ifndef _INTEL_SYNC_H_
++#define _INTEL_SYNC_H_
++
++#include "../../../../drivers/staging/android/sync.h"
++
++struct drm_i915_private;
++
++#ifdef CONFIG_DRM_I915_SYNC
++#define I915_SYNC_USER_INTERRUPTS (GT_RENDER_USER_INTERRUPT | \
++				   GT_BSD_USER_INTERRUPT | \
++				   GT_BLT_USER_INTERRUPT)
++#else
++#define I915_SYNC_USER_INTERRUPTS (0)
++#endif
++
++struct i915_sync_timeline {
++	struct	sync_timeline	obj;
++
++	struct {
++		struct drm_device	*dev;
++
++		u32			value;
++		u32			cycle;
++		struct intel_engine_cs *ring;
++	} pvt;
++};
++
++struct i915_sync_pt {
++	struct sync_pt		pt;
++
++	struct {
++		u32		value;
++		u32		cycle;
++	} pvt;
++};
++
++#ifdef CONFIG_DRM_I915_SYNC
++
++int i915_sync_timeline_create(struct drm_device *dev,
++			      const char *name,
++			      struct intel_engine_cs *ring);
++
++void i915_sync_timeline_destroy(struct intel_engine_cs *ring);
++
++void i915_sync_reset_timelines(struct drm_i915_private *dev_priv);
++void *i915_sync_prepare_request(struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring, u32 seqno);
++void *gen8_sync_prepare_request(struct drm_i915_gem_execbuffer2 *args,
++				struct intel_ringbuffer *ringbuf,
++				u32 seqno);
++int i915_sync_finish_request(void *handle,
++				struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring);
++int gen8_sync_finish_request(void *handle,
++			     struct drm_i915_gem_execbuffer2 *args,
++			     struct intel_ringbuffer *ringbuf);
++void i915_sync_cancel_request(void *handle,
++			      struct drm_i915_gem_execbuffer2 *args,
++			      struct intel_engine_cs *ring);
++void i915_sync_timeline_advance(struct intel_engine_cs *ring);
++void i915_sync_hung_ring(struct intel_engine_cs *ring);
++
++#else
++
++static inline
++int i915_sync_timeline_create(struct drm_device *dev,
++				const char *name,
++				struct intel_engine_cs *ring)
++{
++	return 0;
++}
++
++static inline
++void i915_sync_timeline_destroy(struct intel_engine_cs *ring)
++{
++
++}
++
++static inline
++void i915_sync_reset_timelines(struct drm_i915_private *dev_priv)
++{
++
++}
++
++static inline
++void *i915_sync_prepare_request(struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring, u32 seqno)
++{
++	return NULL;
++}
++
++static inline
++void *gen8_sync_prepare_request(struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring,
++				struct intel_context *ctx, u32 seqno)
++{
++	return NULL;
++}
++
++static inline
++int i915_sync_finish_request(void *handle,
++				struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring)
++{
++	return 0;
++}
++
++static inline
++int gen8_sync_finish_request(void *handle,
++				struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring,
++				struct intel_context *ctx)
++{
++	return 0;
++}
++
++static inline
++void i915_sync_cancel_request(void *handle,
++				struct drm_i915_gem_execbuffer2 *args,
++				struct intel_engine_cs *ring)
++{
++
++}
++
++static inline
++void i915_sync_timeline_advance(struct intel_engine_cs *ring)
++{
++
++}
++
++static inline
++void i915_sync_hung_ring(struct intel_engine_cs *ring)
++{
++
++}
++
++#endif /* CONFIG_DRM_I915_SYNC */
++
++#endif /* _INTEL_SYNC_H_ */
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 11ae57a..0a820aa 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -304,7 +304,9 @@ struct csc_coeff {
+ #define DRM_IOCTL_I915_HWS_ADDR		DRM_IOW(DRM_COMMAND_BASE + DRM_I915_HWS_ADDR, struct drm_i915_gem_init)
+ #define DRM_IOCTL_I915_GEM_INIT		DRM_IOW(DRM_COMMAND_BASE + DRM_I915_GEM_INIT, struct drm_i915_gem_init)
+ #define DRM_IOCTL_I915_GEM_EXECBUFFER	DRM_IOW(DRM_COMMAND_BASE + DRM_I915_GEM_EXECBUFFER, struct drm_i915_gem_execbuffer)
+-#define DRM_IOCTL_I915_GEM_EXECBUFFER2	DRM_IOW(DRM_COMMAND_BASE + DRM_I915_GEM_EXECBUFFER2, struct drm_i915_gem_execbuffer2)
++#define DRM_IOCTL_I915_GEM_EXECBUFFER2	\
++		DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_GEM_EXECBUFFER2, \
++			 struct drm_i915_gem_execbuffer2)
+ #define DRM_IOCTL_I915_GEM_PIN		DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_GEM_PIN, struct drm_i915_gem_pin)
+ #define DRM_IOCTL_I915_GEM_UNPIN	DRM_IOW(DRM_COMMAND_BASE + DRM_I915_GEM_UNPIN, struct drm_i915_gem_unpin)
+ #define DRM_IOCTL_I915_GEM_BUSY		DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_GEM_BUSY, struct drm_i915_gem_busy)
+@@ -819,7 +821,17 @@ struct drm_i915_gem_execbuffer2 {
+  */
+ #define I915_EXEC_HANDLE_LUT		(1<<12)
+ 
+-#define __I915_EXEC_UNKNOWN_FLAGS -(I915_EXEC_HANDLE_LUT<<1)
++/** Caller supplies a sync fence fd in the rsvd2 field.
++ * Wait for it to be signalled before starting the work
++ */
++#define I915_EXEC_WAIT_FENCE		(1<<13)
++
++/** Caller wants a sync fence fd for this execbuffer.
++ *  It will be returned in rsvd2
++ */
++#define I915_EXEC_REQUEST_FENCE         (1<<14)
++
++#define __I915_EXEC_UNKNOWN_FLAGS -(I915_EXEC_REQUEST_FENCE<<1)
+ 
+ #define I915_EXEC_CONTEXT_ID_MASK	(0xffffffff)
+ #define i915_execbuffer2_set_context_id(eb2, context) \
+-- 
+1.7.9.5
+

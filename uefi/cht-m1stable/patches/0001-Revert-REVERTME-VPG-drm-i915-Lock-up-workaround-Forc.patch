@@ -1,0 +1,245 @@
+From aa9849875fd9575e7de3d51e779ec326100b81c0 Mon Sep 17 00:00:00 2001
+Message-Id: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 1 Dec 2014 14:54:22 +0000
+Subject: [PATCH 01/63] Revert "REVERTME [VPG]: drm/i915: Lock-up workaround:
+ Forced context resubmission"
+
+Revert of commit 194e4dd19e3e1d4abffcd7a01a6c9a3a7f3e855c.
+
+Change-Id: I6fdec3ae45c7b202294d0456d8101872b3760a12
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c         |    1 -
+ drivers/gpu/drm/i915/i915_irq.c         |   54 +++------------------------
+ drivers/gpu/drm/i915/intel_lrc.c        |   61 -------------------------------
+ drivers/gpu/drm/i915/intel_lrc_tdr.h    |    3 --
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   11 ------
+ 5 files changed, 6 insertions(+), 124 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 6e38690..4191988 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1618,7 +1618,6 @@ i915_hangcheck_init(struct drm_device *dev)
+ 		dev_priv->ring[i].hangcheck.last_acthd = 0;
+ 		dev_priv->ring[i].hangcheck.ringid = i;
+ 		dev_priv->ring[i].hangcheck.dev = dev;
+-		dev_priv->ring[i].hangcheck.forced_resubmission_cnt = 0;
+ 
+ 		INIT_DELAYED_WORK(&dev_priv->ring[i].hangcheck.work,
+ 			i915_hangcheck_sample);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 9fb02f2..e5f4942 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -3470,8 +3470,6 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 	struct drm_device *dev;
+ 	struct drm_i915_private *dev_priv;
+ 	struct intel_engine_cs *ring;
+-	struct intel_context *current_context = NULL;
+-	enum context_submission_status status = CONTEXT_SUBMISSION_STATUS_OK;
+ 	struct intel_ring_hangcheck *hc =
+ 		container_of(work, typeof(*hc), work.work);
+ 
+@@ -3484,10 +3482,6 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 
+ 	/* Sample the current state */
+ 
+-	if (i915.enable_execlists)
+-		status = i915_gem_context_get_current_context(ring,
+-			&current_context);
+-
+ 	head = I915_READ_HEAD(ring) & HEAD_ADDR;
+ 	tail = I915_READ_TAIL(ring) & TAIL_ADDR;
+ 	acthd = intel_ring_get_active_head(ring);
+@@ -3514,10 +3508,10 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 
+ 	idle = ((head == tail) && (pending_work == 0));
+ 
+-	DRM_DEBUG_TDR("[%u] HD: 0x%08x 0x%08x, ACTHD: 0x%08x 0x%08x IC: %d " \
+-		      "status: %u\n", ring->id, (unsigned int) head,
+-		      (unsigned int) hc->last_hd, (unsigned int) acthd,
+-		      (unsigned int) hc->last_acthd, instdone_cmp, status);
++	DRM_DEBUG_TDR("[%u] HD: 0x%08x 0x%08x, ACTHD: 0x%08x 0x%08x IC: %d\n",
++		      ring->id, (unsigned int) head, (unsigned int) hc->last_hd,
++		      (unsigned int) acthd, (unsigned int) hc->last_acthd,
++		      instdone_cmp);
+ 	DRM_DEBUG_TDR("[%u] E:%d PW:%d TL:0x%08x Csq:0x%08x (%ld) Lsq:0x%08x " \
+ 		      "(%ld) Idle: %s\n", ring->id, empty, pending_work,
+ 		      (unsigned int) tail, (unsigned int) cur_seqno,
+@@ -3540,7 +3534,7 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 	    && (hc->last_hd == head)
+ 	    && instdone_cmp) {
+ 		/* Ring hasn't advanced in this sampling period */
+-		if (idle && (status == CONTEXT_SUBMISSION_STATUS_OK)) {
++		if (idle) {
+ 			ring->hangcheck.action = HANGCHECK_IDLE;
+ 
+ 			/* The hardware is idle */
+@@ -3560,7 +3554,7 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 				hc->count = 0;
+ 				resched_timer = 0;
+ 			}
+-		} else if (status == CONTEXT_SUBMISSION_STATUS_OK) {
++		} else {
+ 			/*
+ 			 * The hardware is busy but has not advanced
+ 			 * since the last sample - possible hang
+@@ -3578,34 +3572,6 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 	hc->last_acthd = acthd;
+ 	memcpy(hc->prev_instdone, instdone, sizeof(instdone));
+ 
+-	if (i915.enable_execlists) {
+-		if (resched_timer & (status == CONTEXT_SUBMISSION_STATUS_SUBMITTED)) {
+-			u32 remaining_detections =
+-				(DRM_I915_FORCED_RESUBMISSION_THRESHOLD -
+-					++hc->forced_resubmission_cnt);
+-
+-			DRM_DEBUG_TDR("HACK: EXECLIST_STATUS context ID=0 on" \
+-				      " %s with requests pending! " \
+-				      "Forced submission in %u\n",
+-				      ring->name,
+-				      (unsigned int) remaining_detections);
+-
+-		} else {
+-			/* Wait some more before forcing resubmission again */
+-			hc->forced_resubmission_cnt = 0;
+-		}
+-
+-		if (hc->forced_resubmission_cnt ==
+-				DRM_I915_FORCED_RESUBMISSION_THRESHOLD) {
+-			DRM_DEBUG_TDR("HACK: Forcing resubmission to move " \
+-				      "%s forward.\n", ring->name);
+-			intel_execlists_TDR_force_resubmit(dev_priv, hc->ringid);
+-			hc->forced_resubmission_cnt = 0;
+-		}
+-	}
+-
+-	resched_timer &= (status != CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED);
+-
+ 	if (resched_timer) {
+ 		/*
+ 		 * Work is still pending! Reschedule hang check to come back
+@@ -3615,14 +3581,6 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 				&dev_priv->ring[hc->ringid].hangcheck.work,
+ 				round_jiffies_up_relative(DRM_I915_HANGCHECK_JIFFIES));
+ 	}
+-
+-	if (i915.enable_execlists) {
+-		unsigned long flags;
+-
+-		spin_lock_irqsave(&ring->execlist_lock, flags);
+-		i915_gem_context_unreference(current_context);
+-		spin_unlock_irqrestore(&ring->execlist_lock, flags);
+-	}
+ }
+ 
+ void i915_queue_hangcheck(struct drm_device *dev, u32 ringid,
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index f28b0c5..b891d39 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -2940,64 +2940,3 @@ error:
+ 	drm_gem_object_unreference(&ctx_obj->base);
+ 	return ret;
+ }
+-
+-/**
+- * execlists_TDR_force_resubmit() - resubmit pending context if EXECLIST_STATUS
+- * context ID is stuck to 0.
+- *
+- * @dev_priv: ...
+- * @ringid: engine to resubmit context to.
+- *
+- * This function is simply a hack to work around a hardware oddity that
+- * manifests itself through stuck context ID zero in EXECLIST_STATUS register
+- * even though context is pending post-submission. There is no reason for this
+- * hardware behaviour but until we have resolved this issue we need this
+- * workaround.
+- */
+-void intel_execlists_TDR_force_resubmit(struct drm_i915_private *dev_priv,
+-		unsigned ringid)
+-{
+-	unsigned long flags;
+-	struct intel_engine_cs *ring = &dev_priv->ring[ringid];
+-	struct intel_ctx_submit_request *req = NULL;
+-	struct intel_context *ctx = NULL;
+-	unsigned hw_context = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
+-
+-	if (spin_is_locked(&ring->execlist_lock))
+-		return;
+-	else
+-		spin_lock_irqsave(&ring->execlist_lock, flags);
+-
+-	if (hw_context) {
+-		WARN(1, "EXECLIST_STATUS context ID (%u) on %s is " \
+-			"not zero - no need for forced resubmission!\n",
+-			hw_context, ring->name);
+-		goto exit;
+-	}
+-
+-	req = list_first_entry_or_null(&ring->execlist_queue,
+-			struct intel_ctx_submit_request, execlist_link);
+-
+-	if (req) {
+-		if (req->ctx) {
+-			ctx = req->ctx;
+-			i915_gem_context_reference(ctx);
+-
+-		} else {
+-			WARN(1, "No context in request %p!", req);
+-			goto exit;
+-		}
+-	} else {
+-		WARN(1, "No context submitted to %s!\n", ring->name);
+-		goto exit;
+-	}
+-
+-	execlists_TDR_context_unqueue(ring);
+-
+-exit:
+-	if (ctx)
+-		i915_gem_context_unreference(ctx);
+-
+-	spin_unlock_irqrestore(&ring->execlist_lock, flags);
+-}
+-
+diff --git a/drivers/gpu/drm/i915/intel_lrc_tdr.h b/drivers/gpu/drm/i915/intel_lrc_tdr.h
+index dd837c3..95949a0 100644
+--- a/drivers/gpu/drm/i915/intel_lrc_tdr.h
++++ b/drivers/gpu/drm/i915/intel_lrc_tdr.h
+@@ -34,8 +34,5 @@ enum context_submission_status
+ intel_execlists_TDR_get_submitted_context(struct intel_engine_cs *ring,
+ 		struct intel_context **ctx);
+ 
+-void intel_execlists_TDR_force_resubmit(struct drm_i915_private *dev_priv,
+-		unsigned ringid);
+-
+ #endif /* _INTEL_LRC_TDR_H_ */
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 93c1321..695d908 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -241,17 +241,6 @@ struct intel_ring_hangcheck {
+ 	 * idleness
+ 	 */
+ 	u32 last_seqno;
+-
+-	/* Forced resubmission counter */
+-	u32 forced_resubmission_cnt;
+-
+-	/*
+-	 * Number of detections before forced resubmission is
+-	 * carried out. Yes, this number is arbitrary and is based
+-	 * on empirical evidence.
+-	 */
+-#define DRM_I915_FORCED_RESUBMISSION_THRESHOLD 2
+-
+ };
+ 
+ struct intel_ringbuffer {
+-- 
+1.7.9.5
+

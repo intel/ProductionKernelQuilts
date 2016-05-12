@@ -1,0 +1,2449 @@
+From abbec76d4ddc8d0cc156980bbe8683eaf5db7ce4 Mon Sep 17 00:00:00 2001
+Message-Id: <abbec76d4ddc8d0cc156980bbe8683eaf5db7ce4.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: rtshiva <sivakumar.thulasimani@intel.com>
+Date: Tue, 3 Feb 2015 09:07:35 +0530
+Subject: [PATCH 51/95] MUST_REBASE [VPG]: drivers/video/adf: Platform support
+ for DP/eDP
+
+This patch adds CHV/VLV platform support for DP/eDP panels. The changes
+include
+1) enumerating vlv_dp_port
+2) update MNTu values in vlv_pipe
+3) enable and disable dp panel in vlv_pipeline
+4) other platform access functions that can be called from
+    encoder are implemented in vlv_pipeline
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5485
+Change-Id: Ia5e5ef0eda395893701d77e000c91777030f3641
+Signed-off-by: Thulasimani, Sivakumar <sivakumar.thulasimani@intel.com>
+---
+ drivers/gpu/drm/gma500/psb_intel_reg.h             |    2 +-
+ drivers/video/adf/intel/core/vlv/Makefile          |    3 +-
+ drivers/video/adf/intel/core/vlv/chv_dpio.c        |    7 +
+ drivers/video/adf/intel/core/vlv/vlv_dc_config.c   |   13 +-
+ drivers/video/adf/intel/core/vlv/vlv_dp_port.c     |  956 ++++++++++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_pipe.c        |   46 +-
+ drivers/video/adf/intel/core/vlv/vlv_pipeline.c    |  257 +++++-
+ drivers/video/adf/intel/core/vlv/vlv_pll.c         |   44 +-
+ .../adf/intel/include/core/common/dp/dp_panel.h    |  422 +++++++++
+ .../adf/intel/include/core/common/dp/gen_dp_pipe.h |   60 ++
+ .../video/adf/intel/include/core/intel_dc_config.h |   19 +-
+ .../adf/intel/include/core/vlv/vlv_dc_config.h     |   25 +
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |    5 +
+ .../video/adf/intel/include/core/vlv/vlv_dp_port.h |   78 ++
+ .../video/adf/intel/include/core/vlv/vlv_pipe.h    |    8 +-
+ drivers/video/adf/intel/include/core/vlv/vlv_pll.h |    4 +-
+ 16 files changed, 1919 insertions(+), 30 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/vlv/vlv_dp_port.c
+ create mode 100644 drivers/video/adf/intel/include/core/common/dp/dp_panel.h
+ create mode 100644 drivers/video/adf/intel/include/core/common/dp/gen_dp_pipe.h
+ create mode 100644 drivers/video/adf/intel/include/core/vlv/vlv_dp_port.h
+
+diff --git a/drivers/gpu/drm/gma500/psb_intel_reg.h b/drivers/gpu/drm/gma500/psb_intel_reg.h
+index 0be30e4..e2f8f69 100644
+--- a/drivers/gpu/drm/gma500/psb_intel_reg.h
++++ b/drivers/gpu/drm/gma500/psb_intel_reg.h
+@@ -539,7 +539,7 @@
+ #define PIPE_TE_ENABLE				(1UL << 22)
+ #define PIPE_LEGACY_BLC_EVENT_ENABLE		(1UL << 22)
+ #define PIPE_DPST_EVENT_ENABLE			(1UL << 23)
+-#define PIPE_VSYNC_ENABL			(1UL << 25)
++#define PIPE_VSYNC_ENABLE			(1UL << 25)
+ #define PIPE_HDMI_AUDIO_UNDERRUN		(1UL << 26)
+ #define PIPE_HDMI_AUDIO_BUFFER_DONE		(1UL << 27)
+ #define PIPE_FIFO_UNDERRUN			(1UL << 31)
+diff --git a/drivers/video/adf/intel/core/vlv/Makefile b/drivers/video/adf/intel/core/vlv/Makefile
+index e3c88c8..fe0f05b 100644
+--- a/drivers/video/adf/intel/core/vlv/Makefile
++++ b/drivers/video/adf/intel/core/vlv/Makefile
+@@ -13,4 +13,5 @@ obj-y := vlv_dc_config.o \
+ 	vlv_dsi_port_cmd.o \
+ 	vlv_pipeline.o \
+ 	vlv_hdmi_port.o \
+-	chv_dpio.o
++	chv_dpio.o \
++	vlv_dp_port.o
+diff --git a/drivers/video/adf/intel/core/vlv/chv_dpio.c b/drivers/video/adf/intel/core/vlv/chv_dpio.c
+index 2f1df24..a252615 100644
+--- a/drivers/video/adf/intel/core/vlv/chv_dpio.c
++++ b/drivers/video/adf/intel/core/vlv/chv_dpio.c
+@@ -121,6 +121,8 @@ int vlv_disp_to_port(struct vlv_pipeline *pipeline)
+ 		break;
+ 	case INTEL_PIPE_DP:
+ 	case INTEL_PIPE_EDP:
++		port_id = pipeline->port.dp_port.port_id;
++		break;
+ 	default:
+ 		BUG();
+ 		return -EINVAL;
+@@ -293,6 +295,11 @@ void chv_dpio_update_channel(struct intel_pipeline *pipeline)
+ 	u32 port = 0;
+ 	u32 pll = disp->pll.pll_id;
+ 
++	if (disp->type == INTEL_PIPE_HDMI)
++		port = disp->port.hdmi_port.port_id;
++	else
++		port = disp->port.dp_port.port_id;
++
+ 	mutex_lock(&config->dpio_lock);
+ 
+ 	/* Need to program for cross linking alone, otherwise use default */
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+index 6812a9e..a906870 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+@@ -16,10 +16,13 @@
+ #include <core/intel_dc_config.h>
+ #include <core/common/dsi/dsi_pipe.h>
+ #include <core/common/hdmi/gen_hdmi_pipe.h>
++#include <core/common/dp/gen_dp_pipe.h>
+ #include <core/vlv/vlv_dc_config.h>
+ #include <core/vlv/vlv_pri_plane.h>
+ #include <core/vlv/vlv_sp_plane.h>
+ 
++/* only PIPE_C should use DPIO, A & B shares DPIO_2  */
++#define CHV_DPIO(pipe) (((pipe == PIPE_C) ? IOSF_PORT_DPIO : IOSF_PORT_DPIO_2))
+ #define VLV_ID(pipe, plane) ((pipe * VLV_MAX_PLANES) + plane)
+ 
+ int chv_pipe_offsets[] = {
+@@ -47,8 +50,6 @@ int chv_cursor_offsets[] = {
+ };
+ 
+ 
+-#define CHV_DPIO(pipe) (((pipe & 0x1) ? IOSF_PORT_DPIO : IOSF_PORT_DPIO_2))
+-
+ static const struct intel_dc_attachment chv_allowed_attachments[] = {
+ 	{
+ 		.pipe_id = PIPE_A,
+@@ -228,6 +229,7 @@ static int vlv_initialize_port(struct vlv_dc_config *vlv_config,
+ 			int pipe, int port, int type, u8 disp_no)
+ {
+ 	struct vlv_dsi_port *dsi_port = NULL;
++	struct vlv_dp_port *dp_port = NULL;
+ 	struct vlv_hdmi_port *hdmi_port = NULL;
+ 	struct vlv_pipeline *disp = NULL;
+ 	struct dsi_pipe *dsi_pipe = NULL;
+@@ -244,6 +246,12 @@ static int vlv_initialize_port(struct vlv_dc_config *vlv_config,
+ 			vlv_dsi_port_init(dsi_port, port, pipe);
+ 		}
+ 		break;
++	case INTEL_PIPE_DP:
++	case INTEL_PIPE_EDP:
++		dp_port = &disp->port.dp_port;
++		vlv_dp_port_init(dp_port, port, pipe, type,
++		vlv_config->base.dev);
++		break;
+ 	case INTEL_PIPE_HDMI:
+ 		hdmi_port = &disp->port.hdmi_port;
+ 		vlv_hdmi_port_init(hdmi_port, port, pipe);
+@@ -402,6 +410,7 @@ static u16 chv_dc_get_stepping(struct pci_dev *pdev)
+ 	pr_info("ADF %s CHV stepping id = 0x%x\n", __func__, stepping);
+ 	return stepping;
+ }
++
+ struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
+ {
+ 	struct vlv_dc_config *config;
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dp_port.c b/drivers/video/adf/intel/core/vlv/vlv_dp_port.c
+new file mode 100644
+index 0000000..139f1c5
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/vlv_dp_port.c
+@@ -0,0 +1,956 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Created on 15 Sep 2014
++ * Author: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
++ */
++
++#include <linux/i2c.h>
++#include <drm/i915_adf.h>
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_dc_regs.h>
++#include <core/vlv/vlv_dp_port.h>
++
++
++#define BARE_ADDRESS_SIZE	3
++#define HEADER_SIZE		(BARE_ADDRESS_SIZE + 1)
++
++#define IDLE_ON_MASK		(PP_ON | PP_SEQUENCE_MASK | 0 \
++						| PP_SEQUENCE_STATE_MASK)
++#define IDLE_ON_VALUE		(PP_ON | PP_SEQUENCE_NONE | 0 \
++						| PP_SEQUENCE_STATE_ON_IDLE)
++
++#define IDLE_OFF_MASK		(PP_ON | PP_SEQUENCE_MASK | 0 | 0)
++#define IDLE_OFF_VALUE		(0     | PP_SEQUENCE_NONE | 0 | 0)
++
++#define IDLE_CYCLE_MASK		(PP_ON | PP_SEQUENCE_MASK |\
++				PP_CYCLE_DELAY_ACTIVE | PP_SEQUENCE_STATE_MASK)
++#define IDLE_CYCLE_VALUE	(0     | PP_SEQUENCE_NONE | 0 \
++						| PP_SEQUENCE_STATE_OFF_IDLE)
++#define MAXIMUM_BRIGHTNESS	100
++#define PWM_CTL_DEFAULT		0x1592b00
++#define PWM_DUTY_CYCLE		0x1e841e84
++#define PLATFORM_MAX_BRIGHTNESS	0x1FFF
++#define PWM_ENABLE		(1 << 31)
++
++static u32 wait_panel_status(struct vlv_dp_port *port, u32 mask, u32 value)
++{
++	u32 pp_stat_reg, pp_ctrl_reg;
++	u32 err = 0;
++
++	pp_stat_reg = port->pp_stat_offset;
++	pp_ctrl_reg = port->pp_ctl_offset;
++
++	pr_debug("mask %08x value %08x status %08x control %08x\n",
++			mask, value,
++			REG_READ(pp_stat_reg),
++			REG_READ(pp_ctrl_reg));
++
++	if (_wait_for((REG_READ(pp_stat_reg) & mask) == value, 5000, 10)) {
++		pr_debug("Panel status timeout: status %08x control %08x\n",
++				REG_READ(pp_stat_reg),
++				REG_READ(pp_ctrl_reg));
++		err = -ETIMEDOUT;
++	}
++
++	return err;
++}
++
++u8 get_vswing_max(u8 preemp)
++{
++	switch (preemp) {
++	case 0:
++		return DP_TRAIN_VOLTAGE_SWING_1200;
++	case 1:
++		return DP_TRAIN_VOLTAGE_SWING_800;
++	case 2:
++		return DP_TRAIN_VOLTAGE_SWING_600;
++	case 3:
++	default:
++		return DP_TRAIN_VOLTAGE_SWING_400;
++	}
++}
++
++u8 get_preemp_max(void)
++{
++	return DP_TRAIN_PRE_EMPHASIS_9_5 >> DP_TRAIN_PRE_EMPHASIS_SHIFT;
++}
++
++void vlv_dp_port_get_max_vswing_preemp(struct vlv_dp_port *port,
++	enum vswing_level *max_v, enum preemp_level *max_p)
++{
++	*max_v = e1_2;
++	if (port->is_edp)
++		*max_p = e6dB;
++	else
++		*max_p = e9_5dB;
++}
++
++u32 vlv_dp_port_panel_power_seq(struct vlv_dp_port *port, bool enable)
++{
++	u32 pp = 0;
++	u32 err = 0;
++
++
++	if (enable) {
++		wait_panel_status(port, IDLE_CYCLE_MASK, IDLE_CYCLE_VALUE);
++
++		pp = REG_READ(port->pp_ctl_offset);
++		pp |= (POWER_TARGET_ON | PANEL_POWER_RESET | (1 << 3));
++
++		REG_WRITE(port->pp_ctl_offset, pp);
++		err = wait_panel_status(port, IDLE_ON_MASK, IDLE_ON_VALUE);
++	} else {
++		pp = REG_READ(port->pp_ctl_offset);
++		pp &= ~(POWER_TARGET_ON | PANEL_POWER_RESET);
++
++		REG_WRITE(port->pp_ctl_offset, pp);
++		msleep(port->pps_delays.t10);
++		err = wait_panel_status(port, IDLE_OFF_MASK, IDLE_OFF_VALUE);
++	}
++
++	pr_info("ctl = %8x stat = %8x\n", REG_READ(port->pp_ctl_offset),
++					REG_READ(port->pp_stat_offset));
++	return err;
++}
++
++u32 vlv_dp_port_pwm_seq(struct vlv_dp_port *port, bool enable)
++{
++	u32 val = 0;
++
++	if (enable) {
++		val = PWM_CTL_DEFAULT | PWM_ENABLE;
++		REG_WRITE(port->pwm_ctl_offset, val);
++		val = port->duty_cycle_delay = PWM_DUTY_CYCLE;
++		REG_WRITE(port->pwm_duty_cycle_offset, val);
++		mdelay(5);
++	} else {
++
++		val = REG_READ(port->pwm_duty_cycle_offset);
++		port->duty_cycle_delay = val;
++
++		/* clear the duty cycle */
++		val &= ~BACKLIGHT_DUTY_CYCLE_MASK;
++		REG_WRITE(port->pwm_duty_cycle_offset, val);
++
++		mdelay(5);
++		val = REG_READ(port->pwm_ctl_offset);
++		val &= ~BIT31;
++		REG_WRITE(port->pwm_ctl_offset, val);
++	}
++	return 0;
++}
++
++u32 vlv_dp_port_backlight_seq(struct vlv_dp_port *port, bool enable)
++{
++	u32 pp = 0;
++
++	/* FIXME: implement register locking */
++	if (enable) {
++		vlv_dp_port_pwm_seq(port, enable);
++
++		msleep(port->pps_delays.t8);
++		pp = REG_READ(port->pp_ctl_offset);
++		pp |= EDP_BLC_ENABLE;
++		REG_WRITE(port->pp_ctl_offset, pp);
++	} else {
++		pp = REG_READ(port->pp_ctl_offset);
++		pp &= ~EDP_BLC_ENABLE;
++		REG_WRITE(port->pp_ctl_offset, pp);
++		vlv_dp_port_pwm_seq(port, enable);
++	}
++
++	return 0;
++}
++
++u32 vlv_dp_port_enable(struct vlv_dp_port *port, u32 flags,
++		union encoder_params *params)
++{
++	u32 reg_val = 0;
++	u8 lane_count = params->dp.lane_count;
++
++	reg_val = REG_READ(port->offset);
++	reg_val |= DP_VOLTAGE_0_4 | DP_PRE_EMPHASIS_0;
++	reg_val |= DP_PORT_WIDTH(lane_count);
++
++	/* FIXME: set audio if supported */
++	if (flags & DRM_MODE_FLAG_PHSYNC)
++		reg_val |= DP_SYNC_HS_HIGH;
++
++	if (flags & DRM_MODE_FLAG_PVSYNC)
++		reg_val |= DP_SYNC_VS_HIGH;
++
++	reg_val &= ~(DP_LINK_TRAIN_MASK);
++	reg_val |= DP_LINK_TRAIN_PAT_IDLE;
++
++	/* FIXME: find a way to check this based on dpcd */
++	reg_val |= DP_ENHANCED_FRAMING;
++
++	/*
++	 * bit varies between VLV/CHV hence using local var
++	 * that was set during init itself
++	 */
++	reg_val |= port->pipe_select_val;
++
++	REG_WRITE(port->offset, reg_val);
++
++	reg_val |= DP_PORT_EN;
++
++	REG_WRITE(port->offset, reg_val);
++	return 0;
++}
++
++u32 vlv_dp_port_disable(struct vlv_dp_port *port)
++{
++	u32 reg_val = 0;
++
++	reg_val = REG_READ(port->offset);
++
++	/* set link to idle */
++	reg_val &= ~DP_LINK_TRAIN_MASK_CHV;
++	reg_val |= DP_LINK_TRAIN_PAT_IDLE;
++	REG_WRITE(port->offset, reg_val);
++	mdelay(17);
++
++	/* disable port */
++	reg_val &= ~DP_AUDIO_OUTPUT_ENABLE;
++	reg_val &= ~DP_PORT_EN;
++	REG_WRITE(port->offset, reg_val);
++
++	reg_val = REG_READ(port->hist_guard_offset);
++	reg_val &= ~(1 << 31);
++	REG_WRITE(port->hist_guard_offset, reg_val);
++
++	reg_val = REG_READ(port->hist_ctl_offset);
++	reg_val &= ~(1 << 31);
++	REG_WRITE(port->hist_ctl_offset, reg_val);
++
++	/* perform lane reset frm chv_post_disable_dp */
++	return 0;
++}
++
++bool vlv_dp_port_is_screen_connected(struct vlv_dp_port *port)
++{
++	bool ret = false;
++	u32 bit = 0;
++	u32 val = REG_READ(PORT_HOTPLUG_STAT);
++
++	switch (port->port_id) {
++	case PORT_B:
++		bit = PORTB_HOTPLUG_LIVE_STATUS_VLV;
++		break;
++	case PORT_C:
++		bit = PORTC_HOTPLUG_LIVE_STATUS_VLV;
++		break;
++	case PORT_D:
++		bit = PORTD_HOTPLUG_LIVE_STATUS_VLV;
++		break;
++	default:
++		break;
++	}
++
++	if (val & bit)
++		ret = true;
++
++	return ret;
++
++}
++
++static u32 vlv_dp_port_aux_wait_done(struct vlv_dp_port *port, bool has_aux_irq)
++{
++	u32 ch_ctl = port->aux_ctl_offset;
++	u32 status = 0;
++	bool done = true;
++
++#define c (((status = REG_READ(ch_ctl)) & DP_AUX_CH_CTL_SEND_BUSY) == 0)
++	if (has_aux_irq)
++		;
++	/*
++	 * FIXME: check if this required
++	 * done = wait_event_timeout(dev_priv->gmbus_wait_queue, c,
++	 *				msecs_to_jiffies_timeout(10));
++	 */
++	else
++		done = wait_for_atomic(c, 10) == 0;
++	if (!done)
++		pr_err("dp aux hw did not signal timeout (has irq: %i)!\n",
++			has_aux_irq);
++#undef c
++
++	return status;
++}
++
++static u32 get_aux_send_ctl(bool has_aux_irq, int send_bytes,
++		uint32_t aux_clock_divider)
++{
++	u32 precharge, timeout;
++
++	precharge = 5;
++	timeout = DP_AUX_CH_CTL_TIME_OUT_400us;
++
++	return DP_AUX_CH_CTL_SEND_BUSY |
++		DP_AUX_CH_CTL_DONE |
++		(has_aux_irq ? DP_AUX_CH_CTL_INTERRUPT : 0) |
++		DP_AUX_CH_CTL_TIME_OUT_ERROR |
++		timeout |
++		DP_AUX_CH_CTL_RECEIVE_ERROR |
++		(send_bytes << DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT) |
++		(precharge << DP_AUX_CH_CTL_PRECHARGE_2US_SHIFT) |
++		(aux_clock_divider << DP_AUX_CH_CTL_BIT_CLOCK_2X_SHIFT);
++}
++
++static u32 get_aux_clock_divider(u32 index)
++{
++	return index ? 0 : 100;
++}
++
++static u32 pack_aux(uint8_t *src, int src_bytes)
++{
++	int	i;
++	uint32_t v = 0;
++
++	if (src_bytes > 4)
++		src_bytes = 4;
++	for (i = 0; i < src_bytes; i++)
++		v |= ((uint32_t) src[i]) << ((3-i) * 8);
++	return v;
++}
++
++static void unpack_aux(uint32_t src, uint8_t *dst, int dst_bytes)
++{
++	int i;
++	if (dst_bytes > 4)
++		dst_bytes = 4;
++	for (i = 0; i < dst_bytes; i++)
++		dst[i] = src >> ((3-i) * 8);
++}
++
++static u32 vlv_dp_port_aux_ch(struct vlv_dp_port *port,
++		u8 *send, u32 send_bytes,
++		u8 *recv, u32 recv_size)
++{
++	int try, clock = 0;
++	u32 ch_data, ch_ctl;
++	u32 aux_clock_divider;
++	u32 status = 0, recv_bytes = 0;
++	u32 ret = 0, i;
++	/* FIXME: check if this is needed */
++	bool has_aux_irq = false;
++	u32 val = 0;
++
++	ch_ctl = port->aux_ctl_offset;
++	ch_data = port->aux_ctl_offset + 4;
++
++	/* Try to wait for any previous AUX channel activity */
++	for (try = 0; try < 3; try++) {
++		status = REG_READ(ch_ctl);
++		if ((status & DP_AUX_CH_CTL_SEND_BUSY) == 0)
++			break;
++		mdelay(1);
++	}
++
++	if (try == 3) {
++		pr_err("%s:aux_ch not started status 0x%08x\n",
++			 __func__, REG_READ(ch_ctl));
++		ret = -EBUSY;
++		goto aux_out;
++	}
++
++	/* Only 5 data registers! */
++	if (WARN_ON(send_bytes > 20 || recv_size > 20)) {
++		ret = -E2BIG;
++		goto aux_out;
++	}
++
++	while ((aux_clock_divider = get_aux_clock_divider(clock++))) {
++		u32 send_ctl = get_aux_send_ctl(has_aux_irq, send_bytes,
++							aux_clock_divider);
++
++		/* Must try at least 3 times according to DP spec */
++		for (try = 0; try < 5; try++) {
++			/* Load the send data into the aux data registers */
++			for (i = 0; i < send_bytes; i += 4) {
++				val = pack_aux(send + i, send_bytes - i);
++				REG_WRITE(ch_data + i, val);
++			}
++
++			/* Send the command and wait for it to complete */
++			REG_WRITE(ch_ctl, send_ctl);
++
++			/* FIXME:!!!!!!!!!!!!! check if has_irq helps here  */
++			status = vlv_dp_port_aux_wait_done(port, false);
++
++			status = REG_READ(ch_ctl);
++			val =  status |
++				DP_AUX_CH_CTL_DONE |
++				DP_AUX_CH_CTL_TIME_OUT_ERROR |
++				DP_AUX_CH_CTL_RECEIVE_ERROR;
++
++			/* Clear done status and any errors */
++			REG_WRITE(ch_ctl, val);
++
++			if (status & (DP_AUX_CH_CTL_TIME_OUT_ERROR |
++					DP_AUX_CH_CTL_RECEIVE_ERROR))
++				continue;
++			if (status & DP_AUX_CH_CTL_DONE)
++				break;
++		}
++		if (status & DP_AUX_CH_CTL_DONE)
++			break;
++	}
++
++	if ((status & DP_AUX_CH_CTL_DONE) == 0) {
++		pr_warn("dp_port_aux_ch not done status 0x%08x\n", status);
++		ret = -EBUSY;
++		goto aux_out;
++	}
++
++	/*
++	 * Check for timeout or receive error.
++	 * Timeouts occur when the sink is not connected
++	 */
++	if (status & DP_AUX_CH_CTL_RECEIVE_ERROR) {
++		pr_warn("dp_port_aux_ch receive error status 0x%08x\n", status);
++		ret = -EIO;
++		goto aux_out;
++	}
++
++	/*
++	 * Timeouts occur when the device isn't connected, so they're
++	 * "normal" -- don't fill the kernel log with these
++	 */
++	if (status & DP_AUX_CH_CTL_TIME_OUT_ERROR) {
++		pr_warn("dp_port_aux_ch timeout status 0x%08x\n", status);
++		ret = -ETIMEDOUT;
++		goto aux_out;
++	}
++
++	/* Unload any bytes sent back from the other side */
++	recv_bytes = ((status & DP_AUX_CH_CTL_MESSAGE_SIZE_MASK) >>
++		      DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT);
++	if (recv_bytes > recv_size)
++		recv_bytes = recv_size;
++
++	for (i = 0; i < recv_bytes; i += 4)
++		unpack_aux(REG_READ(ch_data + i),
++			   recv + i, recv_bytes - i);
++
++	ret = recv_bytes;
++
++aux_out:
++	return ret;
++}
++
++u32 vlv_dp_port_aux_transfer(struct vlv_dp_port *port,
++		struct dp_aux_msg *msg)
++{
++	uint8_t txbuf[20], rxbuf[20];
++	size_t txsize, rxsize;
++	u32 ret;
++
++	mutex_lock(&port->hw_mutex);
++
++	txbuf[0] = msg->request << 4;
++	txbuf[1] = msg->address >> 8;
++	txbuf[2] = msg->address & 0xff;
++	txbuf[3] = msg->size - 1;
++
++	switch (msg->request & ~DP_AUX_I2C_MOT) {
++	case DP_AUX_NATIVE_WRITE:
++	case DP_AUX_I2C_WRITE:
++		txsize = msg->size ? HEADER_SIZE + msg->size :
++					BARE_ADDRESS_SIZE;
++		rxsize = 1;
++
++		if (WARN_ON(txsize > 20)) {
++			ret = -E2BIG;
++			goto aux_tx_exit;
++		}
++
++		memcpy(txbuf + HEADER_SIZE, msg->buffer, msg->size);
++		ret = vlv_dp_port_aux_ch(port, txbuf, txsize, rxbuf, rxsize);
++		if ((ret > 0) && (ret < 20)) {
++			msg->reply = rxbuf[0] >> 4;
++
++			/* Return payload size. */
++			ret = msg->size;
++		}
++		break;
++
++	case DP_AUX_NATIVE_READ:
++	case DP_AUX_I2C_READ:
++		txsize = msg->size ? HEADER_SIZE : BARE_ADDRESS_SIZE;
++		rxsize = msg->size + 1;
++
++		if (WARN_ON(rxsize > 20)) {
++			ret = -E2BIG;
++			goto aux_tx_exit;
++		}
++		ret = vlv_dp_port_aux_ch(port, txbuf, txsize, rxbuf, rxsize);
++		if ((ret > 0) && (ret < 20)) {
++			msg->reply = rxbuf[0] >> 4;
++			/*
++			 * Assume happy day, and copy the data. The caller is
++			 * expected to check msg->reply before touching it.
++			 *
++			 * Return payload size.
++			 */
++			ret--;
++			memcpy(msg->buffer, rxbuf + 1, ret);
++		}
++		break;
++
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++aux_tx_exit:
++	mutex_unlock(&port->hw_mutex);
++	return ret;
++
++}
++
++u32 vlv_dp_port_set_signal_levels(struct vlv_dp_port *port,
++	struct link_params *params, u32 *deemp, u32 *margin)
++{
++	/* FIXME: implement this */
++	BUG();
++	return -EINVAL;
++}
++
++void vlv_dp_port_get_adjust_train(struct vlv_dp_port *port,
++	struct link_params *params)
++{
++	u8 v = 0, this_v = 0, p = 0, this_p = 0;
++	u32 link_status;
++	u8 temp;
++	struct dp_aux_msg msg = {0};
++	int lane;
++	u8 preemph_max;
++	u8 voltage_max;
++
++	/* read status 206 & 207 */
++	msg.address = DP_ADJUST_REQUEST_LANE0_1;
++	msg.request = DP_AUX_NATIVE_READ;
++	msg.buffer = (u8 *) &link_status;
++	msg.size = 2;
++
++	vlv_dp_port_aux_transfer(port, &msg);
++	for (lane = 0; lane < params->lane_count; lane++) {
++		temp = (u8) (0xF & (link_status >> (lane * 4)));
++		this_v = (temp & DP_TRAIN_VOLTAGE_SWING_MASK);
++		this_p = ((temp & 0xC) >> 2);
++
++		if (this_v > v)
++			v = this_v;
++		if (this_p > p)
++			p = this_p;
++	}
++
++	params->vswing = v;
++	params->preemp = p;
++
++	preemph_max = get_preemp_max();
++	if (p >= preemph_max)
++		params->preemp = preemph_max;
++
++	voltage_max = get_vswing_max(p);
++	if (v >= voltage_max)
++		params->vswing = voltage_max;
++}
++
++u32 vlv_dp_port_set_link_pattern(struct vlv_dp_port *port,
++		u8 train_pattern)
++{
++	u32 val = 0;
++
++	val = REG_READ(port->offset);
++
++	if (train_pattern & DP_LINK_SCRAMBLING_DISABLE)
++		val |= DP_TP_CTL_SCRAMBLE_DISABLE;
++	else
++		val &= ~DP_TP_CTL_SCRAMBLE_DISABLE;
++
++
++	val &= ~DP_LINK_TRAIN_MASK_CHV;
++
++	switch (train_pattern & DP_TRAINING_PATTERN_MASK) {
++	case DP_TRAINING_PATTERN_DISABLE:
++		val |= DP_LINK_TRAIN_OFF;
++		break;
++	case DP_TRAINING_PATTERN_1:
++		val |= DP_LINK_TRAIN_PAT_1;
++		break;
++	case DP_TRAINING_PATTERN_2:
++		val |= DP_LINK_TRAIN_PAT_2;
++		break;
++	/* This case may never hit !!!! */
++	case DP_PORT_IDLE_PATTERN_SET:
++		val |= DP_LINK_TRAIN_PAT_IDLE;
++		break;
++	case DP_TRAINING_PATTERN_3:
++		val |= DP_LINK_TRAIN_PAT_3_CHV;
++		break;
++	}
++
++	if (train_pattern & DP_PORT_IDLE_PATTERN_SET)
++		val |= DP_LINK_TRAIN_PAT_IDLE;
++
++	REG_WRITE(port->offset, val);
++	REG_READ(port->offset);
++
++	if (train_pattern & DP_PORT_IDLE_PATTERN_SET)
++		mdelay(1);
++
++	return 0;
++}
++
++static u32 vlv_dp_port_i2c_functionality(struct i2c_adapter *adapter)
++{
++	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL |
++		I2C_FUNC_SMBUS_READ_BLOCK_DATA |
++		I2C_FUNC_SMBUS_BLOCK_PROC_CALL |
++		I2C_FUNC_10BIT_ADDR;
++}
++
++/*
++ * Transfer a single I2C-over-AUX message and handle various error conditions,
++ * retrying the transaction as appropriate.  It is assumed that the
++ * vlv_dp_port_aux_transfer function does not modify anything in the msg
++ * other than the reply field.
++ */
++static int vlv_dp_port_i2c_do_msg(struct vlv_dp_port *port,
++		struct dp_aux_msg *msg)
++{
++	unsigned int retry;
++	int err;
++
++	/*
++	 * DP1.2 sections 2.7.7.1.5.6.1 and 2.7.7.1.6.6.1: A DP Source device
++	 * is required to retry at least seven times upon receiving AUX_DEFER
++	 * before giving up the AUX transaction.
++	 */
++	for (retry = 0; retry < 7; retry++) {
++		err = vlv_dp_port_aux_transfer(port, msg);
++		if (err < 0) {
++			if (err == -EBUSY)
++				continue;
++
++			pr_debug("transaction failed: %d\n", err);
++			return err;
++		}
++
++
++		switch (msg->reply & DP_AUX_NATIVE_REPLY_MASK) {
++		case DP_AUX_NATIVE_REPLY_ACK:
++			/*
++			 * For I2C-over-AUX transactions this isn't enough, we
++			 * need to check for the I2C ACK reply.
++			 */
++			break;
++
++		case DP_AUX_NATIVE_REPLY_NACK:
++			pr_debug("native nack\n");
++			return -EREMOTEIO;
++
++		case DP_AUX_NATIVE_REPLY_DEFER:
++			pr_debug("native defer");
++
++			/*
++			 * We could check for I2C bit rate capabilities and if
++			 * available adjust this interval. We could also be
++			 * more careful with DP-to-legacy adapters where a
++			 * long legacy cable may force very low I2C bit rates.
++			 *
++			 * For now just defer for long enough to hopefully be
++			 * safe for all use-cases.
++			 */
++			usleep_range(500, 600);
++			continue;
++
++		default:
++			pr_err("invalid native reply %#04x\n", msg->reply);
++			return -EREMOTEIO;
++		}
++
++		switch (msg->reply & DP_AUX_I2C_REPLY_MASK) {
++		case DP_AUX_I2C_REPLY_ACK:
++			/*
++			 * Both native ACK and I2C ACK replies received. We
++			 * can assume the transfer was successful.
++			 */
++			if (err < msg->size)
++				return -EPROTO;
++			return 0;
++
++		case DP_AUX_I2C_REPLY_NACK:
++			pr_debug("I2C nack\n");
++			return -EREMOTEIO;
++
++		case DP_AUX_I2C_REPLY_DEFER:
++			pr_debug("I2C defer\n");
++			usleep_range(400, 500);
++			continue;
++
++		default:
++			pr_err("invalid I2C reply %#04x\n", msg->reply);
++			return -EREMOTEIO;
++		}
++	}
++
++	pr_debug("too many retries, giving up\n");
++	return -EREMOTEIO;
++}
++
++struct i2c_adapter *vlv_dp_port_get_i2c_adapter(struct vlv_dp_port *port)
++{
++	return &port->ddc;
++}
++
++static int vlv_dp_port_i2c_xfer(struct i2c_adapter *adapter,
++		struct i2c_msg *msgs, int num)
++{
++	struct vlv_dp_port *port = adapter->algo_data;
++	unsigned int i, j;
++	struct dp_aux_msg msg;
++	int err = 0;
++
++	memset(&msg, 0, sizeof(msg));
++
++	for (i = 0; i < num; i++) {
++		msg.address = msgs[i].addr;
++		msg.request = (msgs[i].flags & I2C_M_RD) ?
++				DP_AUX_I2C_READ : DP_AUX_I2C_WRITE;
++		msg.request |= DP_AUX_I2C_MOT;
++
++		/*
++		 * Send a bare address packet to start the transaction.
++		 * Zero sized messages specify an address only (bare
++		 * address) transaction.
++		 */
++		msg.buffer = NULL;
++		msg.size = 0;
++		err = vlv_dp_port_i2c_do_msg(port, &msg);
++		if (err < 0)
++			break;
++
++		/*
++		 * Many hardware implementations support FIFOs larger than a
++		 * single byte, but it has been empirically determined that
++		 * transferring data in larger chunks can actually lead to
++		 * decreased performance. Therefore each message is simply
++		 * transferred byte-by-byte.
++		 */
++		for (j = 0; j < msgs[i].len; j++) {
++			msg.buffer = msgs[i].buf + j;
++			msg.size = 1;
++			err = vlv_dp_port_i2c_do_msg(port, &msg);
++			if (err < 0)
++				break;
++		}
++		if (err < 0)
++			break;
++	}
++	if (err >= 0)
++		err = num;
++
++	/*
++	 * Send a bare address packet to close out the transaction.
++	 * Zero sized messages specify an address only (bare
++	 * address) transaction.
++	 */
++	msg.request &= ~DP_AUX_I2C_MOT;
++	msg.buffer = NULL;
++	msg.size = 0;
++	(void)vlv_dp_port_i2c_do_msg(port, &msg);
++
++	return err;
++}
++
++static const struct i2c_algorithm i2c_algo = {
++	.functionality = vlv_dp_port_i2c_functionality,
++	.master_xfer = vlv_dp_port_i2c_xfer,
++};
++
++u32 vlv_dp_port_i2c_register(struct vlv_dp_port *port, struct device *dev)
++{
++	mutex_init(&port->hw_mutex);
++
++	port->ddc.algo = &i2c_algo;
++	port->ddc.algo_data = port;
++	port->ddc.retries = 3;
++	port->ddc.class = I2C_CLASS_DDC;
++	port->ddc.owner = THIS_MODULE;
++	port->ddc.dev.parent = dev;
++	port->ddc.dev.of_node = dev->of_node;
++	strlcpy(port->ddc.name, port->name, sizeof(port->ddc.name));
++
++	return i2c_add_adapter(&port->ddc);
++}
++
++u32 vlv_dp_port_vdd_seq(struct vlv_dp_port *port, bool enable)
++{
++	u32 val = 0;
++	val = REG_READ(port->pp_ctl_offset);
++
++	if (enable == (val & (1 << 3)))
++		return 0;
++
++	if (enable) {
++		val |= (1 << 3);
++		REG_WRITE(port->pp_ctl_offset, val);
++		msleep(200);
++	} else {
++		val &= ~(1 << 3);
++		REG_WRITE(port->pp_ctl_offset, val);
++	}
++
++	return 0;
++}
++
++u32 vlv_dp_port_load_panel_delays(struct vlv_dp_port *port)
++{
++	u16 *ptr = NULL;
++	u32 val = 0;
++	if (!port->is_edp)
++		return 0;
++
++	ptr = intel_get_vbt_pps_delays();
++	if (!ptr) {
++		pr_err("unable to load pps delays from vbt, using spec default\n");
++
++		port->pps_delays.t1_t3 = 210 * 10;
++		port->pps_delays.t8 = 50 * 10;
++		port->pps_delays.t9 = 50 * 10;
++		port->pps_delays.t10 = 500 * 10;
++		port->pps_delays.t11_t12 = (510 + 100) * 10;
++
++	} else {
++		pr_err("PPS delays: %d %d %d %d %d\n", *ptr, *(ptr+1), *(ptr+2),
++				*(ptr+3), *(ptr+4));
++
++		port->pps_delays.t1_t3 = *ptr;
++		port->pps_delays.t8 = *(ptr+1);
++		port->pps_delays.t9 = *(ptr+2);
++		port->pps_delays.t10 = *(ptr+3);
++		port->pps_delays.t11_t12 = *(ptr+4);
++	}
++
++	val = (port->port_id << 30);
++	val |= ((port->pps_delays.t1_t3 << 16) | (port->pps_delays.t8));
++	REG_WRITE(port->pp_on_delay_offset, val);
++
++	val = ((port->pps_delays.t9 << 16) | (port->pps_delays.t10));
++	REG_WRITE(port->pp_off_delay_offset, val);
++
++	val = (port->pps_delays.t11_t12 / 1000) + 1;
++
++	/* 200Mhz so directly program it */
++	val = ((0x270F << 8) | (val));
++	REG_WRITE(port->pp_divisor_offset, val);
++	return 0;
++}
++
++bool vlv_dp_port_init(struct vlv_dp_port *port, enum port port_id,
++		enum pipe pipe_id, enum intel_pipe_type type,
++		struct device *dev)
++{
++	bool ret = false;
++	port->port_id = port_id;
++	switch (port_id) {
++	case PORT_B:
++		port->offset = VLV_DISPLAY_BASE + DP_B;
++		port->aux_ctl_offset = VLV_DISPLAY_BASE + DPB_AUX_CH_CTL;
++		port->name = "DPDDC-B";
++		break;
++	case PORT_C:
++		port->offset = VLV_DISPLAY_BASE + DP_C;
++		port->aux_ctl_offset = VLV_DISPLAY_BASE + DPC_AUX_CH_CTL;
++		port->name = "DPDDC-C";
++		break;
++	case PORT_D:
++		if (type == INTEL_PIPE_EDP) {
++			pr_err("%s: EDP not supported on port D\n", __func__);
++			return false;
++		}
++		port->offset = VLV_DISPLAY_BASE + DP_D;
++		port->aux_ctl_offset = VLV_DISPLAY_BASE + DPD_AUX_CH_CTL;
++		port->name = "DPDDC-D";
++		break;
++	case PORT_A:
++	default:
++		/* PORT A not supported for DP/eDP in VLV/CHV */
++		pr_err("%s: invalid port id passed\n", __func__);
++		return false;
++	}
++
++	if (type == INTEL_PIPE_EDP)
++		port->is_edp = true;
++
++	port->pp_ctl_offset = VLV_PIPE_PP_CONTROL(pipe_id);
++	port->pp_stat_offset = VLV_PIPE_PP_STATUS(pipe_id);
++	port->pp_on_delay_offset = VLV_PIPE_PP_ON_DELAYS(pipe_id);
++	port->pp_off_delay_offset = VLV_PIPE_PP_OFF_DELAYS(pipe_id);
++	port->pp_divisor_offset = VLV_PIPE_PP_DIVISOR(pipe_id);
++	port->pwm_ctl_offset = VLV_BLC_PWM_CTL2(pipe_id);
++	port->pwm_duty_cycle_offset = VLV_BLC_PWM_CTL(pipe_id);
++	port->hist_guard_offset = VLV_BLC_HIST_GUARD(pipe_id);
++	port->hist_ctl_offset = VLV_BLC_HIST_CTL(pipe_id);
++
++	port->duty_cycle_delay = 0;
++
++	ret = vlv_dp_port_load_panel_delays(port);
++	vlv_dp_port_i2c_register(port, dev);
++
++	/* enable vdd in case it is not already on for edid read */
++	if (port->is_edp)
++		vlv_dp_port_vdd_seq(port, true);
++
++#ifdef CONFIG_ADF_INTEL_CHV
++	port->pipe_select_val = DP_PIPE_SELECT_CHV(pipe_id);
++#else
++	port->pipe_select_val = (pipe_id ? DP_PIPE_MASK : 0);
++#endif
++	pr_info("%s:%d port_id %d pipe %d\n", __func__, __LINE__,
++			port_id, pipe_id);
++
++	return true;
++}
++
++u32 vlv_dp_port_set_brightness(struct vlv_dp_port *port, int level)
++{
++	u32 val;
++
++	if (!port->is_edp)
++		return 0;
++
++	val = REG_READ(port->pwm_duty_cycle_offset);
++	level = (level * PLATFORM_MAX_BRIGHTNESS) / MAXIMUM_BRIGHTNESS;
++	val = val & ~BACKLIGHT_DUTY_CYCLE_MASK;
++	REG_WRITE(port->pwm_duty_cycle_offset, val | level);
++
++	return 1;
++}
++
++u32 vlv_dp_port_get_brightness(struct vlv_dp_port *port)
++{
++	u32 val;
++	val = REG_READ(port->pwm_duty_cycle_offset) & BACKLIGHT_DUTY_CYCLE_MASK;
++
++	if (!port->is_edp)
++		return 0;
++
++	val = (val/PLATFORM_MAX_BRIGHTNESS * MAXIMUM_BRIGHTNESS);
++
++	return val;
++}
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipe.c b/drivers/video/adf/intel/core/vlv/vlv_pipe.c
+index 1374fd2..4043d44 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipe.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipe.c
+@@ -17,6 +17,16 @@
+ #include <core/vlv/vlv_dc_regs.h>
+ #include <core/vlv/vlv_pipe.h>
+ 
++#define PIPE_B_SIZE 0x1E1A0C
++
++void vlv_pipe_program_m_n(struct vlv_pipe *pipe, struct intel_link_m_n *m_n)
++{
++	REG_WRITE(pipe->datam1_offset, TU_SIZE(m_n->tu) | m_n->gmch_m);
++	REG_WRITE(pipe->datan1_offset, m_n->gmch_n);
++	REG_WRITE(pipe->linkm1_offset, m_n->link_m);
++	REG_WRITE(pipe->linkn1_offset, m_n->link_n);
++}
++
+ bool vlv_pipe_vblank_on(struct vlv_pipe *pipe)
+ {
+ 	u32 val = REG_READ(pipe->status_offset);
+@@ -29,6 +39,10 @@ bool vlv_pipe_vblank_on(struct vlv_pipe *pipe)
+ 		REG_POSTING_READ(pipe->status_offset);
+ 	}
+ 
++	val = REG_READ(pipe->status_offset);
++	val |= PIPE_VSYNC_INTERRUPT_ENABLE;
++	REG_WRITE(pipe->status_offset, val);
++
+ 	return true;
+ }
+ 
+@@ -44,6 +58,10 @@ bool vlv_pipe_vblank_off(struct vlv_pipe *pipe)
+ 		pr_info("ADF: %s: vblank already off for pipe = %x\n",
+ 			__func__, pipe->offset);
+ 
++	val = REG_READ(pipe->status_offset);
++	val &= ~PIPE_VSYNC_INTERRUPT_ENABLE;
++	REG_WRITE(pipe->status_offset, val);
++
+ 	return true;
+ }
+ 
+@@ -223,7 +241,14 @@ u32 vlv_pipe_disable(struct vlv_pipe *pipe)
+ 	u32 err = 0;
+ 
+ 	val = REG_READ(pipe->offset);
+-	val &= ~PIPECONF_ENABLE;
++	val |= PIPECONF_PLANE_DISABLE;
++	REG_WRITE(pipe->offset, val);
++	vlv_pipe_wait_for_vblank(pipe);
++
++	val = REG_READ(pipe->offset);
++	val &= ~(PIPECONF_ENABLE);
++	val &= ~(DITHERING_TYPE_MASK | DDA_RESET | BPC_MASK |
++					PIPECONF_DITHERING);
+ 	REG_WRITE(pipe->offset, val);
+ 
+ 	/* Wait for the Pipe State to go off */
+@@ -295,6 +320,10 @@ u32 vlv_pipe_program_timings(struct vlv_pipe *pipe,
+ 	REG_WRITE(pipe->src_size_offset,
+ 			((mode->hdisplay - 1) << 16) | (mode->vdisplay - 1));
+ 
++	if (pipe->pipe_id == PIPE_B)
++		REG_WRITE(PIPE_B_SIZE, (mode->hdisplay - 1) |
++				((mode->vdisplay - 1) << 16));
++
+ 	/*
+ 	 * FIXME: check if dithering needs checing here or later
+ 	 * if (intel_crtc->config.dither && intel_crtc->config.pipe_bpp != 30)
+@@ -323,6 +352,9 @@ u32 vlv_pipe_program_timings(struct vlv_pipe *pipe,
+ 	else
+ 		pipeconf |= PIPECONF_PROGRESSIVE;
+ 
++	/* clear the plane disable bits */
++	pipeconf &= ~PIPECONF_PLANE_DISABLE;
++
+ 	/*
+ 	 * FIXME: enable when color ranges are supported
+ 	 * pipeconf |= PIPECONF_COLOR_RANGE_SELECT;
+@@ -331,6 +363,10 @@ u32 vlv_pipe_program_timings(struct vlv_pipe *pipe,
+ 	REG_WRITE(pipe->offset, pipeconf);
+ 	REG_POSTING_READ(pipe->offset);
+ 
++	/* clear flags by writing back 1 */
++	pipeconf = REG_READ(pipe->status_offset);
++	REG_WRITE(pipe->status_offset, pipeconf);
++
+ 	/* FIXME: make this separate func and use passed values */
+ 	/* Load default gamma LUT */
+ 	for (i = 0; i < 256; i++) {
+@@ -340,8 +376,6 @@ u32 vlv_pipe_program_timings(struct vlv_pipe *pipe,
+ 			(i));
+ 	}
+ 
+-	/* TODO primary plane fb update */
+-
+ 	return 0;
+ }
+ 
+@@ -359,6 +393,12 @@ bool vlv_pipe_init(struct vlv_pipe *pipe, enum pipe pipeid)
+ 	pipe->vblank_offset = VBLANK(pipeid);
+ 	pipe->vsync_offset = VSYNC(pipeid);
+ 	pipe->gamma_offset = PALETTE(pipeid);
++
++	pipe->datam1_offset = PIPE_DATA_M1(pipeid);
++	pipe->datan1_offset = PIPE_DATA_N1(pipeid);
++	pipe->linkm1_offset = PIPE_LINK_M1(pipeid);
++	pipe->linkn1_offset = PIPE_LINK_N1(pipeid);
++
+ 	pipe->src_size_offset = PIPESRC(pipeid);
+ 	pipe->pipe_id = pipeid;
+ 
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+index 5e2c313..47f5667 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+@@ -23,10 +23,13 @@
+ #include <core/vlv/vlv_dc_regs.h>
+ #include <core/common/dsi/dsi_pipe.h>
+ #include <core/common/hdmi/gen_hdmi_pipe.h>
++#include <core/common/dp/gen_dp_pipe.h>
+ #include <core/vlv/vlv_pm.h>
+ #include <core/vlv/vlv_pll.h>
+ #include <core/vlv/dpio.h>
+ 
++#define LINK_TO_DOT_CLK(x) ((x) * 27 * 100)
++
+ enum port vlv_get_connected_port(struct intel_pipe *intel_pipe)
+ {
+ 	struct vlv_pipeline *vlv_pipeline =
+@@ -41,6 +44,11 @@ enum port vlv_get_connected_port(struct intel_pipe *intel_pipe)
+ 		return port->port_id;
+ 	}
+ 
++	if (intel_pipe->type == INTEL_PIPE_DP) {
++		struct vlv_dp_port *port = &vlv_pipeline->port.dp_port;
++		return port->port_id;
++	}
++
+ 	pr_err("ADF: %s: invalid display type\n", __func__);
+ 	return PORT_INVALID;
+ }
+@@ -152,6 +160,7 @@ u32 vlv_port_enable(struct intel_pipeline *pipeline,
+ 	struct dsi_config *config = pipeline->params.dsi.dsi_config;
+ 	struct dsi_context *intel_dsi = &config->ctx;
+ 	struct vlv_dsi_port *dsi_port = NULL;
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
+ 	enum port port;
+ 	enum pipe pipe = disp->gen.dsi.config.pipe;
+ 	u32 temp;
+@@ -186,6 +195,13 @@ u32 vlv_port_enable(struct intel_pipeline *pipeline,
+ 
+ 		if (ret)
+ 			pr_err("ADF: %s Enable DSI port failed\n", __func__);
++	} else if ((disp->type == INTEL_PIPE_DP) ||
++			(disp->type == INTEL_PIPE_EDP)) {
++		chv_dpio_lane_reset_en(pipeline, true);
++		vlv_dp_port_enable(dp_port, mode->flags, &pipeline->params);
++		ret = vlv_pll_wait_for_port_ready(dp_port->port_id);
++		if (ret)
++			pr_err("%s:DP Port ready failed\n", __func__);
+ 	} else if (disp->type == INTEL_PIPE_HDMI) {
+ 		/* HDMI pre port enable */
+ 		chv_dpio_hdmi_swing_levels(pipeline, mode->clock * 1000);
+@@ -203,6 +219,36 @@ u32 vlv_port_enable(struct intel_pipeline *pipeline,
+ 	return ret;
+ }
+ 
++u32 vlv_calc_multiplier(struct intel_pipeline *pipeline, u32 dotclock)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	u32 multiplier = 1;
++	u32 i = 0;
++	u32 temp = 0;
++
++	if ((disp->type != INTEL_PIPE_DP) &&
++			(disp->type != INTEL_PIPE_EDP))
++		goto calc_exit;
++
++	dotclock = LINK_TO_DOT_CLK(dotclock);
++
++	for (i = 1; i <= 5; i++) {
++		/* 3 is not allowed */
++		if (i == 3)
++			continue;
++
++		temp = dotclock * i;
++
++		if (temp >= 100000) {
++			multiplier = i;
++			break;
++		}
++	}
++
++calc_exit:
++	return multiplier;
++}
++
+ /*
+  * DSI is a special beast that requires 3 calls to pipeline
+  * 1) setup pll : dsi_prepare_on
+@@ -221,9 +267,8 @@ u32 vlv_pipeline_on(struct intel_pipeline *pipeline,
+ 	struct vlv_plane_params plane_params;
+ 	struct vlv_pll *pll = &disp->pll;
+ 	struct intel_clock clock;
+-	u32 dotclock = 0;
+ 	bool ret = 0;
+-	u32 err = 0;
++	u32 err = 0, dotclock = 0, multiplier = 1;
+ 	u8 bpp = 0;
+ 
+ 	if (!mode) {
+@@ -236,12 +281,25 @@ u32 vlv_pipeline_on(struct intel_pipeline *pipeline,
+ 	vlv_pll_disable(pll);
+ 	/* pll enable */
+ 	if (disp->type != INTEL_PIPE_DSI) {
+-		err = vlv_pll_program_timings(pll, mode, &clock);
++		if ((disp->type == INTEL_PIPE_DP) ||
++			(disp->type == INTEL_PIPE_EDP)) {
++			dotclock = pipeline->params.dp.link_bw;
++			mode->clock = dotclock;
++			multiplier = vlv_calc_multiplier(pipeline, dotclock);
++
++			/* Multiply by 10000 to conver to KHz */
++			dotclock = LINK_TO_DOT_CLK(pipeline->params.dp.link_bw)
++							* 10000;
++		} else
++			/* Convert MHz to KHz */
++			dotclock = mode->clock * 1000;
++
++		err = vlv_pll_program_timings(pll, mode, &clock, multiplier);
+ 		if (err)
+ 			pr_err("ADF: %s: clock calculation failed\n", __func__);
+-
+ 		if (disp->type == INTEL_PIPE_HDMI) {
+ 			pr_err("HARDCODING clock for 19x10 HDMI\n");
++
+ 			clock.p1 = 4;
+ 			clock.p2 = 2;
+ 			clock.m1 = 2;
+@@ -277,6 +335,8 @@ u32 vlv_pipeline_on(struct intel_pipeline *pipeline,
+ 
+ 	case INTEL_PIPE_DP:
+ 	case INTEL_PIPE_EDP:
++		vlv_pipe_program_m_n(pipe, disp->base.params.dp.m_n);
++		bpp = disp->base.params.dp.bpp;
+ 		break;
+ 	}
+ 
+@@ -378,6 +438,7 @@ static inline u32 vlv_port_disable(struct intel_pipeline *pipeline)
+ {
+ 	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
+ 	struct vlv_dsi_port *dsi_port = NULL;
++	struct vlv_dp_port *dp_port = NULL;
+ 	struct vlv_hdmi_port *hdmi_port = NULL;
+ 	struct dsi_pipe *dsi_pipe = NULL;
+ 	struct dsi_context *dsi_ctx = NULL;
+@@ -405,6 +466,10 @@ static inline u32 vlv_port_disable(struct intel_pipeline *pipeline)
+ 		break;
+ 	case INTEL_PIPE_EDP:
+ 	case INTEL_PIPE_DP:
++		dp_port =  &disp->port.dp_port;
++		err = vlv_dp_port_disable(dp_port);
++		chv_dpio_lane_reset_en(pipeline, false);
++		break;
+ 	default:
+ 		err = -EINVAL;
+ 		break;
+@@ -422,6 +487,9 @@ u32 vlv_pipeline_off(struct intel_pipeline *pipeline)
+ 	struct vlv_pll *pll = NULL;
+ 	u32 err = 0, i = 0;
+ 
++	if (IS_CHERRYVIEW() && disp->type != INTEL_PIPE_DSI)
++		return chv_pipeline_off(pipeline);
++
+ 	/* Disable DPST */
+ 	/* FIXME: vlv_dpst_pipeline_off(); */
+ 
+@@ -582,6 +650,7 @@ bool vlv_can_be_disabled(struct intel_pipeline *pipeline)
+ bool vlv_is_screen_connected(struct intel_pipeline *pipeline)
+ {
+ 	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = NULL;
+ 	bool ret = false;
+ 
+ 	switch (disp->type) {
+@@ -591,6 +660,8 @@ bool vlv_is_screen_connected(struct intel_pipeline *pipeline)
+ 		break;
+ 	case INTEL_PIPE_DP:
+ 	case INTEL_PIPE_EDP:
++		dp_port = &disp->port.dp_port;
++		ret = vlv_dp_port_is_screen_connected(dp_port);
+ 		break;
+ 	default:
+ 		break;
+@@ -713,3 +784,181 @@ bool vlv_is_plane_enabled(struct intel_pipeline *pipeline,
+ 
+ 	return ret;
+ }
++
++u32 vlv_aux_transfer(struct intel_pipeline *pipeline,
++		struct dp_aux_msg *msg)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
++	u32 retry, size;
++	u32 err = -EINVAL;
++
++	size = msg->size;
++
++	/*
++	 * The specification doesn't give any recommendation on
++	 * how often to retry native transactions, so retry 7 times
++	 * like for I2C-over-AUX transactions.
++	 */
++	for (retry = 0; retry < 7; retry++) {
++		err = vlv_dp_port_aux_transfer(dp_port, msg);
++		if (20 < err) {
++			if (err == -EBUSY)
++				continue;
++			return err;
++		}
++
++		switch (msg->reply & DP_AUX_NATIVE_REPLY_MASK) {
++		case DP_AUX_NATIVE_REPLY_ACK:
++			if (err < size) {
++				pr_err("%s: Error ret_%d < size_%d\n",
++					__func__, err, size);
++				return -EPROTO;
++			}
++			return err;
++
++		case DP_AUX_NATIVE_REPLY_NACK:
++			pr_err("%s:recevied nack\n", __func__);
++			return -EIO;
++
++		case DP_AUX_NATIVE_REPLY_DEFER:
++			pr_debug("%s:recevied defer\n", __func__);
++			usleep_range(400, 500);
++			break;
++		}
++	}
++	pr_err("too many retries, giving up\n");
++	return -EIO;
++}
++
++u32 vlv_set_link_pattern(struct intel_pipeline *pipeline, u8 train_pattern)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
++	u32 ret = 0;
++
++	ret = vlv_dp_port_set_link_pattern(dp_port, train_pattern);
++	if (ret != 0) {
++		pr_err("%s: Set link pattern failed\n", __func__);
++		goto out_link;
++	}
++
++	switch (train_pattern & DP_TRAINING_PATTERN_MASK) {
++	case DP_TRAINING_PATTERN_DISABLE:
++		chv_dpio_lane_reset_en(pipeline, true);
++		break;
++	case DP_TRAINING_PATTERN_1:
++		chv_dpio_lane_reset_en(pipeline, true);
++		break;
++	default:
++		break;
++	}
++
++out_link:
++	return ret;
++
++}
++
++u32 vlv_set_signal_levels(struct intel_pipeline *pipeline,
++	struct link_params *params)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
++	u32 deemp = 0, margin = 0;
++
++#ifdef CONFIG_ADF_INTEL_CHV
++	return chv_set_signal_levels(pipeline, params);
++#endif
++	vlv_dp_port_set_signal_levels(dp_port, params, &deemp, &margin);
++	vlv_dpio_signal_levels(pipeline, deemp, margin);
++
++	return 0;
++}
++
++u32 chv_set_signal_levels(struct intel_pipeline *pipeline,
++	struct link_params *params)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++
++	if (disp->type == INTEL_PIPE_DP)
++		chv_dpio_signal_levels(pipeline, params->vswing,
++			params->preemp);
++	else
++		chv_dpio_edp_signal_levels(pipeline, params->vswing,
++			params->preemp);
++	return 0;
++}
++
++void vlv_get_adjust_train(struct intel_pipeline *pipeline,
++	struct link_params *params)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
++	vlv_dp_port_get_adjust_train(dp_port, params);
++}
++
++void vlv_get_max_vswing_preemp(struct intel_pipeline *pipeline,
++	enum vswing_level *max_vswing, enum preemp_level *max_preemp)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
++	vlv_dp_port_get_max_vswing_preemp(dp_port, max_vswing, max_preemp);
++}
++
++
++u32 vlv_dp_panel_power_seq(struct intel_pipeline *pipeline, bool enable)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
++	u32 err = 0;
++
++	if (disp->type == INTEL_PIPE_EDP) {
++		err = vlv_dp_port_panel_power_seq(dp_port, enable);
++		if (enable == false)
++			chv_dpio_lane_reset_en(pipeline, false);
++	}
++
++	return err;
++}
++
++u32 vlv_dp_backlight_seq(struct intel_pipeline *pipeline, bool enable)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
++	u32 err = 0;
++
++	if (disp->type == INTEL_PIPE_EDP)
++		err = vlv_dp_port_backlight_seq(dp_port, enable);
++	return err;
++}
++
++struct i2c_adapter *vlv_get_i2c_adapter(struct intel_pipeline *pipeline)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
++
++	if ((disp->type == INTEL_PIPE_EDP) ||
++		(disp->type == INTEL_PIPE_DP))
++		return vlv_dp_port_get_i2c_adapter(dp_port);
++	else
++		return NULL;
++}
++
++u32 vlv_dp_set_brightness(struct intel_pipeline *pipeline, int level)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *port = &disp->port.dp_port;
++
++	return vlv_dp_port_set_brightness(port, level);
++}
++
++u32 vlv_dp_get_brightness(struct intel_pipeline *pipeline)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *port = &disp->port.dp_port;
++	int level;
++
++	level = vlv_dp_port_get_brightness(port);
++	return level;
++
++}
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pll.c b/drivers/video/adf/intel/core/vlv/vlv_pll.c
+index 7223e22..00f4cbb 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pll.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pll.c
+@@ -21,6 +21,25 @@
+ 	({ u64 _tmp = (ll)+(d)/2; do_div(_tmp, d); _tmp; })
+ 
+ #define intel_pll_invalid(s)   do { pr_debug(s);  return false; } while (0)
++#define DISP_PHY_CTL		(VLV_DISPLAY_BASE + 0x60100)
++#define DPIO_INIT_VAL		0xB8800003
++
++struct dp_intel_clock {
++	u32 link_rate;
++	struct intel_clock clock;
++};
++
++static struct dp_intel_clock dp_clock[] = {
++	{ DP_LINK_BW_1_62,      /* m2_int = 32, m2_fraction = 1677722 */
++		{ .p1 = 3, .p2 = 2, .n = 1, .m1 = 2, .m2 = 0x18133330,
++			.vco = 0x76a70 } },
++	{ DP_LINK_BW_2_7,       /* m2_int = 27, m2_fraction = 0 */
++		{ .p1 = 4, .p2 = 1, .n = 1, .m1 = 2, .m2 = 0x1b000000,
++			.vco = 0x83d60 } },
++	{ DP_LINK_BW_5_4,       /* m2_int = 27, m2_fraction = 0 */
++		{ .p1 = 2, .p2 = 1, .n = 1, .m1 = 2, .m2 = 0x1b000000,
++			.vco = 0x83d60 } },
++};
+ 
+ static struct intel_limit intel_limits_chv = {
+ 	/*
+@@ -92,12 +111,18 @@ static bool calc_clock_timings(u32 target, struct intel_clock *best_clock)
+ {
+ 	struct intel_limit *limit = &intel_limits_chv;
+ 	struct intel_clock clock = {0};
+-	uint64_t m2;
++	u64 m2;
+ 	int refclk = 100000;
+ 	int found = false;
+-
++	int i = 0;
+ 	memset(best_clock, 0, sizeof(*best_clock));
+ 
++	for (i = 0; i < ARRAY_SIZE(dp_clock); i++) {
++		if (target == dp_clock[i].link_rate) {
++			*best_clock = dp_clock[i].clock;
++			return true;
++		}
++	}
+ 	/*
+ 	 * Based on hardware doc, the n always set to 1, and m1 always
+ 	 * set to 2.  If requires to support 200Mhz refclk, we need to
+@@ -135,27 +160,27 @@ static bool calc_clock_timings(u32 target, struct intel_clock *best_clock)
+ 		}
+ 	}
+ 
+-	/* FIXME: program the calc values through DPIO */
+ 	return found;
+ }
+ 
+ u32 vlv_pll_program_timings(struct vlv_pll *pll,
+ 		struct drm_mode_modeinfo *mode,
+-		struct intel_clock *clock)
++		struct intel_clock *clock, u32 multiplier)
+ {
+ 	u32 val = 0;
+ 	bool ret = false;
+-	/* FIXME: get this from encoder */
+-	/* int pixel_multiplier = 1; */
+ 
+ 	val = DPLL_SSC_REF_CLOCK_CHV | DPLL_REFA_CLK_ENABLE_VLV
+ 		| DPLL_VGA_MODE_DIS;
+ 
+ 	if (pll->pll_id != PLL_A)
+-		val = DPLL_INTEGRATED_CRI_CLK_VLV;
++		val |= DPLL_INTEGRATED_CRI_CLK_VLV;
+ 
+ 	REG_WRITE(pll->offset, val);
+ 
++	val = (multiplier - 1) << DPLL_MD_UDI_MULTIPLIER_SHIFT;
++	REG_WRITE(pll->md_offset, val);
++
+ 	ret = calc_clock_timings(mode->clock, clock);
+ 	if (!ret) {
+ 		pr_err("%s: unable to find clock values\n", __func__);
+@@ -208,7 +233,7 @@ u32 vlv_pll_enable(struct vlv_pll *pll,
+ 	val = REG_READ(pll->offset);
+ 	val |= DPLL_VCO_ENABLE;
+ 	REG_WRITE(pll->offset, val);
+-
++	mdelay(40);
+ 	if (wait_for(((REG_READ(pll->offset) & DPLL_LOCK_VLV) ==
+ 						DPLL_LOCK_VLV), 1)) {
+ 		pr_err("PLL %d failed to lock\n", pll->pll_id);
+@@ -240,11 +265,12 @@ bool vlv_pll_init(struct vlv_pll *pll, enum intel_pipe_type type,
+ 	if (type == INTEL_PIPE_DSI)
+ 		return vlv_dsi_pll_init(pll, pipe_id, port_id);
+ 
+-	/* FIXME: convert to proper pll */
+ 	pll->pll_id = (enum pll) pipe_id;
+ 	pll->offset = DPLL(pipe_id);
++	pll->md_offset = DPLL_MD(pipe_id);
+ 	pll->port_id = port_id;
+ 
++	REG_WRITE(DISP_PHY_CTL, DPIO_INIT_VAL);
+ 	return true;
+ }
+ 
+diff --git a/drivers/video/adf/intel/include/core/common/dp/dp_panel.h b/drivers/video/adf/intel/include/core/common/dp/dp_panel.h
+new file mode 100644
+index 0000000..c874f17
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/common/dp/dp_panel.h
+@@ -0,0 +1,422 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Create on 15 Sep 2014
++ * Author: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
++ */
++
++#ifndef _DP_PANEL_H_
++#define _DP_PANEL_H_
++
++#include <linux/i2c.h>
++
++#define DP_AUX_I2C_WRITE                0x0
++#define DP_AUX_I2C_READ                 0x1
++#define DP_AUX_I2C_STATUS               0x2
++#define DP_AUX_I2C_MOT                  0x4
++#define DP_AUX_NATIVE_WRITE             0x8
++#define DP_AUX_NATIVE_READ              0x9
++
++#define DP_AUX_NATIVE_REPLY_ACK         (0x0 << 0)
++#define DP_AUX_NATIVE_REPLY_NACK        (0x1 << 0)
++#define DP_AUX_NATIVE_REPLY_DEFER       (0x2 << 0)
++#define DP_AUX_NATIVE_REPLY_MASK        (0x3 << 0)
++
++#define DP_AUX_I2C_REPLY_ACK            (0x0 << 2)
++#define DP_AUX_I2C_REPLY_NACK           (0x1 << 2)
++#define DP_AUX_I2C_REPLY_DEFER          (0x2 << 2)
++#define DP_AUX_I2C_REPLY_MASK           (0x3 << 2)
++
++/* AUX CH addresses */
++/* DPCD */
++#define DP_DPCD_REV                         0x000
++
++#define DP_MAX_LINK_RATE                    0x001
++
++#define DP_MAX_LANE_COUNT                   0x002
++# define DP_MAX_LANE_COUNT_MASK             0x1f
++# define DP_TPS3_SUPPORTED                  (1 << 6) /* 1.2 */
++# define DP_ENHANCED_FRAME_CAP              (1 << 7)
++
++#define DP_MAX_DOWNSPREAD                   0x003
++# define DP_NO_AUX_HANDSHAKE_LINK_TRAINING  (1 << 6)
++
++#define DP_NORP                             0x004
++
++#define DP_DOWNSTREAMPORT_PRESENT           0x005
++# define DP_DWN_STRM_PORT_PRESENT           (1 << 0)
++# define DP_DWN_STRM_PORT_TYPE_MASK         0x06
++# define DP_DWN_STRM_PORT_TYPE_DP           (0 << 1)
++# define DP_DWN_STRM_PORT_TYPE_ANALOG       (1 << 1)
++# define DP_DWN_STRM_PORT_TYPE_TMDS         (2 << 1)
++# define DP_DWN_STRM_PORT_TYPE_OTHER        (3 << 1)
++# define DP_FORMAT_CONVERSION               (1 << 3)
++# define DP_DETAILED_CAP_INFO_AVAILABLE     (1 << 4) /* DPI */
++
++#define DP_MAIN_LINK_CHANNEL_CODING         0x006
++#define DP_DOWN_STREAM_PORT_COUNT           0x007
++# define DP_PORT_COUNT_MASK                 0x0f
++# define DP_MSA_TIMING_PAR_IGNORED          (1 << 6) /* eDP */
++# define DP_OUI_SUPPORT                     (1 << 7)
++
++#define DP_I2C_SPEED_CAP                    0x00c    /* DPI */
++# define DP_I2C_SPEED_1K                    0x01
++# define DP_I2C_SPEED_5K                    0x02
++# define DP_I2C_SPEED_10K                   0x04
++# define DP_I2C_SPEED_100K                  0x08
++# define DP_I2C_SPEED_400K                  0x10
++# define DP_I2C_SPEED_1M                    0x20
++
++#define DP_EDP_CONFIGURATION_CAP            0x00d   /* XXX 1.2? */
++#define DP_TRAINING_AUX_RD_INTERVAL         0x00e   /* XXX 1.2? */
++
++/* Multiple stream transport */
++#define DP_FAUX_CAP                         0x020   /* 1.2 */
++# define DP_FAUX_CAP_1                      (1 << 0)
++
++#define DP_MSTM_CAP                         0x021   /* 1.2 */
++# define DP_MST_CAP                         (1 << 0)
++
++#define DP_GUID                             0x030   /* 1.2 */
++
++#define DP_PSR_SUPPORT                      0x070   /* XXX 1.2? */
++# define DP_PSR_IS_SUPPORTED                1
++#define DP_PSR_CAPS                         0x071   /* XXX 1.2? */
++# define DP_PSR_NO_TRAIN_ON_EXIT            1
++# define DP_PSR_SETUP_TIME_330              (0 << 1)
++# define DP_PSR_SETUP_TIME_275              (1 << 1)
++# define DP_PSR_SETUP_TIME_220              (2 << 1)
++# define DP_PSR_SETUP_TIME_165              (3 << 1)
++# define DP_PSR_SETUP_TIME_110              (4 << 1)
++# define DP_PSR_SETUP_TIME_55               (5 << 1)
++# define DP_PSR_SETUP_TIME_0                (6 << 1)
++# define DP_PSR_SETUP_TIME_MASK             (7 << 1)
++# define DP_PSR_SETUP_TIME_SHIFT            1
++
++/*
++* 0x80-0x8f describe downstream port capabilities, but there are two layouts
++* based on whether DP_DETAILED_CAP_INFO_AVAILABLE was set.  If it was not,
++* each port's descriptor is one byte wide.  If it was set, each port's is
++* four bytes wide, starting with the one byte from the base info.  As of
++* DP interop v1.1a only VGA defines additional detail.
++*/
++
++/* offset 0 */
++#define DP_DOWNSTREAM_PORT_0                0x80
++# define DP_DS_PORT_TYPE_MASK               (7 << 0)
++# define DP_DS_PORT_TYPE_DP                 0
++# define DP_DS_PORT_TYPE_VGA                1
++# define DP_DS_PORT_TYPE_DVI                2
++# define DP_DS_PORT_TYPE_HDMI               3
++# define DP_DS_PORT_TYPE_NON_EDID           4
++# define DP_DS_PORT_HPD                     (1 << 3)
++/* offset 1 for VGA is maximum megapixels per second / 8 */
++/* offset 2 */
++# define DP_DS_VGA_MAX_BPC_MASK             (3 << 0)
++# define DP_DS_VGA_8BPC                     0
++# define DP_DS_VGA_10BPC                    1
++# define DP_DS_VGA_12BPC                    2
++# define DP_DS_VGA_16BPC                    3
++
++/* link configuration */
++#define DP_LINK_BW_SET                      0x100
++# define DP_LINK_BW_1_62                    0x06
++# define DP_LINK_BW_2_7                     0x0a
++# define DP_LINK_BW_5_4                     0x14    /* 1.2 */
++
++#define DP_LANE_COUNT_SET                   0x101
++# define DP_LANE_COUNT_MASK                 0x0f
++# define DP_LANE_COUNT_ENHANCED_FRAME_EN    (1 << 7)
++
++#define DP_TRAINING_PATTERN_SET             0x102
++# define DP_TRAINING_PATTERN_DISABLE        0
++# define DP_TRAINING_PATTERN_1              1
++# define DP_TRAINING_PATTERN_2              2
++# define DP_TRAINING_PATTERN_3              3       /* 1.2 */
++# define DP_TRAINING_PATTERN_MASK           0x3
++
++#define DP_PORT_IDLE_PATTERN_SET			4
++
++# define DP_LINK_QUAL_PATTERN_DISABLE       (0 << 2)
++# define DP_LINK_QUAL_PATTERN_D10_2         (1 << 2)
++# define DP_LINK_QUAL_PATTERN_ERROR_RATE    (2 << 2)
++# define DP_LINK_QUAL_PATTERN_PRBS7         (3 << 2)
++# define DP_LINK_QUAL_PATTERN_MASK          (3 << 2)
++
++# define DP_RECOVERED_CLOCK_OUT_EN          (1 << 4)
++# define DP_LINK_SCRAMBLING_DISABLE         (1 << 5)
++
++# define DP_SYMBOL_ERROR_COUNT_BOTH         (0 << 6)
++# define DP_SYMBOL_ERROR_COUNT_DISPARITY    (1 << 6)
++# define DP_SYMBOL_ERROR_COUNT_SYMBOL       (2 << 6)
++# define DP_SYMBOL_ERROR_COUNT_MASK         (3 << 6)
++
++#define DP_TRAINING_LANE0_SET               0x103
++#define DP_TRAINING_LANE1_SET               0x104
++#define DP_TRAINING_LANE2_SET               0x105
++#define DP_TRAINING_LANE3_SET               0x106
++
++# define DP_TRAIN_VOLTAGE_SWING_MASK        0x3
++# define DP_TRAIN_VOLTAGE_SWING_SHIFT       0
++# define DP_TRAIN_MAX_SWING_REACHED         (1 << 2)
++# define DP_TRAIN_VOLTAGE_SWING_400         (0 << 0)
++# define DP_TRAIN_VOLTAGE_SWING_600         (1 << 0)
++# define DP_TRAIN_VOLTAGE_SWING_800         (2 << 0)
++# define DP_TRAIN_VOLTAGE_SWING_1200        (3 << 0)
++
++# define DP_TRAIN_PRE_EMPHASIS_MASK         (3 << 3)
++# define DP_TRAIN_PRE_EMPHASIS_0            (0 << 3)
++# define DP_TRAIN_PRE_EMPHASIS_3_5          (1 << 3)
++# define DP_TRAIN_PRE_EMPHASIS_6            (2 << 3)
++# define DP_TRAIN_PRE_EMPHASIS_9_5          (3 << 3)
++
++# define DP_TRAIN_PRE_EMPHASIS_SHIFT        3
++# define DP_TRAIN_MAX_PRE_EMPHASIS_REACHED  (1 << 5)
++
++#define DP_DOWNSPREAD_CTRL                  0x107
++# define DP_SPREAD_AMP_0_5                  (1 << 4)
++# define DP_MSA_TIMING_PAR_IGNORE_EN        (1 << 7) /* eDP */
++
++#define DP_MAIN_LINK_CHANNEL_CODING_SET     0x108
++# define DP_SET_ANSI_8B10B                  (1 << 0)
++
++#define DP_I2C_SPEED_CONTROL_STATUS         0x109   /* DPI */
++/* bitmask as for DP_I2C_SPEED_CAP */
++
++#define DP_EDP_CONFIGURATION_SET            0x10a   /* XXX 1.2? */
++
++#define DP_MSTM_CTRL                        0x111   /* 1.2 */
++# define DP_MST_EN                          (1 << 0)
++# define DP_UP_REQ_EN                       (1 << 1)
++# define DP_UPSTREAM_IS_SRC                 (1 << 2)
++
++#define DP_PSR_EN_CFG                       0x170   /* XXX 1.2? */
++# define DP_PSR_ENABLE                      (1 << 0)
++# define DP_PSR_MAIN_LINK_ACTIVE            (1 << 1)
++# define DP_PSR_CRC_VERIFICATION            (1 << 2)
++# define DP_PSR_FRAME_CAPTURE               (1 << 3)
++
++#define DP_ADAPTER_CTRL                     0x1a0
++# define DP_ADAPTER_CTRL_FORCE_LOAD_SENSE   (1 << 0)
++
++#define DP_BRANCH_DEVICE_CTRL               0x1a1
++# define DP_BRANCH_DEVICE_IRQ_HPD           (1 << 0)
++
++#define DP_PAYLOAD_ALLOCATE_SET             0x1c0
++#define DP_PAYLOAD_ALLOCATE_START_TIME_SLOT 0x1c1
++#define DP_PAYLOAD_ALLOCATE_TIME_SLOT_COUNT 0x1c2
++
++#define DP_SINK_COUNT                       0x200
++/* prior to 1.2 bit 7 was reserved mbz */
++# define DP_GET_SINK_COUNT(x)               ((((x) & 0x80) >> 1) | ((x) & 0x3f))
++# define DP_SINK_CP_READY                   (1 << 6)
++
++#define DP_DEVICE_SERVICE_IRQ_VECTOR        0x201
++# define DP_REMOTE_CONTROL_COMMAND_PENDING  (1 << 0)
++# define DP_AUTOMATED_TEST_REQUEST          (1 << 1)
++# define DP_CP_IRQ                          (1 << 2)
++# define DP_MCCS_IRQ                        (1 << 3)
++# define DP_DOWN_REP_MSG_RDY                (1 << 4) /* 1.2 MST */
++# define DP_UP_REQ_MSG_RDY                  (1 << 5) /* 1.2 MST */
++# define DP_SINK_SPECIFIC_IRQ               (1 << 6)
++
++#define DP_LANE0_1_STATUS                   0x202
++#define DP_LANE2_3_STATUS                   0x203
++# define DP_LANE_CR_DONE                    (1 << 0)
++# define DP_LANE_CHANNEL_EQ_DONE            (1 << 1)
++# define DP_LANE_SYMBOL_LOCKED              (1 << 2)
++
++#define DP_CHANNEL_EQ_BITS (DP_LANE_CR_DONE |           \
++DP_LANE_CHANNEL_EQ_DONE |   \
++DP_LANE_SYMBOL_LOCKED)
++
++#define DP_LANE_ALIGN_STATUS_UPDATED        0x204
++
++#define DP_INTERLANE_ALIGN_DONE             (1 << 0)
++#define DP_DOWNSTREAM_PORT_STATUS_CHANGED   (1 << 6)
++#define DP_LINK_STATUS_UPDATED              (1 << 7)
++
++#define DP_SINK_STATUS                      0x205
++
++#define DP_RECEIVE_PORT_0_STATUS            (1 << 0)
++#define DP_RECEIVE_PORT_1_STATUS            (1 << 1)
++
++#define DP_ADJUST_REQUEST_LANE0_1           0x206
++#define DP_ADJUST_REQUEST_LANE2_3           0x207
++# define DP_ADJUST_VOLTAGE_SWING_LANE0_MASK  0x03
++# define DP_ADJUST_VOLTAGE_SWING_LANE0_SHIFT 0
++# define DP_ADJUST_PRE_EMPHASIS_LANE0_MASK   0x0c
++# define DP_ADJUST_PRE_EMPHASIS_LANE0_SHIFT  2
++# define DP_ADJUST_VOLTAGE_SWING_LANE1_MASK  0x30
++# define DP_ADJUST_VOLTAGE_SWING_LANE1_SHIFT 4
++# define DP_ADJUST_PRE_EMPHASIS_LANE1_MASK   0xc0
++# define DP_ADJUST_PRE_EMPHASIS_LANE1_SHIFT  6
++
++#define DP_TEST_REQUEST                     0x218
++# define DP_TEST_LINK_TRAINING              (1 << 0)
++# define DP_TEST_LINK_VIDEO_PATTERN         (1 << 1)
++# define DP_TEST_LINK_EDID_READ             (1 << 2)
++# define DP_TEST_LINK_PHY_TEST_PATTERN      (1 << 3) /* DPCD >= 1.1 */
++# define DP_TEST_LINK_FAUX_PATTERN          (1 << 4) /* DPCD >= 1.2 */
++
++#define DP_TEST_LINK_RATE                   0x219
++# define DP_LINK_RATE_162                   (0x6)
++# define DP_LINK_RATE_27                    (0xa)
++
++#define DP_TEST_LANE_COUNT                  0x220
++
++#define DP_TEST_PATTERN                     0x221
++
++#define DP_TEST_CRC_R_CR                    0x240
++#define DP_TEST_CRC_G_Y                     0x242
++#define DP_TEST_CRC_B_CB                    0x244
++
++#define DP_TEST_SINK_MISC                   0x246
++#define DP_TEST_CRC_SUPPORTED               (1 << 5)
++
++#define DP_TEST_RESPONSE                    0x260
++# define DP_TEST_ACK                        (1 << 0)
++# define DP_TEST_NAK                        (1 << 1)
++# define DP_TEST_EDID_CHECKSUM_WRITE        (1 << 2)
++
++#define DP_TEST_EDID_CHECKSUM               0x261
++
++#define DP_TEST_SINK                        0x270
++#define DP_TEST_SINK_START          (1 << 0)
++
++#define DP_PAYLOAD_TABLE_UPDATE_STATUS      0x2c0   /* 1.2 MST */
++# define DP_PAYLOAD_TABLE_UPDATED           (1 << 0)
++# define DP_PAYLOAD_ACT_HANDLED             (1 << 1)
++
++#define DP_VC_PAYLOAD_ID_SLOT_1             0x2c1   /* 1.2 MST */
++/* up to ID_SLOT_63 at 0x2ff */
++
++#define DP_SOURCE_OUI                       0x300
++#define DP_SINK_OUI                         0x400
++#define DP_BRANCH_OUI                       0x500
++
++#define DP_SET_POWER                        0x600
++# define DP_SET_POWER_D0                    0x1
++# define DP_SET_POWER_D3                    0x2
++# define DP_SET_POWER_MASK                  0x3
++
++#define DP_SIDEBAND_MSG_DOWN_REQ_BASE       0x1000   /* 1.2 MST */
++#define DP_SIDEBAND_MSG_UP_REP_BASE         0x1200   /* 1.2 MST */
++#define DP_SIDEBAND_MSG_DOWN_REP_BASE       0x1400   /* 1.2 MST */
++#define DP_SIDEBAND_MSG_UP_REQ_BASE         0x1600   /* 1.2 MST */
++
++#define DP_SINK_COUNT_ESI                   0x2002   /* 1.2 */
++/* 0-5 sink count */
++# define DP_SINK_COUNT_CP_READY             (1 << 6)
++
++#define DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0   0x2003   /* 1.2 */
++
++#define DP_DEVICE_SERVICE_IRQ_VECTOR_ESI1   0x2004   /* 1.2 */
++
++#define DP_LINK_SERVICE_IRQ_VECTOR_ESI0     0x2005   /* 1.2 */
++
++#define DP_PSR_ERROR_STATUS                 0x2006  /* XXX 1.2? */
++# define DP_PSR_LINK_CRC_ERROR              (1 << 0)
++# define DP_PSR_RFB_STORAGE_ERROR           (1 << 1)
++
++#define DP_PSR_ESI                          0x2007  /* XXX 1.2? */
++# define DP_PSR_CAPS_CHANGE                 (1 << 0)
++
++#define DP_PSR_STATUS                       0x2008  /* XXX 1.2? */
++# define DP_PSR_SINK_INACTIVE               0
++# define DP_PSR_SINK_ACTIVE_SRC_SYNCED      1
++# define DP_PSR_SINK_ACTIVE_RFB             2
++# define DP_PSR_SINK_ACTIVE_SINK_SYNCED     3
++# define DP_PSR_SINK_ACTIVE_RESYNC          4
++# define DP_PSR_SINK_INTERNAL_ERROR         7
++# define DP_PSR_SINK_STATE_MASK             0x07
++
++# define MAX_ELD_LENGTH			    128
++
++enum vswing_level {
++	e0_4 = 0,
++	e0_6,
++	e0_8,
++	e1_2,
++};
++
++enum preemp_level {
++	e0dB = 0,
++	e3_5dB,
++	e6dB,
++	e9_5dB,
++};
++
++struct dp_panel;
++
++struct link_params {
++	u32 link_bw;
++	u32 lane_count;
++	u32 bpp;
++	enum preemp_level preemp;
++	enum vswing_level vswing;
++	bool max_vswing;
++	bool max_preemp;
++};
++
++struct dp_aux_msg {
++	u32 address;
++	u8 request;
++	u8 reply;
++	void *buffer;
++	size_t size;
++};
++
++struct dp_panel {
++	struct intel_pipeline *pipeline;
++	enum preemp_level max_preemp;
++	enum vswing_level max_vswing;
++	struct edid *edid;
++
++	uint8_t eld[MAX_ELD_LENGTH];
++
++	/* information parsed from edid*/
++	bool is_hdmi;
++	bool has_audio;
++
++	struct list_head probedModes;
++	struct drm_mode_modeinfo *modelist;
++	struct drm_mode_modeinfo *preferred_mode;
++
++	int screen_width_mm;
++	int screen_height_mm;
++	bool quant_range_selectable;
++	u8 video_code;
++	u8 no_probed_modes;
++
++	/* First 12 bytes of dpcd read during init */
++	u8 dpcd_start[12];
++};
++
++extern bool dp_panel_init(struct dp_panel *panel,
++			struct intel_pipeline *pipeline);
++extern bool dp_panel_destroy(struct dp_panel *panel);
++extern u32 dp_panel_get_max_link_bw(struct dp_panel *panel);
++extern u32 dp_panel_get_max_lane_count(struct dp_panel *panel);
++extern bool dp_panel_train_link(struct dp_panel *panel,
++			struct link_params *params);
++extern  bool dp_panel_fast_link_train(struct dp_panel *panel,
++			struct link_params *params);
++extern bool dp_panel_probe(struct dp_panel *panel,
++			struct intel_pipeline *pipeline);
++u32 dp_panel_set_dpcd(struct dp_panel *panel, u32 address,
++			u8 *buffer, u32 size);
++
++/* Hack:to avoid duplication of edid parsing logic hdmi's parser is used */
++extern struct hdmi_monitor *intel_adf_hdmi_get_monitor(struct edid *edid);
++extern struct edid *get_edid(struct i2c_adapter *adapter);
++#endif /* _DP_PANEL_H_ */
+diff --git a/drivers/video/adf/intel/include/core/common/dp/gen_dp_pipe.h b/drivers/video/adf/intel/include/core/common/dp/gen_dp_pipe.h
+new file mode 100644
+index 0000000..49ad46d
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/common/dp/gen_dp_pipe.h
+@@ -0,0 +1,60 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Create on 15 Sep 2014
++ * Author: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
++ */
++
++#ifndef _INTEL_DP_PIPE_H_
++#define _INTEL_DP_PIPE_H_
++
++#include <drm/drmP.h>
++#include <core/intel_dc_config.h>
++#include <core/common/dp/dp_panel.h>
++
++#define DP_LINK_BW_1_62	    0x06
++#define DP_LINK_BW_2_7      0x0a
++#define DP_LINK_BW_5_4      0x14
++
++struct dp_pipe {
++	struct intel_pipe base;
++	struct intel_pipeline *pipeline;
++	struct dp_panel panel;
++	struct drm_mode_modeinfo preferred_mode;
++	struct drm_mode_modeinfo current_mode;
++	struct link_params link_params;
++	u8 dpms_state;
++	bool panel_present;
++};
++
++
++/* Used by dp and fdi links */
++struct intel_link_m_n {
++	u32        tu;
++	u32        gmch_m;
++	u32        gmch_n;
++	u32        link_m;
++	u32        link_n;
++};
++
++static inline struct dp_pipe *to_dp_pipe(struct intel_pipe *pipe)
++{
++	return container_of(pipe, struct dp_pipe, base);
++}
++
++u32 dp_pipe_init(struct dp_pipe *pipe, struct device *dev,
++	struct intel_plane *primary_plane, u8 idx,
++	struct intel_pipeline *pipeline, enum intel_pipe_type type);
++
++u32 dp_pipe_destroy(struct dp_pipe *pipe);
++
++#endif /* _INTEL_DP_PIPE_H_ */
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 2b3c179..7850026 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -468,15 +468,15 @@ struct intel_global_status {
+ 
+ struct intel_clock {
+ 	/* given values */
+-	int n;
+-	int m1, m2;
+-	int p1, p2;
++	u32 n;
++	u32 m1, m2;
++	u32 p1, p2;
+ 
+ 	/* derived values */
+-	int dot;
+-	int vco;
+-	int m;
+-	int p;
++	u32 dot;
++	u32 vco;
++	u32 m;
++	u32 p;
+ };
+ 
+ struct intel_pipe {
+@@ -513,7 +513,10 @@ union encoder_params {
+ 	} dsi;
+ 
+ 	struct {
+-		int temp;/*stub*/
++		struct intel_link_m_n *m_n;
++		u8 lane_count;
++		u8 link_bw;
++		u8 bpp;
+ 	} dp;
+ 
+ 	struct {
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+index d5523d3..524c669 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+@@ -19,13 +19,16 @@
+ #include "core/vlv/vlv_dc_regs.h"
+ #include <drm/i915_drm.h>
+ #include <drm/i915_adf.h>
++#include <linux/i2c.h>
+ #include <core/common/dsi/dsi_pipe.h>
+ #include <core/common/hdmi/gen_hdmi_pipe.h>
++#include <core/common/dp/gen_dp_pipe.h>
+ #include <core/vlv/vlv_pri_plane.h>
+ #include <core/vlv/vlv_sp_plane.h>
+ #include <core/vlv/vlv_dpst.h>
+ #include <core/vlv/vlv_dsi_port.h>
+ #include <core/vlv/vlv_hdmi_port.h>
++#include <core/vlv/vlv_dp_port.h>
+ #include <core/vlv/vlv_pll.h>
+ #include <core/vlv/vlv_pipe.h>
+ #include <core/vlv/vlv_pm.h>
+@@ -148,10 +151,12 @@ struct vlv_pipeline {
+ 	union {
+ 		struct dsi_pipe dsi;
+ 		struct hdmi_pipe hdmi;
++		struct dp_pipe dp;
+ 	} gen;
+ 	union {
+ 		struct vlv_dsi_port dsi_port[ADF_MAX_PORTS - 1];
+ 		struct vlv_hdmi_port hdmi_port;
++		struct vlv_dp_port dp_port;
+ 	} port;
+ 
+ };
+@@ -233,11 +238,31 @@ extern void vlv_debugfs_teardown(struct vlv_dc_config *vlv_config);
+ bool vlv_dsi_port_init(struct vlv_dsi_port *port, enum port, enum pipe);
+ bool vlv_dsi_port_destroy(struct vlv_dsi_port *port);
+ 
++extern u32 vlv_aux_transfer(struct intel_pipeline *pipeline,
++	struct dp_aux_msg *msg);
++extern u32 vlv_set_signal_levels(struct intel_pipeline *pipeline,
++	struct link_params *params);
++extern u32 chv_set_signal_levels(struct intel_pipeline *pipeline,
++	struct link_params *params);
++extern u32 vlv_set_link_pattern(struct intel_pipeline *pipeline,
++	u8 train_pattern);
++extern void vlv_get_max_vswing_preemp(struct intel_pipeline *pipeline,
++	enum vswing_level *max_v, enum preemp_level *max_p);
++extern void vlv_get_adjust_train(struct intel_pipeline *pipeline,
++	struct link_params *params);
++extern u32 vlv_dp_panel_power_seq(struct intel_pipeline *pipeline,
++	bool enable);
++extern u32 vlv_dp_backlight_seq(struct intel_pipeline *pipeline,
++	bool enable);
++extern struct i2c_adapter *vlv_get_i2c_adapter(struct intel_pipeline *pipeline);
++
+ /* reg access */
+ extern u32 REG_READ(u32 reg);
+ extern u32 REG_POSTING_READ(u32 reg);
+ extern void REG_WRITE(u32 reg, u32 val);
+ extern void REG_WRITE_BITS(u32 reg, u32 val, u32 mask);
+ 
++extern u32 vlv_dp_set_brightness(struct intel_pipeline *pipeline, int level);
++extern u32 vlv_dp_get_brightness(struct intel_pipeline *pipeline);
+ 
+ #endif
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index c1cabcc..8743c08 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -3463,6 +3463,11 @@ extern int chv_cursor_offsets[];
+ #define   DSL_LINEMASK_GEN2	0x00000fff
+ #define   DSL_LINEMASK_GEN3	0x00001fff
+ #define _PIPEACONF		(VLV_DISPLAY_BASE + 0x70008)
++#define   PIPECONF_PLANE_DISABLE        (3<<18)
++#define   DITHERING_TYPE_MASK	(3<<2)
++#define   DDA_RESET		(1<<1)
++#define   BPC_MASK		(7<<5)
++#define   PIPECONF_DITHERING	(1<<4)
+ #define   PIPECONF_ENABLE	(1<<31)
+ #define   PIPECONF_DISABLE	0
+ #define   PIPECONF_DOUBLE_WIDE	(1<<30)
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dp_port.h b/drivers/video/adf/intel/include/core/vlv/vlv_dp_port.h
+new file mode 100644
+index 0000000..2011b4b
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dp_port.h
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Author: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
++ */
++
++#ifndef _VLV_DP_PORT_H_
++#define _VLV_DP_PORT_H_
++
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_dc_regs.h>
++
++struct edp_pps_delays {
++	u16 t1_t3;
++	u16 t8;
++	u16 t9;
++	u16 t10;
++	u16 t11_t12;
++};
++
++struct vlv_dp_port {
++	u32 offset;
++	u32 pipe_select_val;
++	u32 aux_ctl_offset;
++	u32 pp_ctl_offset;
++	u32 pp_stat_offset;
++	u32 pp_on_delay_offset;
++	u32 pp_off_delay_offset;
++	u32 pp_divisor_offset;
++	u32 pwm_ctl_offset;
++	u32 pwm_duty_cycle_offset;
++	u32 duty_cycle_delay;
++	u32 hist_guard_offset;
++	u32 hist_ctl_offset;
++
++	enum port port_id;
++	bool is_edp;
++	struct edp_pps_delays pps_delays;
++	const char *name;
++	struct device *dev;
++	struct mutex hw_mutex;
++	/* for reading edid */
++	struct i2c_adapter ddc;
++};
++
++bool vlv_dp_port_init(struct vlv_dp_port *port, enum port port_id,
++	enum pipe pipe_id, enum intel_pipe_type type, struct device *dev);
++
++u32 vlv_dp_port_set_link_pattern(struct vlv_dp_port *port,
++		u8 train_pattern);
++void vlv_dp_port_get_adjust_train(struct vlv_dp_port *port,
++	struct link_params *params);
++u32 vlv_dp_port_set_signal_levels(struct vlv_dp_port *port,
++	struct link_params *params, u32 *deemp, u32 *margin);
++u32 vlv_dp_port_aux_transfer(struct vlv_dp_port *port,
++		struct dp_aux_msg *msg);
++bool vlv_dp_port_is_screen_connected(struct vlv_dp_port *port);
++u32 vlv_dp_port_disable(struct vlv_dp_port *port);
++u32 vlv_dp_port_enable(struct vlv_dp_port *port, u32 flags,
++		union encoder_params *params);
++u32 vlv_dp_port_backlight_seq(struct vlv_dp_port *port, bool enable);
++u32 vlv_dp_port_pwm_seq(struct vlv_dp_port *port, bool enable);
++u32 vlv_dp_port_panel_power_seq(struct vlv_dp_port *port, bool enable);
++void vlv_dp_port_get_max_vswing_preemp(struct vlv_dp_port *port,
++	enum vswing_level *max_v, enum preemp_level *max_p);
++struct i2c_adapter *vlv_dp_port_get_i2c_adapter(struct vlv_dp_port *port);
++u32 vlv_dp_port_set_brightness(struct vlv_dp_port *port, int level);
++u32 vlv_dp_port_get_brightness(struct vlv_dp_port *port);
++#endif /* _VLV_DP_PORT_H_ */
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h b/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h
+index 1c532d1..842453e 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h
+@@ -31,14 +31,20 @@ struct vlv_pipe {
+ 	u32 vsync_offset;
+ 	u32 gamma_offset;
+ 
++	u32 datam1_offset;
++	u32 datan1_offset;
++	u32 linkm1_offset;
++	u32 linkn1_offset;
++
+ 	u32 src_size_offset;
+ };
+ 
++void vlv_pipe_program_m_n(struct vlv_pipe *pipe,
++		struct intel_link_m_n *m_n);
+ bool vlv_pipe_vblank_on(struct vlv_pipe *pipe);
+ bool vlv_pipe_vblank_off(struct vlv_pipe *pipe);
+ bool vlv_pipe_wait_for_vblank(struct vlv_pipe *pipe);
+ bool vlv_pipe_wait_for_pll_lock(struct vlv_pipe *pipe);
+-bool vlv_pipe_wait_for_pll_lock(struct vlv_pipe *pipe);
+ u32 vlv_pipe_program_timings(struct vlv_pipe *pipe,
+ 		struct drm_mode_modeinfo *mode,
+ 		enum intel_pipe_type type, u8 bpp);
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pll.h b/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
+index 2721579..7aede9d 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
+@@ -26,6 +26,7 @@ struct vlv_pll {
+ 	enum port port_id;
+ 	enum pll pll_id;
+ 	u32 offset;
++	u32 md_offset;
+ 	u32 multiplier_offset;
+ 	u32 dpio_stat_offset;
+ 	u32 phy_ctrl_offset;
+@@ -51,7 +52,8 @@ struct intel_limit {
+ u32 vlv_pll_wait_for_port_ready(enum port port_id);
+ u32 vlv_pll_program_timings(struct vlv_pll *pll,
+ 		struct drm_mode_modeinfo *mode,
+-		struct intel_clock *clock);
++		struct intel_clock *clock,
++		u32 multiplier);
+ u32 vlv_dsi_pll_enable(struct vlv_pll *pll,
+ 		struct drm_mode_modeinfo *mode);
+ u32 vlv_dsi_pll_disable(struct vlv_pll *pll);
+-- 
+1.7.9.5
+

@@ -1,0 +1,364 @@
+From 8551051dbd8170f2297daf4097ddaf2681a42723 Mon Sep 17 00:00:00 2001
+Message-Id: <8551051dbd8170f2297daf4097ddaf2681a42723.1417465742.git.chang-joon.lee@intel.com>
+In-Reply-To: <664d811e547fec51f0453c5acda92012de288ecd.1417465742.git.chang-joon.lee@intel.com>
+References: <664d811e547fec51f0453c5acda92012de288ecd.1417465742.git.chang-joon.lee@intel.com>
+From: Vidya Srinivas <vidya.srinivas@intel.com>
+Date: Tue, 11 Nov 2014 15:34:06 +0530
+Subject: [PATCH 08/11] SQUASHME! [VPG]: drm/i915: Changes to panel fitter as
+ per atomicity.
+
+SQUASHME! - This patch should be squashed into the following exising patch:
+	Author: Arun R Murthy <arun.r.murthy@intel.com>
+	Change-Id: Id9fb3280aa59680a27536658dcaa335504a02e31
+	REVERTME [VPG]: drm/i915: Add atomicity to i915.
+
+Update Pfit register only when there is a change in value.
+Current implementation we don't enable pfit for HDMI so removing
+Pfit calls from HDMI path. Scaling reqd flag if set, we don't
+disable Pfit. Disable call comes for Pfit we determine in
+which mode (Autoscale, letterbox, pillbox) Pfit should be in
+based on layer provided by HWC and touch bit 31 to disable Pfit.
+Writing 0 in pfit register to disable Panel fitter creates
+pipe hang, above check was added for same
+
+Issue: GMIN-3045
+Change-Id: Iaa49da2492dbbba204062ee886c79702170ac736
+Signed-off-by: vkorjani <vikas.korjani@intel.com>
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+Signed-off-by: Sangani, Suryanarayana R <suryanarayana.r.sangani@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c      |   18 ++++++++
+ drivers/gpu/drm/i915/i915_drv.h      |    2 +
+ drivers/gpu/drm/i915/intel_display.c |   80 +++++++++++++++++++++++++---------
+ drivers/gpu/drm/i915/intel_hdmi.c    |   24 ----------
+ drivers/gpu/drm/i915/intel_panel.c   |    6 ++-
+ drivers/gpu/drm/i915/intel_sprite.c  |    8 ++--
+ 6 files changed, 87 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 478c1fc..9b15613 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1309,6 +1309,23 @@ static const struct vga_switcheroo_client_ops i915_switcheroo_ops = {
+ 	.can_switch = i915_switcheroo_can_switch,
+ };
+ 
++static void intel_assign_pfit_pipe(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_crtc *crtc;
++
++	/* Safe for all platforms, assign panel fitter to one pipe */
++	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
++		if (intel_pipe_has_type(crtc, INTEL_OUTPUT_DSI) ||
++			intel_pipe_has_type(crtc, INTEL_OUTPUT_EDP)) {
++				int pipe = to_intel_crtc(crtc)->pipe;
++				dev_priv->pfit_pipe = pipe;
++				I915_WRITE_BITS(PFIT_CONTROL, pipe,
++					PFIT_PIPE_MASK);
++		}
++	}
++}
++
+ static int i915_load_modeset_init(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1386,6 +1403,7 @@ static int i915_load_modeset_init(struct drm_device *dev)
+ 	intel_fbdev_initial_config(dev);
+ 
+ 	drm_kms_helper_poll_init(dev);
++	intel_assign_pfit_pipe(dev);
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index fc0ab99..b3821c8 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2239,6 +2239,8 @@ extern int i915_suspend(struct drm_device *dev, pm_message_t state);
+ extern int i915_resume(struct drm_device *dev);
+ extern int i915_master_create(struct drm_device *dev, struct drm_master *master);
+ extern void i915_master_destroy(struct drm_device *dev, struct drm_master *master);
++extern void i9xx_get_pfit_mode(struct drm_crtc *crtc,
++	uint32_t src_w, uint32_t src_h);
+ 
+ /* i915_params.c */
+ struct i915_params {
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 88079e2..ce47d01 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2563,6 +2563,35 @@ int i915_set_plane_180_rotation(struct drm_device *dev, void *data,
+ 	return ret;
+ }
+ 
++void i9xx_get_pfit_mode(struct drm_crtc *crtc, uint32_t src_w, uint32_t src_h)
++{
++	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++	struct drm_display_mode *adjusted_mode =
++		&intel_crtc->config.adjusted_mode;
++	u32 scaled_width = adjusted_mode->hdisplay * src_w;
++	u32 scaled_height = src_h * adjusted_mode->vdisplay;
++	u32 pfit_control = intel_crtc->config.gmch_pfit.control;
++
++	if (scaled_width > scaled_height) {
++		pfit_control &= MASK_PFIT_SCALING_MODE;
++		pfit_control |= PFIT_SCALING_PILLAR;
++	} else if (scaled_width < scaled_height) {
++		pfit_control &=  MASK_PFIT_SCALING_MODE;
++		pfit_control |= PFIT_SCALING_LETTER;
++	} else if (!(adjusted_mode->hdisplay <= (src_w+25) &&
++			adjusted_mode->hdisplay >= (src_w-25))) {
++
++		/*
++		 * TODO: If native width doest not lies b/n src layer
++		 * width-25 and width+25, we put pfit in auto scale,
++		 * not expecting variation more than 25
++		 */
++		pfit_control &=  MASK_PFIT_SCALING_MODE;
++		pfit_control |= PFIT_SCALING_AUTO;
++	}
++	intel_crtc->config.gmch_pfit.control = pfit_control;
++}
++
+ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 				      struct drm_framebuffer *fb,
+ 				      int x, int y)
+@@ -2711,12 +2740,10 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 
+ 		/* if panel fitter is enabled program the input src size */
+ 		if (intel_crtc->scaling_src_size &&
+-			intel_crtc->config.gmch_pfit.control) {
++			(intel_crtc->config.gmch_pfit.control & PFIT_ENABLE)) {
+ 			intel_crtc->reg.pfit_control =
+ 				intel_crtc->config.gmch_pfit.control;
+ 			intel_crtc->reg.pipesrc = intel_crtc->scaling_src_size;
+-			dev_priv->pfit_pipe = ((intel_crtc->reg.pfit_control &
+-						PFIT_PIPE_MASK) >> 29);
+ 			if (!dev_priv->atomic_update) {
+ 				I915_WRITE(PFIT_CONTROL,
+ 					intel_crtc->reg.pfit_control);
+@@ -2725,10 +2752,11 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 				intel_crtc->pfit_en_status = true;
+ 			}
+ 		} else if (intel_crtc->pfit_en_status) {
++			intel_crtc->reg.pfit_control =
++				intel_crtc->config.gmch_pfit.control;
+ 			intel_crtc->reg.pipesrc =
+ 				((mode->hdisplay - 1) <<
+ 				SCALING_SRCSIZE_SHIFT) | (mode->vdisplay - 1);
+-			intel_crtc->reg.pfit_control = 0;
+ 			if (!dev_priv->atomic_update) {
+ 				I915_WRITE(PIPESRC(pipe),
+ 						intel_crtc->reg.pipesrc);
+@@ -4889,7 +4917,8 @@ static void i9xx_pfit_enable(struct intel_crtc *crtc)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc_config *pipe_config = &crtc->config;
+ 
+-	if (!crtc->config.gmch_pfit.control)
++	if (!crtc->config.gmch_pfit.control &&
++		!dev_priv->scaling_reqd)
+ 		return;
+ 
+ 	/*
+@@ -5462,15 +5491,16 @@ static void i9xx_pfit_disable(struct intel_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	u32 tmp;
+ 
+ 	if (!crtc->config.gmch_pfit.control)
+ 		return;
+ 
+ 	assert_pipe_disabled(dev_priv, crtc->pipe);
+ 
+-	DRM_DEBUG_DRIVER("disabling pfit, current: 0x%08x\n",
+-			 I915_READ(PFIT_CONTROL));
+-	I915_WRITE(PFIT_CONTROL, 0);
++	tmp = (crtc->config.gmch_pfit.control & ~PFIT_ENABLE);
++	if (I915_READ(PFIT_CONTROL) != tmp)
++		I915_WRITE(PFIT_CONTROL, tmp);
+ 	crtc->pfit_en_status = false;
+ }
+ 
+@@ -10485,16 +10515,20 @@ static void i915_commit(struct drm_i915_private *dev_priv,
+ 	}
+ 
+ 	if (reg->pfit_control && reg->pipesrc) {
+-		if (I915_READ(PFIT_CONTROL) != reg->pfit_control)
+-			I915_WRITE(PFIT_CONTROL, reg->pfit_control);
++		if (dev_priv->pfit_pipe ==
++			((reg->pfit_control & PFIT_PIPE_MASK) >> 29) &&
++			I915_READ(PFIT_CONTROL) != reg->pfit_control)
++				I915_WRITE(PFIT_CONTROL, reg->pfit_control);
+ 		if (I915_READ(PIPESRC(pipe)) != reg->pipesrc)
+ 			I915_WRITE(PIPESRC(pipe), reg->pipesrc);
+ 		intel_crtc->pfit_en_status = true;
+ 	} else if (intel_crtc->pfit_en_status) {
+ 		if (I915_READ(PIPESRC(pipe)) != reg->pipesrc)
+ 			I915_WRITE(PIPESRC(pipe), reg->pipesrc);
+-		if (I915_READ(PFIT_CONTROL) != reg->pfit_control)
+-			I915_WRITE(PFIT_CONTROL, reg->pfit_control);
++		if (dev_priv->pfit_pipe ==
++			((reg->pfit_control & PFIT_PIPE_MASK) >> 29)
++			&& I915_READ(PFIT_CONTROL) != reg->pfit_control)
++				I915_WRITE(PFIT_CONTROL, reg->pfit_control);
+ 		intel_crtc->pfit_en_status = false;
+ 	}
+ 
+@@ -10641,26 +10675,30 @@ int intel_set_disp_calc_flip(struct drm_mode_set_display *disp,
+ 	struct drm_i915_plane_180_rotation *rotate;
+ 	struct drm_i915_set_plane_zorder *zorder;
+ 	int i, tmp_ret, ret = 0;
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	/* Update the panel fitter */
+ 	if (disp->update_flag & DRM_MODE_SET_DISPLAY_UPDATE_PANEL_FITTER) {
+ 		if (intel_crtc->config.gmch_pfit.control ||
+ 				disp->panel_fitter.mode) {
+-			u32 pfit_control = intel_crtc->config.gmch_pfit.control
+-				& MASK_PFIT_SCALING_MODE;
++			u32 pfit_control = intel_crtc->config.gmch_pfit.control;
+ 
+ 			/* Enable Panel fitter if any valid mode is set */
+ 			pfit_control = (1 << 31) | pfit_control;
+-			if (disp->panel_fitter.mode == AUTOSCALE)
++			if (disp->panel_fitter.mode == AUTOSCALE) {
++				pfit_control &=  MASK_PFIT_SCALING_MODE;
+ 				pfit_control |= PFIT_SCALING_AUTO;
+-			else if (disp->panel_fitter.mode == PILLARBOX)
++			} else if (disp->panel_fitter.mode == PILLARBOX) {
++				pfit_control &=  MASK_PFIT_SCALING_MODE;
+ 				pfit_control |= PFIT_SCALING_PILLAR;
+-			else if (disp->panel_fitter.mode == LETTERBOX)
++			} else if (disp->panel_fitter.mode == LETTERBOX) {
++				pfit_control &=  MASK_PFIT_SCALING_MODE;
+ 				pfit_control |= PFIT_SCALING_LETTER;
+-			else {
+-				/* Disable Panel fitter if no valid mode */
+-				pfit_control |= PFIT_SCALING_AUTO;
+-				pfit_control &= ~(1 << 31);
++			} else {
++				if (!dev_priv->scaling_reqd)
++					pfit_control &= ~PFIT_ENABLE;
++				else
++					pfit_control &=  MASK_PFIT_SCALING_MODE;
+ 			}
+ 			intel_crtc->config.gmch_pfit.control = pfit_control;
+ 		}
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index f763cd5..20e14b2 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -948,9 +948,6 @@ bool intel_hdmi_compute_config(struct intel_encoder *encoder,
+ 	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(&encoder->base);
+ 	struct drm_device *dev = encoder->base.dev;
+ 	struct drm_display_mode *adjusted_mode = &pipe_config->adjusted_mode;
+-	struct intel_crtc *intel_crtc = encoder->new_crtc;
+-	struct intel_connector *intel_connector =
+-		intel_hdmi->attached_connector;
+ 	int clock_12bpc = pipe_config->adjusted_mode.crtc_clock * 3 / 2;
+ 	int portclock_limit = hdmi_portclock_limit(intel_hdmi, false);
+ 	int desired_bpp;
+@@ -959,11 +956,6 @@ bool intel_hdmi_compute_config(struct intel_encoder *encoder,
+ 
+ 	intel_hdmi_compute_color_range(intel_hdmi, adjusted_mode);
+ 
+-	if (IS_VALLEYVIEW(dev)) {
+-		intel_gmch_panel_fitting(intel_crtc, pipe_config,
+-			intel_connector->panel.fitting_mode);
+-	}
+-
+ 	if (intel_hdmi->color_range)
+ 		pipe_config->limited_color_range = true;
+ 
+@@ -1232,19 +1224,6 @@ intel_hdmi_set_property(struct drm_connector *connector,
+ 		goto done;
+ 	}
+ 
+-	if (property == dev_priv->force_pfit_property) {
+-		if (intel_connector->panel.fitting_mode == val)
+-			return 0;
+-
+-		intel_connector->panel.fitting_mode = val;
+-		if (IS_VALLEYVIEW(dev_priv->dev)) {
+-			intel_gmch_panel_fitting(intel_crtc,
+-				&intel_crtc->config,
+-				intel_connector->panel.fitting_mode);
+-			return 0;
+-		} else
+-			goto done;
+-	}
+ 	if (property == dev_priv->scaling_src_size_property) {
+ 		intel_crtc->scaling_src_size = val;
+ 		DRM_DEBUG_DRIVER("src size = %u\n",
+@@ -1741,9 +1720,6 @@ void intel_hdmi_init_connector(struct intel_digital_port *intel_dig_port,
+ 		u32 temp = I915_READ(PEG_BAND_GAP_DATA);
+ 		I915_WRITE(PEG_BAND_GAP_DATA, (temp & ~0xf) | 0xd);
+ 	}
+-
+-	/* Load initialized connector */
+-	intel_hdmi->attached_connector = intel_connector;
+ }
+ 
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+diff --git a/drivers/gpu/drm/i915/intel_panel.c b/drivers/gpu/drm/i915/intel_panel.c
+index 34a9a04..80358c5 100644
+--- a/drivers/gpu/drm/i915/intel_panel.c
++++ b/drivers/gpu/drm/i915/intel_panel.c
+@@ -338,9 +338,9 @@ void intel_gmch_panel_fitting(struct intel_crtc *intel_crtc,
+ 		else if (fitting_mode == LETTERBOX)
+ 			pfit_control = PFIT_SCALING_LETTER;
+ 		else {
+-			pfit_control = 0;
++			pipe_config->gmch_pfit.control &= ~PFIT_ENABLE;
+ 			intel_crtc->base.panning_en = false;
+-			goto out;
++			goto out1;
+ 		}
+ 		pfit_control |= (PFIT_ENABLE | (intel_crtc->pipe
+ 					<< PFIT_PIPE_SHIFT));
+@@ -411,6 +411,8 @@ out:
+ 	}
+ 
+ 	pipe_config->gmch_pfit.control = pfit_control;
++
++out1:
+ 	pipe_config->gmch_pfit.pgm_ratios = pfit_pgm_ratios;
+ 	pipe_config->gmch_pfit.lvds_border_bits = border;
+ }
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index ca0f04e..d131da9 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -546,22 +546,22 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 
+ 	/* if panel fitter is enabled program the input src size */
+ 	if (intel_crtc->scaling_src_size &&
+-			intel_crtc->config.gmch_pfit.control) {
++		(intel_crtc->config.gmch_pfit.control &	PFIT_ENABLE)) {
+ 		intel_plane->reg.pfit_control =
+ 				intel_crtc->config.gmch_pfit.control;
+ 		intel_plane->reg.pipesrc = intel_crtc->scaling_src_size;
+-		dev_priv->pfit_pipe = ((intel_crtc->reg.pfit_control &
+-						PFIT_PIPE_MASK) >> 29);
+ 		if (!dev_priv->atomic_update) {
+ 			I915_WRITE(PFIT_CONTROL, intel_plane->reg.pfit_control);
+ 			I915_WRITE(PIPESRC(pipe), intel_plane->reg.pipesrc);
+ 			intel_crtc->pfit_en_status = true;
+ 		}
+ 	} else if (intel_crtc->pfit_en_status) {
++		i9xx_get_pfit_mode(crtc, src_w, src_h);
++		intel_plane->reg.pfit_control =
++			intel_crtc->config.gmch_pfit.control;
+ 		intel_plane->reg.pipesrc =
+ 			((mode->hdisplay - 1) << SCALING_SRCSIZE_SHIFT) |
+ 			(mode->vdisplay - 1);
+-		intel_plane->reg.pfit_control = 0;
+ 		if (!dev_priv->atomic_update) {
+ 			I915_WRITE(PIPESRC(pipe), intel_plane->reg.pipesrc);
+ 			I915_WRITE(PFIT_CONTROL, intel_plane->reg.pfit_control);
+-- 
+1.7.9.5
+

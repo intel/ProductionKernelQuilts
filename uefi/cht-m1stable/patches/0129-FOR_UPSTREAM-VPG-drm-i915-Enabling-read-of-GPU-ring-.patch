@@ -1,0 +1,108 @@
+From eede4a52c4da269aa6b95e87ee64213b54c7e244 Mon Sep 17 00:00:00 2001
+Message-Id: <eede4a52c4da269aa6b95e87ee64213b54c7e244.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Wed, 9 Oct 2013 16:08:57 +0530
+Subject: [PATCH 129/312] FOR_UPSTREAM [VPG]: drm/i915: Enabling read of GPU
+ ring timestamp from GPU registers.
+
+BZ: 143870
+
+Split RING_TIMESTAMP into two 32 bit register (HI and LO words).
+Read RING_TIMESTAMP_LO and RING_TIMESTAMP_HI register to get GPU ring
+timestamp.
+
+Issue: VIZ-3652
+Change-Id: Ie17b005056637c6f85142363e5674c1094aeda3e
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Reviewed-on: http://android.intel.com:8080/137205
+Reviewed-by: Kamble, Sagar A <sagar.a.kamble@intel.com>
+Reviewed-by: Yang, Fei <fei.yang@intel.com>
+Reviewed-by: Sun, Hang L <hang.l.sun@intel.com>
+Tested-by: Sun, Hang L <hang.l.sun@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Reviewed-on: https://android.intel.com/168444
+Reviewed-by: Ursulin, Tvrtko <tvrtko.ursulin@intel.com>
+Reviewed-by: Landowski, Piotr <piotr.landowski@intel.com>
+Reviewed-by: Purdila, Octavian <octavian.purdila@intel.com>
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   16 +++++++++++++---
+ drivers/gpu/drm/i915/i915_reg.h     |    3 ++-
+ drivers/gpu/drm/i915/intel_uncore.c |    3 ++-
+ 3 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 92a72ab..44e73f1 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4809,14 +4809,24 @@ ssize_t i915_timestamp_read(struct file *filp,
+ 	int len = 0;
+ 	char buf[TIMESTAMP_BUFFER_LEN] = {0,};
+ 	unsigned long flags;
+-	unsigned int gpu_ts;
++	u32 gpu_ts_hi, gpu_ts_lo, gpu_ts_hi_new;
++	u64 gpu_ts;
+ 	unsigned int cpu;
+ 	u32 sec, nsec;
+ 	u64 ftrace_ts;
+ 
+ 	local_irq_save(flags);
+ 	cpu = smp_processor_id();
+-	gpu_ts = I915_READ(RING_TIMESTAMP(RENDER_RING_BASE));
++
++	gpu_ts_hi = I915_READ(RING_TIMESTAMP_HI(RENDER_RING_BASE));
++	gpu_ts_lo = I915_READ(RING_TIMESTAMP_LO(RENDER_RING_BASE));
++	gpu_ts_hi_new = I915_READ(RING_TIMESTAMP_HI(RENDER_RING_BASE));
++	if (gpu_ts_hi_new != gpu_ts_hi) {
++		gpu_ts_lo = I915_READ(RING_TIMESTAMP_LO(RENDER_RING_BASE));
++		gpu_ts_hi = gpu_ts_hi_new;
++	}
++	gpu_ts = (u64)gpu_ts_hi << 32 | gpu_ts_lo;
++
+ 	ftrace_ts = ftrace_now(cpu);
+ 	local_irq_restore(flags);
+ 
+@@ -4824,7 +4834,7 @@ ssize_t i915_timestamp_read(struct file *filp,
+ 	sec = (u32) ftrace_ts;
+ 
+ 	len = snprintf(buf, TIMESTAMP_BUFFER_LEN,
+-		      "CPU%03u %u.%09u s\nGPU %u ticks\n",
++		      "CPU%03u %u.%09u s\nGPU %llu ticks\n",
+ 		      cpu, sec, nsec, gpu_ts);
+ 
+ 	return simple_read_from_buffer(ubuf, max, ppos,
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 9bdaccf..06f7a35 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -1029,7 +1029,8 @@ enum punit_power_well {
+ #define RING_ACTHD_UDW(base)	((base)+0x5c)
+ #define RING_NOPID(base)	((base)+0x94)
+ #define RING_IMR(base)		((base)+0xa8)
+-#define RING_TIMESTAMP(base)	((base)+0x358)
++#define RING_TIMESTAMP_LO(base)	((base)+0x358)
++#define RING_TIMESTAMP_HI(base)	((base)+0x35c)
+ #define   TAIL_ADDR		0x001FFFF8
+ #define   HEAD_WRAP_COUNT	0xFFE00000
+ #define   HEAD_WRAP_ONE		0x00200000
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index 3d463af..89fcbab 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -854,7 +854,8 @@ static const struct register_whitelist {
+ 	/* supported gens, 0x10 for 4, 0x30 for 4 and 5, etc. */
+ 	uint32_t gen_bitmask;
+ } whitelist[] = {
+-	{ RING_TIMESTAMP(RENDER_RING_BASE), 8, GEN_RANGE(4, 8) },
++	{ RING_TIMESTAMP_LO(RENDER_RING_BASE), 4, GEN_RANGE(4, 8) },
++	{ RING_TIMESTAMP_HI(RENDER_RING_BASE), 4, GEN_RANGE(4, 8) },
+ };
+ 
+ int i915_reg_read_ioctl(struct drm_device *dev,
+-- 
+1.7.9.5
+

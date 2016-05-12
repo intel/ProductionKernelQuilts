@@ -1,0 +1,133 @@
+From c54543c9d34a78aa8942421a8cb793a5fd87116d Mon Sep 17 00:00:00 2001
+Message-Id: <c54543c9d34a78aa8942421a8cb793a5fd87116d.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Jeff McGee <jeff.mcgee@intel.com>
+Date: Tue, 17 Dec 2013 12:05:51 -0600
+Subject: [PATCH 052/312] FOR_UPSTREAM [VPG]: drm/i915: Add FBC debugfs
+ disabling
+
+i915_fbc_disable:
+'0' - FBC enabled normally per device and settings.
+'1' - FBC explicitly disabled.
+
+For: APDEV-723
+OTC-Tracker: VIZ-3345
+Change-Id: I81a3408bd79707ba32e8709bf81f461aaab740be
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   50 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h     |    3 +++
+ drivers/gpu/drm/i915/intel_pm.c     |    5 ++++
+ 3 files changed, 58 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 1c06daf..190f7b1 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -1489,6 +1489,9 @@ static int i915_fbc_status(struct seq_file *m, void *unused)
+ 		case FBC_CHIP_DEFAULT:
+ 			seq_puts(m, "disabled per chip default");
+ 			break;
++		case FBC_DEBUG_FS:
++			seq_puts(m, "disabled per debugfs");
++			break;
+ 		default:
+ 			seq_puts(m, "unknown reason");
+ 		}
+@@ -1500,6 +1503,52 @@ static int i915_fbc_status(struct seq_file *m, void *unused)
+ 	return 0;
+ }
+ 
++static int i915_fbc_disable_get(void *data, u64 *val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (!HAS_FBC(dev))
++		return -ENODEV;
++
++	*val = dev_priv->fbc.disable;
++
++	return 0;
++}
++
++static int i915_fbc_disable_set(void *data, u64 val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_crtc *crtc;
++
++	if (!HAS_FBC(dev))
++		return -ENODEV;
++
++	if (dev_priv->fbc.disable == (bool)val)
++		return 0;
++
++	drm_modeset_lock_all(dev);
++
++	DRM_DEBUG_DRIVER("Setting FBC disable %s\n",
++			 val ? "true" : "false");
++
++	dev_priv->fbc.disable = (bool)val;
++
++	/* Reset enabled crtc to force FBC state update */
++	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head)
++		if (crtc->enabled)
++			intel_crtc_restore_mode(crtc);
++
++	drm_modeset_unlock_all(dev);
++
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(i915_fbc_disable_fops,
++			i915_fbc_disable_get, i915_fbc_disable_set,
++			"%llu\n");
++
+ static int i915_ips_status(struct seq_file *m, void *unused)
+ {
+ 	struct drm_info_node *node = m->private;
+@@ -4040,6 +4089,7 @@ static const struct i915_debugfs_files {
+ 	{"i915_rps_manual", &i915_rps_manual_fops},
+ 	{"i915_rc6_disable", &i915_rc6_disable_fops},
+ 	{"i915_ips_disable", &i915_ips_disable_fops},
++	{"i915_fbc_disable", &i915_fbc_disable_fops},
+ 	{"i915_cache_sharing", &i915_cache_sharing_fops},
+ 	{"i915_ring_stop", &i915_ring_stop_fops},
+ 	{"i915_ring_missed_irq", &i915_ring_missed_irq_fops},
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 689496b0..a452f93 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -636,7 +636,10 @@ struct i915_fbc {
+ 		FBC_MULTIPLE_PIPES, /* more than one pipe active */
+ 		FBC_MODULE_PARAM,
+ 		FBC_CHIP_DEFAULT, /* disabled by default on this chip */
++		FBC_DEBUG_FS, /* user requests disabling through debugfs */
+ 	} no_fbc_reason;
++
++	bool disable;
+ };
+ 
+ struct i915_drrs {
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index bde9af2..0b1a9a3 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -521,6 +521,11 @@ void intel_update_fbc(struct drm_device *dev)
+ 			DRM_DEBUG_KMS("fbc disabled per module param\n");
+ 		goto out_disable;
+ 	}
++	if (dev_priv->fbc.disable) {
++		if (set_no_fbc_reason(dev_priv, FBC_DEBUG_FS))
++			DRM_DEBUG_KMS("fbc disabled per debugfs\n");
++		goto out_disable;
++	}
+ 	if ((adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE) ||
+ 	    (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)) {
+ 		if (set_no_fbc_reason(dev_priv, FBC_UNSUPPORTED_MODE))
+-- 
+1.7.9.5
+

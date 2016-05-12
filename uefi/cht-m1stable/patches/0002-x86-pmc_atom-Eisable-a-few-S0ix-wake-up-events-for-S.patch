@@ -1,0 +1,128 @@
+From d452f2275a65f4eec0b0a2a1fbfb4caa72144332 Mon Sep 17 00:00:00 2001
+From: "Li, Aubrey" <aubrey.li@linux.intel.com>
+Date: Mon, 30 Jun 2014 14:09:38 +0800
+Subject: [PATCH 2/4] x86/pmc_atom: Eisable a few S0ix wake up events for S0ix
+ residency
+
+Disable PMC S0IX_WAKE_EN events coming from LPC block(unused) and
+also from GPIO_SUS ored dedicated IRQs (must be disabled as per PMC
+programming rule), GPIOSCORE ored dedicated IRQs (must be disabled
+as per PMC programming rule), GPIO_SUS shared IRQ (not necessary
+since the IOAPIC_DS wake event will still work), GPIO_SCORE shared
+IRQ (not necessary since the IOAPIC_DS wake event will still work).
+
+Signed-off-by: Aubrey Li <aubrey.li@linux.intel.com>
+Link: http://lkml.kernel.org/r/53B0FF22.5080403@linux.intel.com
+Signed-off-by: Olivier Leveque <olivier.leveque@intel.com>
+Signed-off-by: H. Peter Anvin <hpa@linux.intel.com>
+---
+ arch/x86/include/asm/pmc_atom.h |   21 ++++++++++++++++++++
+ arch/x86/kernel/pmc_atom.c      |   42 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+)
+
+diff --git a/arch/x86/include/asm/pmc_atom.h b/arch/x86/include/asm/pmc_atom.h
+index 03a2769f2d7f..8e47e5d10e1d 100644
+--- a/arch/x86/include/asm/pmc_atom.h
++++ b/arch/x86/include/asm/pmc_atom.h
+@@ -19,6 +19,27 @@
+ /* ValleyView Power Control Unit PCI Device ID */
+ #define	PCI_DEVICE_ID_VLV_PMC	0x0F1C
+ 
++/* PMC Memory mapped IO registers */
++#define	PMC_BASE_ADDR_OFFSET	0x44
++#define	PMC_BASE_ADDR_MASK	0xFFFFFE00
++#define	PMC_MMIO_REG_LEN	0x100
++#define	PMC_REG_BIT_WIDTH	32
++
++/* S0ix wake event control */
++#define	PMC_S0IX_WAKE_EN	0x3C
++
++#define	BIT_LPC_CLOCK_RUN		BIT(4)
++#define	BIT_SHARED_IRQ_GPSC		BIT(5)
++#define	BIT_ORED_DEDICATED_IRQ_GPSS	BIT(18)
++#define	BIT_ORED_DEDICATED_IRQ_GPSC	BIT(19)
++#define	BIT_SHARED_IRQ_GPSS		BIT(20)
++
++#define	PMC_WAKE_EN_SETTING	~(BIT_LPC_CLOCK_RUN | \
++				BIT_SHARED_IRQ_GPSC | \
++				BIT_ORED_DEDICATED_IRQ_GPSS | \
++				BIT_ORED_DEDICATED_IRQ_GPSC | \
++				BIT_SHARED_IRQ_GPSS)
++
+ /* PMC I/O Registers */
+ #define	ACPI_BASE_ADDR_OFFSET	0x40
+ #define	ACPI_BASE_ADDR_MASK	0xFFFFFE00
+diff --git a/arch/x86/kernel/pmc_atom.c b/arch/x86/kernel/pmc_atom.c
+index 9eb79f6fc512..d6cc0e9eee54 100644
+--- a/arch/x86/kernel/pmc_atom.c
++++ b/arch/x86/kernel/pmc_atom.c
+@@ -23,8 +23,24 @@
+ 
+ #include <asm/pmc_atom.h>
+ 
++struct pmc_dev {
++	u32 base_addr;
++	void __iomem *regmap;
++};
++
++static struct pmc_dev pmc_device;
+ static u32 acpi_base_addr;
+ 
++static inline u32 pmc_reg_read(struct pmc_dev *pmc, int reg_offset)
++{
++	return readl(pmc->regmap + reg_offset);
++}
++
++static inline void pmc_reg_write(struct pmc_dev *pmc, int reg_offset, u32 val)
++{
++	writel(val, pmc->regmap + reg_offset);
++}
++
+ static void pmc_power_off(void)
+ {
+ 	u16	pm1_cnt_port;
+@@ -42,8 +58,23 @@ static void pmc_power_off(void)
+ 	outl(pm1_cnt_value, pm1_cnt_port);
+ }
+ 
++static void pmc_hw_reg_setup(struct pmc_dev *pmc)
++{
++	/*
++	 * Disable PMC S0IX_WAKE_EN events coming from:
++	 * - LPC clock run
++	 * - GPIO_SUS ored dedicated IRQs
++	 * - GPIO_SCORE ored dedicated IRQs
++	 * - GPIO_SUS shared IRQ
++	 * - GPIO_SCORE shared IRQ
++	 */
++	pmc_reg_write(pmc, PMC_S0IX_WAKE_EN, (u32)PMC_WAKE_EN_SETTING);
++}
++
+ static int pmc_setup_dev(struct pci_dev *pdev)
+ {
++	struct pmc_dev *pmc = &pmc_device;
++
+ 	/* Obtain ACPI base address */
+ 	pci_read_config_dword(pdev, ACPI_BASE_ADDR_OFFSET, &acpi_base_addr);
+ 	acpi_base_addr &= ACPI_BASE_ADDR_MASK;
+@@ -52,6 +83,17 @@ static int pmc_setup_dev(struct pci_dev *pdev)
+ 	if (acpi_base_addr != 0 && pm_power_off == NULL)
+ 		pm_power_off = pmc_power_off;
+ 
++	pci_read_config_dword(pdev, PMC_BASE_ADDR_OFFSET, &pmc->base_addr);
++	pmc->base_addr &= PMC_BASE_ADDR_MASK;
++
++	pmc->regmap = ioremap_nocache(pmc->base_addr, PMC_MMIO_REG_LEN);
++	if (!pmc->regmap) {
++		dev_err(&pdev->dev, "error: ioremap failed\n");
++		return -ENOMEM;
++	}
++
++	/* PMC hardware registers setup */
++	pmc_hw_reg_setup(pmc);
+ 	return 0;
+ }
+ 
+-- 
+1.7.9.5
+

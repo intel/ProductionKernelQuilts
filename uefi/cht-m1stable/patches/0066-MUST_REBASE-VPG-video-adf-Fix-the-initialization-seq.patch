@@ -1,0 +1,179 @@
+From 3001a8c47ea5610b727119bb1783f1139737db90 Mon Sep 17 00:00:00 2001
+Message-Id: <3001a8c47ea5610b727119bb1783f1139737db90.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: Shashank Sharma <shashank.sharma@intel.com>
+Date: Sat, 31 Jan 2015 04:05:18 +0530
+Subject: [PATCH 66/95] MUST_REBASE [VPG]: video/adf: Fix the initialization
+ sequence
+
+This patch changes the order in which platform is initialized
+for VLV/CHV ADF driver.
+
+Any REG_READ/WRITE operations depend on
+g_intel_adf_dev->mmio to be available. For that, we need
+the adf device to be created. If not, any REG_READ/WRITE
+operation will crash. Hot pluggable encoders like HDMI
+and DP need to probe themselves during the init time, else in
+connected boot scenario, they wont get a hot-plug. So in
+short create adf device first, then create context.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5213
+Change-Id: If118e058e95090a45e8805796a2d80a869628295
+Signed-off-by: Shashank Sharma <shashank.sharma@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/vlv_dc_config.c |    9 ---
+ drivers/video/adf/intel/intel_adf.c              |   85 ++++++++++++++++++++--
+ 2 files changed, 79 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+index dfec750..41b967d 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+@@ -654,7 +654,6 @@ static void vlv_disable_displays(struct vlv_dc_config *config,
+ struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
+ {
+ 	struct vlv_dc_config *config;
+-	struct intel_dc_memory *memory;
+ 	union child_device_config *child_dev = NULL;
+ 	int dev_num;
+ 	int dvo_port;
+@@ -706,14 +705,6 @@ struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
+ 		goto err;
+ 	}
+ 
+-	/* create and add memory */
+-	/*
+-	 * TODO: add gem config or get the gem struct here and register as a
+-	 * interface with adf y using intel_dc_config_add_memory();
+-	 */
+-	memory = kzalloc(sizeof(struct intel_dc_memory), GFP_KERNEL);
+-	config->base.memory = memory;
+-
+ 	/* create and add power */
+ 	/*
+ 	 * TODO: add dpms config over here and register with adf using
+diff --git a/drivers/video/adf/intel/intel_adf.c b/drivers/video/adf/intel/intel_adf.c
+index 65290ff..aa21e8c 100644
+--- a/drivers/video/adf/intel/intel_adf.c
++++ b/drivers/video/adf/intel/intel_adf.c
+@@ -245,6 +245,62 @@ void intel_adf_context_destroy(struct intel_adf_context *ctx)
+ 	g_adf_context = NULL;
+ }
+ 
++#ifdef CONFIG_ADF_INTEL_VLV
++struct intel_dc_config *intel_adf_get_config(struct pci_dev *pdev,
++	struct intel_adf_device **dev, u32 platform_id)
++{
++	struct intel_dc_memory *memory;
++	struct intel_dc_config *config;
++
++	/*
++	 * Any REG_READ/WRITE operations depend on
++	 * g_intel_adf_dev->mmio to be available. For that, we need
++	 * the adf device to be created. If not, any REG_READ/WRITE
++	 * operation will crash. Hot pluggable encoders like HDMI
++	 * and DP need to probe themselves during the init time, else in
++	 * connected boot scenario, they wont get a hot-plug. So in
++	 * short create adf device first, then create context.
++	 */
++	if (!pdev || !dev) {
++		dev_err(&pdev->dev, "%s: Invalid input\n",
++			__func__);
++		return NULL;
++	}
++
++	/* Create context memory */
++	memory = kzalloc(sizeof(struct intel_dc_memory), GFP_KERNEL);
++	if (!memory) {
++		dev_err(&pdev->dev, "%s: OOM while allocating memory\n",
++			__func__);
++		return NULL;
++	}
++
++	/* Create ADF device */
++	*dev = intel_adf_device_create(pdev, memory);
++	if (IS_ERR(*dev)) {
++		dev_err(&pdev->dev, "%s: failed to create adf device\n",
++			__func__);
++		goto failed_dev;
++	}
++
++	/* Get display controller configure of this platform */
++	config = intel_adf_get_dc_config(pdev, platform_id);
++	if (IS_ERR(config)) {
++		dev_err(&pdev->dev, "%s: failed to get DC config\n", __func__);
++		goto failed_config;
++	}
++
++	config->memory = memory;
++	return config;
++
++failed_config:
++	intel_adf_device_destroy(*dev);
++failed_dev:
++	kfree(memory);
++	return NULL;
++}
++#endif
++
+ struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev)
+ {
+ 	struct intel_adf_context *ctx;
+@@ -270,6 +326,22 @@ struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev)
+ 		goto err;
+ 	}
+ 
++#ifdef CONFIG_ADF_INTEL_VLV
++	/*
++	 * VLV adf context create order is different from
++	 * other platforms. So create separate context for
++	 * VLV/CHV, without disturbing others.
++	 */
++	config = intel_adf_get_config(pdev, &dev, platform_id);
++	if (!config || !dev) {
++		dev_err(&pdev->dev, "%s: failed to get DC config\n", __func__);
++		if (config)
++			err = PTR_ERR(dev);
++		else
++			err = PTR_ERR(config);
++		goto err;
++	}
++#else
+ 	/*get display controller configure of this platform*/
+ 	config = intel_adf_get_dc_config(pdev, platform_id);
+ 	if (IS_ERR(config)) {
+@@ -278,12 +350,6 @@ struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev)
+ 		goto err;
+ 	}
+ 
+-#ifdef CONFIG_BACKLIGHT_CLASS_DEVICE
+-	err = backlight_init(ctx);
+-	if (err)
+-		goto err;
+-#endif
+-
+ 	/*create ADF device*/
+ 	dev = intel_adf_device_create(pdev, config->memory);
+ 	if (IS_ERR(dev)) {
+@@ -292,6 +358,13 @@ struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev)
+ 		err = PTR_ERR(dev);
+ 		goto err;
+ 	}
++#endif
++
++#ifdef CONFIG_BACKLIGHT_CLASS_DEVICE
++	err = backlight_init(ctx);
++	if (err)
++		goto err;
++#endif
+ 
+ 	/*create ADF interfaces*/
+ 	n_intfs = config->n_pipes;
+-- 
+1.7.9.5
+

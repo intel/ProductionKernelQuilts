@@ -1,0 +1,192 @@
+From dfd4e190eab40b439165c66452563137ac26e40e Mon Sep 17 00:00:00 2001
+From: Albin B <albin.bala.krishnan@intel.com>
+Date: Thu, 30 Jul 2015 11:43:24 +0530
+Subject: [PATCH] [EM/USBC_PD]: Get source current value from phy supported
+ host current
+
+In Power Delivery, to advertise the source capability with the source
+current value, the source current value should be the platform
+supported current. Hence the source current value is getting from the
+phy host current value for the source capability.
+
+Change-Id: I95bbf1519f3e7cee552912e70469dcde4d1007ed
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-15044
+Signed-off-by: Albin B <albin.bala.krishnan@intel.com>
+
+Conflicts:
+	drivers/usb/typec/pd/devpolicy_mgr.c
+---
+ drivers/usb/typec/pd/devpolicy_mgr.c | 24 ++++++++++++++++++++++++
+ drivers/usb/typec/pd/devpolicy_mgr.h | 12 ++++++++++++
+ drivers/usb/typec/pd/policy_engine.c | 10 ++++++++++
+ drivers/usb/typec/pd/policy_engine.h | 10 ++++++++++
+ drivers/usb/typec/pd/src_port_pe.c   | 16 ++--------------
+ 5 files changed, 58 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/devpolicy_mgr.c b/drivers/usb/typec/pd/devpolicy_mgr.c
+index 9d51520..7a21e60 100644
+--- a/drivers/usb/typec/pd/devpolicy_mgr.c
++++ b/drivers/usb/typec/pd/devpolicy_mgr.c
+@@ -123,6 +123,29 @@ static int dpm_get_max_snkpwr_cap(struct devpolicy_mgr *dpm,
+ 	return 0;
+ }
+ 
++static int dpm_get_source_power_cap(struct devpolicy_mgr *dpm,
++					struct power_cap *cap)
++{
++	int val;
++
++	val = typec_get_host_current(dpm->phy);
++	if (val < 0) {
++		pr_err("DPM: Unable to get the host current from phy\n");
++		return val;
++	}
++
++	if (val == TYPEC_CURRENT_USB)
++		/* setting 900mA source current in case of USB, as
++		 * typec connector is capable of supporting USB3.0 */
++		cap->ma = IBUS_0P9A;
++	else
++		cap->ma = val;
++
++	cap->mv = VBUS_5V;
++
++	return 0;
++}
++
+ static enum batt_soc_status dpm_get_batt_status(struct devpolicy_mgr *dpm)
+ {
+ 	int soc;
+@@ -976,6 +999,7 @@ static void dpm_unregister_pd_class_dev(struct devpolicy_mgr *dpm)
+ static struct dpm_interface interface = {
+ 	.get_max_srcpwr_cap = dpm_get_max_srcpwr_cap,
+ 	.get_max_snkpwr_cap = dpm_get_max_snkpwr_cap,
++	.get_source_power_cap = dpm_get_source_power_cap,
+ 	.get_sink_power_cap = dpm_get_sink_power_cap,
+ 	.get_sink_power_caps = dpm_get_sink_power_caps,
+ 	.get_cable_state = dpm_get_cable_state,
+diff --git a/drivers/usb/typec/pd/devpolicy_mgr.h b/drivers/usb/typec/pd/devpolicy_mgr.h
+index 702b941..3ddaff9 100644
+--- a/drivers/usb/typec/pd/devpolicy_mgr.h
++++ b/drivers/usb/typec/pd/devpolicy_mgr.h
+@@ -65,6 +65,7 @@ enum batt_soc_status {
+ /* host mode: max of 5V, 1A */
+ #define VBUS_5V		5000
+ #define IBUS_1A		1000
++#define IBUS_0P9A	900
+ #define IBUS_0P5A	500
+ 
+ /* device mode: max of 12, 3A */
+@@ -169,6 +170,8 @@ struct dpm_interface {
+ 					struct power_cap *cap);
+ 	int (*get_max_snkpwr_cap)(struct devpolicy_mgr *dpm,
+ 					struct power_cap *cap);
++	int (*get_source_power_cap)(struct devpolicy_mgr *dpm,
++					struct power_cap *cap);
+ 	int (*get_sink_power_cap)(struct devpolicy_mgr *dpm,
+ 					struct power_cap *cap);
+ 	int (*get_sink_power_caps)(struct devpolicy_mgr *dpm,
+@@ -213,6 +216,15 @@ static inline int devpolicy_get_max_snkpwr_cap(struct devpolicy_mgr *dpm,
+ 	return -ENODEV;
+ }
+ 
++static inline int devpolicy_get_srcpwr_cap(struct devpolicy_mgr *dpm,
++					struct power_cap *cap)
++{
++	if (dpm && dpm->interface && dpm->interface->get_source_power_cap)
++		return dpm->interface->get_source_power_cap(dpm, cap);
++	else
++		return -ENODEV;
++}
++
+ static inline int devpolicy_get_snkpwr_cap(struct devpolicy_mgr *dpm,
+ 					struct power_cap *cap)
+ {
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 46f2372..c968ccd 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -259,6 +259,15 @@ static inline void policy_prot_update_power_role(struct policy_engine *pe,
+ 		pe->prot->policy_update_power_role(pe->prot, prole);
+ }
+ 
++static int pe_get_srcpwr_cap(struct policy_engine *pe,
++					struct power_cap *cap)
++{
++	if (pe && pe->dpm)
++		return devpolicy_get_srcpwr_cap(pe->dpm, cap);
++
++	return -ENODEV;
++}
++
+ static int pe_get_snkpwr_cap(struct policy_engine *pe,
+ 					struct power_cap *cap)
+ {
+@@ -760,6 +769,7 @@ static int pe_dpm_notification(struct policy_engine *pe,
+ static struct pe_operations ops = {
+ 	.get_snkpwr_cap = pe_get_snkpwr_cap,
+ 	.get_snkpwr_caps = pe_get_snkpwr_caps,
++	.get_srcpwr_cap = pe_get_srcpwr_cap,
+ 	.get_max_snkpwr_cap = pe_get_max_snkpwr_cap,
+ 	.get_data_role = pe_get_data_role,
+ 	.get_power_role = pe_get_power_role,
+diff --git a/drivers/usb/typec/pd/policy_engine.h b/drivers/usb/typec/pd/policy_engine.h
+index 6c86fcdf..50b9c30 100644
+--- a/drivers/usb/typec/pd/policy_engine.h
++++ b/drivers/usb/typec/pd/policy_engine.h
+@@ -330,6 +330,8 @@ struct policy_engine {
+ struct pe_operations {
+ 	int (*get_snkpwr_cap)(struct policy_engine *pe,
+ 					struct power_cap *cap);
++	int (*get_srcpwr_cap)(struct policy_engine *pe,
++					struct power_cap *cap);
+ 	int (*get_snkpwr_caps)(struct policy_engine *pe,
+ 					struct power_caps *caps);
+ 	int (*get_max_snkpwr_cap)(struct policy_engine *pe,
+@@ -386,6 +388,14 @@ static inline const char *policy_port_type_string(enum policy_type ptype)
+ }
+ 
+ /* methods to initialize/destroy the policy manager */
++static inline int policy_get_srcpwr_cap(struct policy *p, struct power_cap *cap)
++{
++	if (p && p->pe && p->pe->ops && p->pe->ops->get_srcpwr_cap)
++		return p->pe->ops->get_srcpwr_cap(p->pe, cap);
++
++	return -ENOTSUPP;
++}
++
+ static inline int policy_get_snkpwr_cap(struct policy *p, struct power_cap *cap)
+ {
+ 	if (p && p->pe && p->pe->ops && p->pe->ops->get_snkpwr_cap)
+diff --git a/drivers/usb/typec/pd/src_port_pe.c b/drivers/usb/typec/pd/src_port_pe.c
+index 1e599ab..8dd9edb 100644
+--- a/drivers/usb/typec/pd/src_port_pe.c
++++ b/drivers/usb/typec/pd/src_port_pe.c
+@@ -71,22 +71,10 @@ enum src_pe_state {
+ 	SRC_PE_STATE_PD_FAILED,
+ };
+ 
+-static int src_pe_get_default_power_cap(struct src_port_pe *src_pe,
+-					struct power_cap *pcap)
+-{
+-	/* By default 5V/500mA is supported in provider mode */
+-	pcap->mv = VBUS_5V;
+-	pcap->ma = IBUS_0P5A;
+-	return 0;
+-}
+-
+-static int src_pe_get_power_cap(struct src_port_pe *src_pe,
++static inline int src_pe_get_power_cap(struct src_port_pe *src_pe,
+ 				struct power_cap *pcap)
+ {
+-	/* The power capabilities should be read from dev policy manager.
+-	 * Currently using default capabilities.
+-	 */
+-	return src_pe_get_default_power_cap(src_pe, pcap);
++	return policy_get_srcpwr_cap(&src_pe->p, pcap);
+ }
+ 
+ static void src_pe_reset_policy_engine(struct src_port_pe *src_pe)
+-- 
+1.9.1
+

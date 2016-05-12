@@ -1,0 +1,273 @@
+From 54b2b7fd1539614ed0d5449db1e2d40b663d7e72 Mon Sep 17 00:00:00 2001
+Message-Id: <54b2b7fd1539614ed0d5449db1e2d40b663d7e72.1425610844.git.chang-joon.lee@intel.com>
+In-Reply-To: <6fa2ab23adf6d7de781e906d04a0224410262d9b.1425610844.git.chang-joon.lee@intel.com>
+References: <6fa2ab23adf6d7de781e906d04a0224410262d9b.1425610844.git.chang-joon.lee@intel.com>
+From: Durgadoss R <durgadoss.r@intel.com>
+Date: Thu, 5 Feb 2015 19:09:34 +0530
+Subject: [PATCH 04/27] MUST_REBASE [VPG]: drivers/video/adf: Add generic eDP
+ DRRS methods
+
+This patch adds methods that define the general flow of eDP
+DRRS. These methods register themselves with the DRRS framework
+during initialization, and when called during runtime, access
+the hardware registers through the platform specific methods.
+
+* For clarity, a new file containing eDP related code is added.
+* Rearrange struct intel_link_m_n in gen_dp_pipe.h to address
+  forward declaration constraints.
+* Add eDP related data structures to gen_dp_pipe.h
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5760
+Change-Id: I1e1c7a04356d32d79e0ad727d4fab4f194e9d9f4
+Signed-off-by: Durgadoss R <durgadoss.r@intel.com>
+---
+ drivers/video/adf/intel/core/common/dp/Makefile    |    4 +-
+ drivers/video/adf/intel/core/common/dp/edp_drrs.c  |  158 ++++++++++++++++++++
+ .../adf/intel/include/core/common/dp/gen_dp_pipe.h |   36 +++--
+ 3 files changed, 187 insertions(+), 11 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/common/dp/edp_drrs.c
+
+diff --git a/drivers/video/adf/intel/core/common/dp/Makefile b/drivers/video/adf/intel/core/common/dp/Makefile
+index 2ac0037..c5e8c8d 100644
+--- a/drivers/video/adf/intel/core/common/dp/Makefile
++++ b/drivers/video/adf/intel/core/common/dp/Makefile
+@@ -2,4 +2,6 @@
+ ccflags-y := -Idrivers/staging/ -Iinclude/adf -Iinclude/uapi/adf -Idrivers/video/adf/intel/include -Werror
+ 
+ obj-y = gen_dp_pipe.o \
+-	dp_panel.o
++	dp_panel.o \
++	edp_drrs.o
++
+diff --git a/drivers/video/adf/intel/core/common/dp/edp_drrs.c b/drivers/video/adf/intel/core/common/dp/edp_drrs.c
+new file mode 100644
+index 0000000..8587930
+--- /dev/null
++++ b/drivers/video/adf/intel/core/common/dp/edp_drrs.c
+@@ -0,0 +1,158 @@
++/*
++ * Copyright (C) 2015, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Author:
++ * Durgadoss R <durgadoss.r@intel.com>
++ */
++
++#define pr_fmt(fmt) "adf_edp_drrs: " fmt
++
++#include <linux/delay.h>
++#include <drm/i915_drm.h>
++#include <intel_adf_device.h>
++#include <core/common/intel_drrs.h>
++#include <core/common/dp/gen_dp_pipe.h>
++#include <core/common/drm_modeinfo_ops.h>
++#include <core/vlv/vlv_dc_config.h>
++
++void intel_edp_set_drrs_state(struct intel_pipeline *pipeline)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct dp_pipe *dp_pipe = &disp->gen.dp;
++
++	dp_pipe->drrs.platform_ops->set_drrs_state(pipeline);
++}
++
++static
++struct drm_mode_modeinfo *find_downclock_mode(struct intel_pipe *i_pipe,
++				struct drm_mode_modeinfo *fixed)
++{
++	struct drm_mode_modeinfo *modelist, *tmp = NULL;
++	bool ret;
++	int i;
++	size_t n_modes = 0;
++	int lower_clock = fixed->clock;
++
++	if (!i_pipe->ops->get_modelist)
++		return NULL;
++
++	i_pipe->ops->get_modelist(i_pipe, &modelist, &n_modes);
++	if (!n_modes) {
++		pr_err("Cannot obtain modelist\n");
++		return NULL;
++	}
++
++	for (i = 0; i < n_modes; i++) {
++		ret = drm_modeinfo_equal_no_clocks(&modelist[i], fixed);
++		if (ret && modelist[i].clock < lower_clock) {
++			tmp = &modelist[i];
++			lower_clock = modelist[i].clock;
++		}
++	}
++
++	if (lower_clock < fixed->clock)
++		return drm_modeinfo_duplicate(tmp);
++
++	return NULL;
++}
++
++int intel_edp_drrs_init(struct intel_pipeline *pipeline)
++{
++	struct adf_drrs *drrs = pipeline->drrs;
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct dp_pipe *dp_pipe = &disp->gen.dp;
++	struct intel_pipe *i_pipe = &dp_pipe->base;
++	struct drm_mode_modeinfo *downclock, *fixed, *preferred;
++	u8 bpp, link_bw, lane_count;
++	int ret = -EINVAL;
++
++	if (drrs->vbt.drrs_type != SEAMLESS_DRRS_SUPPORT) {
++		pr_err("VBT does not support DRRS\n");
++		return ret;
++	}
++
++	if (!dp_pipe->drrs.platform_ops ||
++			!dp_pipe->drrs.platform_ops->init ||
++			!dp_pipe->drrs.platform_ops->set_drrs_state) {
++		pr_err("Required platform ops are NULL\n");
++		return ret;
++	}
++
++	if (!i_pipe->ops->get_preferred_mode)
++		return ret;
++
++	i_pipe->ops->get_preferred_mode(i_pipe, &preferred);
++	if (!preferred) {
++		pr_err("Failed to obtain edp preferred mode\n");
++		return ret;
++	}
++
++	/* Obtain fixed mode */
++	fixed = drm_modeinfo_duplicate(preferred);
++	if (!fixed) {
++		pr_err("Failed to create fixed mode\n");
++		return ret;
++	}
++	if (fixed->vrefresh == 0)
++		fixed->vrefresh = drm_modeinfo_vrefresh(fixed);
++
++	downclock = find_downclock_mode(i_pipe, fixed);
++	if (!downclock)
++		goto free_fixed_mode;
++
++	pr_debug("eDP DRRS modes:\n");
++	drm_modeinfo_debug_printmodeline(fixed);
++	drm_modeinfo_debug_printmodeline(downclock);
++
++	lane_count = pipeline->params.dp.lane_count;
++	link_bw = pipeline->params.dp.link_bw;
++	bpp = pipeline->params.dp.bpp;
++
++	/* Calculate m_n_tu for fixed and downclock modes */
++	dp_pipe_compute_m_n(bpp, lane_count, fixed->clock, link_bw,
++				&dp_pipe->drrs.fixed_mn);
++
++	dp_pipe_compute_m_n(bpp, lane_count, downclock->clock, link_bw,
++				&dp_pipe->drrs.downclock_mn);
++
++	/* We are good to go .. */
++	drrs->panel_mode.fixed_mode = fixed;
++	drrs->panel_mode.downclock_mode = downclock;
++	drrs->panel_mode.target_mode = NULL;
++
++	return 0;
++
++free_fixed_mode:
++	drm_modeinfo_destroy(fixed);
++	return ret;
++}
++
++void intel_edp_drrs_exit(struct intel_pipeline *pipeline)
++{
++	struct adf_drrs *drrs = pipeline->drrs;
++
++	drm_modeinfo_destroy(drrs->panel_mode.downclock_mode);
++	drm_modeinfo_destroy(drrs->panel_mode.fixed_mode);
++	drrs->has_drrs = false;
++}
++
++struct drrs_encoder_ops edp_drrs_ops = {
++	.init = intel_edp_drrs_init,
++	.exit = intel_edp_drrs_exit,
++	.set_drrs_state = intel_edp_set_drrs_state,
++};
++
++/* Called by intel_drrs_init() to get ->ops for edp panel */
++struct drrs_encoder_ops *intel_get_edp_drrs_ops(void)
++{
++	return &edp_drrs_ops;
++}
+diff --git a/drivers/video/adf/intel/include/core/common/dp/gen_dp_pipe.h b/drivers/video/adf/intel/include/core/common/dp/gen_dp_pipe.h
+index 2bbd3e29..ce63f7c 100644
+--- a/drivers/video/adf/intel/include/core/common/dp/gen_dp_pipe.h
++++ b/drivers/video/adf/intel/include/core/common/dp/gen_dp_pipe.h
+@@ -41,8 +41,33 @@ struct edp_psr {
+ 	atomic_t update_pending;
+ };
+ 
++/* eDP DRRS related fields */
++struct edp_drrs_platform_ops {
++	void (*init)(struct intel_pipeline *pipeline);
++	void (*exit)(struct intel_pipeline *pipeline);
++	void (*set_drrs_state)(struct intel_pipeline *pipeline);
++};
++
++/* Used by dp and fdi links */
++struct intel_link_m_n {
++	u32        tu;
++	u32        gmch_m;
++	u32        gmch_n;
++	u32        link_m;
++	u32        link_n;
++};
++
++struct edp_drrs {
++	/* M1, N1 for normal mode */
++	struct intel_link_m_n fixed_mn;
++	/* M2, N2 for downclock mode */
++	struct intel_link_m_n downclock_mn;
++	struct edp_drrs_platform_ops *platform_ops;
++};
++
+ struct dp_pipe {
+ 	struct edp_psr psr;
++	struct edp_drrs drrs;
+ 	struct intel_pipe base;
+ 	struct intel_pipeline *pipeline;
+ 	struct dp_panel panel;
+@@ -53,16 +78,6 @@ struct dp_pipe {
+ 	bool panel_present;
+ };
+ 
+-
+-/* Used by dp and fdi links */
+-struct intel_link_m_n {
+-	u32        tu;
+-	u32        gmch_m;
+-	u32        gmch_n;
+-	u32        link_m;
+-	u32        link_n;
+-};
+-
+ static inline struct dp_pipe *to_dp_pipe(struct intel_pipe *pipe)
+ {
+ 	return container_of(pipe, struct dp_pipe, base);
+@@ -82,4 +97,5 @@ int intel_dp_self_modeset(struct dp_pipe *dp_pipe);
+ extern int
+ intel_adf_dp_handle_events(struct dp_pipe *dp_pipe, u32 events);
+ 
++struct drrs_encoder_ops *intel_get_edp_drrs_ops(void);
+ #endif /* _INTEL_DP_PIPE_H_ */
+-- 
+1.7.9.5
+

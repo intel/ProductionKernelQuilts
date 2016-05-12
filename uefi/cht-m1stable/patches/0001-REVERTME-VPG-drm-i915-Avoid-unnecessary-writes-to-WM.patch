@@ -1,0 +1,235 @@
+From 7c8af138acbe907021f93af6d5e51d2a311ab097 Mon Sep 17 00:00:00 2001
+Message-Id: <7c8af138acbe907021f93af6d5e51d2a311ab097.1435736732.git.chang-joon.lee@intel.com>
+From: vandita kulkarni <vandita.kulkarni@intel.com>
+Date: Sat, 13 Jun 2015 00:13:37 +0530
+Subject: [PATCH 1/3] REVERTME [VPG] drm/i915: Avoid unnecessary writes to WM,
+ DSPARB
+
+This patch updates only the changed values of wm and dsparb
+in turn reducing number of writes. The WM values programmed
+are as suggested by power architects.
+REVERTME: This patch depends on set display atomicity design
+which would get replaced once nuclear flip implementation
+gets in.
+
+Issue: IMINAN-33414
+Change-Id: Idd3e74cd06013544e6175cf7abe5af52cad047dc
+Signed-off-by: vandita kulkarni <vandita.kulkarni@intel.com>
+---
+ drivers/gpu/drm/i915/i915_reg.h      |   5 ++
+ drivers/gpu/drm/i915/intel_display.c |  14 ++++
+ drivers/gpu/drm/i915/intel_pm.c      | 131 ++++++++++++++++++++++-------------
+ 3 files changed, 102 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index aaa0b85..dfde670 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -4325,6 +4325,11 @@ enum punit_power_well {
+ #define VLV_FW_PIPEB_WM1_MASK1	0xff00
+ #define VLV_FW_PIPEB_WM1_MASK2	0xff000000
+ 
++#define FW1_SR_WM 23
++#define NUM_SR_BITS 9
++#define SHOWM_SR_WM_HO 24
++#define NIBBLE_HIGH 8
++
+ #define VLV_FW_SR_MASK		0xff800000
+ #define VLV_FW_SR_WM1_MASK	0xff
+ #define VLV_DSPHOWM_SR_MASK	0x3000000
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 8c76fdd..f7e8274 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2647,6 +2647,20 @@ void vlv_update_watermarks(struct drm_i915_private *dev_priv)
+ 			(DSPFW7_SPRITED_VAL << DSPFW7_SPRITED_SHIFT) |
+ 			(DSPFW7_SPRITEC1_VAL << DSPFW7_SPRITEC1_SHIFT) |
+ 			DSPFW7_SPRITEC_VAL);
++
++	/* make all WM1 0 - as suggested by power architects */
++	if (IS_CHERRYVIEW(dev_priv->dev)) {
++		I915_WRITE_BITS(DSPFW5, 0, VLV_FW_PIPEA_PA_WM1_MASK);
++		I915_WRITE_BITS(DSPFW4, 0, VLV_FW_PIPEA_SA_WM1_MASK);
++		I915_WRITE_BITS(DSPFW4, 0, VLV_FW_PIPEA_SB_WM1_MASK);
++		I915_WRITE_BITS(DSPFW5, 0, VLV_FW_PIPEB_PB_WM1_MASK);
++		I915_WRITE_BITS(DSPFW7, 0, VLV_FW_PIPEB_SC_WM1_MASK);
++		I915_WRITE_BITS(DSPFW7, 0, VLV_FW_PIPEB_SD_WM1_MASK);
++		I915_WRITE_BITS(DSPFW9, 0, VLV_FW_PIPEC_PC_WM1_MASK);
++		I915_WRITE_BITS(DSPFW8, 0, VLV_FW_PIPEC_SE_WM1_MASK);
++		I915_WRITE_BITS(DSPFW8, 0, VLV_FW_PIPEC_SF_WM1_MASK);
++		I915_WRITE_BITS(DSPFW6, 0, VLV_FW_SR_WM1_MASK);
++	}
+ }
+ 
+ int i915_set_plane_180_rotation(struct drm_device *dev, void *data,
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index deb81a6..7abb7b4 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -1466,6 +1466,7 @@ void vlv_update_dsparb(struct intel_crtc *intel_crtc)
+ 	u32 dsparb2 = DSPARB2_50_25_25;
+ 	u32 pa = 0, sa = 0, sb = 0, sr = 0;
+ 	int fifo_size = 0;
++	u32 dsphowm = 0;
+ 
+ 	if (hweight32(plane_stat) == 1) {
+ 		/* Allocate the entire fifo to the plane that is enabled */
+@@ -1515,73 +1516,107 @@ void vlv_update_dsparb(struct intel_crtc *intel_crtc)
+ 		sr = 0;
+ 	}
+ 
+-	if (sr) {
+-		I915_WRITE_BITS(DSPFW1, (sr << 23), VLV_FW_SR_MASK);
+-		I915_WRITE_BITS(DSPFW6, 0, VLV_FW_SR_WM1_MASK);
+-		I915_WRITE(DSPHOWM, (I915_READ(DSPHOWM) &
+-						~(VLV_DSPHOWM_SR_MASK)) |
+-					((sr >> 9) << 24));
+-	}
++	if ((I915_READ(DSPFW1) & VLV_FW_SR_MASK) != (sr << FW1_SR_WM))
++		I915_WRITE_BITS(DSPFW1, (sr << FW1_SR_WM), VLV_FW_SR_MASK);
++
++	if ((I915_READ(DSPHOWM) & VLV_DSPHOWM_SR_MASK) !=
++		((sr >> NUM_SR_BITS) << SHOWM_SR_WM_HO))
++			I915_WRITE(DSPHOWM, (I915_READ(DSPHOWM) &
++				~(VLV_DSPHOWM_SR_MASK)) |
++				((sr >> NUM_SR_BITS) << SHOWM_SR_WM_HO));
+ 
+ 	switch (pipe) {
+ 	case PIPE_A:
+-		I915_WRITE_BITS(DSPARB, dsparb, DSPARB_PIPEA_MASK);
+-		I915_WRITE_BITS(DSPARB2, dsparb_h, DSPARB2_PIPEA_MASK);
++		if ((I915_READ(DSPARB) & DSPARB_PIPEA_MASK) != dsparb)
++			I915_WRITE_BITS(DSPARB, dsparb, DSPARB_PIPEA_MASK);
++		if ((I915_READ(DSPARB2) & DSPARB2_PIPEA_MASK) != dsparb_h)
++			I915_WRITE_BITS(DSPARB2, dsparb_h, DSPARB2_PIPEA_MASK);
+ 
+ 		/* update wm */
+-		I915_WRITE_BITS(DSPFW1, pa, VLV_FW_PIPEA_PA_MASK);
+-		I915_WRITE_BITS(DSPFW2, sa, VLV_FW_PIPEA_SA_MASK);
+-		I915_WRITE_BITS(DSPFW2, (sb << VLV_FW_PIPEA_SB_SHIFT),
++		if ((I915_READ(DSPFW1) & VLV_FW_PIPEA_PA_MASK) != pa)
++			I915_WRITE_BITS(DSPFW1, pa, VLV_FW_PIPEA_PA_MASK);
++
++		if ((I915_READ(DSPFW2) & VLV_FW_PIPEA_SA_MASK) != sa)
++			I915_WRITE_BITS(DSPFW2, sa, VLV_FW_PIPEA_SA_MASK);
++
++		if ((I915_READ(DSPFW2) & VLV_FW_PIPEA_SB_MASK) !=
++					(sb << VLV_FW_PIPEA_SB_SHIFT))
++			I915_WRITE_BITS(DSPFW2, (sb << VLV_FW_PIPEA_SB_SHIFT),
+ 							VLV_FW_PIPEA_SB_MASK);
+-		I915_WRITE_BITS(DSPFW5, 0, VLV_FW_PIPEA_PA_WM1_MASK);
+-		I915_WRITE_BITS(DSPFW4, 0, VLV_FW_PIPEA_SA_WM1_MASK);
+-		I915_WRITE_BITS(DSPFW4, 0, VLV_FW_PIPEA_SB_WM1_MASK);
+-		I915_WRITE(DSPHOWM, (I915_READ(DSPHOWM) &
+-						~(VLV_DSPHOWM_PIPEA_MASK)) |
+-						(((pa >> 8) | ((sa >> 8) <<
+-						VLV_DSPHOWM_PIPEA_SA_SHIFT) |
+-						((sb >> 8) <<
+-						VLV_DSPHOWM_PIPEA_SB_SHIFT))));
++
++
++		dsphowm = (pa >> NIBBLE_HIGH) |
++				((sa >> NIBBLE_HIGH) <<
++					VLV_DSPHOWM_PIPEA_SA_SHIFT) |
++				((sb >> NIBBLE_HIGH) <<
++					VLV_DSPHOWM_PIPEA_SB_SHIFT);
++
++		if ((I915_READ(DSPHOWM) & VLV_DSPHOWM_PIPEA_MASK) !=  dsphowm)
++			I915_WRITE(DSPHOWM, (I915_READ(DSPHOWM) &
++					~VLV_DSPHOWM_PIPEA_MASK) | dsphowm);
+ 		break;
+ 	case PIPE_B:
+-		I915_WRITE_BITS(DSPARB, (dsparb << DSPARB_PIPEB_SHIFT),
++		if ((I915_READ(DSPARB) & DSPARB_PIPEB_MASK) !=
++					(dsparb << DSPARB_PIPEB_SHIFT))
++			I915_WRITE_BITS(DSPARB, (dsparb << DSPARB_PIPEB_SHIFT),
+ 						DSPARB_PIPEB_MASK);
+-		I915_WRITE_BITS(DSPARB2, (dsparb_h << DSPARB2_PIPEB_SHIFT),
++		if ((I915_READ(DSPARB2) & DSPARB2_PIPEB_MASK) !=
++					(dsparb_h << DSPARB2_PIPEB_SHIFT))
++			I915_WRITE_BITS(DSPARB2,
++					(dsparb_h << DSPARB2_PIPEB_SHIFT),
+ 						DSPARB2_PIPEB_MASK);
+ 		/* update wm */
+-		I915_WRITE_BITS(DSPFW1, (pa << VLV_FW_PIPEB_PB_SHIFT),
++		if ((I915_READ(DSPFW1) & VLV_FW_PIPEB_PB_MASK) !=
++						(pa << VLV_FW_PIPEB_PB_SHIFT))
++			I915_WRITE_BITS(DSPFW1, (pa << VLV_FW_PIPEB_PB_SHIFT),
+ 							VLV_FW_PIPEB_PB_MASK);
+-		I915_WRITE_BITS(DSPFW5, 0, VLV_FW_PIPEB_PB_WM1_MASK);
+-		I915_WRITE_BITS(DSPFW7, sa, VLV_FW_PIPEB_SC_MASK);
+-		I915_WRITE_BITS(DSPFW7, 0, VLV_FW_PIPEB_SC_WM1_MASK);
+-		I915_WRITE_BITS(DSPFW7, (sb << VLV_FW_PIPEB_SD_SHIFT),
++
++		if ((I915_READ(DSPFW7) & VLV_FW_PIPEB_SC_MASK) != sa)
++			I915_WRITE_BITS(DSPFW7, sa, VLV_FW_PIPEB_SC_MASK);
++
++		if ((I915_READ(DSPFW7) & VLV_FW_PIPEB_SD_MASK) !=
++						(sb << VLV_FW_PIPEB_SD_SHIFT))
++			I915_WRITE_BITS(DSPFW7, (sb << VLV_FW_PIPEB_SD_SHIFT),
+ 							VLV_FW_PIPEB_SD_MASK);
+-		I915_WRITE_BITS(DSPFW7, 0, VLV_FW_PIPEB_SD_WM1_MASK);
+-		I915_WRITE(DSPHOWM, (I915_READ(DSPHOWM) &
+-					~(VLV_DSPHOWM_PIPEB_MASK)) |
+-				((((pa >> 8) << VLV_DSPHOWM_PIPEB_PB_SHIFT) |
+-				((sa >> 8) << VLV_DSPHOWM_PIPEB_SC_SHIFT) |
+-				((sb >> 8) << VLV_DSPHOWM_PIPEB_SD_SHIFT))));
++
++		dsphowm = ((pa >> NIBBLE_HIGH) <<
++					VLV_DSPHOWM_PIPEB_PB_SHIFT) |
++				((sa >> NIBBLE_HIGH) <<
++					VLV_DSPHOWM_PIPEB_SC_SHIFT) |
++				((sb >> NIBBLE_HIGH) <<
++					VLV_DSPHOWM_PIPEB_SD_SHIFT);
++
++		if ((I915_READ(DSPHOWM) & VLV_DSPHOWM_PIPEB_MASK) !=  dsphowm)
++			I915_WRITE(DSPHOWM, (I915_READ(DSPHOWM) &
++					~(VLV_DSPHOWM_PIPEB_MASK)) | dsphowm);
+ 
+ 		break;
+ 	case PIPE_C:
+-		I915_WRITE_BITS(DSPARB3, dsparb3, DSPARB3_PIPEC_MASK);
+-		I915_WRITE_BITS(DSPARB2, (dsparb2 << DSPARB2_PIPEC_SHIFT),
+-						DSPARB2_PIPEC_MASK);
++		if ((I915_READ(DSPARB3) & DSPARB3_PIPEC_MASK) != dsparb3)
++			I915_WRITE_BITS(DSPARB3, dsparb3, DSPARB3_PIPEC_MASK);
++		if ((I915_READ(DSPARB2) & DSPARB2_PIPEC_MASK) !=
++					(dsparb2 << DSPARB2_PIPEC_SHIFT))
++			I915_WRITE_BITS(DSPARB2,
++					(dsparb2 << DSPARB2_PIPEC_SHIFT),
++							DSPARB2_PIPEC_MASK);
+ 		/* update wm */
+-		I915_WRITE_BITS(DSPFW9, (pa << VLV_FW_PIPEC_PC_SHIFT),
++		if ((I915_READ(DSPFW9) & VLV_FW_PIPEC_PC_MASK) !=
++						(pa << VLV_FW_PIPEC_PC_SHIFT))
++			I915_WRITE_BITS(DSPFW9, (pa << VLV_FW_PIPEC_PC_SHIFT),
+ 							VLV_FW_PIPEC_PC_MASK);
+-		I915_WRITE_BITS(DSPFW9, 0, VLV_FW_PIPEC_PC_WM1_MASK);
+-		I915_WRITE_BITS(DSPFW8, sa, VLV_FW_PIPEC_SE_MASK);
+-		I915_WRITE_BITS(DSPFW8, 0, VLV_FW_PIPEC_SE_WM1_MASK);
+-		I915_WRITE_BITS(DSPFW8, (sb << VLV_FW_PIPEC_SF_SHIFT),
++		if ((I915_READ(DSPFW8) & VLV_FW_PIPEC_SE_MASK) != sa)
++			I915_WRITE_BITS(DSPFW8, sa, VLV_FW_PIPEC_SE_MASK);
++		if ((I915_READ(DSPFW8) & VLV_FW_PIPEC_SF_MASK) !=
++						(sb << VLV_FW_PIPEC_SF_SHIFT))
++			I915_WRITE_BITS(DSPFW8, (sb << VLV_FW_PIPEC_SF_SHIFT),
+ 							VLV_FW_PIPEC_SF_MASK);
+-		I915_WRITE_BITS(DSPFW8, 0, VLV_FW_PIPEC_SE_WM1_MASK);
+-		I915_WRITE(DSPHOWM, (I915_READ(DSPHOWM) &
+-						~(VLV_DSPHOWM_PIPEC_MASK)) |
+-				((((pa >> 8) << VLV_DSPHOWM_PIPEC_PC_SHIFT) |
+-				((sa >> 8) << VLV_DSPHOWM_PIPEC_SE_SHIFT) |
+-				((sb >> 8) << VLV_DSPHOWM_PIPEC_SF_SHIFT))));
++
++		dsphowm = ((pa >> NIBBLE_HIGH) << VLV_DSPHOWM_PIPEC_PC_SHIFT) |
++			((sa >> NIBBLE_HIGH) << VLV_DSPHOWM_PIPEC_SE_SHIFT) |
++			((sb >> NIBBLE_HIGH) << VLV_DSPHOWM_PIPEC_SF_SHIFT);
++		if ((I915_READ(DSPHOWM) & VLV_DSPHOWM_PIPEC_MASK) != dsphowm)
++			I915_WRITE(DSPHOWM, (I915_READ(DSPHOWM) &
++					~(VLV_DSPHOWM_PIPEC_MASK)) | dsphowm);
+ 		break;
+ 	}
+ }
+-- 
+1.9.1
+

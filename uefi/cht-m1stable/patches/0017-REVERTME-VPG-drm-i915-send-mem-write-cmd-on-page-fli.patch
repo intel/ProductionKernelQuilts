@@ -1,0 +1,211 @@
+From d1ef523e75bd1fbaa145e2b36dd0a709853fd5a1 Mon Sep 17 00:00:00 2001
+Message-Id: <d1ef523e75bd1fbaa145e2b36dd0a709853fd5a1.1421830309.git.chang-joon.lee@intel.com>
+In-Reply-To: <49dde4951ccd12ce81e60aed3b24793e0ac12fed.1421830308.git.chang-joon.lee@intel.com>
+References: <49dde4951ccd12ce81e60aed3b24793e0ac12fed.1421830308.git.chang-joon.lee@intel.com>
+From: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+Date: Mon, 15 Dec 2014 14:26:12 +0530
+Subject: [PATCH 17/17] REVERTME [VPG]: drm/i915: send mem write cmd on page
+ flip for MIPI cmd mode
+
+In case of MIPI command mode, frames are not automaticaly sent to panel.
+Software has to request the mem write command to send the frame to the
+panel. This patch requests to send one frame whenever there is a page
+flip request.
+
+REVERTME:
+This patch sends one mem write command on page flip. This
+idea will work on atomic page flip where only one atomic
+page flip happens per frame. Also already with this patch
+AOSP, S0ix works fine. But since, we will have to study
+more and cover for the corner cases which we can possiblity
+hit. Marking this patch as revertme till we are confident
+on the solution.
+
+Issue: GMINL-1644
+Change-Id: Icdb861133130276ffbc2dd438f401ccb6b67cc99
+Signed-off-by: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |   33 +++++++++++++++++++++++++--------
+ drivers/gpu/drm/i915/intel_drv.h     |    4 +++-
+ drivers/gpu/drm/i915/intel_dsi.c     |   32 ++++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_sprite.c  |   18 ++++++++++++++++++
+ 4 files changed, 76 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 45a989b..b19d02d 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2898,9 +2898,13 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 	if (INTEL_INFO(dev)->gen >= 4) {
+ 		intel_crtc->reg.surf = i915_gem_obj_ggtt_offset(obj) +
+ 						intel_crtc->dspaddr_offset;
+-		if (!dev_priv->atomic_update)
++
++		if (!dev_priv->atomic_update) {
+ 			I915_MODIFY_DISPBASE(DSPSURF(plane),
+ 				intel_crtc->reg.surf);
++			intel_dsi_send_fb_on_crtc(crtc);
++		}
++
+ 		if (rotate) {
+ 			intel_crtc->reg.tileoff =
+ 				(((y + fb->height - 1) << 16) |
+@@ -10762,6 +10766,8 @@ static void i915_commit(struct drm_i915_private *dev_priv,
+ 		I915_MODIFY_DISPBASE(DSPSURF(pipe), reg->surf);
+ 		POSTING_READ(DSPCNTR(pipe));
+ 	}
++
++	intel_dsi_send_fb_on_crtc(&intel_crtc->base);
+ 	reg->surf = 0;
+ }
+ 
+@@ -11109,16 +11115,27 @@ static int intel_crtc_set_display(struct drm_crtc *crtc,
+ 	ret = intel_set_disp_calc_flip(disp, dev, file_priv, intel_crtc);
+ 
+ 	/* Check if we need to a vblank, if so wait for vblank */
+-	if (dev_priv->wait_vbl) {
+-		if (dev_priv->vblcount ==
+-			atomic_read(&dev->vblank[intel_crtc->pipe].count)) {
+-			intel_wait_for_vblank(dev, intel_crtc->pipe);
++	if (intel_dsi_is_enc_on_crtc_cmd_mode(crtc)) {
++		/*
++		 * In case of cmd mode the flips are triggered by software
++		 * when mem write command is sent and hence the flips
++		 * are already atomic.
++		 *
++		 * TBD: if more than one atomic flip is requested by user space
++		 * within a blank then need to detect it and make sure it is
++		 * queued.
++		 */
++	} else {
++		if (dev_priv->wait_vbl) {
++			if (dev_priv->vblcount == atomic_read(
++					&dev->vblank[intel_crtc->pipe].count)) {
++				intel_wait_for_vblank(dev, intel_crtc->pipe);
++			}
++			dev_priv->wait_vbl = false;
+ 		}
+-		dev_priv->wait_vbl = false;
++		intel_pipe_vblank_evade(crtc);
+ 	}
+ 
+-	intel_pipe_vblank_evade(crtc);
+-
+ 	/* Commit to registers */
+ 	ret = intel_set_disp_commit_regs(disp, dev, intel_crtc);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 7e7eb34..b311780 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -989,7 +989,9 @@ enum pipe vlv_power_sequencer_pipe(struct intel_dp *intel_dp);
+ 
+ /* intel_dsi.c */
+ bool intel_dsi_init(struct drm_device *dev);
+-void intel_dsi_update_panel_fb(struct intel_encoder *encoder);
++int intel_dsi_update_panel_fb(struct intel_encoder *encoder);
++int intel_dsi_send_fb_on_crtc(struct drm_crtc *crtc);
++struct intel_encoder *intel_dsi_is_enc_on_crtc_cmd_mode(struct drm_crtc *crtc);
+ 
+ /* intel_dvo.c */
+ void intel_dvo_init(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 58a6218..818e94e 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -63,6 +63,24 @@ struct intel_dsi *intel_attached_dsi(struct drm_connector *connector)
+ 			    struct intel_dsi, base);
+ }
+ 
++struct intel_encoder *intel_dsi_is_enc_on_crtc_cmd_mode(struct drm_crtc *crtc)
++{
++	struct drm_device *dev = crtc->dev;
++	struct intel_encoder *encoder;
++	struct intel_dsi *intel_dsi;
++
++	for_each_encoder_on_crtc(dev, crtc, encoder) {
++		if (encoder->type != INTEL_OUTPUT_DSI)
++			continue;
++
++		intel_dsi = enc_to_intel_dsi(&encoder->base);
++		if (is_cmd_mode(intel_dsi))
++			return encoder;
++	}
++
++	return NULL;
++}
++
+ static void intel_dsi_hot_plug(struct intel_encoder *encoder)
+ {
+ 	DRM_DEBUG_KMS("\n");
+@@ -672,12 +690,22 @@ static void intel_dsi_get_config(struct intel_encoder *encoder,
+ 	pipe_config->port_clock = dev_priv->vbt.lfp_lvds_vbt_mode->clock;
+ }
+ 
+-void intel_dsi_update_panel_fb(struct intel_encoder *encoder)
++int intel_dsi_update_panel_fb(struct intel_encoder *encoder)
+ {
+ 	struct intel_dsi *intel_dsi = enc_to_intel_dsi(&encoder->base);
+ 	unsigned char uc_data[] = {MIPI_DCS_WRITE_MEMORY_START};
+ 
+-	dsi_send_dcs_cmd(intel_dsi, 0, uc_data, sizeof(uc_data), true);
++	return dsi_send_dcs_cmd(intel_dsi, 0, uc_data, sizeof(uc_data), true);
++}
++
++int intel_dsi_send_fb_on_crtc(struct drm_crtc *crtc)
++{
++	struct intel_encoder *encoder = intel_dsi_is_enc_on_crtc_cmd_mode(crtc);
++
++	if (encoder)
++		return intel_dsi_update_panel_fb(encoder);
++
++	return 0;
+ }
+ 
+ static enum drm_mode_status
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 05b2dd0..0300a2d 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -71,6 +71,20 @@ static bool intel_pipe_update_start(struct intel_crtc *crtc, uint32_t *start_vbl
+ 	if (WARN_ON(drm_vblank_get(dev, pipe)))
+ 		return false;
+ 
++	if (intel_dsi_is_enc_on_crtc_cmd_mode(&crtc->base)) {
++		/*
++		 * In case of cmd mode the flips are triggered by software
++		 * when mem write command is sent and hence the flips
++		 * are already atomic.
++		 *
++		 * TBD: if more than one flip is requested by user space
++		 * for a frame, then need to figure it and make mem_write is
++		 * sent for the last flip.
++		 */
++		*start_vbl_count = dev->driver->get_vblank_counter(dev, pipe);
++		return false;
++	}
++
+ 	local_irq_disable();
+ 
+ 	trace_i915_pipe_update_start(crtc, min, max);
+@@ -160,6 +174,8 @@ static void intel_update_primary_plane(struct drm_plane *dplane,
+ 				I915_READ(dspreg) & ~DISPLAY_PLANE_ENABLE);
+ 			I915_WRITE(DSPSURF(plane),
+ 				I915_READ(DSPSURF(plane)));
++
++			intel_dsi_send_fb_on_crtc(&intel_crtc->base);
+ 		}
+ 		dev_priv->plane_stat &=
+ 				~VLV_UPDATEPLANE_STAT_PRIM_PER_PIPE(pipe);
+@@ -686,6 +702,8 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 		I915_WRITE(SPCNTR(pipe, plane), sprctl);
+ 		I915_MODIFY_DISPBASE(SPSURF(pipe, plane),
+ 			i915_gem_obj_ggtt_offset(obj) + sprsurf_offset);
++
++		intel_dsi_send_fb_on_crtc(crtc);
+ 	}
+ 
+ 	dev_priv->plane_stat |= VLV_UPDATEPLANE_STAT_SP_PER_PIPE(pipe, plane);
+-- 
+1.7.9.5
+

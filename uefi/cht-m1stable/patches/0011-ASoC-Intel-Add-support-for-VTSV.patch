@@ -1,0 +1,487 @@
+From 402592d8e418dcac68481502879a09a428f54ab7 Mon Sep 17 00:00:00 2001
+From: Praveen Diwakar <praveen.diwakar@intel.com>
+Date: Mon, 23 Feb 2015 16:48:17 +0530
+Subject: [PATCH 11/15] ASoC: Intel: Add support for VTSV
+
+Issue: GMINL-6292
+
+This is a consolidated patch enabling vtsv.
+
+Change-Id: Ie41d6e10b599182f8abd8cdb7a7b75185a658ae5
+Signed-off-by: Praveen Diwakar <praveen.diwakar@intel.com>
+Signed-off-by: Omair Mohammed Abdullah <omair.m.abdullah@intel.com>
+Signed-off-by: Hardik T Shah <hardik.t.shah@intel.com>
+Signed-off-by: Dharageswari.R <dharageswari.r@intel.com>
+Signed-off-by: Mythri P K <mythri.p.k@intel.com>
+Signed-off-by: Samreen Nilofer <samreen.nilofer@intel.com>
+Signed-off-by: Fabien Marotte <fabien.marotte@intel.com>
+---
+ arch/x86/include/asm/platform_sst.h              |   2 +-
+ sound/soc/intel/pcm.c                            |   2 +
+ sound/soc/intel/platform-libs/controls_v2_dpcm.c | 109 +++++++++++++++++++++--
+ sound/soc/intel/sst/sst.h                        |   8 ++
+ sound/soc/intel/sst/sst_drv_interface.c          |  22 ++++-
+ sound/soc/intel/sst/sst_platform.c               |   1 +
+ sound/soc/intel/sst/sst_stream.c                 |  37 ++++++--
+ sound/soc/intel/sst_platform.h                   |  11 +++
+ sound/soc/intel/sst_platform_pvt.h               |   2 +-
+ 9 files changed, 173 insertions(+), 21 deletions(-)
+
+diff --git a/arch/x86/include/asm/platform_sst.h b/arch/x86/include/asm/platform_sst.h
+index 83f973f..be84543 100644
+--- a/arch/x86/include/asm/platform_sst.h
++++ b/arch/x86/include/asm/platform_sst.h
+@@ -17,7 +17,7 @@
+ #include <linux/sfi.h>
+ 
+ #define MAX_NUM_STREAMS_CTP	5
+-#define MAX_NUM_STREAMS_MRFLD	25
++#define MAX_NUM_STREAMS_MRFLD	26
+ #define MAX_NUM_STREAMS	MAX_NUM_STREAMS_MRFLD
+ 
+ #define SST_MAX_SSP_PORTS 4
+diff --git a/sound/soc/intel/pcm.c b/sound/soc/intel/pcm.c
+index 7f009bd..764c108 100644
+--- a/sound/soc/intel/pcm.c
++++ b/sound/soc/intel/pcm.c
+@@ -957,8 +957,10 @@ static int sst_platform_async_cb(struct sst_platform_cb_params *params)
+ 			pr_err("SST VTSV POLL control not found\n");
+ 			return -EINVAL;
+ 		}
++		mutex_lock(&sst->lock);
+ 		/* 0th index of array contains size of array */
+ 		memcpy(sst->vtsv_result.data, vtsv_result, vtsv_result[0]);
++		mutex_unlock(&sst->lock);
+ 		snd_ctl_notify(card->snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
+ 					&kcontrol->id);
+ 		break;
+diff --git a/sound/soc/intel/platform-libs/controls_v2_dpcm.c b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+index 4da1a7d..47d4428 100644
+--- a/sound/soc/intel/platform-libs/controls_v2_dpcm.c
++++ b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+@@ -430,6 +430,10 @@ int sst_vtsv_event_get(struct snd_kcontrol *kcontrol,
+ 	pr_debug("in %s\n", __func__);
+ 	/* First element contains size */
+ 	memcpy(ucontrol->value.bytes.data, sst->vtsv_result.data, sst->vtsv_result.data[0]);
++	/* Reset the control values to 0 once its read */
++	mutex_lock(&sst->lock);
++	memset(sst->vtsv_result.data, 0x0, VTSV_MAX_TOTAL_RESULT_ARRAY_SIZE);
++	mutex_unlock(&sst->lock);
+ 	return 0;
+ }
+ 
+@@ -1534,27 +1538,99 @@ static int sst_alloc_hostless_stream(const struct sst_pcm_format *pcm_params,
+ }
+ 
+ static int sst_hostless_stream_event(struct snd_soc_dapm_widget *w,
+-					struct snd_kcontrol *k, int event)
++				     struct snd_kcontrol *k, int event)
+ {
+ 	struct sst_ids *ids = w->priv;
+ 	struct snd_card *card = w->platform->card->snd_card;
++	uint str_id = 0;
++
++#define MERR_DPCM_HOSTLESS_VADID 25
++#define MERR_DPCM_HOSTLESS_AWAREID 26
+ 
+ 	if (snd_power_get_state(card) == SNDRV_CTL_POWER_D3) {
+ 		pr_info("The fw may be in a bad state\n");
+ 		return -EAGAIN;
+ 	}
+ 
+-#define MERR_DPCM_HOSTLESS_STRID 25
++
++	switch (ids->location_id) {
++
++	case SST_DFW_PATH_INDEX_VAD_OUT:
++		str_id = MERR_DPCM_HOSTLESS_VADID;
++		break;
++
++	case SST_DFW_PATH_INDEX_AWARE_OUT:
++		str_id = MERR_DPCM_HOSTLESS_AWAREID;
++		break;
++
++	default:
++		pr_err("Current hostless stream support is only for AWARE/VAD\n");
++		return -EINVAL;
++	}
++
+ 	if (SND_SOC_DAPM_EVENT_ON(event))
+ 		/* ALLOC */
+ 		/* FIXME: HACK - FW shouldn't require alloc for aware */
+ 		return sst_alloc_hostless_stream(ids->pcm_fmt,
+-						 MERR_DPCM_HOSTLESS_STRID,
+-						 ids->location_id >> SST_PATH_ID_SHIFT,
+-						 ids->task_id);
++				 str_id,
++				 ids->location_id >> SST_DFW_PATH_ID_SHIFT,
++				 ids->task_id);
+ 	else
+ 		/* FREE */
+-		return sst_dsp->ops->close(MERR_DPCM_HOSTLESS_STRID);
++		return sst_dsp->ops->close(str_id);
++}
++
++static int sst_vtsv_path_get(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_platform *platform = snd_kcontrol_chip(kcontrol);
++	struct sst_data *sst = snd_soc_platform_get_drvdata(platform);
++
++	pr_debug("in %s\n", __func__);
++	memcpy(ucontrol->value.bytes.data, sst->vtsv_path,
++				SST_MAX_VTSV_PATH_BYTE_CTL_LEN);
++
++	return 0;
++}
++
++static int sst_vtsv_path_set(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_platform *platform = snd_kcontrol_chip(kcontrol);
++	struct sst_data *sst = snd_soc_platform_get_drvdata(platform);
++	struct snd_soc_dapm_widget *w;
++	u16 ret = 0, len;
++
++	pr_debug("in %s\n", __func__);
++	len = *(u16 *)ucontrol->value.bytes.data;
++	if (len > SST_MAX_VTSV_PATH_LEN) {
++		pr_err("Invalid vtsv path length %d\n", len);
++		return -EINVAL;
++	}
++
++	memcpy(sst->vtsv_path, ucontrol->value.bytes.data, (len + sizeof(u16)));
++	ret = sst_dsp->ops->set_generic_params(SST_SET_VTSV_LIBS,
++					sst->vtsv_path);
++
++	w = snd_soc_dapm_find_widget(&platform->dapm, "vtsv", false);
++	if (w && w->power)
++		ret = sst_dsp->ops->set_generic_params(SST_SET_VTSV_INFO, NULL);
++
++	return ret;
++}
++
++static int sst_vtsv_event(struct snd_soc_dapm_widget *w,
++	struct snd_kcontrol *k, int event)
++{
++	int ret;
++
++	ret = sst_hostless_stream_event(w, k, event);
++	if (ret < 0)
++		return ret;
++
++	if (SND_SOC_DAPM_EVENT_ON(event))
++		ret = sst_dsp->ops->set_generic_params(SST_SET_VTSV_INFO, NULL);
++	return ret;
+ }
+ 
+ static const struct snd_kcontrol_new sst_mix_sw_aware =
+@@ -1568,11 +1644,18 @@ static const struct snd_kcontrol_new sst_mix_sw_vad =
+ static const struct snd_kcontrol_new sst_mix_sw_tone_gen =
+ 	SOC_SINGLE_EXT("switch", SST_MIX_SWITCH, 1, 1, 0,
+ 		sst_mix_get, sst_mix_put);
++
++
++static const struct snd_kcontrol_new sst_vad_enroll[] = {
++	SND_SOC_BYTES_EXT("SST VTSV Enroll", SST_MAX_VTSV_PATH_BYTE_CTL_LEN,
++		sst_vtsv_path_get, sst_vtsv_path_set),
++};
++
+ static const struct snd_kcontrol_new sst_vtsv_read[] = {
+ 	SND_SOC_BYTES_EXT("vtsv event", VTSV_MAX_TOTAL_RESULT_ARRAY_SIZE,
+ 		 sst_vtsv_event_get, NULL),
+-
+ };
++
+ static const char * const sst_bt_fm_texts[] = {
+ 	"fm", "bt",
+ };
+@@ -2282,6 +2365,7 @@ const struct snd_soc_fw_widget_events sst_widget_ops[] = {
+ 	{SST_SET_SWM, sst_swm_mixer_event_dfw},
+ 	{SST_SET_LINKED_PATH, sst_set_linked_pipe},
+ 	{SST_SET_GENERIC_MODULE_EVENT, sst_generic_modules_event},
++	{SST_EVENT_VTSV, sst_vtsv_event},
+ };
+ 
+ static int sst_copy_algo_control(struct snd_soc_platform *platform,
+@@ -2535,6 +2619,13 @@ int sst_dsp_init_v2_dpcm_dfw(struct snd_soc_platform *platform)
+ 		return -ENOMEM;
+ 	}
+ 
++	sst->vtsv_path = devm_kzalloc(platform->dev,
++				SST_MAX_VTSV_PATH_BYTE_CTL_LEN, GFP_KERNEL);
++	if (!sst->vtsv_path) {
++		pr_err("%s: kzalloc failed vtsv\n", __func__);
++		return -ENOMEM;
++	}
++
+ 	ret = request_firmware(&fw, "dfw_sst.bin", platform->dev);
+ 	if (fw == NULL) {
+ 		pr_err("config firmware request failed with %d\n", ret);
+@@ -2548,6 +2639,10 @@ int sst_dsp_init_v2_dpcm_dfw(struct snd_soc_platform *platform)
+ 	}
+ 	snd_soc_add_platform_controls(platform, sst_slot_controls,
+ 			ARRAY_SIZE(sst_slot_controls));
++	snd_soc_add_platform_controls(platform, sst_vad_enroll,
++			ARRAY_SIZE(sst_vad_enroll));
++	snd_soc_add_platform_controls(platform, sst_vtsv_read,
++			ARRAY_SIZE(sst_vtsv_read));
+ 
+ 	/* initialize the names of the probe points */
+ 	for (i = 0; i < ARRAY_SIZE(sst_probes); i++)
+diff --git a/sound/soc/intel/sst/sst.h b/sound/soc/intel/sst/sst.h
+index 45fad6e..691b963 100644
+--- a/sound/soc/intel/sst/sst.h
++++ b/sound/soc/intel/sst/sst.h
+@@ -363,6 +363,11 @@ struct snd_sst_probe_bytes {
+ 	char bytes[0];
+ };
+ 
++struct snd_sst_vtsv_path {
++	u16 len;
++	char bytes[SST_MAX_VTSV_PATH_LEN];
++};
++
+ #define PCI_DMAC_CLV_ID 0x08F0
+ #define PCI_DMAC_MRFLD_ID 0x119B
+ 
+@@ -560,6 +565,8 @@ struct intel_sst_drv {
+ 	struct mutex		csr_lock;
+ 	/* byte control to set the probe stream */
+ 	struct snd_sst_probe_bytes *probe_bytes;
++	/* vtsv path */
++	struct snd_sst_vtsv_path vtsv_path;
+ 	/* contains the ipc registers */
+ 	struct sst_ipc_reg	ipc_reg;
+ 	/* IMR region Library space memory manager */
+@@ -704,6 +711,7 @@ void sst_save_shim64(struct intel_sst_drv *ctx, void __iomem *shim,
+ 		     struct sst_shim_regs64 *shim_regs);
+ void sst_firmware_load_cb(const struct firmware *fw, void *context);
+ int sst_send_vtsv_data_to_fw(struct intel_sst_drv *ctx);
++int sst_cache_vtsv_libs(struct intel_sst_drv *ctx);
+ 
+ void sst_do_recovery_mrfld(struct intel_sst_drv *sst);
+ void sst_do_recovery(struct intel_sst_drv *sst);
+diff --git a/sound/soc/intel/sst/sst_drv_interface.c b/sound/soc/intel/sst/sst_drv_interface.c
+index f3c83a7..1e3c285 100644
+--- a/sound/soc/intel/sst/sst_drv_interface.c
++++ b/sound/soc/intel/sst/sst_drv_interface.c
+@@ -1010,13 +1010,12 @@ static int sst_set_generic_params(enum sst_controls cmd, void *arg)
+ 	int ret_val = 0;
+ 	pr_debug("Enter:%s, cmd:%d\n", __func__, cmd);
+ 
+-	if (NULL == arg)
+-		return -EINVAL;
+-
+ 	switch (cmd) {
+ 	case SST_SET_RUNTIME_PARAMS: {
+ 		struct snd_sst_runtime_params *src;
+ 		struct snd_sst_runtime_params *dst;
++		if (NULL == arg)
++			return -EINVAL;
+ 
+ 		src = (struct snd_sst_runtime_params *)arg;
+ 		dst = &(sst_drv_ctx->runtime_param.param);
+@@ -1036,6 +1035,8 @@ static int sst_set_generic_params(enum sst_controls cmd, void *arg)
+ 		break;
+ 	}
+ 	case SST_SET_BYTE_STREAM: {
++		if (NULL == arg)
++			return -EINVAL;
+ 		ret_val = intel_sst_check_device();
+ 		if (ret_val)
+ 			return ret_val;
+@@ -1046,6 +1047,8 @@ static int sst_set_generic_params(enum sst_controls cmd, void *arg)
+ 	}
+ 	case SST_GET_PROBE_BYTE_STREAM: {
+ 		struct snd_sst_probe_bytes *prb_bytes = (struct snd_sst_probe_bytes *)arg;
++		if (NULL == arg)
++			return -EINVAL;
+ 
+ 		if (sst_drv_ctx->probe_bytes) {
+ 			prb_bytes->len = sst_drv_ctx->probe_bytes->len;
+@@ -1055,6 +1058,8 @@ static int sst_set_generic_params(enum sst_controls cmd, void *arg)
+ 	}
+ 	case SST_SET_PROBE_BYTE_STREAM: {
+ 		struct snd_sst_probe_bytes *prb_bytes = (struct snd_sst_probe_bytes *)arg;
++		if (NULL == arg)
++			return -EINVAL;
+ 
+ 		if (sst_drv_ctx->probe_bytes) {
+ 			sst_drv_ctx->probe_bytes->len = prb_bytes->len;
+@@ -1080,10 +1085,21 @@ static int sst_set_generic_params(enum sst_controls cmd, void *arg)
+ 		break;
+ 	}
+ 	case SST_SET_MONITOR_LPE: {
++		if (NULL == arg)
++			return -EINVAL;
+ 		if (sst_drv_ctx->pdata->start_recovery_timer)
+ 			ret_val = sst_set_timer(&sst_drv_ctx->monitor_lpe, *(bool *)arg);
+ 		break;
+ 	}
++	case SST_SET_VTSV_LIBS: {
++		struct snd_sst_vtsv_path *p = (struct snd_sst_vtsv_path *)arg;
++		if (NULL == arg)
++			return -EINVAL;
++
++		memcpy(sst_drv_ctx->vtsv_path.bytes, p->bytes, p->len);
++		ret_val = sst_cache_vtsv_libs(sst_drv_ctx);
++		break;
++	}
+ 	default:
+ 		pr_err("Invalid cmd request:%d\n", cmd);
+ 		ret_val = -EINVAL;
+diff --git a/sound/soc/intel/sst/sst_platform.c b/sound/soc/intel/sst/sst_platform.c
+index 56e515f..530d832 100644
+--- a/sound/soc/intel/sst/sst_platform.c
++++ b/sound/soc/intel/sst/sst_platform.c
+@@ -100,6 +100,7 @@ static struct sst_dev_stream_map dpcm_strm_map_cht[] = {
+ 	{CHT_DPCM_PROBE, 7, SNDRV_PCM_STREAM_CAPTURE,
+ 		SST_DFW_PATH_INDEX_PROBE8_PIPE_OUT >> SST_DFW_PATH_ID_SHIFT,
+ 		SST_TASK_ID_MEDIA, SST_DEV_MAP_IN_USE},
++	/* stream_id 25, 26 reserved for VAD and AWARE respectively */
+ };
+ 
+ static const int sst_ssp_mux_shift[SST_NUM_SSPS] = {
+diff --git a/sound/soc/intel/sst/sst_stream.c b/sound/soc/intel/sst/sst_stream.c
+index cf50606..3d00e9d 100644
+--- a/sound/soc/intel/sst/sst_stream.c
++++ b/sound/soc/intel/sst/sst_stream.c
+@@ -29,7 +29,8 @@
+ #include <linux/sched.h>
+ #include <linux/delay.h>
+ #include <linux/pm_runtime.h>
+-#include <asm/platform_sst_audio.h>
++#include "../platform-libs/atom_controls.h"
++#include "../platform-libs/atom_pipes.h"
+ #include "../sst_platform.h"
+ #include "../platform_ipc_v2.h"
+ #include "sst.h"
+@@ -767,6 +768,10 @@ int sst_format_vtsv_message(struct intel_sst_drv *ctx,
+ 	vinfo.vfiles[1].addr = (u32)((unsigned long)ctx->vcache.file2_in_mem
+ 				& 0xffffffff);
+ 	vinfo.vfiles[1].size = ctx->vcache.size2;
++	if (vinfo.vfiles[0].addr == 0 || vinfo.vfiles[1].addr == 0) {
++		pr_err("%s: invalid address for vtsv libs\n", __func__);
++		return -EINVAL;
++	}
+ 
+ 	/* Create the vtsv message */
+ 	pvt_id = sst_assign_pvt_id(ctx);
+@@ -776,7 +781,7 @@ int sst_format_vtsv_message(struct intel_sst_drv *ctx,
+ 		return retval;
+ 	msg = *msgptr;
+ 	sst_fill_header_mrfld(&msg->mrfld_header, IPC_CMD,
+-			SST_TASK_ID_AWARE, 1, pvt_id);
++			SST_TASK_AWARE, 1, pvt_id);
+ 	pr_debug("header:%x\n",
+ 			(unsigned int)msg->mrfld_header.p.header_high.full);
+ 	msg->mrfld_header.p.header_high.part.res_rqd = 1;
+@@ -784,7 +789,8 @@ int sst_format_vtsv_message(struct intel_sst_drv *ctx,
+ 	len = sizeof(vinfo) + sizeof(dsp_hdr);
+ 	msg->mrfld_header.p.header_low_payload = len;
+ 	sst_fill_header_dsp(&dsp_hdr, IPC_IA_VTSV_UPDATE_MODULES,
+-				PIPE_VAD_OUT, sizeof(u8));
++		(SST_DFW_PATH_INDEX_VAD_OUT >> SST_DFW_PATH_ID_SHIFT),
++		sizeof(u8));
+ 	dsp_hdr.mod_id = SST_ALGO_VTSV;
+ 	memcpy(msg->mailbox_data, &dsp_hdr, sizeof(dsp_hdr));
+ 	memcpy(msg->mailbox_data + sizeof(dsp_hdr),
+@@ -792,26 +798,39 @@ int sst_format_vtsv_message(struct intel_sst_drv *ctx,
+ 	return 0;
+ }
+ 
+-int sst_send_vtsv_data_to_fw(struct intel_sst_drv *ctx)
++int sst_cache_vtsv_libs(struct intel_sst_drv *ctx)
+ {
+-	int retval = 0;
+-	struct ipc_post *msg = NULL;
+-	struct sst_block *block = NULL;
++	int retval;
++	char buff[SST_MAX_VTSV_PATH_BUF_LEN];
++
++	snprintf(buff, sizeof(buff), "%s/%s", ctx->vtsv_path.bytes,
++						"vtsv_net.bin");
+ 
+ 	/* Download both the data files */
+-	retval = sst_request_vtsv_file("vtsv_net.bin", ctx,
++	retval = sst_request_vtsv_file(buff, ctx,
+ 			&ctx->vcache.file1_in_mem, &ctx->vcache.size1);
+ 	if (retval) {
+ 		pr_err("vtsv data file1 request failed %d\n", retval);
+ 		return retval;
+ 	}
+ 
+-	retval = sst_request_vtsv_file("vtsv_grammar.bin", ctx,
++	snprintf(buff, sizeof(buff), "%s/%s", ctx->vtsv_path.bytes,
++						"vtsv_grammar.bin");
++
++	retval = sst_request_vtsv_file(buff, ctx,
+ 			&ctx->vcache.file2_in_mem, &ctx->vcache.size2);
+ 	if (retval) {
+ 		pr_err("vtsv data file2 request failed %d\n", retval);
+ 		return retval;
+ 	}
++	return retval;
++}
++
++int sst_send_vtsv_data_to_fw(struct intel_sst_drv *ctx)
++{
++	int retval = 0;
++	struct ipc_post *msg = NULL;
++	struct sst_block *block = NULL;
+ 
+ 	retval = sst_format_vtsv_message(ctx, &msg, &block);
+ 	if (retval) {
+diff --git a/sound/soc/intel/sst_platform.h b/sound/soc/intel/sst_platform.h
+index aca394b..4b1fb26 100644
+--- a/sound/soc/intel/sst_platform.h
++++ b/sound/soc/intel/sst_platform.h
+@@ -26,6 +26,16 @@
+ #include <sound/soc.h>
+ 
+ #define SST_MAX_BIN_BYTES 1024
++#define SST_MAX_VTSV_PATH_LEN 255
++
++/* VTSV PATH selection byte control max length is 257 bytes :
++ * 255 bytes of max path len + 2 bytes (u16) to hold length of
++ * vtsv path given by user*/
++#define SST_MAX_VTSV_PATH_BYTE_CTL_LEN	(SST_MAX_VTSV_PATH_LEN + sizeof(u16))
++
++/* SST_MAX_VTSV_PATH_BUF_LEN = VTSV Path max lenght + length of vtsv bin
++ * file name. Max length of vtsv bin filename "/vtsv_grammar.bin"s 18 bytes */
++#define SST_MAX_VTSV_PATH_BUF_LEN	(SST_MAX_VTSV_PATH_LEN + 18)
+ 
+ /* VTSV Result */
+ #define VTSV_MAX_NUM_RESULTS 6
+@@ -86,6 +96,7 @@ enum sst_controls {
+ 	SST_GET_PROBE_BYTE_STREAM =	0x100E,
+ 	SST_SET_VTSV_INFO =		0x100F,
+ 	SST_SET_MONITOR_LPE =           0x1010,
++	SST_SET_VTSV_LIBS =	        0x1011,
+ };
+ 
+ struct pcm_stream_info {
+diff --git a/sound/soc/intel/sst_platform_pvt.h b/sound/soc/intel/sst_platform_pvt.h
+index 769e45f..a26a137 100644
+--- a/sound/soc/intel/sst_platform_pvt.h
++++ b/sound/soc/intel/sst_platform_pvt.h
+@@ -118,7 +118,6 @@ struct sst_pcm_format {
+ 	unsigned int channels_max;
+ };
+ 
+-
+ struct sst_vtsv_result {
+ 	u8 data[VTSV_MAX_TOTAL_RESULT_ARRAY_SIZE];
+ };
+@@ -134,6 +133,7 @@ struct sst_data {
+ 	/* Pipe_id for probe_stream to be saved in stream map */
+ 	u8 pipe_id;
+ 	bool vtsv_enroll;
++	char *vtsv_path;
+ 	struct sst_vtsv_result vtsv_result;
+ };
+ #endif
+-- 
+1.9.1
+

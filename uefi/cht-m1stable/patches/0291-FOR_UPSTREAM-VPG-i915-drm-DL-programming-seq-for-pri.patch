@@ -1,0 +1,135 @@
+From ea2c27a6235bfa49e64153520beb614bf62cbd16 Mon Sep 17 00:00:00 2001
+Message-Id: <ea2c27a6235bfa49e64153520beb614bf62cbd16.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: amanna <animesh.manna@intel.com>
+Date: Mon, 21 Apr 2014 18:14:09 +0530
+Subject: [PATCH 291/312] FOR_UPSTREAM [VPG]: i915/drm: DL programming seq for
+ primary-plane during pixel format change
+
+Changes done:
+1) Changed the DL programming sequence for pixel
+format change from 4->2. Theoretically this vblank is
+required for 4->2 pixel size change.
+DL values immediately get updated in the hardware whereas primary
+control register updates happen in the next vblank. So 4->2 transition
+needs a vblank otherwise we will/may hit underrun. As we still
+have underrun issue, enabling it for 2->4 as well.
+2) While divide by 1000 the fraction value got truncated which will
+impact DDL calculation, hence changed the way calculation is done
+in vlv_compute_drain_latency function.
+
+Issue: GMIN-2825
+Change-Id: I0b84e62a0808bf5be33736640692a6f933a4dea7
+Signed-off-by: Animesh Manna <animesh.manna@intel.com>
+Signed-off-by: Mahesh Kumar <mahesh1.kumar@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |    6 ++++--
+ drivers/gpu/drm/i915/intel_drv.h     |    1 +
+ drivers/gpu/drm/i915/intel_pm.c      |   23 +++++++++++------------
+ drivers/gpu/drm/i915/intel_sprite.c  |    1 +
+ 4 files changed, 17 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 6a5957b..fb97bb3 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2633,7 +2633,9 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 	intel_fb = to_intel_framebuffer(fb);
+ 	obj = intel_fb->obj;
+ 
+-	intel_update_watermarks(crtc);
++	if (intel_crtc->last_pixel_size < pixel_size)
++		intel_update_watermarks(crtc);
++
+ 
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+ 	if (IS_VALLEYVIEW(dev) && intel_pipe_has_type(crtc,
+@@ -3059,7 +3061,6 @@ intel_pipe_set_base_atomic(struct drm_crtc *crtc, struct drm_framebuffer *fb,
+ 	intel_increase_pllclock(crtc);
+ 
+ 	dev_priv->display.update_primary_plane(crtc, fb, x, y);
+-
+ 	return 0;
+ }
+ 
+@@ -12209,6 +12210,7 @@ static void intel_crtc_init(struct drm_device *dev, int pipe)
+ 	intel_crtc->primary_alpha = true;
+ 	intel_crtc->sprite0_alpha = true;
+ 	intel_crtc->sprite1_alpha = true;
++	intel_crtc->last_pixel_size = 0;
+ 	intel_crtc->rotate180 = false;
+ 	/* Flag for wake from sleep */
+ 	dev_priv->is_resuming = false;
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index d4c3c55..7291753 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -420,6 +420,7 @@ struct intel_crtc {
+ 	bool primary_alpha;
+ 	bool sprite0_alpha;
+ 	bool sprite1_alpha;
++	uint32_t last_pixel_size;
+ 
+ 	/* reset counter value when the last flip was submitted */
+ 	unsigned int reset_counter;
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 4f48b9b..8bc03c9 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -1511,28 +1511,27 @@ static bool vlv_compute_drain_latency(struct drm_device *dev,
+ 		pixel_size =
+ 			crtc->primary->fb->bits_per_pixel / 8;	/* BPP */
+ 
+-		entries = (clock / 1000) * pixel_size;
+-		*plane_prec_mult = (entries > 256) ?
++		entries = clock * pixel_size;
++		*plane_prec_mult = (entries > (256*1000)) ?
+ 			DRAIN_LATENCY_PRECISION_64 : DRAIN_LATENCY_PRECISION_32;
+-		*plane_dl = (64 * (*plane_prec_mult) * 4) / ((clock / 1000) *
+-				pixel_size);
++		*plane_dl = ((64 * (*plane_prec_mult) * 4) * 1000) / entries;
+ 		latencyprogrammed = true;
+ 	}
+ 
+ 	if (enable.cursor_enabled) {
+-		entries = (clock / 1000) * 4;	/* BPP is always 4 for cursor */
+-		*cursor_prec_mult = (entries > 256) ?
++		/* BPP is always 4 for cursor */
++		entries = clock * 4;
++		*cursor_prec_mult = (entries > (256*1000)) ?
+ 			DRAIN_LATENCY_PRECISION_64 : DRAIN_LATENCY_PRECISION_32;
+-		*cursor_dl = (64 * (*cursor_prec_mult) * 4) / ((clock / 1000) *
+-							4);
++		*cursor_dl = ((64 * (*cursor_prec_mult) * 4) * 1000) / entries;
+ 		latencyprogrammed = true;
+ 	}
++
+ 	if (enable.sprite_enabled) {
+-		entries = (clock / 1000) * sprite_pixel_size;
+-		*sprite_prec_mult = (entries > 256) ?
++		entries = clock * sprite_pixel_size;
++		*sprite_prec_mult = (entries > (256*1000)) ?
+ 			DRAIN_LATENCY_PRECISION_64 : DRAIN_LATENCY_PRECISION_32;
+-		*sprite_dl = (64 * (*sprite_prec_mult) * 4) / ((clock / 1000) *
+-						sprite_pixel_size);
++		*sprite_dl = ((64 * (*sprite_prec_mult) * 4) * 1000) / entries;
+ 		latencyprogrammed = true;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index bfb28c8..d31357a 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -1545,6 +1545,7 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 			/* Enable for non-VLV if required */
+ 			if (IS_VALLEYVIEW(dev)) {
+ 				intel_crtc->primary_enabled = false;
++				intel_crtc->last_pixel_size = 0;
+ 				intel_pre_disable_primary(crtc);
+ 			}
+ 		}
+-- 
+1.7.9.5
+

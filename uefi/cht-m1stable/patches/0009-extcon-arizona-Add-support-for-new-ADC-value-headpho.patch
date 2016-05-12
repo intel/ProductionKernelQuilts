@@ -1,0 +1,252 @@
+From 8d3cf44c08ef4d251810b1855eb95a9a6efb6727 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Date: Sun, 29 Sep 2013 16:29:32 +0100
+Subject: [PATCH 009/351] extcon: arizona: Add support for new ADC value
+ headphone detect
+
+Newer devices give users the option to make the 3/4 pole jack
+determination using a software comparison rather than a hardware one.
+This patch adds support for this functionality.
+
+Change-Id: Ic874aa1e37fad439e3e36e6f4dbc477c0615353b
+Signed-off-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Signed-off-by: Nikesh Oswal <Nikesh.Oswal@wolfsonmicro.com>
+---
+ drivers/extcon/extcon-arizona.c       |   66 ++++++++++++++++++++++++++++++---
+ drivers/mfd/wm5110-tables.c           |    3 ++
+ include/linux/mfd/arizona/pdata.h     |    3 ++
+ include/linux/mfd/arizona/registers.h |   17 +++++++--
+ 4 files changed, 80 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/extcon/extcon-arizona.c b/drivers/extcon/extcon-arizona.c
+index 98a14f6..964095b 100644
+--- a/drivers/extcon/extcon-arizona.c
++++ b/drivers/extcon/extcon-arizona.c
+@@ -38,12 +38,18 @@
+ #define ARIZONA_ACCDET_MODE_MIC 0
+ #define ARIZONA_ACCDET_MODE_HPL 1
+ #define ARIZONA_ACCDET_MODE_HPR 2
++#define ARIZONA_ACCDET_MODE_HPM 4
++#define ARIZONA_ACCDET_MODE_ADC 7
+ 
+ #define ARIZONA_HPDET_MAX 10000
+ 
+ #define HPDET_DEBOUNCE 500
+ #define DEFAULT_MICD_TIMEOUT 2000
+ 
++#define QUICK_HEADPHONE_MAX_OHM 3
++#define MICROPHONE_MIN_OHM      1257
++#define MICROPHONE_MAX_OHM      30000
++
+ #define MICD_LVL_1_TO_7 (ARIZONA_MICD_LVL_1 | ARIZONA_MICD_LVL_2 | \
+ 			 ARIZONA_MICD_LVL_3 | ARIZONA_MICD_LVL_4 | \
+ 			 ARIZONA_MICD_LVL_5 | ARIZONA_MICD_LVL_6 | \
+@@ -108,12 +114,15 @@ static const struct arizona_micd_range micd_default_ranges[] = {
+ 	{ .max = 430, .key = BTN_5 },
+ };
+ 
++/* The number of levels in arizona_micd_levels valid for button thresholds */
++#define ARIZONA_NUM_MICD_BUTTON_LEVELS 64
++
+ static const int arizona_micd_levels[] = {
+ 	3, 6, 8, 11, 13, 16, 18, 21, 23, 26, 28, 31, 34, 36, 39, 41, 44, 46,
+ 	49, 52, 54, 57, 60, 62, 65, 67, 70, 73, 75, 78, 81, 83, 89, 94, 100,
+ 	105, 111, 116, 122, 127, 139, 150, 161, 173, 186, 196, 209, 220, 245,
+ 	270, 295, 321, 348, 375, 402, 430, 489, 550, 614, 681, 752, 903, 1071,
+-	1257,
++	1257, 30000,
+ };
+ 
+ #define ARIZONA_CABLE_MECHANICAL 0
+@@ -244,6 +253,7 @@ static void arizona_start_mic(struct arizona_extcon_info *info)
+ 	struct arizona *arizona = info->arizona;
+ 	bool change;
+ 	int ret;
++	unsigned int mode;
+ 
+ 	/* Microphone detection can't use idle mode */
+ 	pm_runtime_get(info->dev);
+@@ -269,9 +279,14 @@ static void arizona_start_mic(struct arizona_extcon_info *info)
+ 		regmap_write(arizona->regmap, 0x80, 0x0);
+ 	}
+ 
++	if (info->detecting && arizona->pdata.micd_software_compare)
++		mode = ARIZONA_ACCDET_MODE_ADC;
++	else
++		mode = ARIZONA_ACCDET_MODE_MIC;
++
+ 	regmap_update_bits(arizona->regmap,
+ 			   ARIZONA_ACCESSORY_DETECT_MODE_1,
+-			   ARIZONA_ACCDET_MODE_MASK, ARIZONA_ACCDET_MODE_MIC);
++			   ARIZONA_ACCDET_MODE_MASK, mode);
+ 
+ 	arizona_extcon_pulse_micbias(info);
+ 
+@@ -776,6 +791,37 @@ static void arizona_micd_detect(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	if (info->detecting && arizona->pdata.micd_software_compare) {
++		/* Must disable MICD before we read the ADCVAL */
++		regmap_update_bits(arizona->regmap, ARIZONA_MIC_DETECT_1,
++				   ARIZONA_MICD_ENA, 0);
++		ret = regmap_read(arizona->regmap, ARIZONA_MIC_DETECT_4, &val);
++		if (ret != 0) {
++			dev_err(arizona->dev,
++				"Failed to read MICDET_ADCVAL: %d\n",
++				ret);
++			mutex_unlock(&info->lock);
++			return;
++		}
++
++		dev_dbg(arizona->dev, "MICDET_ADCVAL: %x\n", val);
++
++		val &= ARIZONA_MICDET_ADCVAL_MASK;
++		if (val < ARRAY_SIZE(arizona_micd_levels))
++			val = arizona_micd_levels[val];
++		else
++			val = INT_MAX;
++
++		if (val <= QUICK_HEADPHONE_MAX_OHM)
++			val = ARIZONA_MICD_STS | ARIZONA_MICD_LVL_0;
++		else if (val <= MICROPHONE_MIN_OHM)
++			val = ARIZONA_MICD_STS | ARIZONA_MICD_LVL_1;
++		else if (val <= MICROPHONE_MAX_OHM)
++			val = ARIZONA_MICD_STS | ARIZONA_MICD_LVL_8;
++		else
++			val = ARIZONA_MICD_LVL_8;
++	}
++
+ 	for (i = 0; i < 10 && !(val & MICD_LVL_0_TO_8); i++) {
+ 		ret = regmap_read(arizona->regmap, ARIZONA_MIC_DETECT_3, &val);
+ 		if (ret != 0) {
+@@ -901,10 +947,17 @@ static void arizona_micd_detect(struct work_struct *work)
+ 	}
+ 
+ handled:
+-	if (info->detecting)
++	if (info->detecting) {
++		if (arizona->pdata.micd_software_compare)
++			regmap_update_bits(arizona->regmap,
++					   ARIZONA_MIC_DETECT_1,
++					   ARIZONA_MICD_ENA,
++					   ARIZONA_MICD_ENA);
++
+ 		queue_delayed_work(system_power_efficient_wq,
+ 				   &info->micd_timeout_work,
+ 				   msecs_to_jiffies(info->micd_timeout));
++	}
+ 
+ 	pm_runtime_mark_last_busy(info->dev);
+ 	mutex_unlock(&info->lock);
+@@ -1228,7 +1281,8 @@ static int arizona_extcon_probe(struct platform_device *pdev)
+ 				   arizona->pdata.micd_dbtime
+ 				   << ARIZONA_MICD_DBTIME_SHIFT);
+ 
+-	BUILD_BUG_ON(ARRAY_SIZE(arizona_micd_levels) != 0x40);
++	BUILD_BUG_ON(ARRAY_SIZE(arizona_micd_levels) <
++		     ARIZONA_NUM_MICD_BUTTON_LEVELS);
+ 
+ 	if (arizona->pdata.num_micd_ranges) {
+ 		info->micd_ranges = pdata->micd_ranges;
+@@ -1261,11 +1315,11 @@ static int arizona_extcon_probe(struct platform_device *pdev)
+ 
+ 	/* Set up all the buttons the user specified */
+ 	for (i = 0; i < info->num_micd_ranges; i++) {
+-		for (j = 0; j < ARRAY_SIZE(arizona_micd_levels); j++)
++		for (j = 0; j < ARIZONA_NUM_MICD_BUTTON_LEVELS; j++)
+ 			if (arizona_micd_levels[j] >= info->micd_ranges[i].max)
+ 				break;
+ 
+-		if (j == ARRAY_SIZE(arizona_micd_levels)) {
++		if (j == ARIZONA_NUM_MICD_BUTTON_LEVELS) {
+ 			dev_err(arizona->dev, "Unsupported MICD level %d\n",
+ 				info->micd_ranges[i].max);
+ 			ret = -EINVAL;
+diff --git a/drivers/mfd/wm5110-tables.c b/drivers/mfd/wm5110-tables.c
+index 11632f1..ecc7ead 100644
+--- a/drivers/mfd/wm5110-tables.c
++++ b/drivers/mfd/wm5110-tables.c
+@@ -548,6 +548,7 @@ static const struct reg_default wm5110_reg_default[] = {
+ 	{ 0x000002A7, 0x372C },    /* R679   - Mic Detect Level 2 */
+ 	{ 0x000002A8, 0x1422 },    /* R680   - Mic Detect Level 3 */
+ 	{ 0x000002A9, 0x300A },    /* R681   - Mic Detect Level 4 */
++	{ 0x000002AB, 0x0000 },    /* R683   - Mic Detect 4 */
+ 	{ 0x000002C3, 0x0000 },    /* R707   - Mic noise mix control 1 */
+ 	{ 0x000002D3, 0x0000 },    /* R723   - Jack detect analogue */
+ 	{ 0x00000300, 0x0000 },    /* R768   - Input Enables */
+@@ -1575,6 +1576,7 @@ static bool wm5110_readable_register(struct device *dev, unsigned int reg)
+ 	case ARIZONA_MIC_DETECT_1:
+ 	case ARIZONA_MIC_DETECT_2:
+ 	case ARIZONA_MIC_DETECT_3:
++	case ARIZONA_MIC_DETECT_4:
+ 	case ARIZONA_MIC_DETECT_LEVEL_1:
+ 	case ARIZONA_MIC_DETECT_LEVEL_2:
+ 	case ARIZONA_MIC_DETECT_LEVEL_3:
+@@ -2509,6 +2511,7 @@ static bool wm5110_volatile_register(struct device *dev, unsigned int reg)
+ 	case ARIZONA_SAMPLE_RATE_3_STATUS:
+ 	case ARIZONA_ASYNC_SAMPLE_RATE_1_STATUS:
+ 	case ARIZONA_MIC_DETECT_3:
++	case ARIZONA_MIC_DETECT_4:
+ 	case ARIZONA_HEADPHONE_DETECT_2:
+ 	case ARIZONA_INPUT_ENABLES_STATUS:
+ 	case ARIZONA_OUTPUT_STATUS_1:
+diff --git a/include/linux/mfd/arizona/pdata.h b/include/linux/mfd/arizona/pdata.h
+index 12a5c13..8a5dda3 100644
+--- a/include/linux/mfd/arizona/pdata.h
++++ b/include/linux/mfd/arizona/pdata.h
+@@ -136,6 +136,9 @@ struct arizona_pdata {
+ 	/** GPIO used for mic isolation with HPDET */
+ 	int hpdet_id_gpio;
+ 
++	/** Use software comparison to determine mic presence */
++	bool micd_software_compare;
++
+ 	/** Extra debounce timeout used during initial mic detection (ms) */
+ 	int micd_detect_debounce;
+ 
+diff --git a/include/linux/mfd/arizona/registers.h b/include/linux/mfd/arizona/registers.h
+index fdf3aa3..2a3a512 100644
+--- a/include/linux/mfd/arizona/registers.h
++++ b/include/linux/mfd/arizona/registers.h
+@@ -132,6 +132,7 @@
+ #define ARIZONA_MIC_DETECT_LEVEL_2		 0x2A7
+ #define ARIZONA_MIC_DETECT_LEVEL_3		 0x2A8
+ #define ARIZONA_MIC_DETECT_LEVEL_4		 0x2A9
++#define ARIZONA_MIC_DETECT_4                     0x2AB
+ #define ARIZONA_MIC_NOISE_MIX_CONTROL_1          0x2C3
+ #define ARIZONA_ISOLATION_CONTROL                0x2CB
+ #define ARIZONA_JACK_DETECT_ANALOGUE             0x2D3
+@@ -2143,9 +2144,9 @@
+ #define ARIZONA_ACCDET_SRC_MASK                  0x2000  /* ACCDET_SRC */
+ #define ARIZONA_ACCDET_SRC_SHIFT                     13  /* ACCDET_SRC */
+ #define ARIZONA_ACCDET_SRC_WIDTH                      1  /* ACCDET_SRC */
+-#define ARIZONA_ACCDET_MODE_MASK                 0x0003  /* ACCDET_MODE - [1:0] */
+-#define ARIZONA_ACCDET_MODE_SHIFT                     0  /* ACCDET_MODE - [1:0] */
+-#define ARIZONA_ACCDET_MODE_WIDTH                     2  /* ACCDET_MODE - [1:0] */
++#define ARIZONA_ACCDET_MODE_MASK                 0x0007  /* ACCDET_MODE - [2:0] */
++#define ARIZONA_ACCDET_MODE_SHIFT                     0  /* ACCDET_MODE - [2:0] */
++#define ARIZONA_ACCDET_MODE_WIDTH                     3  /* ACCDET_MODE - [2:0] */
+ 
+ /*
+  * R667 (0x29B) - Headphone Detect 1
+@@ -2255,6 +2256,16 @@
+ #define ARIZONA_MICD_STS_WIDTH                        1  /* MICD_STS */
+ 
+ /*
++ * R683 (0x2AB) - Mic Detect 4
++ */
++#define ARIZONA_MICDET_ADCVAL_DIFF_MASK          0xFF00  /* MICDET_ADCVAL_DIFF - [15:8] */
++#define ARIZONA_MICDET_ADCVAL_DIFF_SHIFT              8  /* MICDET_ADCVAL_DIFF - [15:8] */
++#define ARIZONA_MICDET_ADCVAL_DIFF_WIDTH              8  /* MICDET_ADCVAL_DIFF - [15:8] */
++#define ARIZONA_MICDET_ADCVAL_MASK               0x007F  /* MICDET_ADCVAL - [15:8] */
++#define ARIZONA_MICDET_ADCVAL_SHIFT                   0  /* MICDET_ADCVAL - [15:8] */
++#define ARIZONA_MICDET_ADCVAL_WIDTH                   7  /* MICDET_ADCVAL - [15:8] */
++
++/*
+  * R707 (0x2C3) - Mic noise mix control 1
+  */
+ #define ARIZONA_MICMUTE_RATE_MASK                0x7800  /* MICMUTE_RATE - [14:11] */
+-- 
+1.7.9.5
+

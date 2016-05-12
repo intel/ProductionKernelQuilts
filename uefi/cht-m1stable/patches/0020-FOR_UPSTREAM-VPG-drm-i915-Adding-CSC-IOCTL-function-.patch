@@ -1,0 +1,269 @@
+From ad0a0b70015722311902d493d27730ee6789a671 Mon Sep 17 00:00:00 2001
+Message-Id: <ad0a0b70015722311902d493d27730ee6789a671.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Ramalingam C <ramalingam.c@intel.com>
+Date: Thu, 24 Oct 2013 10:36:39 +0530
+Subject: [PATCH 020/312] FOR_UPSTREAM [VPG]: drm/i915: Adding CSC IOCTL
+ function for HSW
+
+Adding the support for ioctl for setting the below CSC parameters for HSW
+1. CSC Coefficients
+2. CSC Pre and Post offsets
+3. CSC Mode
+
+This also will make sure that values set by userspace will be retained
+till power off or restart.
+
+Issue: AIAF-5153
+OTC-Tracker: AIAF-5197
+
+Change-Id: I7183c07846f9febf9a4055a4a66e97e5023d2a7a
+Signed-off-by: Ramalingam C <ramalingam.c@intel.com>
+
+Conflicts:
+
+	drivers/gpu/drm/i915/i915_dma.c
+	drivers/gpu/drm/i915/intel_display.c
+	drivers/gpu/drm/i915/intel_drv.h
+	include/uapi/drm/i915_drm.h
+(cherry picked from commit 0eed24b188c9419b2ce53367dcfd9fc1c89b4cda)
+
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c      |    1 +
+ drivers/gpu/drm/i915/intel_display.c |  108 +++++++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/intel_drv.h     |    2 +
+ include/uapi/drm/i915_drm.h          |   26 ++++++++
+ 4 files changed, 115 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 64d42d7..d49b7a4 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -2022,6 +2022,7 @@ const struct drm_ioctl_desc i915_ioctls[] = {
+ 		i915_enable_plane_reserved_reg_bit_2, DRM_AUTH|DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(I915_GEM_ACCESS_USERDATA, i915_gem_access_userdata,
+ 							DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(I915_SET_CSC, intel_configure_csc, DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ };
+ 
+ int i915_max_ioctl = ARRAY_SIZE(i915_ioctls);
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index f6a6d06..4407ec0 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -83,6 +83,23 @@ struct intel_limit {
+ 	intel_p2_t	    p2;
+ };
+ 
++/* Color space conversion coff's */
++static u32 csc_softlut[I915_MAX_PIPES][CSC_MAX_COEFF_REG_COUNT] = {
++	{0x78000000, 0, 0x7800, 0, 0, 0x78000000},
++	{0x78000000, 0, 0x7800, 0, 0, 0x78000000},
++	{0x78000000, 0, 0x7800, 0, 0, 0x78000000},
++};
++
++/* CSC Preoffset*/
++static u32 csc_preoffset[I915_MAX_PIPES][CSC_MAX_OFFSET_COUNT] = {
++			{0, 0, 0}, {0, 0, 0}, {0, 0, 0},
++};
++/* CSC Postoffset*/
++static u32 csc_postoffset[I915_MAX_PIPES][CSC_MAX_OFFSET_COUNT] = {
++			{0, 0, 0}, {0, 0, 0}, {0, 0, 0},
++};
++static u32 csc_mode;
++
+ int
+ intel_pch_rawclk(struct drm_device *dev)
+ {
+@@ -6771,7 +6788,7 @@ static void intel_set_pipe_csc(struct drm_crtc *crtc)
+ 	struct drm_device *dev = crtc->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+-	int pipe = intel_crtc->pipe;
++	int pipe = intel_crtc->pipe, i;
+ 	uint16_t coeff = 0x7800; /* 1.0 */
+ 
+ 	/*
+@@ -6781,38 +6798,40 @@ static void intel_set_pipe_csc(struct drm_crtc *crtc)
+ 	 * consideration.
+ 	 */
+ 
+-	if (intel_crtc->config.limited_color_range)
++	if (intel_crtc->config.limited_color_range) {
+ 		coeff = ((235 - 16) * (1 << 12) / 255) & 0xff8; /* 0.xxx... */
+ 
+-	/*
+-	 * GY/GU and RY/RU should be the other way around according
+-	 * to BSpec, but reality doesn't agree. Just set them up in
+-	 * a way that results in the correct picture.
+-	 */
+-	I915_WRITE(PIPE_CSC_COEFF_RY_GY(pipe), coeff << 16);
+-	I915_WRITE(PIPE_CSC_COEFF_BY(pipe), 0);
+-
+-	I915_WRITE(PIPE_CSC_COEFF_RU_GU(pipe), coeff);
+-	I915_WRITE(PIPE_CSC_COEFF_BU(pipe), 0);
++		csc_softlut[pipe][0] = coeff << 16;
++		csc_softlut[pipe][1] = 0;
++		csc_softlut[pipe][2] = coeff;
++		csc_softlut[pipe][3] = 0;
++		csc_softlut[pipe][4] = 0;
++		csc_softlut[pipe][5] = coeff << 16;
++	}
+ 
+-	I915_WRITE(PIPE_CSC_COEFF_RV_GV(pipe), 0);
+-	I915_WRITE(PIPE_CSC_COEFF_BV(pipe), coeff << 16);
++	for (i = 0; i < CSC_MAX_COEFF_REG_COUNT; i++)
++		I915_WRITE(PIPE_CSC_COEFF_RY_GY(pipe) + (i * 4),
++						csc_softlut[pipe][i]);
+ 
+-	I915_WRITE(PIPE_CSC_PREOFF_HI(pipe), 0);
+-	I915_WRITE(PIPE_CSC_PREOFF_ME(pipe), 0);
+-	I915_WRITE(PIPE_CSC_PREOFF_LO(pipe), 0);
++	for (i = 0; i < CSC_MAX_OFFSET_COUNT; i++)
++		I915_WRITE(PIPE_CSC_PREOFF_HI(pipe) + (i*4),
++						csc_preoffset[pipe][i]);
+ 
+ 	if (INTEL_INFO(dev)->gen > 6) {
+ 		uint16_t postoff = 0;
+ 
+-		if (intel_crtc->config.limited_color_range)
++		if (intel_crtc->config.limited_color_range) {
+ 			postoff = (16 * (1 << 12) / 255) & 0x1fff;
++			csc_postoffset[pipe][0] = postoff;
++			csc_postoffset[pipe][1] = postoff;
++			csc_postoffset[pipe][2] = postoff;
++		}
+ 
+-		I915_WRITE(PIPE_CSC_POSTOFF_HI(pipe), postoff);
+-		I915_WRITE(PIPE_CSC_POSTOFF_ME(pipe), postoff);
+-		I915_WRITE(PIPE_CSC_POSTOFF_LO(pipe), postoff);
++		for (i = 0; i < CSC_MAX_OFFSET_COUNT; i++)
++			I915_WRITE(PIPE_CSC_POSTOFF_HI(pipe) + (i*4),
++						csc_postoffset[pipe][i]);
+ 
+-		I915_WRITE(PIPE_CSC_MODE(pipe), 0);
++		I915_WRITE(PIPE_CSC_MODE(pipe), csc_mode);
+ 	} else {
+ 		uint32_t mode = CSC_MODE_YUV_TO_RGB;
+ 
+@@ -6823,6 +6842,51 @@ static void intel_set_pipe_csc(struct drm_crtc *crtc)
+ 	}
+ }
+ 
++/*
++ * Implementation for Ioctl I915_SET_CSC to modify the CSC parameters
++ */
++int intel_configure_csc(struct drm_device *dev, void *data,
++						struct drm_file *priv)
++{
++	struct csc_coeff *csc_coeff_t = NULL;
++	struct drm_mode_object *obj;
++	struct drm_crtc *crtc;
++	struct intel_crtc *intel_crtc;
++	int pipe, i = 0;
++
++	csc_coeff_t = (struct csc_coeff *)data;
++
++	obj = drm_mode_object_find(dev, csc_coeff_t->crtc_id,
++				DRM_MODE_OBJECT_CRTC);
++	if (!obj) {
++		DRM_ERROR("Unknown CRTC ID %d\n", csc_coeff_t->crtc_id);
++		return -EINVAL;
++	}
++
++	crtc = obj_to_crtc(obj);
++
++	intel_crtc = to_intel_crtc(crtc);
++	pipe = intel_crtc->pipe;
++
++	if (csc_coeff_t->param_valid & CSC_COEFF_VALID_MASK) {
++		for (i = 0; i < CSC_MAX_COEFF_REG_COUNT; i++)
++			csc_softlut[pipe][i] = csc_coeff_t->csc_coeff[i];
++	}
++
++	if (csc_coeff_t->param_valid & CSC_OFFSET_VALID_MASK)
++		for (i = 0; i < CSC_MAX_OFFSET_COUNT; i++) {
++			csc_preoffset[pipe][i] = csc_coeff_t->csc_preoffset[i];
++			csc_postoffset[pipe][i] =
++						csc_coeff_t->csc_postoffset[i];
++		}
++
++	if (csc_coeff_t->param_valid & CSC_MODE_VALID_MASK)
++		csc_mode = csc_coeff_t->csc_mode;
++
++	intel_set_pipe_csc(crtc);
++	return 0;
++}
++
+ static void haswell_set_pipeconf(struct drm_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->dev;
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index bd8d048..8e32792 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -759,6 +759,8 @@ void intel_wait_for_pipe_off(struct drm_device *dev, int pipe);
+ int ironlake_get_lanes_required(int target_clock, int link_bw, int bpp);
+ void vlv_wait_port_ready(struct drm_i915_private *dev_priv,
+ 			 struct intel_digital_port *dport);
++int intel_configure_csc(struct drm_device *dev, void *csc_params,
++					struct drm_file *file_priv);
+ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+ 				struct drm_display_mode *mode,
+ 				struct intel_load_detect_pipe *old,
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index d418397..736360c 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -153,6 +153,29 @@ typedef struct _drm_i915_sarea {
+ 
+ } drm_i915_sarea_t;
+ 
++#define CSC_MAX_COEFF_REG_COUNT		6
++#define CSC_MAX_OFFSET_COUNT		3
++
++#define CSC_COEFF_VALID_MASK		0x1
++#define CSC_OFFSET_VALID_MASK		0x2
++#define CSC_MODE_VALID_MASK		0x4
++
++struct csc_coeff {
++	unsigned int crtc_id;
++	/*
++	 * param_valid : Bits
++	 * XXX1b : Coeff Valid
++	 * XX1Xb : Offset Valid
++	 * X1XXb : Mode Valid
++	 * X000b : Invalid
++	 */
++	unsigned int param_valid;
++	unsigned int csc_coeff[CSC_MAX_COEFF_REG_COUNT];
++	unsigned int csc_preoffset[CSC_MAX_OFFSET_COUNT];
++	unsigned int csc_postoffset[CSC_MAX_OFFSET_COUNT];
++	unsigned int csc_mode;
++};
++
+ /* due to userspace building against these headers we need some compat here */
+ #define planeA_x pipeA_x
+ #define planeA_y pipeA_y
+@@ -225,6 +248,7 @@ typedef struct _drm_i915_sarea {
+ #define DRM_I915_GET_RESET_STATS	0x32
+ #define DRM_I915_GEM_USERPTR		0x33
+ #define DRM_I915_ENABLE_PLANE_RESERVED_REG_BIT_2	0x37
++#define DRM_I915_SET_CSC		0x39
+ #define DRM_I915_GEM_ACCESS_USERDATA	0x3c
+ 
+ #define DRM_IOCTL_I915_INIT		DRM_IOW( DRM_COMMAND_BASE + DRM_I915_INIT, drm_i915_init_t)
+@@ -283,6 +307,8 @@ typedef struct _drm_i915_sarea {
+ #define DRM_IOCTL_I915_GEM_ACCESS_USERDATA	\
+ 		DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_GEM_ACCESS_USERDATA, \
+ 		struct drm_i915_gem_access_userdata)
++#define DRM_IOCTL_I915_SET_CSC DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_SET_CSC, \
++		struct csc_coeff)
+ 
+ /* Allow drivers to submit batchbuffers directly to hardware, relying
+  * on the security mechanisms provided by hardware.
+-- 
+1.7.9.5
+

@@ -1,0 +1,202 @@
+From 620d763604dc6345efbd237e06ac4cc2d48d26ff Mon Sep 17 00:00:00 2001
+Message-Id: <620d763604dc6345efbd237e06ac4cc2d48d26ff.1398812351.git.mark.gross@intel.com>
+In-Reply-To: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+References: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Wed, 12 Mar 2014 09:31:06 -0700
+Subject: [PATCH 277/429] acpi-gpiobtn: GPIO Tablet buttons device
+
+Recent PC tablets have a new ACPI5-based GPIO interface to their
+hardware buttons.
+
+Change-Id: Idff785b3f38fd8d0682c4f7c44943f3a1debb78e
+Upstream-Candidate: yes
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+Reviewed-on: https://android.intel.com/171284
+Reviewed-by: Uyyala, Sridhar <sridhar.uyyala@intel.com>
+Tested-by: Uyyala, Sridhar <sridhar.uyyala@intel.com>
+---
+ drivers/acpi/acpi_platform.c          |   1 +
+ drivers/input/keyboard/Kconfig        |   6 ++
+ drivers/input/keyboard/Makefile       |   1 +
+ drivers/input/keyboard/acpi-gpiobtn.c | 132 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 140 insertions(+)
+ create mode 100644 drivers/input/keyboard/acpi-gpiobtn.c
+
+diff --git a/drivers/acpi/acpi_platform.c b/drivers/acpi/acpi_platform.c
+index 9967493..4f0449d 100644
+--- a/drivers/acpi/acpi_platform.c
++++ b/drivers/acpi/acpi_platform.c
+@@ -36,6 +36,7 @@ static const struct acpi_device_id acpi_platform_device_ids[] = {
+ 	{ "BCM2E1A" },
+ 	{ "BCM2E39" },
+ 	{ "BCM2E3D" },
++	{ "PNP0C40" }, /* GPIO buttons device */
+ 
+ 	/* Intel Smart Sound Technology */
+ 	{ "INT33C8" },
+diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
+index a673c9f..3dfb7b1 100644
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -652,4 +652,10 @@ config KEYBOARD_CROS_EC
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called cros_ec_keyb.
+ 
++config KEYBOARD_ACPI_GPIO
++	tristate "ACPI GPIO Button Array"
++	help
++	  Say Y here to enable support for ACPI5-based GPIO button
++	  array objects used by some modern PC tablet devices.
++
+ endif
+diff --git a/drivers/input/keyboard/Makefile b/drivers/input/keyboard/Makefile
+index a699b61..a7f9baf 100644
+--- a/drivers/input/keyboard/Makefile
++++ b/drivers/input/keyboard/Makefile
+@@ -57,3 +57,4 @@ obj-$(CONFIG_KEYBOARD_TNETV107X)	+= tnetv107x-keypad.o
+ obj-$(CONFIG_KEYBOARD_TWL4030)		+= twl4030_keypad.o
+ obj-$(CONFIG_KEYBOARD_XTKBD)		+= xtkbd.o
+ obj-$(CONFIG_KEYBOARD_W90P910)		+= w90p910_keypad.o
++obj-$(CONFIG_KEYBOARD_ACPI_GPIO)	+= acpi-gpiobtn.o
+diff --git a/drivers/input/keyboard/acpi-gpiobtn.c b/drivers/input/keyboard/acpi-gpiobtn.c
+new file mode 100644
+index 0000000..b921bb7
+--- /dev/null
++++ b/drivers/input/keyboard/acpi-gpiobtn.c
+@@ -0,0 +1,132 @@
++/*
++ * GPIO button array driver
++ * Copyright (c) 2014, Intel Corporation.
++ *
++ * Author: Andy Ross <andrew.j.ross@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ */
++#include <linux/acpi.h>
++#include <linux/input.h>
++#include <linux/platform_device.h>
++#include <linux/gpio/consumer.h>
++#include <linux/gpio_keys.h>
++
++static struct gpio_keys_button gpiobtn_keys[] = {
++	{
++		.code = KEY_POWER,
++		.desc = "Power",
++		.type = EV_KEY,
++		.wakeup = 1,
++	},
++	{
++		.code = KEY_LEFTMETA,
++		.desc = "Home",
++		.type = EV_KEY,
++		.wakeup = 1,
++	},
++	{
++		.code = KEY_VOLUMEUP,
++		.desc = "Volume Up",
++		.type = EV_KEY,
++	},
++	{
++		.code = KEY_VOLUMEDOWN,
++		.desc = "Volume Down",
++		.type = EV_KEY,
++	},
++	{
++		.code = SW_ROTATE_LOCK,
++		.desc = "Rotation Lock",
++		.type = EV_SW,
++	},
++};
++
++static struct gpio_keys_platform_data gpiobtn_keys_pdata = {
++	.buttons = gpiobtn_keys,
++};
++
++static struct platform_device gpiobtn_keys_pdev = {
++	.name = "gpio-keys",
++	.dev = {
++		.platform_data = &gpiobtn_keys_pdata,
++	},
++};
++
++static int gpiobtn_probe(struct platform_device *dev)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(gpiobtn_keys); i++) {
++		struct gpio_desc *d = gpiod_get_index(&dev->dev, NULL, i);
++		if (!d || IS_ERR(d))
++			break;
++
++		gpiobtn_keys[i].gpio = desc_to_gpio(d);
++		gpiobtn_keys[i].desc = d;
++
++		/* ACPI firmware gets this wrong on at least one
++		 * device, but the fact that all these devices work
++		 * with a driver from a single vendor implies that the
++		 * polarity is fixed by specification.
++		 *
++		 * gpiobtn_keys[i].active_low = gpiod_is_active_low(d);
++		 */
++		gpiobtn_keys[i].active_low = 1;
++
++		gpiod_put(d);
++	}
++
++	if (!i) {
++		dev_err(&dev->dev, "No GPIO button lines detected");
++		return -1;
++	}
++
++	gpiobtn_keys_pdata.nbuttons = i;
++	return platform_device_register(&gpiobtn_keys_pdev);
++}
++
++static int gpiobtn_remove(struct platform_device *dev)
++{
++	platform_device_unregister(&gpiobtn_keys_pdev);
++	return 0;
++}
++
++static const struct acpi_device_id acpi_ids[] = {
++	{ "PNP0C40" },
++	{}
++};
++
++static struct platform_driver gpiobtn_plat_drv = {
++	.probe	= gpiobtn_probe,
++	.remove = gpiobtn_remove,
++	.driver = {
++		.name = "ACPI GPIO Buttons",
++		.acpi_match_table = acpi_ids,
++	},
++};
++
++static int __init gpiobtn_init(void)
++{
++	return platform_driver_register(&gpiobtn_plat_drv);
++}
++
++static void __exit gpiobtn_exit(void)
++{
++	platform_driver_unregister(&gpiobtn_plat_drv);
++}
++
++module_init(gpiobtn_init);
++module_exit(gpiobtn_exit);
+-- 
+1.8.3.2
+

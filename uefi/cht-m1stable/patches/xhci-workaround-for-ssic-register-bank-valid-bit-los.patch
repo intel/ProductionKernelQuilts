@@ -1,0 +1,140 @@
+From d337ad16e239cb97f90ee3aa123587ec33c816be Mon Sep 17 00:00:00 2001
+From: Zhuang Jin Can <jin.can.zhuang@intel.com>
+Date: Thu, 5 Mar 2015 18:10:20 +0800
+Subject: [PATCH] xhci: workaround for ssic register bank valid bit lost in D3
+
+ssic register bank valid bit is lost in D3, and it needs to be
+restored after D3 exit, otherwise, RRAP can't be send and link
+training will fail.
+
+Change-Id: I065ff3b5b99ca0eabc6f8477c8dd0f7935e3ddae
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-26932
+Signed-off-by: Zhuang Jin Can <jin.can.zhuang@intel.com>
+---
+ drivers/usb/host/xhci-intel-cap.c | 75 ++++++++++++++++++++++++++-------------
+ drivers/usb/host/xhci-intel-cap.h | 10 ++++++
+ 2 files changed, 60 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-intel-cap.c b/drivers/usb/host/xhci-intel-cap.c
+index 35fcf74..eb55af2 100644
+--- a/drivers/usb/host/xhci-intel-cap.c
++++ b/drivers/usb/host/xhci-intel-cap.c
+@@ -153,37 +153,62 @@ EXPORT_SYMBOL_GPL(xhci_intel_clr_internal_pme_flag);
+    pme and HCRST hangs issue */
+ void xhci_intel_ssic_port_unused(struct xhci_hcd *xhci, bool unused)
+ {
+-	int ext_offset, i;
+-	void __iomem *ssic_port_cfg;
++	int ext_start, ext_offset, i;
++	void __iomem *reg;
+ 	u32 data;
+ 
+ 	xhci_dbg(xhci, "ssic port - %s\n", unused ? "unused" : "used");
+ 
+-	ext_offset = XHCI_HCC_EXT_CAPS(readl(&xhci->cap_regs->hcc_params));
++	ext_start = XHCI_HCC_EXT_CAPS(readl(&xhci->cap_regs->hcc_params));
+ 	ext_offset = xhci_find_ext_cap_by_id(&xhci->cap_regs->hc_capbase,
+-			ext_offset << 2, XHCI_EXT_CAPS_INTEL_SSIC);
+-	if (!ext_offset)
+-		return;
++			ext_start << 2, XHCI_EXT_CAPS_INTEL_SSIC);
++
++	if (ext_offset) {
++		reg = &xhci->cap_regs->hc_capbase +
++				((ext_offset + SSIC_PORT_CFG2) >> 2);
++		for (i = 0; i < SSIC_PORT_NUM; i++) {
++			data = readl(reg);
++			data &= ~PROG_DONE;
++			writel(data, reg);
++
++			data = readl(reg);
++			if (unused)
++				data |= SSIC_PORT_UNUSED;
++			else
++				data &= ~SSIC_PORT_UNUSED;
++			writel(data, reg);
++
++			data = readl(reg);
++			data |= PROG_DONE;
++			writel(data, reg);
++
++			reg += SSIC_PORT_CFG2_OFFSET;
++		}
++	} else
++		xhci_err(xhci, "intel ssic ext caps not found\n");
++
++	/* WORKAROUND: Register Bank Valid bit is lost after controller enters
++	 * D3, need to set it back, otherwise SSIC RRAP commands can't be sent
++	 * and link training will fail.
++	 */
++	if (!unused) {
++		ext_offset = xhci_find_ext_cap_by_id(
++				&xhci->cap_regs->hc_capbase, ext_start << 2,
++				XHCI_EXT_CAPS_INTEL_SSIC_PROFILE);
++		if (!ext_offset) {
++			xhci_err(xhci, "intel ssic profile ext caps not found\n");
++			return;
++		}
++
++		reg = &xhci->cap_regs->hc_capbase +
++				((ext_offset + SSIC_ACCESS_CTRL) >> 2);
++		for (i = 0; i < SSIC_PORT_NUM; i++) {
++			data = readl(reg);
++			data |= SSIC_ACCESS_CTRL_REGISTER_BANK_VALID;
++			writel(data, reg);
+ 
+-	ssic_port_cfg = &xhci->cap_regs->hc_capbase +
+-			((ext_offset + SSIC_PORT_CFG2) >> 2);
+-	for (i = 0; i < SSIC_PORT_NUM; i++) {
+-		data = readl(ssic_port_cfg);
+-		data &= ~PROG_DONE;
+-		writel(data, ssic_port_cfg);
+-
+-		data = readl(ssic_port_cfg);
+-		if (unused)
+-			data |= SSIC_PORT_UNUSED;
+-		else
+-			data &= ~SSIC_PORT_UNUSED;
+-		writel(data, ssic_port_cfg);
+-
+-		data = readl(ssic_port_cfg);
+-		data |= PROG_DONE;
+-		writel(data, ssic_port_cfg);
+-
+-		ssic_port_cfg += SSIC_PORT_CFG2_OFFSET;
++			reg += SSIC_ACCESS_CTRL_OFFSET;
++		}
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(xhci_intel_ssic_port_unused);
+diff --git a/drivers/usb/host/xhci-intel-cap.h b/drivers/usb/host/xhci-intel-cap.h
+index 8b805eb..febe31d 100644
+--- a/drivers/usb/host/xhci-intel-cap.h
++++ b/drivers/usb/host/xhci-intel-cap.h
+@@ -17,6 +17,7 @@
+ /* Extended capability IDs for Intel Vendor Defined */
+ #define XHCI_EXT_CAPS_INTEL_HOST_CAP	192
+ #define XHCI_EXT_CAPS_INTEL_SSIC	196
++#define XHCI_EXT_CAPS_INTEL_SSIC_PROFILE	197
+ 
+ /* register definition */
+ #define PMCTRL			0x34
+@@ -41,6 +42,15 @@
+ #define PROG_DONE		(1 << 30)
+ #define SSIC_PORT_UNUSED	(1 << 31)
+ 
++/* SSIC Port N Register Access Control
++ * Address Offset: 04h – 07h,
++ * Port 1 ... N : 04h, 114h, 224h
++ */
++#define SSIC_ACCESS_CTRL	0x4
++#define SSIC_ACCESS_CTRL_OFFSET	0x110
++#define SSIC_ACCESS_CTRL_REGISTER_BANK_VALID	(1 << 25)
++
++
+ #define DUAL_ROLE_CFG1_POLL_TIMEOUT	1000
+ 
+ extern int xhci_intel_vendor_cap_init(struct xhci_hcd *xhci);
+-- 
+1.9.1
+

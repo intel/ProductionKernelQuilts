@@ -1,0 +1,318 @@
+From 327164a8b51febe703799c455b248c6a1f91e43d Mon Sep 17 00:00:00 2001
+From: "Subhransu S. Prusty" <subhransu.s.prusty@intel.com>
+Date: Mon, 25 Aug 2014 14:07:13 +0530
+Subject: [PATCH 04/12] Audio: Add async call back
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Change-Id: I1571fcda625ee9a3efe69c05a1ddd7da2497a3a2
+Signed-off-by: Subhransu S. Prusty <subhransu.s.prusty@intel.com>
+---
+ sound/soc/intel/pcm.c                            | 42 +++++++++++++++-
+ sound/soc/intel/platform-libs/controls_v2_dpcm.c | 18 +++++++
+ sound/soc/intel/sst/sst.h                        |  2 +-
+ sound/soc/intel/sst/sst_drv_interface.c          | 11 +++++
+ sound/soc/intel/sst/sst_ipc.c                    | 63 +++++++++---------------
+ sound/soc/intel/sst_platform.h                   | 23 +++++++++
+ sound/soc/intel/sst_platform_pvt.h               |  5 ++
+ 7 files changed, 121 insertions(+), 43 deletions(-)
+
+diff --git a/sound/soc/intel/pcm.c b/sound/soc/intel/pcm.c
+index 6335c47..b17db18 100644
+--- a/sound/soc/intel/pcm.c
++++ b/sound/soc/intel/pcm.c
+@@ -1013,6 +1013,46 @@ static struct snd_soc_platform_driver sst_soc_platform_drv  = {
+ 	.write		= sst_soc_write,
+ };
+ 
++static int sst_platform_async_cb(struct sst_platform_cb_params *params)
++{
++	int retval = 0;
++	struct snd_soc_platform *soc_platform;
++	struct snd_soc_card *card;
++	struct snd_kcontrol *kcontrol;
++	struct sst_data *sst;
++
++	switch (params->event) {
++	case SST_PLATFORM_VTSV_READ_EVENT: {
++		u8 *vtsv_result = params->params;
++		soc_platform = snd_soc_lookup_platform(sst_pdev);
++		if (!soc_platform) {
++			pr_err("Platform not found\n");
++			return -EINVAL;
++		}
++		sst = snd_soc_platform_get_drvdata(soc_platform);
++		card = soc_platform->card;
++		kcontrol = snd_soc_card_get_kcontrol(card, "vtsv event");
++		if (!kcontrol) {
++			pr_err("SST VTSV POLL control not found\n");
++			return -EINVAL;
++		}
++		/* 0th index of array contains size of array */
++		memcpy(sst->vtsv_result.data, vtsv_result, vtsv_result[0]);
++		snd_ctl_notify(card->snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
++					&kcontrol->id);
++		break;
++	}
++	default:
++		pr_info("No event handler for event Id %d\n", params->event);
++	}
++
++	return retval;
++}
++
++static struct sst_platform_cb_ops cb_ops = {
++	.async_cb = sst_platform_async_cb,
++};
++
+ int sst_register_dsp(struct sst_device *sst_dev)
+ {
+ 	if (!sst_dev)
+@@ -1024,7 +1064,7 @@ int sst_register_dsp(struct sst_device *sst_dev)
+ 		return -EEXIST;
+ 	}
+ 	pr_debug("registering device %s\n", sst_dev->name);
+-
++	sst_dev->cb_ops = &cb_ops;
+ 	sst_dsp = sst_dev;
+ 	mutex_unlock(&sst_dsp_lock);
+ 	return 0;
+diff --git a/sound/soc/intel/platform-libs/controls_v2_dpcm.c b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+index b6d8c4a..fb82f8c 100644
+--- a/sound/soc/intel/platform-libs/controls_v2_dpcm.c
++++ b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+@@ -267,6 +267,18 @@ static inline bool get_mux_state(struct sst_data *sst, unsigned int reg, unsigne
+ 	return sst_reg_read(sst, reg, shift, 1) == 1;
+ }
+ 
++int sst_vtsv_event_get(struct snd_kcontrol *kcontrol,
++			 struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_platform *platform = snd_kcontrol_chip(kcontrol);
++	struct sst_data *sst = snd_soc_platform_get_drvdata(platform);
++
++	pr_debug("in %s\n", __func__);
++	/* First element contains size */
++	memcpy(ucontrol->value.bytes.data, sst->vtsv_result.data, sst->vtsv_result.data[0]);
++	return 0;
++}
++
+ static int sst_mux_get(struct snd_kcontrol *kcontrol,
+ 		       struct snd_ctl_elem_value *ucontrol)
+ {
+@@ -1245,7 +1257,11 @@ static const struct snd_kcontrol_new sst_vad_enroll[] = {
+ static const struct snd_kcontrol_new sst_mix_sw_tone_gen =
+ 	SOC_SINGLE_EXT("switch", SST_MIX_SWITCH, 1, 1, 0,
+ 		sst_mix_get, sst_mix_put);
++static const struct snd_kcontrol_new sst_vtsv_read[] = {
++	SND_SOC_BYTES_EXT("vtsv event", VTSV_MAX_TOTAL_RESULT_ARRAY_SIZE,
++		 sst_vtsv_event_get, NULL),
+ 
++};
+ static const char * const sst_bt_fm_texts[] = {
+ 	"fm", "bt",
+ };
+@@ -1974,6 +1990,8 @@ int sst_dsp_init_v2_dpcm(struct snd_soc_platform *platform)
+ 			ARRAY_SIZE(sst_debug_controls));
+ 	snd_soc_add_platform_controls(platform, sst_vad_enroll,
+ 			ARRAY_SIZE(sst_vad_enroll));
++	snd_soc_add_platform_controls(platform, sst_vtsv_read,
++			ARRAY_SIZE(sst_vtsv_read));
+ 
+ 	/* initialize the names of the probe points */
+ 	for (i = 0; i < ARRAY_SIZE(sst_probes); i++)
+diff --git a/sound/soc/intel/sst/sst.h b/sound/soc/intel/sst/sst.h
+index 47c6172..3abd0dd 100644
+--- a/sound/soc/intel/sst/sst.h
++++ b/sound/soc/intel/sst/sst.h
+@@ -912,7 +912,7 @@ static inline int get_stream_id_mrfld(u32 pipe_id)
+ 
+ int register_sst(struct device *);
+ int unregister_sst(struct device *);
+-
++int sst_platform_cb(struct sst_platform_cb_params *cb_params);
+ #ifdef CONFIG_DEBUG_FS
+ void sst_debugfs_init(struct intel_sst_drv *sst);
+ void sst_debugfs_exit(struct intel_sst_drv *sst);
+diff --git a/sound/soc/intel/sst/sst_drv_interface.c b/sound/soc/intel/sst/sst_drv_interface.c
+index 2e6b674..56ad1c9 100644
+--- a/sound/soc/intel/sst/sst_drv_interface.c
++++ b/sound/soc/intel/sst/sst_drv_interface.c
+@@ -1098,8 +1098,19 @@ static struct sst_device sst_dsp_device = {
+ 	.dev = NULL,
+ 	.ops = &pcm_ops,
+ 	.compr_ops = &compr_ops,
++	.cb_ops	   = NULL,
+ };
+ 
++int sst_platform_cb(struct sst_platform_cb_params *cb_params)
++{
++	if (sst_dsp_device.cb_ops && sst_dsp_device.cb_ops->async_cb) {
++		return sst_dsp_device.cb_ops->async_cb(cb_params);
++	} else {
++		pr_info("Async ops not defined\n");
++		return 0;
++	}
++}
++
+ /*
+  * register_sst - function to register DSP
+  *
+diff --git a/sound/soc/intel/sst/sst_ipc.c b/sound/soc/intel/sst/sst_ipc.c
+index d5fd228..ce0885d 100644
+--- a/sound/soc/intel/sst/sst_ipc.c
++++ b/sound/soc/intel/sst/sst_ipc.c
+@@ -524,59 +524,40 @@ void sst_process_message_mrfld(struct ipc_post *msg)
+ 	return;
+ }
+ 
+-#define VTSV_MAX_NUM_RESULTS 6
+-#define VTSV_SIZE_PER_RESULT 7 /* 7 16 bit words */
+-/* Max 6 results each of size 7 words + 1 num results word */
+-#define VTSV_MAX_TOTAL_RESULT_SIZE \
+-	(VTSV_MAX_NUM_RESULTS*VTSV_SIZE_PER_RESULT + 1)
+-/* Each data word in the result is sent as a string in the format:
+-DATAn=d, where n is the data word index varying from 0 to
+-				VTSV_MAX_TOTAL_RESULT_SIZE-1
+-d = string representation of data in decimal format;
+-				unsigned 16bit data needs max 5 chars
+-So total data string size = 4("DATA")+2("n")+1("=")
+-				+5("d")+1(null)+5(reserved) = 18  */
+-#define VTSV_DATA_STRING_SIZE 18
+ 
+ static int send_vtsv_result_event(void *data, int size)
+ {
+-	char *envp[VTSV_MAX_TOTAL_RESULT_SIZE+3];
+-	char res_size[30];
+-	char ev_type[30];
+-	char result[VTSV_MAX_TOTAL_RESULT_SIZE][VTSV_DATA_STRING_SIZE];
+-	int offset = 0;
+-	u16 *tmp;
+-	int i;
+-	int ret;
++	/* Add 2 bytes for valid data in bytecontrol */
++	u8 result[VTSV_MAX_TOTAL_RESULT_ARRAY_SIZE];
++	struct sst_platform_cb_params	cb_params;
+ 
+ 	if (!data) {
+ 		pr_err("Data pointer Null into %s\n", __func__);
+ 		return -EINVAL;
+ 	}
+-	size = size / (sizeof(u16)); /* Number of 16 bit data words*/
+ 	if (size > VTSV_MAX_TOTAL_RESULT_SIZE) {
+-		pr_err("VTSV result size exceeds expected value, no uevent sent\n");
++		pr_err("VTSV result size exceeds expected value\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	snprintf(ev_type, sizeof(res_size), "EVENT_TYPE=SST_VTSV");
+-	envp[offset++] = ev_type;
+-	snprintf(res_size, sizeof(ev_type), "VTSV_RESULT_SIZE=%u", size);
+-	envp[offset++] = res_size;
+-	tmp = (u16 *)(data);
+-	for (i = 0; i < size; i++) {
+-		/* Driver assumes all data to be u16; The VTSV service
+-		layer will type cast to u16 or s16 as appropriate for
+-		a given data word*/
+-		snprintf(result[i], VTSV_DATA_STRING_SIZE,
+-				"DATA%u=%u", i, *tmp++);
+-		envp[offset++] = result[i];
+-	}
+-	envp[offset] = NULL;
+-	ret = kobject_uevent_env(&sst_drv_ctx->dev->kobj, KOBJ_CHANGE, envp);
+-	if (ret)
+-		pr_err("VTSV event send failed: ret = %d\n", ret);
+-	return ret;
++	/* First element in byte controls which is 16 bits is size of the data
++	 */
++	result[0] = size;
++	/* Second element is reserved just to maintain 16-bit alignment. App
++	 * parses VTSV  data in terms of 16-bit key value pair
++	 */
++	result[1] = 0x0;
++
++	/* We are filling actual data from index 2 since first two bytes in
++	 * array specify valid data size in an array
++	 */
++	memcpy(&result[2], (char *)data, size);
++	cb_params.event =  SST_PLATFORM_VTSV_READ_EVENT;
++	cb_params.params = &result;
++
++	print_hex_dump_bytes(__func__, DUMP_PREFIX_NONE, (char *)data, size);
++
++	return sst_platform_cb(&cb_params);
+ }
+ 
+ static void process_fw_async_msg(struct ipc_post *msg)
+diff --git a/sound/soc/intel/sst_platform.h b/sound/soc/intel/sst_platform.h
+index 8db7289..c7b9447 100644
+--- a/sound/soc/intel/sst_platform.h
++++ b/sound/soc/intel/sst_platform.h
+@@ -27,6 +27,16 @@
+ 
+ #define SST_MAX_BIN_BYTES 1024
+ 
++/* VTSV Result */
++#define VTSV_MAX_NUM_RESULTS 6
++#define VTSV_SIZE_PER_RESULT 7 /* 7 16 bit words */
++/* Max 6 results each of size 7 words * 2 byte per result */
++#define VTSV_MAX_TOTAL_RESULT_SIZE \
++	(VTSV_MAX_NUM_RESULTS*VTSV_SIZE_PER_RESULT * 2)
++
++/* Adding two bytes to specify the valid data length in the VTSV Result array */
++#define VTSV_MAX_TOTAL_RESULT_ARRAY_SIZE (VTSV_MAX_TOTAL_RESULT_SIZE + 2)
++
+ struct sst_data;
+ 
+ enum sst_audio_device_type {
+@@ -139,12 +149,25 @@ struct sst_runtime_stream {
+ 	spinlock_t	status_lock;
+ };
+ 
++#define SST_PLATFORM_VTSV_READ_EVENT	0x1
++struct sst_platform_cb_params {
++	/* Async event from firmware like VTSV*/
++	unsigned int event;
++	/* Params related to event */
++	void *params;
++};
++
++struct sst_platform_cb_ops {
++	int (*async_cb) (struct sst_platform_cb_params *params);
++};
++
+ struct sst_device {
+ 	char *name;
+ 	struct device *dev;
+ 	struct sst_ops *ops;
+ 	struct platform_device *pdev;
+ 	struct compress_sst_ops *compr_ops;
++	struct sst_platform_cb_ops *cb_ops;
+ };
+ 
+ int sst_register_dsp(struct sst_device *sst);
+diff --git a/sound/soc/intel/sst_platform_pvt.h b/sound/soc/intel/sst_platform_pvt.h
+index 4671cb8..e37e89d 100644
+--- a/sound/soc/intel/sst_platform_pvt.h
++++ b/sound/soc/intel/sst_platform_pvt.h
+@@ -125,6 +125,10 @@ struct sst_pcm_format {
+ };
+ 
+ 
++struct sst_vtsv_result {
++	u8 data[VTSV_MAX_TOTAL_RESULT_ARRAY_SIZE];
++};
++
+ struct sst_data {
+ 	struct platform_device *pdev;
+ 	struct sst_platform_data *pdata;
+@@ -137,5 +141,6 @@ struct sst_data {
+ 	u8 pipe_id;
+ 	bool vtsv_enroll;
+ 	struct sst_lowlatency_deepbuff ll_db;
++	struct sst_vtsv_result vtsv_result;
+ };
+ #endif
+-- 
+1.8.3.2
+

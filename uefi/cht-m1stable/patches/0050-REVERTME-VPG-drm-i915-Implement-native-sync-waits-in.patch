@@ -1,0 +1,112 @@
+From 85d563ead04c8d319d0bc6e7ef5ad583f5ddfcff Mon Sep 17 00:00:00 2001
+Message-Id: <85d563ead04c8d319d0bc6e7ef5ad583f5ddfcff.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 11 Feb 2015 15:04:34 +0000
+Subject: [PATCH 50/68] REVERTME [VPG]: drm/i915: Implement native sync waits
+ in scheduler bypass mode
+
+The scheduler has a bypass mode which basically puts it into direct
+submission as before the scheduler was implemented. However, in that
+mode, there was no support for waiting on native sync fences. This
+patch adds in that ability. Note that the wait is done immediately and
+synchronously when the batch buffer is submitted. However, it is done
+before the mutex lock is acquired.
+
+Note that this patch is a REVERTME because the native sync
+implementation does not exist upstream as the framework is Android
+specific. There is a plan to implement native syncs in upstream linux
+using fence and dmabuf-sync constructs. When that is complete, this
+patch can be replaced by that implementation.
+
+Change-Id: Ic79f2747d2fb5b9f80a63a722ad3d9d33e0b05fe
+For: VIZ-1587
+For: VIZ-4741
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   47 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.c      |    2 ++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 577c1ae..d350db2 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1423,6 +1423,42 @@ eb_get_batch(struct eb_vmas *eb)
+ 	return vma->obj;
+ }
+ 
++#ifdef CONFIG_SYNC
++static int i915_early_fence_wait(struct intel_engine_cs *ring, int fence_fd)
++{
++	struct sync_fence *fence;
++	int ret = 0;
++
++	if (fence_fd < 0) {
++		DRM_ERROR("Invalid wait fence fd %d on ring %d\n", fence_fd,
++			  (int) ring->id);
++		return 1;
++	}
++
++	fence = sync_fence_fdget(fence_fd);
++	if (fence == NULL) {
++		DRM_ERROR("Invalid wait fence %d on ring %d\n", fence_fd,
++			  (int) ring->id);
++		return 1;
++	}
++
++	if (fence->status == 0) {
++		struct drm_i915_private *dev_priv = ring->dev->dev_private;
++		struct i915_scheduler *scheduler = dev_priv->scheduler;
++
++		if (i915_safe_to_ignore_fence(ring, fence))
++			scheduler->stats[ring->id].fence_ignore++;
++		else {
++			scheduler->stats[ring->id].fence_wait++;
++			ret = sync_fence_wait(fence, 1000);
++		}
++	}
++
++	sync_fence_put(fence);
++	return ret;
++}
++#endif
++
+ static int
+ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 		       struct drm_file *file,
+@@ -1516,6 +1552,17 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
++#ifdef CONFIG_SYNC
++	if ((args->flags & I915_EXEC_WAIT_FENCE) &&
++	    (i915.scheduler_override & i915_so_direct_submit)) {
++		ret = i915_early_fence_wait(ring, fd_fence_wait);
++		if (ret < 0)
++			goto pre_mutex_err;
++
++		args->flags &= ~I915_EXEC_WAIT_FENCE;
++	}
++#endif
++
+ 	ret = i915_mutex_lock_interruptible(dev);
+ 	if (ret)
+ 		goto pre_mutex_err;
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 786de77..52d6c7c 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -224,6 +224,8 @@ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe)
+ 
+ 		trace_i915_scheduler_queue(qe->params.ring, qe);
+ 
++		WARN_ON(qe->params.fence_wait && (qe->params.fence_wait->status == 0));
++
+ 		scheduler->flags[qe->params.ring->id] |= i915_sf_submitting;
+ 		ret = dev_priv->gt.do_execfinal(&qe->params);
+ 		scheduler->stats[qe->params.ring->id].submitted++;
+-- 
+1.7.9.5
+

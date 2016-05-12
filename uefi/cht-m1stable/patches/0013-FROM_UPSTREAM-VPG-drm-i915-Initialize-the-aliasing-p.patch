@@ -1,0 +1,171 @@
+From e72d06fb3eedb69494b6aa6e909a50ed80e2a3f3 Mon Sep 17 00:00:00 2001
+Message-Id: <e72d06fb3eedb69494b6aa6e909a50ed80e2a3f3.1415245452.git.chang-joon.lee@intel.com>
+In-Reply-To: <76203ad7c635d495ef3ec1e07b47bad9db4745ba.1415245452.git.chang-joon.lee@intel.com>
+References: <76203ad7c635d495ef3ec1e07b47bad9db4745ba.1415245452.git.chang-joon.lee@intel.com>
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Wed, 6 Aug 2014 20:19:54 +0200
+Subject: [PATCH 13/30] FROM_UPSTREAM [VPG]: drm/i915: Initialize the aliasing
+ ppgtt as part of global gtt
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Stuffing this into the context setup code doesn't make a lot of sense.
+Also reusing the real ppgtt setup code makes even less sense since the
+aliasing ppgtt isn't a real address space. Leaving all that stuff
+unitialized will make sure that we catch any abusers promptly.
+
+This is also a prep work to clean up the context->ppgtt link.
+
+v2: Fix up the logic fail, I've fumbled it so badly to completely
+disable ppgtt on gen6. Spotted by Ville and Michel. Also move around
+the pde write into the gen6 init function, since otherwise it won't
+work at all.
+
+v3: Only initialize the aliasing ppgtt when we actually enable it.
+
+Cc: "Thierry, Michel" <michel.thierry@intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+[danvet: Squash in fixup from Fengguang Wu.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit fa76da3499f1789f0e37d3bbcdc320bdf47c89ca)
+
+Change-Id: I2e47df6a895c57d4056c38c61589490e67f07afa
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: fa76da3499f1789f0e37d3bbcdc320bdf47c89ca
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMINL-2586
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |   13 +---------
+ drivers/gpu/drm/i915/i915_gem_gtt.c     |   42 ++++++++++++++++++++++---------
+ 2 files changed, 31 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 2ec1b05..962e329 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -279,17 +279,6 @@ i915_gem_create_context(struct drm_device *dev,
+ 			goto err_unpin;
+ 		} else
+ 			ctx->vm = &ppgtt->base;
+-
+-		/* This case is reserved for the global default context and
+-		 * should only happen once. */
+-		if (is_global_default_ctx) {
+-			if (WARN_ON(dev_priv->mm.aliasing_ppgtt)) {
+-				ret = -EEXIST;
+-				goto err_unpin;
+-			}
+-
+-			dev_priv->mm.aliasing_ppgtt = ppgtt;
+-		}
+ 	} else if (USES_PPGTT(dev)) {
+ 		/* For platforms which only have aliasing PPGTT, we fake the
+ 		 * address space and refcounting. */
+@@ -368,7 +357,7 @@ int i915_gem_context_init(struct drm_device *dev)
+ 		}
+ 	}
+ 
+-	ctx = i915_gem_create_context(dev, NULL, USES_PPGTT(dev));
++	ctx = i915_gem_create_context(dev, NULL, USES_FULL_PPGTT(dev));
+ 	if (IS_ERR(ctx)) {
+ 		DRM_ERROR("Failed to create default global context (error %ld)\n",
+ 			  PTR_ERR(ctx));
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 4636e95..ecbdea2 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -1184,35 +1184,38 @@ static int gen6_ppgtt_init(struct i915_hw_ppgtt *ppgtt)
+ 			 ppgtt->node.size >> 20,
+ 			 ppgtt->node.start / PAGE_SIZE);
+ 
++	gen6_write_pdes(ppgtt);
++	DRM_DEBUG("Adding PPGTT at offset %x\n",
++		  ppgtt->pd_offset << 10);
++
+ 	return 0;
+ }
+ 
+-int i915_ppgtt_init(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt)
++static int __hw_ppgtt_init(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	int ret = 0;
+ 
+ 	ppgtt->base.dev = dev;
+ 	ppgtt->base.scratch = dev_priv->gtt.base.scratch;
+ 
+ 	if (INTEL_INFO(dev)->gen < 8)
+-		ret = gen6_ppgtt_init(ppgtt);
++		return gen6_ppgtt_init(ppgtt);
+ 	else if (IS_GEN8(dev))
+-		ret = gen8_ppgtt_init(ppgtt, dev_priv->gtt.base.total);
++		return gen8_ppgtt_init(ppgtt, dev_priv->gtt.base.total);
+ 	else
+ 		BUG();
++}
++int i915_ppgtt_init(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int ret = 0;
+ 
+-	if (!ret) {
+-		struct drm_i915_private *dev_priv = dev->dev_private;
++	ret = __hw_ppgtt_init(dev, ppgtt);
++	if (ret == 0) {
+ 		kref_init(&ppgtt->ref);
+ 		drm_mm_init(&ppgtt->base.mm, ppgtt->base.start,
+ 			    ppgtt->base.total);
+ 		i915_init_vm(dev_priv, &ppgtt->base);
+-		if (INTEL_INFO(dev)->gen < 8) {
+-			gen6_write_pdes(ppgtt);
+-			DRM_DEBUG("Adding PPGTT at offset %x\n",
+-				  ppgtt->pd_offset << 10);
+-		}
+ 	}
+ 
+ 	return ret;
+@@ -1754,6 +1757,7 @@ int i915_gem_setup_global_gtt(struct drm_device *dev,
+ 	struct drm_mm_node *entry;
+ 	struct drm_i915_gem_object *obj;
+ 	unsigned long hole_start, hole_end;
++	int ret;
+ 
+ 	BUG_ON(mappable_end > end);
+ 
+@@ -1765,7 +1769,7 @@ int i915_gem_setup_global_gtt(struct drm_device *dev,
+ 	/* Mark any preallocated objects as occupied */
+ 	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_list) {
+ 		struct i915_vma *vma = i915_gem_obj_to_vma(obj, ggtt_vm);
+-		int ret;
++
+ 		DRM_DEBUG_KMS("reserving preallocated space: %lx + %zx\n",
+ 			      i915_gem_obj_ggtt_offset(obj), obj->base.size);
+ 
+@@ -1792,6 +1796,20 @@ int i915_gem_setup_global_gtt(struct drm_device *dev,
+ 	/* And finally clear the reserved guard page */
+ 	ggtt_vm->clear_range(ggtt_vm, end - PAGE_SIZE, PAGE_SIZE, true);
+ 
++	if (USES_PPGTT(dev) && !USES_FULL_PPGTT(dev)) {
++		struct i915_hw_ppgtt *ppgtt;
++
++		ppgtt = kzalloc(sizeof(*ppgtt), GFP_KERNEL);
++		if (!ppgtt)
++			return -ENOMEM;
++
++		ret = __hw_ppgtt_init(dev, ppgtt);
++		if (ret != 0)
++			return ret;
++
++		dev_priv->mm.aliasing_ppgtt = ppgtt;
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+1.7.9.5
+

@@ -1,0 +1,130 @@
+From 944fb655cb3033900c2357dfdb05f3aaf738101f Mon Sep 17 00:00:00 2001
+Message-Id: <944fb655cb3033900c2357dfdb05f3aaf738101f.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Fri, 7 Mar 2014 14:02:43 +0530
+Subject: [PATCH 108/312] FOR_UPSTREAM [VPG]: drm/i915/vlv: Add valleyview RC6
+ debugfs disabling
+
+This patch extends the i915_rc6_disable debugfs interface for VLV.
+The following 2 values can be echoed into this file.
+'0' - RC6 states used normally per device and settings (Enabled for VLV).
+'1' - RC6 states explicitly disabled.
+
+Issue: VIZ-3399
+Change-Id: I4a7a630fa1a4bc008ce4050af2d3aa5822c32953
+Signed-off-by: Deepak S <deepak.s@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |    7 ++++---
+ drivers/gpu/drm/i915/i915_drv.h     |    1 +
+ drivers/gpu/drm/i915/intel_pm.c     |   31 +++++++++++++++++++++++++++----
+ 3 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index becb9c9..b4a1df4 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4492,7 +4492,6 @@ static int i915_cur_freq_get(void *data, u64 *val)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	if ((INTEL_INFO(dev)->gen < 6) ||
+-	     IS_VALLEYVIEW(dev) ||
+ 	     IS_BROADWELL(dev))
+ 		return -ENODEV;
+ 
+@@ -4511,7 +4510,6 @@ static int i915_cur_freq_set(void *data, u64 val)
+ 	int ret;
+ 
+ 	if ((INTEL_INFO(dev)->gen < 6) ||
+-	     IS_VALLEYVIEW(dev) ||
+ 	     IS_BROADWELL(dev))
+ 		return -ENODEV;
+ 
+@@ -4671,7 +4669,10 @@ static int i915_rc6_disable_set(void *data, u64 val)
+ 	if (ret)
+ 		return ret;
+ 
+-	gen6_set_rc6_mode(dev, val);
++	if (IS_VALLEYVIEW(dev))
++		vlv_set_rc6_mode(dev, val);
++	else
++		gen6_set_rc6_mode(dev, val);
+ 
+ 	mutex_unlock(&dev_priv->rps.hw_lock);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index fab0270..1b557e7 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2728,6 +2728,7 @@ extern void intel_disable_fbc(struct drm_device *dev);
+ extern bool ironlake_set_drps(struct drm_device *dev, u8 val);
+ extern void intel_init_pch_refclk(struct drm_device *dev);
+ extern void gen6_set_rc6_mode(struct drm_device *dev, bool disable);
++extern void vlv_set_rc6_mode(struct drm_device *dev, bool disable);
+ extern void gen6_set_rps_mode(struct drm_device *dev, bool manual);
+ extern void gen6_set_rps(struct drm_device *dev, u8 val);
+ extern void valleyview_set_rps(struct drm_device *dev, u8 val);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 7027ffc..4a6a743 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3551,6 +3551,26 @@ void gen6_set_rps_mode(struct drm_device *dev, bool manual)
+ 	gen6_set_rps(dev, delay);
+ }
+ 
++void vlv_set_rc6_mode(struct drm_device *dev, bool disable)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (!IS_VALLEYVIEW(dev)) {
++		DRM_DEBUG_DRIVER("RC6 disable not supported\n");
++		return;
++	}
++
++	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
++
++	dev_priv->rps.rc6_disable = disable;
++
++	if (disable)
++		I915_WRITE(GEN6_RC_CONTROL, 0);
++	else
++		I915_WRITE(GEN6_RC_CONTROL, dev_priv->rps.rc6_mask);
++}
++
++
+ void gen6_set_rc6_mode(struct drm_device *dev, bool disable)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -3685,7 +3705,8 @@ static void valleyview_disable_rps(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+-	I915_WRITE(GEN6_RC_CONTROL, 0);
++	/* Disable rc6 */
++	vlv_set_rc6_mode(dev, true);
+ 
+ 	gen6_disable_rps_interrupts(dev);
+ }
+@@ -4248,13 +4269,15 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 		   _MASKED_BIT_ENABLE(VLV_COUNT_RANGE_HIGH |
+ 				      VLV_MEDIA_RC6_COUNT_EN |
+ 				      VLV_RENDER_RC6_COUNT_EN));
++
++	rc6_mode = GEN7_RC_CTL_TO_MODE | VLV_RC_CTL_CTX_RST_PARALLEL;
++	dev_priv->rps.rc6_mask = rc6_mode;
++
+ 	if (intel_enable_rc6(dev) & INTEL_RC6_ENABLE)
+-		rc6_mode = GEN7_RC_CTL_TO_MODE | VLV_RC_CTL_CTX_RST_PARALLEL;
++		vlv_set_rc6_mode(dev, false);
+ 
+ 	intel_print_rc6_info(dev, rc6_mode);
+ 
+-	I915_WRITE(GEN6_RC_CONTROL, rc6_mode);
+-
+ 	val = vlv_punit_read(dev_priv, PUNIT_REG_GPU_FREQ_STS);
+ 
+ 	DRM_DEBUG_DRIVER("GPLL enabled? %s\n", val & 0x10 ? "yes" : "no");
+-- 
+1.7.9.5
+

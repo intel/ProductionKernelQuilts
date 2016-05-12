@@ -1,0 +1,2989 @@
+From 96cc8a22f52c1296b9d6a11070b404ccf693c298 Mon Sep 17 00:00:00 2001
+From: Mustapha Ben Zoubeir <mustaphax.ben.zoubeir@intel.com>
+Date: Thu, 25 Sep 2014 13:50:30 +0200
+Subject: [PATCH 1/1] Add Modem Control Driver to Kernel 3.14 tree
+
+This module will perform any power and reset commands on modems.
+These commands include:
+* Power on
+* Power off
+* Warm reset
+* Cold reset
+
+This module registers itself as platform driver. If the platform device
+is detected, the platform driver is loaded. The platform device is giving
+a structure that includes basic data used by the driver to initialize its
+own internal parameters.
+
+Command comes from upper layer. Only one client can send a command
+at a time, using IOCTL requests on the specific char device.
+Commands are executed in regards of which modem is available on the
+platform, performing hardware actions with specific timings.
+
+Change-Id: I7fd87babd7cc1844f66e6d14bd29d6ec75274197
+Signed-off-by: Mustapha Ben Zoubeir <mustaphax.ben.zoubeir@intel.com>
+---
+ drivers/acpi/acpi_platform.c             |    2 +
+ drivers/staging/Kconfig                  |    2 +
+ drivers/staging/Makefile                 |    1 +
+ drivers/staging/modem_control/Kconfig    |   22 +
+ drivers/staging/modem_control/Makefile   |    6 +
+ drivers/staging/modem_control/mcd_acpi.c |  392 ++++++++++++
+ drivers/staging/modem_control/mcd_acpi.h |    7 +
+ drivers/staging/modem_control/mcd_cpu.c  |  198 ++++++
+ drivers/staging/modem_control/mcd_cpu.h  |   34 +
+ drivers/staging/modem_control/mcd_mdm.c  |  178 ++++++
+ drivers/staging/modem_control/mcd_mdm.h  |   35 +
+ drivers/staging/modem_control/mcd_pmic.c |  139 ++++
+ drivers/staging/modem_control/mcd_pmic.h |   29 +
+ drivers/staging/modem_control/mdm_ctrl.c | 1018 ++++++++++++++++++++++++++++++
+ drivers/staging/modem_control/mdm_util.c |  307 +++++++++
+ drivers/staging/modem_control/mdm_util.h |  138 ++++
+ include/linux/mdm_ctrl.h                 |  111 ++++
+ include/linux/mdm_ctrl_board.h           |  189 ++++++
+ 18 files changed, 2808 insertions(+)
+ create mode 100644 drivers/staging/modem_control/Kconfig
+ create mode 100644 drivers/staging/modem_control/Makefile
+ create mode 100644 drivers/staging/modem_control/mcd_acpi.c
+ create mode 100644 drivers/staging/modem_control/mcd_acpi.h
+ create mode 100644 drivers/staging/modem_control/mcd_cpu.c
+ create mode 100644 drivers/staging/modem_control/mcd_cpu.h
+ create mode 100644 drivers/staging/modem_control/mcd_mdm.c
+ create mode 100644 drivers/staging/modem_control/mcd_mdm.h
+ create mode 100644 drivers/staging/modem_control/mcd_pmic.c
+ create mode 100644 drivers/staging/modem_control/mcd_pmic.h
+ create mode 100644 drivers/staging/modem_control/mdm_ctrl.c
+ create mode 100644 drivers/staging/modem_control/mdm_util.c
+ create mode 100644 drivers/staging/modem_control/mdm_util.h
+ create mode 100644 include/linux/mdm_ctrl.h
+ create mode 100644 include/linux/mdm_ctrl_board.h
+
+diff --git a/drivers/acpi/acpi_platform.c b/drivers/acpi/acpi_platform.c
+index 205f643a07e8..d99874bf2768 100644
+--- a/drivers/acpi/acpi_platform.c
++++ b/drivers/acpi/acpi_platform.c
+@@ -40,6 +40,8 @@ static const struct acpi_device_id acpi_platform_device_ids[] = {
+ 	{ "OBDA8723" },
+ 	{ "BCM4752E" },
+ 	{ "BCM43241" },
++	/* Modem Controller Device */
++	{ "MCD0001", 0 },
+ 
+ 	/* Intel Smart Sound Technology */
+ 	{ "INT33C8" },
+diff --git a/drivers/staging/Kconfig b/drivers/staging/Kconfig
+index 2189daf6a943..696c96114ac0 100644
+--- a/drivers/staging/Kconfig
++++ b/drivers/staging/Kconfig
+@@ -147,4 +147,6 @@ source "drivers/staging/dgnc/Kconfig"
+ source "drivers/staging/dgap/Kconfig"
+ 
+ source "drivers/staging/pn544/Kconfig"
++
++source "drivers/staging/modem_control/Kconfig"
+ endif # STAGING
+diff --git a/drivers/staging/Makefile b/drivers/staging/Makefile
+index 48c395a30ffa..1df0a141af32 100644
+--- a/drivers/staging/Makefile
++++ b/drivers/staging/Makefile
+@@ -66,3 +66,4 @@ obj-$(CONFIG_DGNC)			+= dgnc/
+ obj-$(CONFIG_DGAP)			+= dgap/
+ obj-$(CONFIG_MTD_SPINAND_MT29F)	+= mt29f_spinand/
+ obj-$(CONFIG_ANDROID_NFC_PN544)		+= pn544/
++obj-$(CONFIG_MDM_CTRL)		+= modem_control/
+diff --git a/drivers/staging/modem_control/Kconfig b/drivers/staging/modem_control/Kconfig
+new file mode 100644
+index 000000000000..83218bd01a70
+--- /dev/null
++++ b/drivers/staging/modem_control/Kconfig
+@@ -0,0 +1,22 @@
++#
++# Modem Control Driver.
++# Perform power on/reset/power off on IMC modems
++#
++
++config MDM_CTRL
++	tristate "Modem control driver"
++	default y
++	---help---
++	  The modem control driver for IMC modems. This driver will perform any
++	  power request on IMC modems. It will create /dev/mdm_ctrl char device
++	  by default.
++	  Verified for XMM6260, XMM7160, XMM6360 and XMM 6263 modems.
++
++config MDM_CTRL_DEV_NAME
++	string "Boot driver device name"
++	depends on MDM_CTRL
++	default "mdm_ctrl"
++	---help---
++	  Sets the name for the modem control driver device.
++
++	  If unsure, use the default value.
+diff --git a/drivers/staging/modem_control/Makefile b/drivers/staging/modem_control/Makefile
+new file mode 100644
+index 000000000000..a97c652f10d0
+--- /dev/null
++++ b/drivers/staging/modem_control/Makefile
+@@ -0,0 +1,6 @@
++#
++# Makefile for modem control device driver.
++#
++
++obj-$(CONFIG_MDM_CTRL) += modem_control.o
++modem_control-objs := mdm_util.o mdm_ctrl.o mcd_mdm.o mcd_cpu.o mcd_pmic.o mcd_acpi.o
+diff --git a/drivers/staging/modem_control/mcd_acpi.c b/drivers/staging/modem_control/mcd_acpi.c
+new file mode 100644
+index 000000000000..f9d9b025bd81
+--- /dev/null
++++ b/drivers/staging/modem_control/mcd_acpi.c
+@@ -0,0 +1,392 @@
++/*
++ * mcd_acpi.c : retrieving modem control ACPI data.
++ *
++ * (C) Copyright 2008 Intel Corporation
++ * Author: Ben Zoubeir Mustapha <mustaphax.ben.zoubeir@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++
++#include <linux/input.h>
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/acpi.h>
++#include <linux/platform_device.h>
++
++#include <linux/gpio.h>
++#include <asm/intel-mid.h>
++
++#include <linux/kobject.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++#include <linux/init.h>
++#include <linux/gpio/consumer.h>
++#include "mcd_acpi.h"
++
++
++/* Modem data */
++static struct mdm_ctrl_mdm_data mdm_6260 = {
++	.pre_on_delay = 200,
++	.on_duration = 60,
++	.pre_wflash_delay = 30,
++	.pre_cflash_delay = 60,
++	.flash_duration = 60,
++	.warm_rst_duration = 60,
++	.pre_pwr_down_delay = 60,
++};
++
++static struct mdm_ctrl_mdm_data mdm_2230 = {
++	.pre_on_delay = 3000,
++	.on_duration = 35000,
++	.pre_wflash_delay = 30,
++	.pre_cflash_delay = 60,
++	.flash_duration = 60,
++	.warm_rst_duration = 60,
++	.pre_pwr_down_delay = 60,
++};
++
++static struct mdm_ctrl_mdm_data mdm_generic = {
++	.pre_on_delay = 200,
++	.on_duration = 60,
++	.pre_wflash_delay = 30,
++	.pre_cflash_delay = 60,
++	.flash_duration = 60,
++	.warm_rst_duration = 60,
++	.pre_pwr_down_delay = 650,
++};
++
++void *modem_data[] = {
++	NULL,			/* MODEM_UNSUP */
++	&mdm_2230,		/* MODEM_2230 */
++	&mdm_6260,		/* MODEM_6260 */
++	&mdm_generic,		/* MODEM_6268 */
++	&mdm_generic,		/* MODEM_6360 */
++	&mdm_generic,		/* MODEM_7160 */
++	&mdm_generic		/* MODEM_7260 */
++};
++
++/*
++ * Element to be read through sysfs entry
++ */
++static char config_name[NAME_LEN];
++
++/*
++ * config name accessor
++ */
++static ssize_t config_name_show(struct kobject *kobj,
++				struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%s\n", config_name);
++}
++
++/* Read-only element */
++static struct kobj_attribute config_name_attribute = __ATTR_RO(config_name);
++
++static struct attribute *mdm_attrs[] = {
++	&config_name_attribute.attr,
++	NULL, /* need to NULL terminate the list of attributes */
++};
++
++static struct attribute_group mdm_attr_group = {
++	.attrs = mdm_attrs,
++};
++
++static struct kobject *telephony_kobj;
++static int nb_mdms;
++
++
++int create_sysfs_telephony_entry(void *pdata)
++{
++	int retval;
++
++	/* Creating telephony directory */
++	telephony_kobj = kobject_create_and_add("telephony", kernel_kobj);
++	if (!telephony_kobj)
++		return -ENOMEM;
++
++	/* Create the files associated with this kobject */
++	retval = sysfs_create_group(telephony_kobj, &mdm_attr_group);
++	if (retval)
++		kobject_put(telephony_kobj);
++
++	return retval;
++}
++
++void mcd_set_mdm(struct mcd_base_info *info, int mdm_ver)
++{
++	if (!info) {
++		pr_err("%s: info is NULL\n", __func__);
++	} else {
++		info->mdm_ver = mdm_ver;
++		info->modem_data = modem_data[mdm_ver];
++	}
++}
++#ifdef CONFIG_ACPI
++acpi_status get_acpi_param(acpi_handle handle, int type, char *id,
++			   union acpi_object **result)
++{
++	acpi_status status = AE_OK;
++	struct acpi_buffer obj_buffer = { ACPI_ALLOCATE_BUFFER, NULL };
++	union acpi_object *out_obj;
++
++	status = acpi_evaluate_object(handle, id, NULL, &obj_buffer);
++	pr_err("%s: acpi_evaluate_object, status:%d\n", __func__, status);
++	if (ACPI_FAILURE(status)) {
++		pr_err("%s: ERROR %d evaluating ID:%s\n", __func__, status, id);
++		goto error;
++	}
++
++	out_obj = obj_buffer.pointer;
++	if (!out_obj || out_obj->type != type) {
++		pr_err("%s: Invalid type:%d for Id:%s\n", __func__, type, id);
++		status = AE_BAD_PARAMETER;
++		goto error;
++	} else {
++		*result = out_obj;
++	}
++
++ error:
++	return status;
++}
++#endif
++
++/*
++ * Access ACPI resources/data to populate global object mcd_reg_info
++ *
++ * @pdev : The platform device object to identify ACPI data.
++ */
++void *retrieve_acpi_modem_data(struct platform_device *pdev)
++{
++#ifdef CONFIG_ACPI
++	struct mcd_base_info *mcd_reg_info;
++	acpi_status status = AE_OK;
++	acpi_handle handle;
++	union acpi_object *out_obj;
++	union acpi_object *item;
++	struct mdm_ctrl_cpu_data *cpu_data;
++	struct mdm_ctrl_pmic_data *pmic_data;
++	int i;
++
++	if (!pdev) {
++		pr_err("%s: platform device is NULL.", __func__);
++		return NULL;
++	}
++
++	cpu_data = kzalloc(sizeof(struct mdm_ctrl_cpu_data), GFP_KERNEL);
++	if (!cpu_data) {
++		pr_err("%s: can't allocate cpu_data memory\n", __func__);
++		return NULL;
++	}
++
++	pmic_data = kzalloc(sizeof(struct mdm_ctrl_pmic_data), GFP_KERNEL);
++	if (!pmic_data) {
++		pr_err("%s: can't allocate pmic_data memory\n", __func__);
++		kfree(cpu_data);
++		return NULL;
++	}
++
++	/* Get ACPI handle */
++	handle = ACPI_HANDLE(&pdev->dev);
++	mcd_reg_info = kzalloc(sizeof(struct mcd_base_info), GFP_KERNEL);
++	if (!mcd_reg_info) {
++		pr_err("%s: can't allocate mcd_reg_tmp_info memory\n",
++				__func__);
++		goto free_mdm_info;
++	}
++
++	pr_info("%s: Getting ACPI data...\n", __func__);
++
++	/* CPU name */
++	status = get_acpi_param(handle, ACPI_TYPE_STRING, "CPU", &out_obj);
++	if (ACPI_FAILURE(status)) {
++		pr_err("%s: ERROR evaluating CPU Name\n", __func__);
++		goto free_mdm_info;
++	}
++
++	/* CPU Id */
++	if (strstr(out_obj->string.pointer, "ValleyView2")) {
++		mcd_reg_info->cpu_ver = CPU_VVIEW2;
++	} else if (strstr(out_obj->string.pointer, "CherryView")) {
++		mcd_reg_info->cpu_ver = CPU_CHERRYVIEW;
++	} else {
++		pr_err("%s: ERROR CPU name %s Not supported!\n", __func__,
++		       out_obj->string.pointer);
++		goto free_mdm_info;
++	}
++
++	mcd_reg_info->mdm_ver = MODEM_UNSUP;
++
++	/* Retrieve Telephony configuration name from ACPI */
++	status = get_acpi_param(handle, ACPI_TYPE_STRING, "CONF", &out_obj);
++	if (ACPI_FAILURE(status)) {
++		/* This is a workaround to handle Baytrail FFRD8 wrong ACPI
++		 * table.
++		 * @TODO: remove this code once this board is no more
++		 * supported */
++		pr_info("CONF field is empty. Might be a Baytrail FFRD8 board");
++		strncpy(config_name, "XMM7160_CONF_3", NAME_LEN - 1);
++	} else {
++		strncpy(config_name, out_obj->string.pointer, NAME_LEN - 1);
++	}
++
++	/* PMIC */
++	switch (mcd_reg_info->cpu_ver) {
++	case CPU_VVIEW2:
++		mcd_reg_info->pmic_ver = PMIC_BYT;
++		break;
++	case CPU_CHERRYVIEW:
++		mcd_reg_info->pmic_ver = PMIC_CHT;
++		break;
++	default:
++		mcd_reg_info->pmic_ver = PMIC_UNSUP;
++		break;
++	}
++
++	status = get_acpi_param(handle, ACPI_TYPE_PACKAGE, "PMIC", &out_obj);
++	if (ACPI_FAILURE(status)) {
++		pr_err("%s: ERROR evaluating PMIC info\n", __func__);
++		goto free_mdm_info;
++	}
++
++	item = &(out_obj->package.elements[0]);
++	pmic_data->chipctrl = (int)item->integer.value;
++	item = &(out_obj->package.elements[1]);
++	pmic_data->chipctrlon = (int)item->integer.value;
++	item = &(out_obj->package.elements[2]);
++	pmic_data->chipctrloff = (int)item->integer.value;
++	item = &(out_obj->package.elements[3]);
++	pmic_data->chipctrl_mask = (int)item->integer.value;
++	pmic_data->pwr_down_duration = 20000;
++	pr_info("%s: Retrieved PMIC values:Reg:%x, On:%x, Off:%x, Mask:%x\n",
++		__func__, pmic_data->chipctrl, pmic_data->chipctrlon,
++		pmic_data->chipctrloff, pmic_data->chipctrl_mask);
++
++	pr_info("%s: cpu info setup\n", __func__);
++	/*CPU Data*/
++	/* set GPIOs Names */
++	cpu_data->gpio_rst_out_name = GPIO_RST_OUT;
++	cpu_data->gpio_pwr_on_name = GPIO_PWR_ON;
++	cpu_data->gpio_rst_bbn_name = GPIO_RST_BBN;
++	cpu_data->gpio_cdump_name = GPIO_CDUMP;
++
++	for (i = 0; i < ARRAY_SIZE(cpu_data->entries); i++)
++		cpu_data->entries[i] =
++			devm_gpiod_get_index(&pdev->dev, NULL, i);
++
++	status = get_acpi_param(handle, ACPI_TYPE_PACKAGE, "EPWR", &out_obj);
++	if (ACPI_FAILURE(status)) {
++		pr_err("%s: ERROR evaluating Early PWR info\n", __func__);
++		goto free_mdm_info;
++	}
++
++	item = &(out_obj->package.elements[0]);
++	pmic_data->early_pwr_on = (int)item->integer.value;
++	item = &(out_obj->package.elements[1]);
++	pmic_data->early_pwr_off = (int)item->integer.value;
++
++	mcd_reg_info->cpu_data = cpu_data;
++	mcd_reg_info->pmic_data = pmic_data;
++
++	nb_mdms = 1;
++
++	return mcd_reg_info;
++
++free_mdm_info:
++	pr_err("%s: ERROR retrieving data from ACPI!!!\n", __func__);
++	kfree(cpu_data);
++	kfree(pmic_data);
++	kfree(mcd_reg_info);
++#endif
++	return NULL;
++}
++
++int mcd_finalize_cpu_data(struct mcd_base_info *mcd_reg_info)
++{
++#ifdef CONFIG_ACPI
++	struct mdm_ctrl_cpu_data *cpu_data = mcd_reg_info->cpu_data;
++	int ret = 0;
++
++	/* finalize cpu data */
++	if (mcd_reg_info->board_type == BOARD_NGFF) {
++		cpu_data->gpio_wwan_disable = cpu_data->entries[0];
++		cpu_data->gpio_rst_bbn = cpu_data->entries[2];
++		cpu_data->gpio_rst_usbhub = cpu_data->entries[4];
++
++		pr_info("%s: Setup GPIOs(WWAN_Disable:%d, RB:%d, rst_usbhub:%d)\n",
++				__func__,
++				desc_to_gpio(cpu_data->gpio_wwan_disable),
++				desc_to_gpio(cpu_data->gpio_rst_bbn),
++				desc_to_gpio(cpu_data->gpio_rst_usbhub));
++
++	} else if (mcd_reg_info->board_type == BOARD_AOB) {
++		cpu_data->gpio_pwr_on = cpu_data->entries[0];
++		cpu_data->gpio_cdump = cpu_data->entries[1];
++		cpu_data->gpio_rst_out = cpu_data->entries[2];
++		cpu_data->gpio_rst_bbn = cpu_data->entries[3];
++
++		pr_info("%s: Setup GPIOs(PO:%d, RO:%d, RB:%d, CD:%d)\n",
++				__func__,
++				desc_to_gpio(cpu_data->gpio_pwr_on),
++				desc_to_gpio(cpu_data->gpio_rst_out),
++				desc_to_gpio(cpu_data->gpio_rst_bbn),
++				desc_to_gpio(cpu_data->gpio_cdump));
++	} else
++		ret = -1;
++
++	return ret;
++#else
++	return 0;
++#endif
++}
++
++/*
++ * Entry point from MCD to populate modem parameters.
++ *
++ * @pdev : The platform device object to identify ACPI data.
++ */
++
++int get_modem_acpi_data(struct platform_device *pdev)
++{
++	int ret = -ENODEV;
++
++	struct mcd_base_info *info;
++	if (!pdev) {
++		pr_err("%s: platform device is NULL, aborting\n", __func__);
++		return ret;
++	}
++
++	if (!ACPI_HANDLE(&pdev->dev)) {
++		pr_err("%s: platform device is NOT ACPI, aborting\n", __func__);
++		return ret;
++	}
++
++	pr_err("%s: Retrieving modem info from ACPI for device %s\n",
++	       __func__, pdev->name);
++	info = retrieve_acpi_modem_data(pdev);
++
++	if (!info)
++		return ret;
++
++	/* Store modem parameters in platform device */
++	pdev->dev.platform_data = info;
++
++	if (telephony_kobj) {
++		pr_err("%s: Unexpected entry for device named %s\n",
++		       __func__, pdev->name);
++		return ret;
++	}
++
++	pr_err("%s: creates sysfs entry for device named %s\n",
++	       __func__, pdev->name);
++	ret = create_sysfs_telephony_entry(pdev->dev.platform_data);
++
++	return ret;
++}
++
++int get_nb_mdms(void)
++{
++	return nb_mdms;
++}
+diff --git a/drivers/staging/modem_control/mcd_acpi.h b/drivers/staging/modem_control/mcd_acpi.h
+new file mode 100644
+index 000000000000..567e4e2b0de4
+--- /dev/null
++++ b/drivers/staging/modem_control/mcd_acpi.h
+@@ -0,0 +1,7 @@
++#include <linux/mdm_ctrl_board.h>
++#include <linux/mdm_ctrl.h>
++
++#define NAME_LEN	16
++
++/* Retrieve modem parameters on ACPI framework */
++int get_modem_acpi_data(struct platform_device *pdev);
+diff --git a/drivers/staging/modem_control/mcd_cpu.c b/drivers/staging/modem_control/mcd_cpu.c
+new file mode 100644
+index 000000000000..d987f1c4e616
+--- /dev/null
++++ b/drivers/staging/modem_control/mcd_cpu.c
+@@ -0,0 +1,198 @@
++/*
++ * linux/drivers/modem_control/mcd_cpu.c
++ *
++ * Version 1.0
++ * This code permits to access the cpu specifics
++ * of each supported platform.
++ * among other things, it permits to configure and access gpios
++ *
++ * Copyright (C) 2013 Intel Corporation. All rights reserved.
++ *
++ * Contact: Ranquet Guillaume <guillaumex.ranquet@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/cdev.h>
++#include <linux/slab.h>
++#include <linux/poll.h>
++#include <linux/sched.h>
++#include <linux/uaccess.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/gpio.h>
++#include <linux/mutex.h>
++#include <linux/wait.h>
++#include <linux/delay.h>
++#include <linux/mdm_ctrl_board.h>
++
++#include "mdm_util.h"
++
++/**
++ * mdm_ctrl_configure_gpio - Configure GPIOs
++ * @gpio: GPIO to configure
++ * @direction: GPIO direction - 0: IN | 1: OUT
++ *
++ */
++static inline int mdm_ctrl_configure_gpio(struct gpio_desc *gpio,
++					  int direction,
++					  int value)
++{
++	int ret = 0;
++
++	if (direction)
++		ret += gpiod_direction_output(gpio, value);
++	else
++		ret += gpiod_direction_input(gpio);
++
++	if (ret) {
++		pr_err(DRVNAME ": Unable to configure GPIO%d\n",
++						desc_to_gpio(gpio));
++		ret = -ENODEV;
++	}
++
++	return ret;
++}
++
++int cpu_init_gpio(void *data)
++{
++	struct mdm_ctrl_cpu_data *cpu_data = data;
++	int ret;
++
++	pr_debug("cpu_init");
++
++	/* Configure the RESET_BB gpio */
++	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_rst_bbn, 1, 0);
++	if (ret)
++		goto out;
++
++	/* Configure the ON gpio */
++	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_pwr_on, 1, 0);
++
++	/* Configure the RESET_OUT gpio & irq */
++	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_rst_out, 0, 0);
++
++	cpu_data->irq_reset = gpiod_to_irq(cpu_data->gpio_rst_out);
++
++	/* Configure the CORE_DUMP gpio & irq */
++	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_cdump, 0, 0);
++	if (ret)
++		goto free_ctx2;
++
++	cpu_data->irq_cdump = gpiod_to_irq(cpu_data->gpio_cdump);
++	if (cpu_data->irq_cdump < 0)
++		goto free_ctx2;
++
++	pr_info(DRVNAME
++		": GPIO (rst_bbn: %d, pwr_on: %d, rst_out: %d, fcdp_rb: %d)\n",
++		desc_to_gpio(cpu_data->gpio_rst_bbn),
++		desc_to_gpio(cpu_data->gpio_pwr_on),
++		desc_to_gpio(cpu_data->gpio_rst_out),
++		desc_to_gpio(cpu_data->gpio_cdump));
++
++	return 0;
++
++ free_ctx2:
++	if (cpu_data->irq_reset > 0)
++		free_irq(cpu_data->irq_reset, cpu_data);
++	cpu_data->irq_reset = 0;
++ out:
++	return -ENODEV;
++}
++
++int cpu_cleanup_gpio(void *data)
++{
++	struct mdm_ctrl_cpu_data *cpu_data = data;
++
++	cpu_data->irq_cdump = 0;
++	cpu_data->irq_reset = 0;
++
++	return 0;
++}
++
++int get_gpio_irq_cdump(void *data)
++{
++	struct mdm_ctrl_cpu_data *cpu_data = data;
++	return cpu_data->irq_cdump;
++}
++
++int get_gpio_irq_rst(void *data)
++{
++	struct mdm_ctrl_cpu_data *cpu_data = data;
++	return cpu_data->irq_reset;
++}
++
++int get_gpio_mdm_state(void *data)
++{
++	struct mdm_ctrl_cpu_data *cpu_data = data;
++	return gpiod_get_value(cpu_data->gpio_rst_out);
++}
++
++int get_gpio_rst(void *data)
++{
++	struct mdm_ctrl_cpu_data *cpu_data = data;
++	return desc_to_gpio(cpu_data->gpio_rst_bbn);
++}
++
++int get_gpio_pwr(void *data)
++{
++	struct mdm_ctrl_cpu_data *cpu_data = data;
++	return desc_to_gpio(cpu_data->gpio_pwr_on);
++}
++
++int cpu_init_gpio_ngff(void *data)
++{
++	struct mdm_ctrl_cpu_data *cpu_data = data;
++	int ret;
++
++	pr_debug("cpu_init");
++
++	/* Configure the RESET_BB gpio */
++	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_rst_bbn, 1, 0);
++	if (ret)
++		goto out;
++
++	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_rst_usbhub, 1, 1);
++
++	pr_info(DRVNAME ": GPIO (rst_bbn: %d, rst_usb_hub: %d)\n",
++				desc_to_gpio(cpu_data->gpio_rst_bbn),
++				desc_to_gpio(cpu_data->gpio_rst_usbhub));
++
++	return 0;
++
++ out:
++	return -ENODEV;
++}
++
++int cpu_cleanup_gpio_ngff(void *data)
++{
++	return 0;
++}
++
++int get_gpio_mdm_state_ngff(void *data)
++{
++	return 0;
++}
++
++int get_gpio_irq_cdump_ngff(void *data)
++{
++	return 0;
++}
++
++int get_gpio_irq_rst_ngff(void *data)
++{
++	return 0;
++}
++
+diff --git a/drivers/staging/modem_control/mcd_cpu.h b/drivers/staging/modem_control/mcd_cpu.h
+new file mode 100644
+index 000000000000..337cd3eabe41
+--- /dev/null
++++ b/drivers/staging/modem_control/mcd_cpu.h
+@@ -0,0 +1,34 @@
++/*
++ * linux/drivers/modem_control/mcd_cpu.h
++ *
++ * Version 1.0
++ *
++ * Copyright (C) 2013 Intel Corporation. All rights reserved.
++ *
++ * Contact: Ranquet Guillaume <guillaumex.ranquet@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++
++#ifndef _MDM_CPU_H
++#define _MDM_CPU_H
++int cpu_init_gpio(void *data);
++int cpu_cleanup_gpio(void *data);
++int get_gpio_irq_cdump(void *data);
++int get_gpio_irq_rst(void *data);
++int get_gpio_mdm_state(void *data);
++int get_gpio_rst(void *data);
++int get_gpio_pwr(void *data);
++int cpu_init_gpio_ngff(void *data);
++int cpu_cleanup_gpio_ngff(void *data);
++int get_gpio_mdm_state_ngff(void *data);
++int get_gpio_irq_cdump_ngff(void *data);
++int get_gpio_irq_rst_ngff(void *data);
++#endif
+diff --git a/drivers/staging/modem_control/mcd_mdm.c b/drivers/staging/modem_control/mcd_mdm.c
+new file mode 100644
+index 000000000000..213d43826288
+--- /dev/null
++++ b/drivers/staging/modem_control/mcd_mdm.c
+@@ -0,0 +1,178 @@
++/**
++ * linux/drivers/modem_control/mcd_mdm.c
++ *
++ * Version 1.0
++ *
++ * This code includes power sequences for IMC 7060 modems and its derivative.
++ * That includes :
++ *	- XMM6360
++ *	- XMM7160
++ *	- XMM7260
++ * There is no guarantee for other modems.
++ *
++ * Intel Mobile driver for modem powering.
++ *
++ * Copyright (C) 2013 Intel Corporation. All rights reserved.
++ *
++ * Contact: Ranquet Guillaune <guillaumex.ranquet@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++
++#include "mdm_util.h"
++#include "mcd_mdm.h"
++
++#include <linux/mdm_ctrl.h>
++
++/*****************************************************************************
++ *
++ * Modem Power/Reset functions
++ *
++ ****************************************************************************/
++
++int mcd_mdm_init(void *data)
++{
++	return 0;
++}
++
++/**
++ *  mcd_mdm_cold_boot - Perform a modem cold boot sequence
++ *  @drv: Reference to the driver structure
++ *
++ *  - Set to HIGH the PWRDWN_N to switch ON the modem
++ *  - Set to HIGH the RESET_BB_N
++ *  - Do a pulse on ON1
++ */
++int mcd_mdm_cold_boot(void *data, int rst, int pwr_on)
++{
++	struct mdm_ctrl_mdm_data *mdm_data = data;
++
++	/* Toggle the RESET_BB_N */
++	gpio_set_value(rst, 1);
++
++	/* Wait before doing the pulse on ON1 */
++	usleep_range(mdm_data->pre_on_delay, mdm_data->pre_on_delay + 1);
++
++	/* Do a pulse on ON1 */
++	gpio_set_value(pwr_on, 1);
++	usleep_range(mdm_data->on_duration, mdm_data->on_duration + 1);
++	gpio_set_value(pwr_on, 0);
++
++	return 0;
++}
++
++/**
++ *  mdm_ctrl_silent_warm_reset_7x6x - Perform a silent modem warm reset
++ *				      sequence
++ *  @drv: Reference to the driver structure
++ *
++ *  - Do a pulse on the RESET_BB_N
++ *  - No struct modification
++ *  - debug purpose only
++ */
++int mcd_mdm_warm_reset(void *data, int rst)
++{
++	struct mdm_ctrl_mdm_data *mdm_data = data;
++
++	gpio_set_value(rst, 0);
++	usleep_range(mdm_data->warm_rst_duration,
++			mdm_data->warm_rst_duration + 1);
++	gpio_set_value(rst, 1);
++
++	return 0;
++}
++
++/**
++ *  mcd_mdm_power_off - Perform the modem switch OFF sequence
++ *  @drv: Reference to the driver structure
++ *
++ *  - Set to low the ON1
++ *  - Write the PMIC reg
++ */
++int mcd_mdm_power_off(void *data, int rst)
++{
++	struct mdm_ctrl_mdm_data *mdm_data = data;
++
++	/* Set the RESET_BB_N to 0 */
++	gpio_set_value(rst, 0);
++
++	/* Wait before doing the pulse on ON1 */
++	usleep_range(mdm_data->pre_pwr_down_delay,
++		     mdm_data->pre_pwr_down_delay + 1);
++
++	return 0;
++}
++
++int mcd_mdm_get_cflash_delay(void *data)
++{
++	struct mdm_ctrl_mdm_data *mdm_data = data;
++	return mdm_data->pre_cflash_delay;
++}
++
++int mcd_mdm_get_wflash_delay(void *data)
++{
++	struct mdm_ctrl_mdm_data *mdm_data = data;
++	return mdm_data->pre_wflash_delay;
++}
++
++int mcd_mdm_cleanup(void *data)
++{
++	return 0;
++}
++
++/**
++ *  mcd_mdm_cold_boot_ngff - Perform a NGFF modem cold boot sequence
++ *  @drv: Reference to the driver structure
++ *
++ *  - Set to HIGH the RESET_BB_N
++ *  - reset USB hub
++ */
++int mcd_mdm_cold_boot_ngff(void *data, int rst, int pwr_on)
++{
++
++	struct mdm_ctrl_cpu_data *cpu_data;
++	struct gpio_desc  *gpio_rst_desc = gpio_to_desc(rst);
++
++	cpu_data = container_of(&gpio_rst_desc, struct mdm_ctrl_cpu_data,
++				gpio_rst_bbn);
++
++	/* Toggle the RESET_BB_N */
++	gpio_set_value(rst, 1);
++
++	/* reset the USB hub here*/
++	usleep_range(1000, 1001);
++	gpiod_set_value(cpu_data->gpio_rst_usbhub, 0);
++	usleep_range(1000, 1001);
++	gpiod_set_value(cpu_data->gpio_rst_usbhub, 1);
++
++	return 0;
++}
++
++int mcd_mdm_cold_boot_2230(void *data, int rst, int pwr_on)
++{
++	struct mdm_ctrl_mdm_data *mdm_data = data;
++
++	/* Toggle the RESET_BB_N */
++	gpio_set_value(rst, 0);
++
++	/* Toggle the POWER_ON */
++	usleep_range(mdm_data->pre_on_delay, mdm_data->pre_on_delay + 1);
++	gpio_set_value(pwr_on, 0);
++
++	/* Toggle RESET_BB_N */
++	usleep_range(mdm_data->on_duration, mdm_data->on_duration + 1);
++	gpio_set_value(rst, 1);
++
++	/* Toggle POWER_ON */
++	usleep_range(100000, 100001);
++	gpio_set_value(pwr_on, 1);
++
++	return 0;
++}
+diff --git a/drivers/staging/modem_control/mcd_mdm.h b/drivers/staging/modem_control/mcd_mdm.h
+new file mode 100644
+index 000000000000..c6defb8698ee
+--- /dev/null
++++ b/drivers/staging/modem_control/mcd_mdm.h
+@@ -0,0 +1,35 @@
++/*
++ * linux/drivers/modem_control/mcd_mdm.h
++ *
++ * Version 1.0
++ *
++ * This code includes definitions for IMC modems.
++ *
++ * Copyright (C) 2013 Intel Corporation. All rights reserved.
++ *
++ * Contact: Ranquet Guillaume <guillaumex.ranquet@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++
++#ifndef _MDM_IMC_H
++#define _MDM_IMC_H
++
++int mcd_mdm_init(void *data);
++int mcd_mdm_cold_boot(void *data, int rst, int pwr_on);
++int mcd_mdm_warm_reset(void *data, int rst);
++int mcd_mdm_power_off(void *data, int rst);
++int mcd_mdm_get_cflash_delay(void *data);
++int mcd_mdm_get_wflash_delay(void *data);
++int mcd_mdm_cleanup(void *data);
++int mcd_mdm_cold_boot_ngff(void *data, int rst, int pwr_on);
++int mcd_mdm_cold_boot_2230(void *data, int rst, int pwr_on);
++
++#endif				/* _MDM_IMC_H */
+diff --git a/drivers/staging/modem_control/mcd_pmic.c b/drivers/staging/modem_control/mcd_pmic.c
+new file mode 100644
+index 000000000000..08a02d2c9761
+--- /dev/null
++++ b/drivers/staging/modem_control/mcd_pmic.c
+@@ -0,0 +1,139 @@
++/*
++ * linux/drivers/modem_control/mcd_pmic.c
++ *
++ * Version 1.0
++ * This code allows to access the pmic specifics
++ * of each supported platforms
++ * among other things, it permits to communicate with the SCU/PMIC
++ * to cold boot/reset the modem
++ *
++ * Copyright (C) 2013 Intel Corporation. All rights reserved.
++ *
++ * Contact: Ranquet Guillaume <guillaumex.ranquet@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/cdev.h>
++#include <linux/slab.h>
++#include <linux/poll.h>
++#include <linux/sched.h>
++#include <linux/uaccess.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/gpio.h>
++#include <linux/mutex.h>
++#include <linux/wait.h>
++#include <linux/delay.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/mdm_ctrl_board.h>
++
++int pmic_io_init(void *data)
++{
++	return 0;
++}
++
++int pmic_io_power_on_ctp_mdm(void *data)
++{
++	/* on ctp, there's no power on, only a reset operation exist */
++	/* just do nothing! */
++	return 0;
++}
++
++int pmic_io_power_on_mdm(void *data)
++{
++	struct mdm_ctrl_pmic_data *pmic_data = data;
++	int ret = 0;
++	u16 addr = pmic_data->chipctrl;
++	u8 def_value = 0x00;
++	u8 iodata;
++
++	if (pmic_data->chipctrl_mask) {
++		/* Get the current register value in order to not
++		 * override it
++		 */
++		def_value = intel_soc_pmic_readb(addr);
++		if (def_value < 0) {
++			pr_err(DRVNAME ": intel_soc_pmic_readb(ON)  failed (err: %d)\n",
++					def_value);
++			return -1;
++		}
++	}
++	/* Write the new register value (CHIPCNTRL_ON) */
++	iodata =
++		(def_value & pmic_data->chipctrl_mask) | pmic_data->chipctrlon;
++	ret = intel_soc_pmic_writeb(addr, iodata);
++	if (ret) {
++		pr_err(DRVNAME ": intel_soc_pmic_writeb(ON) failed (err: %d)\n",
++				ret);
++		return -1;
++	}
++	/* Wait before RESET_PWRDN_N to be 1 */
++	usleep_range(pmic_data->pwr_down_duration,
++		     pmic_data->pwr_down_duration);
++
++	return 0;
++}
++
++int pmic_io_power_off_mdm(void *data)
++{
++	struct mdm_ctrl_pmic_data *pmic_data = data;
++	int ret = 0;
++	u16 addr = pmic_data->chipctrl;
++	u8 iodata;
++	u8 def_value = 0x00;
++
++	if (pmic_data->chipctrl_mask) {
++		/* Get the current register value in order to not override it */
++		def_value = intel_soc_pmic_readb(addr);
++		if (def_value < 0) {
++			pr_err(DRVNAME ": intel_soc_pmic_readb(OFF)  failed (err: %d)\n",
++					def_value);
++			return -1;
++		}
++	}
++
++	/* Write the new register value (CHIPCNTRL_OFF) */
++	iodata =
++	    (def_value & pmic_data->chipctrl_mask) | pmic_data->chipctrloff;
++	ret = intel_soc_pmic_writeb(addr, iodata);
++	if (ret) {
++		pr_err(DRVNAME ": intel_soc_pmic_writeb(OFF) failed (err: %d)\n",
++				ret);
++		return -1;
++	}
++	/* Safety sleep. Avoid to directly call power on. */
++	usleep_range(pmic_data->pwr_down_duration,
++		     pmic_data->pwr_down_duration);
++
++	return 0;
++}
++
++int pmic_io_cleanup(void *data)
++{
++	return 0;
++}
++
++int pmic_io_get_early_pwr_on(void *data)
++{
++	struct mdm_ctrl_pmic_data *pmic_data = data;
++	return pmic_data->early_pwr_on;
++}
++
++int pmic_io_get_early_pwr_off(void *data)
++{
++	struct mdm_ctrl_pmic_data *pmic_data = data;
++	return pmic_data->early_pwr_off;
++}
+diff --git a/drivers/staging/modem_control/mcd_pmic.h b/drivers/staging/modem_control/mcd_pmic.h
+new file mode 100644
+index 000000000000..822f4f7c3ccb
+--- /dev/null
++++ b/drivers/staging/modem_control/mcd_pmic.h
+@@ -0,0 +1,29 @@
++/*
++ * linux/drivers/modem_control/mcd_pmic.h
++ *
++ * Version 1.0
++ *
++ * Copyright (C) 2013 Intel Corporation. All rights reserved.
++ *
++ * Contact: Ranquet Guillaume <guillaumex.ranquet@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++
++#ifndef _MDM_PMIC_H
++#define _MDM_PMIC_H
++int pmic_io_init(void *data);
++int pmic_io_power_on_mdm(void *data);
++int pmic_io_power_on_ctp_mdm(void *data);
++int pmic_io_power_off_mdm(void *data);
++int pmic_io_cleanup(void *data);
++int pmic_io_get_early_pwr_on(void *data);
++int pmic_io_get_early_pwr_off(void *data);
++#endif
+diff --git a/drivers/staging/modem_control/mdm_ctrl.c b/drivers/staging/modem_control/mdm_ctrl.c
+new file mode 100644
+index 000000000000..018cf190ff11
+--- /dev/null
++++ b/drivers/staging/modem_control/mdm_ctrl.c
+@@ -0,0 +1,1018 @@
++/**
++ * linux/modules/drivers/modem_control/mdm_ctrl.c
++ *
++ * Version 1.0
++ *
++ * This code allows to power and reset IMC modems.
++ * There is a list of commands available in include/linux/mdm_ctrl.h
++ * Current version supports the following modems :
++ * - IMC6260
++ * - IMC6360
++ * - IMC7160
++ * - IMC7260
++ * There is no guarantee for other modems
++ *
++ *
++ * Intel Mobile driver for modem powering.
++ *
++ * Copyright (C) 2013 Intel Corporation. All rights reserved.
++ *
++ * Contact: Faouaz Tenoutit <faouazx.tenoutit@intel.com>
++ *          Frederic Berat <fredericx.berat@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++
++#include "mdm_util.h"
++#include "mcd_mdm.h"
++
++#define MDM_BOOT_DEVNAME	CONFIG_MDM_CTRL_DEV_NAME
++
++/* Modem readiness wait duration (sec) */
++#define MDM_MODEM_READY_DELAY	60
++
++/**
++ *  mdm_ctrl_handle_hangup - This function handle the modem reset/coredump
++ *  @work: a reference to work queue element
++ *
++ */
++static void mdm_ctrl_handle_hangup(struct work_struct *work)
++{
++	struct mdm_info *mdm = container_of(work, struct mdm_info, hangup_work);
++	int modem_rst;
++
++	/* Check the hangup reason */
++	modem_rst = mdm->hangup_causes;
++
++	if (modem_rst & MDM_CTRL_HU_COREDUMP)
++		mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_COREDUMP);
++
++	if (modem_rst & MDM_CTRL_HU_RESET)
++		mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_WARM_BOOT);
++
++	pr_info(DRVNAME ": %s (reasons: 0x%X)\n", __func__,
++			mdm->hangup_causes);
++}
++
++/*****************************************************************************
++ *
++ * Local driver functions
++ *
++ ****************************************************************************/
++
++static int mdm_ctrl_cold_boot(struct mdm_info *mdm)
++{
++	int ret = 0;
++
++	struct mdm_ops *mdm_ops = &mdm->pdata->mdm;
++	struct cpu_ops *cpu = &mdm->pdata->cpu;
++	struct pmic_ops *pmic = &mdm->pdata->pmic;
++
++	void *mdm_data = mdm->pdata->modem_data;
++	void *cpu_data = mdm->pdata->cpu_data;
++	void *pmic_data = mdm->pdata->pmic_data;
++
++	int rst, pwr_on, cflash_delay;
++
++	pr_warn(DRVNAME ": Cold boot requested");
++
++	/* Set the current modem state */
++	mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_COLD_BOOT);
++
++	/* AP request => just ignore the modem reset */
++	atomic_set(&mdm->rst_ongoing, 1);
++
++	rst = cpu->get_gpio_rst(cpu_data);
++	pwr_on = cpu->get_gpio_pwr(cpu_data);
++	cflash_delay = mdm_ops->get_cflash_delay(mdm_data);
++
++	/* @TODO: remove this */
++	if (mdm->pdata->mdm_ver != MODEM_2230) {
++		if (pmic->power_on_mdm(pmic_data)) {
++			pr_err(DRVNAME ": Error PMIC power-ON.");
++			ret = -1;
++			goto end;
++		}
++	}
++
++	if (mdm_ops->power_on(mdm_data, rst, pwr_on)) {
++		pr_err(DRVNAME ": Error MDM power-ON.");
++		ret = -1;
++		goto end;
++	}
++
++	mdm_ctrl_launch_timer(mdm, cflash_delay, MDM_TIMER_FLASH_ENABLE);
++
++	/* If no IPC ready signal between modem and AP */
++	if (!mdm->pdata->cpu.get_irq_rst(mdm->pdata->cpu_data)) {
++		atomic_set(&mdm->rst_ongoing, 0);
++		mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_IPC_READY);
++	}
++end:
++	return ret;
++}
++
++static int mdm_ctrl_normal_warm_reset(struct mdm_info *mdm)
++{
++	struct mdm_ops *mdm_ops = &mdm->pdata->mdm;
++	struct cpu_ops *cpu = &mdm->pdata->cpu;
++
++	void *mdm_data = mdm->pdata->modem_data;
++	void *cpu_data = mdm->pdata->cpu_data;
++
++	int rst, wflash_delay;
++
++	pr_info(DRVNAME ": Normal warm reset requested\n");
++
++	/* AP requested reset => just ignore */
++	atomic_set(&mdm->rst_ongoing, 1);
++
++	/* Set the current modem state */
++	mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_WARM_BOOT);
++
++	rst = cpu->get_gpio_rst(cpu_data);
++	wflash_delay = mdm_ops->get_wflash_delay(mdm_data);
++	mdm_ops->warm_reset(mdm_data, rst);
++
++	mdm_ctrl_launch_timer(mdm, wflash_delay, MDM_TIMER_FLASH_ENABLE);
++
++	return 0;
++}
++
++static int mdm_ctrl_flashing_warm_reset(struct mdm_info *mdm)
++{
++	struct mdm_ops *mdm_ops = &mdm->pdata->mdm;
++	struct cpu_ops *cpu = &mdm->pdata->cpu;
++
++	void *mdm_data = mdm->pdata->modem_data;
++	void *cpu_data = mdm->pdata->cpu_data;
++
++	int rst, wflash_delay;
++
++	pr_info(DRVNAME ": Flashing warm reset requested");
++
++	/* AP requested reset => just ignore */
++	atomic_set(&mdm->rst_ongoing, 1);
++
++	/* Set the current modem state */
++	mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_WARM_BOOT);
++
++	rst = cpu->get_gpio_rst(cpu_data);
++	wflash_delay = mdm_ops->get_wflash_delay(mdm_data);
++	mdm_ops->warm_reset(mdm_data, rst);
++
++	msleep(wflash_delay);
++
++	return 0;
++}
++
++static int mdm_ctrl_power_off(struct mdm_info *mdm)
++{
++	int ret = 0;
++
++	struct mdm_ops *mdm_ops = &mdm->pdata->mdm;
++	struct cpu_ops *cpu = &mdm->pdata->cpu;
++	struct pmic_ops *pmic = &mdm->pdata->pmic;
++
++	void *mdm_data = mdm->pdata->modem_data;
++	void *cpu_data = mdm->pdata->cpu_data;
++	void *pmic_data = mdm->pdata->pmic_data;
++
++	int rst;
++
++	pr_info(DRVNAME ": Power OFF requested");
++
++	/* AP requested reset => just ignore */
++	atomic_set(&mdm->rst_ongoing, 1);
++
++	/* Set the modem state to OFF */
++	mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_OFF);
++
++	rst = cpu->get_gpio_rst(cpu_data);
++	if (mdm_ops->power_off(mdm_data, rst)) {
++		pr_err(DRVNAME ": Error MDM power-OFF.");
++		ret = -1;
++		goto end;
++	}
++	if (mdm->pdata->mdm_ver != MODEM_2230) {
++		if (pmic->power_off_mdm(pmic_data)) {
++			pr_err(DRVNAME ": Error PMIC power-OFF.");
++			ret = -1;
++			goto end;
++		}
++	}
++end:
++	return ret;
++}
++
++static int mdm_ctrl_cold_reset(struct mdm_info *mdm)
++{
++	pr_warn(DRVNAME ": Cold reset requested");
++
++	mdm_ctrl_power_off(mdm);
++	mdm_ctrl_cold_boot(mdm);
++
++	return 0;
++}
++
++/**
++ *  mdm_ctrl_coredump_it - Modem has signaled a core dump
++ *  @irq: IRQ number
++ *  @data: mdm_ctrl driver reference
++ *
++ *  Schedule a work to handle CORE_DUMP depending on current modem state.
++ */
++static irqreturn_t mdm_ctrl_coredump_it(int irq, void *data)
++{
++	struct mdm_info *mdm = data;
++
++	pr_err(DRVNAME ": CORE_DUMP it");
++
++	/* Ignoring event if we are in OFF state. */
++	if (mdm_ctrl_get_state(mdm) == MDM_CTRL_STATE_OFF) {
++		pr_err(DRVNAME ": CORE_DUMP while OFF\n");
++		goto out;
++	}
++
++	/* Ignoring if Modem reset is ongoing. */
++	if (atomic_read(&mdm->rst_ongoing) == 1) {
++		pr_err(DRVNAME ": CORE_DUMP while Modem Reset is ongoing\n");
++		goto out;
++	}
++
++	/* Set the reason & launch the work to handle the hangup */
++	mdm->hangup_causes |= MDM_CTRL_HU_COREDUMP;
++	queue_work(mdm->hu_wq, &mdm->hangup_work);
++
++ out:
++	return IRQ_HANDLED;
++}
++
++/**
++ *  mdm_ctrl_reset_it - Modem has changed reset state
++ *  @irq: IRQ number
++ *  @data: mdm_ctrl driver reference
++ *
++ *  Change current state and schedule work to handle unexpected resets.
++ */
++static irqreturn_t mdm_ctrl_reset_it(int irq, void *data)
++{
++	int value, reset_ongoing;
++	struct mdm_info *mdm = data;
++
++	value = mdm->pdata->cpu.get_mdm_state(mdm->pdata->cpu_data);
++
++	/* Ignoring event if we are in OFF state. */
++	if (mdm_ctrl_get_state(mdm) == MDM_CTRL_STATE_OFF) {
++		/* Logging event in order to minimise risk of hidding bug */
++		pr_err(DRVNAME ": RESET_OUT 0x%x while OFF\n", value);
++		goto out;
++	}
++
++	/* If reset is ongoing we expect falling if applicable and rising
++	 * edge.
++	 */
++	reset_ongoing = atomic_read(&mdm->rst_ongoing);
++	if (reset_ongoing) {
++		pr_err(DRVNAME ": RESET_OUT 0x%x\n", value);
++
++		/* Rising EDGE (IPC ready) */
++		if (value) {
++			/* Reset the reset ongoing flag */
++			atomic_set(&mdm->rst_ongoing, 0);
++
++			pr_err(DRVNAME ": IPC READY !\n");
++			mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_IPC_READY);
++		}
++
++		goto out;
++	}
++
++	pr_err(DRVNAME ": Unexpected RESET_OUT 0x%x\n", value);
++
++	/* Unexpected reset received */
++	atomic_set(&mdm->rst_ongoing, 1);
++
++	/* Set the reason & launch the work to handle the hangup */
++	mdm->hangup_causes |= MDM_CTRL_HU_RESET;
++	queue_work(mdm->hu_wq, &mdm->hangup_work);
++
++ out:
++	return IRQ_HANDLED;
++}
++
++/**
++ *  clear_hangup_reasons - Clear the hangup reasons flag
++ */
++static void clear_hangup_reasons(struct mdm_info *mdm)
++{
++	mdm->hangup_causes = MDM_CTRL_NO_HU;
++}
++
++/**
++ *  get_hangup_reasons - Hangup reason flag accessor
++ */
++static int get_hangup_reasons(struct mdm_info *mdm)
++{
++	return mdm->hangup_causes;
++}
++
++/*****************************************************************************
++ *
++ * Char device functions
++ *
++ ****************************************************************************/
++
++/**
++ *  mdm_ctrl_dev_open - Manage device access
++ *  @inode: The node
++ *  @filep: Reference to file
++ *
++ *  Called when a process tries to open the device file
++ */
++static int mdm_ctrl_dev_open(struct inode *inode, struct file *filep)
++{
++	unsigned int minor = iminor(inode);
++	struct mdm_info *mdm = &mdm_drv->mdm[minor];
++
++	mutex_lock(&mdm->lock);
++	/* Only ONE instance of this device can be opened */
++	if (mdm_ctrl_get_opened(mdm)) {
++		mutex_unlock(&mdm->lock);
++		return -EBUSY;
++	}
++
++	/* Set the open flag */
++	mdm_ctrl_set_opened(mdm, 1);
++	mutex_unlock(&mdm->lock);
++	return 0;
++}
++
++/**
++ *  mdm_ctrl_dev_close - Reset open state
++ *  @inode: The node
++ *  @filep: Reference to file
++ *
++ *  Called when a process closes the device file.
++ */
++static int mdm_ctrl_dev_close(struct inode *inode, struct file *filep)
++{
++	unsigned int minor = iminor(inode);
++	struct mdm_info *mdm = &mdm_drv->mdm[minor];
++
++	/* Set the open flag */
++	mutex_lock(&mdm->lock);
++	mdm_ctrl_set_opened(mdm, 0);
++	mutex_unlock(&mdm->lock);
++	return 0;
++}
++
++inline bool mcd_is_initialized(struct mdm_info *mdm)
++{
++	return (BOARD_UNSUP != mdm->pdata->board_type) &&
++		(MODEM_UNSUP != mdm->pdata->mdm_ver);
++}
++
++static int mcd_init(struct mdm_info *mdm)
++{
++	int ret = 0;
++
++	if (mdm->pdata->mdm.init(mdm->pdata->modem_data)) {
++		pr_err(DRVNAME ": MDM init failed...returning -ENODEV.");
++		ret = -ENODEV;
++		goto out;
++	}
++
++	if (mdm->pdata->cpu.init(mdm->pdata->cpu_data)) {
++		pr_err(DRVNAME ": CPU init failed...returning -ENODEV.");
++		ret = -ENODEV;
++		goto del_mdm;
++	}
++
++	if (mdm->pdata->cpu.get_irq_rst(mdm->pdata->cpu_data) > 0) {
++		ret = request_irq(mdm->pdata->cpu.
++			get_irq_rst(mdm->pdata->cpu_data),
++			mdm_ctrl_reset_it,
++			IRQF_TRIGGER_RISING |
++			IRQF_TRIGGER_FALLING |
++			IRQF_NO_SUSPEND,
++			DRVNAME, mdm);
++		if (ret) {
++			pr_err(DRVNAME
++				": IRQ request failed (err:%d) for GPIO (RST_OUT)\n",
++				ret);
++			ret = -ENODEV;
++			goto del_cpu;
++		}
++	}
++
++	if (mdm->pdata->cpu.get_irq_cdump(mdm->pdata->cpu_data) > 0) {
++		ret = request_irq(mdm->pdata->cpu.
++			get_irq_cdump(mdm->pdata->cpu_data),
++			mdm_ctrl_coredump_it,
++			IRQF_TRIGGER_RISING | IRQF_NO_SUSPEND, DRVNAME,
++			mdm);
++		if (ret) {
++			pr_err(DRVNAME
++				": IRQ request failed (err:%d) for GPIO (CORE DUMP)\n",
++				ret);
++			ret = -ENODEV;
++			goto free_irq;
++		}
++	}
++
++	/* Modem power off sequence */
++	if (mdm->pdata->pmic.get_early_pwr_off(mdm->pdata->pmic_data)) {
++		if (mdm_ctrl_power_off(mdm)) {
++			ret = -EPROBE_DEFER;
++			goto free_all;
++		}
++	}
++
++	/* Modem cold boot sequence */
++	if (mdm->pdata->pmic.get_early_pwr_on(mdm->pdata->pmic_data)) {
++		if (mdm_ctrl_cold_boot(mdm)) {
++			ret = -EPROBE_DEFER;
++			goto free_all;
++		}
++	}
++
++	pr_info(DRVNAME ": %s initialization has succeed\n", __func__);
++	return 0;
++
++ free_all:
++	free_irq(mdm->pdata->cpu.get_irq_cdump(mdm->pdata->cpu_data), mdm);
++
++ free_irq:
++	free_irq(mdm->pdata->cpu.get_irq_rst(mdm->pdata->cpu_data), mdm);
++
++ del_cpu:
++	mdm->pdata->cpu.cleanup(mdm->pdata->cpu_data);
++
++ del_mdm:
++	mdm->pdata->mdm.cleanup(mdm->pdata->modem_data);
++
++out:
++	return ret;
++}
++
++/**
++ *  mdm_ctrl_dev_ioctl - Process ioctl requests
++ *  @filep: Reference to file that stores private data.
++ *  @cmd: Command that should be executed.
++ *  @arg: Command's arguments.
++ *
++ */
++long mdm_ctrl_dev_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
++{
++	unsigned int minor = iminor(file_inode(filep));
++	struct mdm_info *mdm = &mdm_drv->mdm[minor];
++	long ret = 0;
++	unsigned int mdm_state;
++	unsigned int param;
++	struct mdm_ctrl_cfg cfg;
++
++	pr_info(DRVNAME ": ioctl request 0x%x received on %d\n", cmd, minor);
++
++	if (!mcd_is_initialized(mdm)) {
++		if (cmd == MDM_CTRL_SET_CFG) {
++			ret = copy_from_user(&cfg, (void *)arg, sizeof(cfg));
++			if (ret < 0) {
++				pr_info(DRVNAME ": copy from user failed ret = %ld\n",
++					ret);
++				goto out;
++			}
++
++			/* The modem family must be set first */
++			mcd_set_mdm(mdm->pdata, cfg.type);
++			mdm->pdata->board_type = cfg.board;
++
++			mdm_ctrl_set_mdm_cpu(mdm);
++			mcd_finalize_cpu_data(mdm->pdata);
++
++			ret = mcd_init(mdm);
++			if (!ret)
++				pr_info(DRVNAME ": modem (board: %d, family: %d)",
++						cfg.board, cfg.type);
++			else
++				mdm->is_mdm_ctrl_disabled = true;
++		} else {
++			pr_err(DRVNAME ": Provide modem and board type first");
++			ret = -EINVAL;
++		}
++		goto out;
++	}
++
++	mdm_state = mdm_ctrl_get_state(mdm);
++
++	switch (cmd) {
++	case MDM_CTRL_POWER_OFF:
++		/* Unconditional power off */
++		mdm_ctrl_power_off(mdm);
++		break;
++
++	case MDM_CTRL_POWER_ON:
++		/* Only allowed when modem is OFF or in unknown state */
++		if ((mdm_state == MDM_CTRL_STATE_OFF) ||
++				(mdm_state == MDM_CTRL_STATE_UNKNOWN))
++			mdm_ctrl_cold_boot(mdm);
++		else
++			/* Specific log in COREDUMP state */
++			if (mdm_state == MDM_CTRL_STATE_COREDUMP)
++				pr_err(DRVNAME ": Power ON not allowed (coredump)");
++			else
++				pr_info(DRVNAME ": Powering on while already on");
++		break;
++
++	case MDM_CTRL_WARM_RESET:
++		/* Allowed in any state unless OFF */
++		if (mdm_state != MDM_CTRL_STATE_OFF)
++			mdm_ctrl_normal_warm_reset(mdm);
++		else
++			pr_err(DRVNAME ": Warm reset not allowed (Modem OFF)");
++		break;
++
++	case MDM_CTRL_FLASHING_WARM_RESET:
++		/* Allowed in any state unless OFF */
++		if (mdm_state != MDM_CTRL_STATE_OFF)
++			mdm_ctrl_flashing_warm_reset(mdm);
++		else
++			pr_err(DRVNAME ": Warm reset not allowed (Modem OFF)");
++		break;
++
++	case MDM_CTRL_COLD_RESET:
++		/* Allowed in any state unless OFF */
++		if (mdm_state != MDM_CTRL_STATE_OFF)
++			mdm_ctrl_cold_reset(mdm);
++		else
++			pr_err(DRVNAME ": Cold reset not allowed (Modem OFF)");
++		break;
++
++	case MDM_CTRL_SET_STATE:
++		/* Read the user command params */
++		ret = copy_from_user(&param, (void *)arg, sizeof(param));
++		if (ret < 0) {
++			pr_info(DRVNAME ": copy from user failed ret = %ld\n",
++				ret);
++			goto out;
++		}
++
++		/* Filtering states. Allow any state ? */
++		param &=
++		    (MDM_CTRL_STATE_OFF |
++		     MDM_CTRL_STATE_COLD_BOOT |
++		     MDM_CTRL_STATE_WARM_BOOT |
++		     MDM_CTRL_STATE_COREDUMP |
++		     MDM_CTRL_STATE_IPC_READY |
++		     MDM_CTRL_STATE_FW_DOWNLOAD_READY);
++
++		mdm_ctrl_set_state(mdm, param);
++		break;
++
++	case MDM_CTRL_GET_STATE:
++		/* Return supposed current state.
++		 * Real state can be different.
++		 */
++		param = mdm_state;
++
++		ret = copy_to_user((void __user *)arg, &param, sizeof(param));
++		if (ret < 0) {
++			pr_info(DRVNAME ": copy to user failed ret = %ld\n",
++				ret);
++			return ret;
++		}
++		break;
++
++	case MDM_CTRL_GET_HANGUP_REASONS:
++		/* Return last hangup reason. Can be cumulative
++		 * if they were not cleared since last hangup.
++		 */
++		param = get_hangup_reasons(mdm);
++
++		ret = copy_to_user((void __user *)arg, &param, sizeof(param));
++		if (ret < 0) {
++			pr_info(DRVNAME ": copy to user failed ret = %ld\n",
++				ret);
++			return ret;
++		}
++		break;
++
++	case MDM_CTRL_CLEAR_HANGUP_REASONS:
++		clear_hangup_reasons(mdm);
++		break;
++
++	case MDM_CTRL_SET_POLLED_STATES:
++		/* Set state to poll on. */
++		/* Read the user command params */
++		ret = copy_from_user(&param, (void *)arg, sizeof(param));
++		if (ret < 0) {
++			pr_info(DRVNAME ": copy from user failed ret = %ld\n",
++				ret);
++			return ret;
++		}
++		mdm->polled_states = param;
++		/* Poll is active ? */
++		if (waitqueue_active(&mdm->wait_wq)) {
++			mdm_state = mdm_ctrl_get_state(mdm);
++			/* Check if current state is awaited */
++			if (mdm_state)
++				mdm->polled_state_reached = ((mdm_state & param)
++							     == mdm_state);
++
++			/* Waking up the wait work queue to handle any
++			 * polled state reached.
++			 */
++			wake_up(&mdm->wait_wq);
++		} else {
++			/* Assume that mono threaded client are probably
++			 * not polling yet and that they are not interested
++			 * in the current state. This state may change until
++			 * they start the poll. May be an issue for some cases.
++			 */
++			mdm->polled_state_reached = false;
++		}
++
++		pr_info(DRVNAME ": states polled = 0x%x\n",
++			mdm->polled_states);
++		break;
++
++	case MDM_CTRL_SET_CFG:
++		pr_info(DRVNAME ": already configured\n");
++		ret = -EBUSY;
++		break;
++
++	default:
++		pr_err(DRVNAME ": ioctl command %x unknown\n", cmd);
++		ret = -ENOIOCTLCMD;
++	}
++
++ out:
++	return ret;
++}
++
++/**
++ *  mdm_ctrl_dev_read - Device read function
++ *  @filep: Reference to file
++ *  @data: User data
++ *  @count: Bytes read.
++ *  @ppos: Reference to position in file.
++ *
++ *  Called when a process, which already opened the dev file, attempts to
++ *  read from it. Not allowed.
++ */
++static ssize_t mdm_ctrl_dev_read(struct file *filep,
++				 char __user *data,
++				 size_t count, loff_t *ppos)
++{
++	pr_err(DRVNAME ": Nothing to read\n");
++	return -EINVAL;
++}
++
++/**
++ *  mdm_ctrl_dev_write - Device write function
++ *  @filep: Reference to file
++ *  @data: User data
++ *  @count: Bytes read.
++ *  @ppos: Reference to position in file.
++ *
++ *  Called when a process writes to dev file.
++ *  Not allowed.
++ */
++static ssize_t mdm_ctrl_dev_write(struct file *filep,
++				  const char __user *data,
++				  size_t count, loff_t *ppos)
++{
++	pr_err(DRVNAME ": Nothing to write to\n");
++	return -EINVAL;
++}
++
++/**
++ *  mdm_ctrl_dev_poll - Poll function
++ *  @filep: Reference to file storing private data
++ *  @pt: Reference to poll table structure
++ *
++ *  Flush the change state workqueue to ensure there is no new state pending.
++ *  Relaunch the poll wait workqueue.
++ *  Return POLLHUP|POLLRDNORM if any of the polled states was reached.
++ */
++static unsigned int mdm_ctrl_dev_poll(struct file *filep,
++				      struct poll_table_struct *pt)
++{
++	unsigned int minor = iminor(file_inode(filep));
++	struct mdm_info *mdm = &mdm_drv->mdm[minor];
++	unsigned int ret = 0;
++
++	/* Wait event change */
++	poll_wait(filep, &mdm->wait_wq, pt);
++
++	/* State notify */
++	if (mdm->polled_state_reached ||
++	    (mdm_ctrl_get_state(mdm) & mdm->polled_states)) {
++
++		mdm->polled_state_reached = false;
++		ret |= POLLHUP | POLLRDNORM;
++		pr_info(DRVNAME ": POLLHUP occured. Current state = 0x%x\n",
++			mdm_ctrl_get_state(mdm));
++#ifdef CONFIG_HAS_WAKELOCK
++		wake_unlock(&mdm->stay_awake);
++#endif
++	}
++
++	return ret;
++}
++
++/**
++ * Device driver file operations
++ */
++static const struct file_operations mdm_ctrl_ops = {
++	.open = mdm_ctrl_dev_open,
++	.read = mdm_ctrl_dev_read,
++	.write = mdm_ctrl_dev_write,
++	.poll = mdm_ctrl_dev_poll,
++	.release = mdm_ctrl_dev_close,
++	.unlocked_ioctl = mdm_ctrl_dev_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = mdm_ctrl_dev_ioctl
++#endif
++};
++
++/**
++ * Destroy all modem specific resources like timer, workqueue, etc
++ */
++static void mdm_cleanup(struct mdm_info *mdm)
++{
++	if (mdm->hu_wq) {
++		/* if wq is initialized, it means that timer, wake-lock and
++		 * mutex are also initialized */
++		destroy_workqueue(mdm->hu_wq);
++		del_timer(&mdm->flashing_timer);
++		mutex_destroy(&mdm->lock);
++#ifdef CONFIG_HAS_WAKELOCK
++		wake_lock_destroy(&mdm->stay_awake);
++#endif
++	}
++}
++
++/**
++ *  mdm_ctrl_module_init - initialises the Modem Control driver
++ *
++ */
++static int mdm_ctrl_module_probe(struct platform_device *pdev)
++{
++	int ret;
++	struct mdm_ctrl *new_drv;
++	int i;
++	char name[25];
++
++	pr_info(DRVNAME ": probing mdm_ctrl\n");
++	/* Allocate modem struct data */
++	new_drv = kzalloc(sizeof(struct mdm_ctrl), GFP_KERNEL);
++	if (!new_drv) {
++		pr_err(DRVNAME ": Out of memory(new_drv)\n");
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	pr_info(DRVNAME ": Getting device infos\n");
++
++	/* Pre-initialisation: Retrieve platform device data.
++	 * For ACPI platforms, this function shall be called before
++	 * get_nb_mdms. Otherwise, the number of modem is not known.
++	 *
++	 * new_drv will contain all modem specifics data such as cpu name,
++	 * pmic and enabling of early power mode */
++	if (mdm_ctrl_get_device_info(new_drv, pdev)) {
++		pr_err(DRVNAME ": failed to retrieve platform data\n");
++		ret = -ENODEV;
++		goto free_drv;
++	}
++
++	new_drv->nb_mdms = get_nb_mdms();
++	pr_info(DRVNAME ": number of modems: %d\n", new_drv->nb_mdms);
++
++	/* Register the device */
++	ret = alloc_chrdev_region(&new_drv->tdev, 0, new_drv->nb_mdms,
++			MDM_BOOT_DEVNAME);
++	if (ret) {
++		pr_err(DRVNAME ": alloc_chrdev_region failed (err: %d)\n", ret);
++		goto free_drv;
++	}
++
++	new_drv->major = MAJOR(new_drv->tdev);
++	cdev_init(&new_drv->cdev, &mdm_ctrl_ops);
++	new_drv->cdev.owner = THIS_MODULE;
++
++	ret = cdev_add(&new_drv->cdev, new_drv->tdev, new_drv->nb_mdms);
++	if (ret) {
++		pr_err(DRVNAME ": cdev_add failed (err: %d)\n", ret);
++		goto unreg_reg;
++	}
++
++	new_drv->class = class_create(THIS_MODULE, DRVNAME);
++	if (IS_ERR(new_drv->class)) {
++		pr_err(DRVNAME ": class_create failed (err: %d)\n", ret);
++		ret = -EIO;
++		goto del_cdev;
++	}
++
++	new_drv->mdm = kzalloc(sizeof(struct mdm_info) * new_drv->nb_mdms,
++				GFP_KERNEL);
++	if (!new_drv->mdm) {
++		pr_err(DRVNAME ": Out of memory (new_drv->mdm)\n");
++		ret = -ENOMEM;
++		goto del_class;
++	}
++
++	for (i = 0; i < new_drv->nb_mdms; i++) {
++		struct mdm_info *mdm = &new_drv->mdm[i];
++		if (!mdm) {
++			pr_err(DRVNAME " %s: mdm is NULL\n", __func__);
++			break;
++		}
++
++		mdm_ctrl_get_modem_data(new_drv, i);
++		if (mdm->is_mdm_ctrl_disabled) {
++			pr_info(DRVNAME ": modem %d is disabled\n", i);
++			continue;
++		}
++
++		mdm->polled_state_reached = false;
++		mdm->dev = device_create(new_drv->class, NULL,
++				MKDEV(new_drv->major, i),
++				NULL, MDM_BOOT_DEVNAME"%d", i);
++
++		if (IS_ERR(mdm->dev)) {
++			pr_err(DRVNAME ": device_create failed (err: %ld)\n",
++					PTR_ERR(mdm->dev));
++			ret = -EIO;
++			goto del_mdms;
++		}
++
++		/* Create a high priority ordered
++		 * workqueue to change modem state */
++		INIT_WORK(&mdm->hangup_work, mdm_ctrl_handle_hangup);
++
++		/* Create a workqueue to manage hangup */
++		snprintf(name, sizeof(name), "%s-hu_wq%d", DRVNAME, i);
++		mdm->hu_wq = create_singlethread_workqueue(name);
++		if (!mdm->hu_wq) {
++			pr_err(DRVNAME
++				": Unable to create control workqueue: %s\n",
++				name);
++			ret = -EIO;
++			goto del_mdms;
++		}
++
++		/* Initialization */
++		mutex_init(&mdm->lock);
++		init_waitqueue_head(&mdm->wait_wq);
++		init_timer(&mdm->flashing_timer);
++
++#ifdef CONFIG_HAS_WAKELOCK
++		snprintf(name, sizeof(name), "%s-wakelock%d", DRVNAME, i);
++		wake_lock_init(&mdm->stay_awake, WAKE_LOCK_SUSPEND, name);
++#endif
++
++		if (mdm->pdata->mdm_ver != MODEM_2230) {
++			if (mdm->pdata->pmic.init(mdm->pdata->pmic_data)) {
++				pr_err(DRVNAME ": PMIC init failed...returning -ENODEV\n");
++				ret = -ENODEV;
++				goto del_mdms;
++			}
++		}
++
++		mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_OFF);
++		pr_info(DRVNAME " %s: Modem %d initialized\n", __func__, i);
++	}
++
++	/* Everything is OK */
++	mdm_drv = new_drv;
++
++	pr_info(DRVNAME ": MCD initialization successful\n");
++	return 0;
++
++ del_mdms:
++	for (i = 0; i < new_drv->nb_mdms; i++)
++		mdm_cleanup(&new_drv->mdm[i]);
++
++	kfree(new_drv->mdm);
++
++	device_destroy(new_drv->class, new_drv->tdev);
++
++ del_class:
++	class_destroy(new_drv->class);
++
++ del_cdev:
++	cdev_del(&new_drv->cdev);
++
++ unreg_reg:
++	unregister_chrdev_region(new_drv->tdev, 1);
++
++ free_drv:
++	kfree(new_drv->all_pdata);
++	kfree(new_drv);
++
++ out:
++	pr_err(DRVNAME ": ERROR initializing MCD (err:%d)\n", ret);
++	return ret;
++}
++
++/**
++ *  mdm_ctrl_module_exit - Frees the resources taken by the control driver
++ */
++static int mdm_ctrl_module_remove(struct platform_device *pdev)
++{
++	int i = 0;
++
++	if (!mdm_drv)
++		return 0;
++
++	for (i = 0; i < mdm_drv->nb_mdms; i++) {
++		struct mdm_info *mdm = &mdm_drv->mdm[i];
++
++		if (mdm->is_mdm_ctrl_disabled)
++			continue;
++
++		mdm_cleanup(mdm);
++
++		if (mdm->pdata->cpu.get_irq_cdump(mdm->pdata->cpu_data) > 0)
++			free_irq(mdm->pdata->cpu.
++				 get_irq_cdump(mdm->pdata->cpu_data), NULL);
++		if (mdm->pdata->cpu.get_irq_rst(mdm->pdata->cpu_data) > 0)
++			free_irq(mdm->pdata->cpu.
++				 get_irq_rst(mdm->pdata->cpu_data), NULL);
++
++		mdm->pdata->mdm.cleanup(mdm->pdata->modem_data);
++		mdm->pdata->cpu.cleanup(mdm->pdata->cpu_data);
++		mdm->pdata->pmic.cleanup(mdm->pdata->pmic_data);
++	}
++
++	/* Unregister the device */
++	device_destroy(mdm_drv->class, mdm_drv->tdev);
++	class_destroy(mdm_drv->class);
++	cdev_del(&mdm_drv->cdev);
++	unregister_chrdev_region(mdm_drv->tdev, 1);
++
++	/* Free the driver context */
++	kfree(mdm_drv->all_pdata);
++	kfree(mdm_drv->mdm);
++	kfree(mdm_drv);
++
++	mdm_drv = NULL;
++
++	return 0;
++}
++
++/* FOR ACPI HANDLING */
++static struct acpi_device_id mdm_ctrl_acpi_ids[] = {
++	/* ACPI IDs here */
++	{"MCD0001", 0},
++	{}
++};
++
++MODULE_DEVICE_TABLE(acpi, mdm_ctrl_acpi_ids);
++
++static const struct platform_device_id mdm_ctrl_id_table[] = {
++	{DEVICE_NAME, 0},
++	{},
++};
++
++MODULE_DEVICE_TABLE(platform, mdm_ctrl_id_table);
++
++static struct platform_driver mcd_driver = {
++	.probe = mdm_ctrl_module_probe,
++	.remove = mdm_ctrl_module_remove,
++	.driver = {
++		   .name = DRVNAME,
++		   .owner = THIS_MODULE,
++		   /* FOR ACPI HANDLING */
++		   .acpi_match_table = ACPI_PTR(mdm_ctrl_acpi_ids),
++		   },
++	.id_table = mdm_ctrl_id_table,
++};
++
++static int __init mdm_ctrl_module_init(void)
++{
++	return platform_driver_register(&mcd_driver);
++}
++
++static void __exit mdm_ctrl_module_exit(void)
++{
++	platform_driver_unregister(&mcd_driver);
++}
++
++module_init(mdm_ctrl_module_init);
++module_exit(mdm_ctrl_module_exit);
++
++MODULE_AUTHOR("Faouaz Tenoutit <faouazx.tenoutit@intel.com>");
++MODULE_AUTHOR("Frederic Berat <fredericx.berat@intel.com>");
++MODULE_DESCRIPTION("Intel Modem control driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:" DEVICE_NAME);
+diff --git a/drivers/staging/modem_control/mdm_util.c b/drivers/staging/modem_control/mdm_util.c
+new file mode 100644
+index 000000000000..9b2825985db7
+--- /dev/null
++++ b/drivers/staging/modem_control/mdm_util.c
+@@ -0,0 +1,307 @@
++/*
++ * linux/drivers/modem_control/mdm_util.c
++ *
++ * Version 1.0
++ *
++ * Utilities for modem control driver.
++ *
++ * Copyright (C) 2012 Intel Corporation. All rights reserved.
++ *
++ * Contact: Faouaz Tenoutit <faouazx.tenoutit@intel.com>
++ *          Frederic Berat <fredericx.berat@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++
++#include "mdm_util.h"
++#include "mcd_mdm.h"
++#include "mcd_cpu.h"
++#include "mcd_pmic.h"
++#include "mcd_acpi.h"
++
++/* Modem control driver instance */
++struct mdm_ctrl *mdm_drv;
++
++/**
++ *  mdm_ctrl_set_opened - Set the open device state
++ *  @drv: Reference to the driver structure
++ *  @value: Value to set
++ *
++ */
++inline void mdm_ctrl_set_opened(struct mdm_info *mdm, int value)
++{
++	/* Set the open flag */
++	mdm->opened = value;
++}
++
++/**
++ *  mdm_ctrl_get_opened - Return the device open state
++ *  @drv: Reference to the driver structure
++ *
++ */
++inline int mdm_ctrl_get_opened(struct mdm_info *mdm)
++{
++	/* Get the open flag */
++	return mdm->opened;
++}
++
++/**
++ *  mdm_ctrl_enable_flashing - Set the modem state to FW_DOWNLOAD_READY
++ *
++ */
++void mdm_ctrl_enable_flashing(unsigned long int param)
++{
++	struct mdm_info *mdm = (struct mdm_info *)param;
++
++	del_timer(&mdm->flashing_timer);
++	if (mdm_ctrl_get_state(mdm) != MDM_CTRL_STATE_IPC_READY)
++		mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_FW_DOWNLOAD_READY);
++}
++
++/**
++ *  mdm_ctrl_launch_timer - Timer launcher helper
++ *  @mdm: modem info
++ *  @delay: Timer duration
++ *  @timer_type: Timer type
++ *
++ *  Type can be MDM_TIMER_FLASH_ENABLE.
++ *  Note: Type MDM_TIMER_FLASH_DISABLE is not used anymore.
++ */
++void mdm_ctrl_launch_timer(struct mdm_info *mdm, int delay,
++			   unsigned int timer_type)
++{
++	struct timer_list *timer = &mdm->flashing_timer;
++	timer->data = (unsigned long int)mdm;
++
++	switch (timer_type) {
++	case MDM_TIMER_FLASH_ENABLE:
++		timer->function = mdm_ctrl_enable_flashing;
++		break;
++	case MDM_TIMER_FLASH_DISABLE:
++	default:
++		pr_err(DRVNAME ": Unrecognized timer type %d", timer_type);
++		del_timer(timer);
++		return;
++	}
++	mod_timer(timer, jiffies + msecs_to_jiffies(delay));
++}
++
++/**
++ *  mdm_ctrl_set_mdm_cpu - Set modem sequences functions to use
++ *  @drv: Reference to the driver structure
++ *
++ */
++void mdm_ctrl_set_mdm_cpu(struct mdm_info *mdm)
++{
++	int board_type = mdm->pdata->board_type;
++	struct mcd_base_info *pdata = mdm->pdata;
++
++	pr_info(DRVNAME ": board type: %d", board_type);
++
++	switch (board_type) {
++	case BOARD_AOB:
++		pdata->mdm.init = mcd_mdm_init;
++		if (mdm->pdata->mdm_ver == MODEM_2230)
++			pdata->mdm.power_on = mcd_mdm_cold_boot_2230;
++		else
++			pdata->mdm.power_on = mcd_mdm_cold_boot;
++		pdata->mdm.warm_reset = mcd_mdm_warm_reset;
++		pdata->mdm.power_off = mcd_mdm_power_off;
++		pdata->mdm.cleanup = mcd_mdm_cleanup;
++		pdata->mdm.get_wflash_delay = mcd_mdm_get_wflash_delay;
++		pdata->mdm.get_cflash_delay = mcd_mdm_get_cflash_delay;
++		pdata->cpu.init = cpu_init_gpio;
++		pdata->cpu.cleanup = cpu_cleanup_gpio;
++		pdata->cpu.get_mdm_state = get_gpio_mdm_state;
++		pdata->cpu.get_irq_cdump = get_gpio_irq_cdump;
++		pdata->cpu.get_irq_rst = get_gpio_irq_rst;
++		pdata->cpu.get_gpio_rst = get_gpio_rst;
++		pdata->cpu.get_gpio_pwr = get_gpio_pwr;
++		break;
++	case BOARD_NGFF:
++		pdata->mdm.init = mcd_mdm_init;
++		pdata->mdm.power_on = mcd_mdm_cold_boot_ngff;
++		pdata->mdm.warm_reset = mcd_mdm_warm_reset;
++		pdata->mdm.power_off = mcd_mdm_power_off;
++		pdata->mdm.cleanup = mcd_mdm_cleanup;
++		pdata->mdm.get_wflash_delay = mcd_mdm_get_wflash_delay;
++		pdata->mdm.get_cflash_delay = mcd_mdm_get_cflash_delay;
++		pdata->cpu.init = cpu_init_gpio_ngff;
++		pdata->cpu.cleanup = cpu_cleanup_gpio_ngff;
++		pdata->cpu.get_mdm_state = get_gpio_mdm_state_ngff;
++		pdata->cpu.get_irq_cdump = get_gpio_irq_cdump_ngff;
++		pdata->cpu.get_irq_rst = get_gpio_irq_rst_ngff;
++		pdata->cpu.get_gpio_rst = get_gpio_rst;
++		pdata->cpu.get_gpio_pwr = get_gpio_pwr;
++		break;
++	default:
++		pr_info(DRVNAME ": Can't retrieve conf specific functions");
++		mdm->is_mdm_ctrl_disabled = true;
++		break;
++	}
++}
++
++/**
++ * configures PMIC
++ * @drv: Reference to the driver structure
++ */
++static void mdm_ctrl_set_pmic(struct mdm_info *mdm)
++{
++	int pmic_type = mdm->pdata->pmic_ver;
++	struct mcd_base_info *pdata = mdm->pdata;
++
++	switch (pmic_type) {
++	case PMIC_MFLD:
++	case PMIC_MRFL:
++	case PMIC_BYT:
++	case PMIC_MOOR:
++	case PMIC_CHT:
++		pdata->pmic.init = pmic_io_init;
++		pdata->pmic.power_on_mdm = pmic_io_power_on_mdm;
++		pdata->pmic.power_off_mdm = pmic_io_power_off_mdm;
++		pdata->pmic.cleanup = pmic_io_cleanup;
++		pdata->pmic.get_early_pwr_on = pmic_io_get_early_pwr_on;
++		pdata->pmic.get_early_pwr_off = pmic_io_get_early_pwr_off;
++		break;
++	case PMIC_CLVT:
++		pdata->pmic.init = pmic_io_init;
++		pdata->pmic.power_on_mdm = pmic_io_power_on_ctp_mdm;
++		pdata->pmic.power_off_mdm = pmic_io_power_off_mdm;
++		pdata->pmic.cleanup = pmic_io_cleanup;
++		pdata->pmic.get_early_pwr_on = pmic_io_get_early_pwr_on;
++		pdata->pmic.get_early_pwr_off = pmic_io_get_early_pwr_off;
++		break;
++	default:
++		pr_info(DRVNAME ": Can't retrieve pmic specific functions");
++		mdm->is_mdm_ctrl_disabled = true;
++		break;
++	}
++}
++
++/**
++ *  mdm_ctrl_set_state -  Effectively sets the modem state on work execution
++ *  @state : New state to set
++ *
++ */
++inline void mdm_ctrl_set_state(struct mdm_info *mdm, int state)
++{
++	/* Set the current modem state */
++	atomic_set(&mdm->modem_state, state);
++	if (likely(state != MDM_CTRL_STATE_UNKNOWN) &&
++	    (state & mdm->polled_states)) {
++
++		mdm->polled_state_reached = true;
++		/* Waking up the poll work queue */
++		wake_up(&mdm->wait_wq);
++		pr_info(DRVNAME ": Waking up polling 0x%x\r\n", state);
++#ifdef CONFIG_HAS_WAKELOCK
++		/* Grab the wakelock for 10 ms to avoid
++		   the system going to sleep */
++		if (mdm->opened)
++			wake_lock_timeout(&mdm->stay_awake,
++					msecs_to_jiffies(10));
++#endif
++
++	}
++}
++
++/**
++ *  mdm_ctrl_get_state - Return the local current modem state
++ *  @drv: Reference to the driver structure
++ *
++ *  Note: Real current state may be different in case of self-reset
++ *	  or if user has manually changed the state.
++ */
++inline int mdm_ctrl_get_state(struct mdm_info *mdm)
++{
++	return atomic_read(&mdm->modem_state);
++}
++
++/**
++ *  modem_ctrl_create_pdata - Create platform data
++ *
++ *  pdata is created base on information given by platform.
++ *  Data used is the modem type, the cpu type and the pmic type.
++ */
++struct mcd_base_info *modem_ctrl_get_dev_data(struct platform_device *pdev)
++{
++	struct mcd_base_info *info = NULL;
++
++		/* FOR ACPI HANDLING */
++		if (get_modem_acpi_data(pdev)) {
++			pr_err(DRVNAME
++			       " %s: No registered info found. Disabling driver.",
++			       __func__);
++			return NULL;
++		}
++
++	info = pdev->dev.platform_data;
++
++	pr_err(DRVNAME ": cpu: %d pmic: %d.", info->cpu_ver, info->pmic_ver);
++	if ((info->cpu_ver == CPU_UNSUP) || (info->pmic_ver == PMIC_UNSUP)) {
++		/* mdm_ctrl is disabled as some components */
++		/* of the platform are not supported */
++		kfree(info);
++		return NULL;
++	}
++
++	return info;
++}
++
++/**
++ *  mdm_ctrl_get_device_info - Create platform and modem data.
++ *  @drv: Reference to the driver structure
++ *  @pdev: Reference to platform device data
++ *
++ *  Platform are build from SFI table data.
++ */
++int mdm_ctrl_get_device_info(struct mdm_ctrl *drv,
++			      struct platform_device *pdev)
++{
++	int ret = 0;
++
++	drv->all_pdata = modem_ctrl_get_dev_data(pdev);
++	if (!drv->all_pdata)
++		ret = -1;
++
++	return ret;
++}
++
++/**
++ * mdm_ctrl_get_modem_data - get platform data for one modem
++ * @drv: Reference to the driver structure
++ * @minor: modem id
++ *
++ * @return 0 if successful
++ */
++int mdm_ctrl_get_modem_data(struct mdm_ctrl *drv, int minor)
++{
++	int ret = -1;
++
++	if (!drv->all_pdata) {
++		pr_err(DRVNAME ": %s platform data is NULL\n", __func__);
++		goto out;
++	}
++
++	drv->mdm[minor].pdata = &drv->all_pdata[minor];
++
++	if (!drv->mdm[minor].pdata->cpu_data) {
++		drv->mdm[minor].is_mdm_ctrl_disabled = true;
++		pr_info(DRVNAME " %s: Disabling modem %d. No known device\n",
++				__func__, minor);
++	} else {
++		drv->mdm[minor].pdata->board_type = BOARD_UNSUP;
++		mdm_ctrl_set_pmic(&drv->mdm[minor]);
++		ret = 0;
++	}
++
++ out:
++	return ret;
++}
+diff --git a/drivers/staging/modem_control/mdm_util.h b/drivers/staging/modem_control/mdm_util.h
+new file mode 100644
+index 000000000000..575f442f8be9
+--- /dev/null
++++ b/drivers/staging/modem_control/mdm_util.h
+@@ -0,0 +1,138 @@
++/*
++ * linux/drivers/modem_control/mdm_util.h
++ *
++ * mdm_util.h
++ * Utilities functions header.
++ *
++ * Copyright (C) 2013 Intel Corporation. All rights reserved.
++ *
++ * Contact: Faouaz Tenoutit <faouazx.tenoutit@intel.com>
++ *          Frederic Berat <fredericx.berat@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/acpi.h>
++#include <linux/platform_device.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/cdev.h>
++#include <linux/slab.h>
++#include <linux/poll.h>
++#include <linux/sched.h>
++#include <linux/uaccess.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/gpio.h>
++#include <linux/mutex.h>
++#include <linux/wait.h>
++#include <linux/delay.h>
++#ifdef CONFIG_HAS_WAKELOCK
++#include <linux/wakelock.h>
++#endif
++#include <linux/mdm_ctrl.h>
++#include <asm/intel-mid.h>
++#include <linux/mdm_ctrl_board.h>
++
++#ifndef _MDM_UTIL_H
++#define _MDM_UTIL_H
++
++/**
++ *
++ * @opened: This flag is used to allow only ONE instance of this driver
++ * @wait_wq: Read/Poll/Select wait event
++ * @lock: spinlock to serialise access to the driver information
++ * @hangup_work: Modem Reset/Coredump work
++ */
++struct mdm_info {
++	/* Device infos */
++	struct mcd_base_info *pdata;
++	struct device *dev;
++
++	/* Used to prevent multiple access to device */
++	unsigned int opened;
++
++	/* A waitqueue for poll/read operations */
++	wait_queue_head_t wait_wq;
++	unsigned int polled_states;
++	bool polled_state_reached;
++
++	/* modem status */
++	atomic_t rst_ongoing;
++	int hangup_causes;
++
++	struct mutex lock;
++	atomic_t modem_state;
++#ifdef CONFIG_HAS_WAKELOCK
++	struct wake_lock	 stay_awake;
++#endif
++
++	struct work_struct change_state_work;
++
++	struct workqueue_struct *hu_wq;
++	struct work_struct hangup_work;
++
++	struct timer_list flashing_timer;
++
++	bool is_mdm_ctrl_disabled;
++};
++
++/**
++ * struct mdm_ctrl - Modem boot driver
++ *
++ * @major: char device major number
++ * @tdev: char device type dev
++ * @dev: char device
++ * @cdev: char device
++ * @class: char device class
++ */
++struct mdm_ctrl {
++	/* Char device registration */
++	int major;
++	int nb_mdms;
++	dev_t tdev;
++	struct cdev cdev;
++	struct class *class;
++	struct mdm_info *mdm;
++	struct mcd_base_info *all_pdata;
++};
++
++/* List of states */
++struct next_state {
++	struct list_head link;
++	int state;
++};
++
++/* Modem control driver instance */
++extern struct mdm_ctrl *mdm_drv;
++
++inline void mdm_ctrl_set_opened(struct mdm_info *mdm, int value);
++inline int mdm_ctrl_get_opened(struct mdm_info *mdm);
++
++void mdm_ctrl_enable_flashing(unsigned long int param);
++void mdm_ctrl_disable_flashing(unsigned long int param);
++
++void mdm_ctrl_launch_timer(struct mdm_info *mdm, int delay,
++			   unsigned int timer_type);
++
++inline void mdm_ctrl_set_reset_ongoing(struct mdm_ctrl *drv, int ongoing);
++inline int mdm_ctrl_get_reset_ongoing(struct mdm_ctrl *drv);
++
++inline void mdm_ctrl_set_state(struct mdm_info *mdm, int state);
++inline int mdm_ctrl_get_state(struct mdm_info *mdm);
++
++int mdm_ctrl_get_device_info(struct mdm_ctrl *drv,
++		struct platform_device *pdev);
++int mdm_ctrl_get_modem_data(struct mdm_ctrl *drv, int minor);
++
++void mdm_ctrl_set_mdm_cpu(struct mdm_info *mdm);
++#endif				/* _MDM_UTIL_H */
+diff --git a/include/linux/mdm_ctrl.h b/include/linux/mdm_ctrl.h
+new file mode 100644
+index 000000000000..4cac0a7daf17
+--- /dev/null
++++ b/include/linux/mdm_ctrl.h
+@@ -0,0 +1,111 @@
++/*
++ * mdm_ctrl.h
++ *
++ * Intel Mobile Communication modem boot driver
++ *
++ * Copyright (C) 2012 Intel Corporation. All rights reserved.
++ *
++ * Contact: Faouaz Tenoutit <faouazx.tenoutit@intel.com>
++ *          Frederic Berat <fredericx.berat@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++#ifndef _MDM_CTRL_H
++#define _MDM_CTRL_H
++
++#include <linux/ioctl.h>
++
++/* Modem state */
++enum {
++	MDM_CTRL_STATE_UNKNOWN			= 0x0000,
++	MDM_CTRL_STATE_OFF			= 0x0001,
++	MDM_CTRL_STATE_COLD_BOOT		= 0x0002,
++	MDM_CTRL_STATE_WARM_BOOT		= 0x0004,
++	MDM_CTRL_STATE_COREDUMP			= 0x0008,
++	MDM_CTRL_STATE_IPC_READY		= 0x0010,
++	MDM_CTRL_STATE_FW_DOWNLOAD_READY	= 0x0020,
++};
++
++/* Backward compatibility with previous patches */
++#define MDM_CTRL_STATE_NONE MDM_CTRL_STATE_UNKNOWN
++
++/* Modem hanging up reasons */
++enum {
++	MDM_CTRL_NO_HU		= 0x00,
++	MDM_CTRL_HU_RESET	= 0x01,
++	MDM_CTRL_HU_COREDUMP	= 0x02,
++};
++
++enum {
++	MDM_TIMER_FLASH_ENABLE,
++	MDM_TIMER_FLASH_DISABLE,
++	MDM_TIMER_DEFAULT
++};
++
++/* Supported Modem IDs*/
++enum mdm_ctrl_mdm_type {
++	MODEM_UNSUP,
++	MODEM_2230,
++	MODEM_6260,
++	MODEM_6268,
++	MODEM_6360,
++	MODEM_7160,
++	MODEM_7260
++};
++
++/* Type of modem board */
++enum mdm_ctrl_board_type {
++	BOARD_UNSUP,
++	BOARD_AOB,
++	BOARD_NGFF,
++	BOARD_PCIE,
++};
++
++/**
++ * struct mdm_ctrl_cmd - Command parameters
++ *
++ * @timeout: the command timeout duration
++ * @curr_state: the current modem state
++ * @expected_state: the modem state to wait for
++ */
++struct mdm_ctrl_cmd {
++	unsigned int param;
++	unsigned int timeout;
++};
++
++/**
++ * struct mdm_ctrl_cfg - MCD configuration
++ *
++ * @board board type
++ * @type modem family type
++ */
++struct mdm_ctrl_cfg {
++	enum mdm_ctrl_board_type board;
++	enum mdm_ctrl_mdm_type type;
++};
++
++#define MDM_CTRL_MAGIC	0x87 /* FIXME: Revisit */
++
++/* IOCTL commands list */
++#define MDM_CTRL_POWER_OFF		_IO(MDM_CTRL_MAGIC, 0)
++#define MDM_CTRL_POWER_ON		_IO(MDM_CTRL_MAGIC, 1)
++#define MDM_CTRL_WARM_RESET		_IO(MDM_CTRL_MAGIC, 2)
++#define MDM_CTRL_COLD_RESET		_IO(MDM_CTRL_MAGIC, 3)
++#define MDM_CTRL_SET_STATE		_IO(MDM_CTRL_MAGIC, 4)
++#define MDM_CTRL_GET_STATE		_IO(MDM_CTRL_MAGIC, 5)
++#define MDM_CTRL_RESERVED		_IO(MDM_CTRL_MAGIC, 6)
++#define MDM_CTRL_FLASHING_WARM_RESET	_IO(MDM_CTRL_MAGIC, 7)
++#define MDM_CTRL_GET_HANGUP_REASONS	_IO(MDM_CTRL_MAGIC, 8)
++#define MDM_CTRL_CLEAR_HANGUP_REASONS	_IO(MDM_CTRL_MAGIC, 9)
++#define MDM_CTRL_SET_POLLED_STATES	_IO(MDM_CTRL_MAGIC, 10)
++#define MDM_CTRL_SET_CFG		_IO(MDM_CTRL_MAGIC, 11)
++
++#endif /* _MDM_CTRL_H */
++
+diff --git a/include/linux/mdm_ctrl_board.h b/include/linux/mdm_ctrl_board.h
+new file mode 100644
+index 000000000000..44f53a0477f7
+--- /dev/null
++++ b/include/linux/mdm_ctrl_board.h
+@@ -0,0 +1,189 @@
++/*
++ * mdm_ctrl_board.h
++ *
++ * Header for the Modem control driver.
++ *
++ * Copyright (C) 2010, 2011 Intel Corporation. All rights reserved.
++ *
++ * Contact: Frederic BERAT <fredericx.berat@intel.com>
++ *          Faouaz TENOUTIT <faouazx.tenoutit@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++
++#ifndef __MDM_CTRL_BOARD_H__
++#define __MDM_CTRL_BOARD_H__
++
++#include <asm/intel-mid.h>
++#include <linux/module.h>
++
++#define DEVICE_NAME "modem_control"
++#define DRVNAME "mdm_ctrl"
++
++/* Supported PMIC IDs*/
++enum {
++	PMIC_UNSUP,
++	PMIC_MFLD,
++	PMIC_CLVT,
++	PMIC_MRFL,
++	PMIC_BYT,
++	PMIC_MOOR,
++	PMIC_CHT
++};
++
++/* Supported CPU IDs*/
++enum {
++	CPU_UNSUP,
++	CPU_PWELL,
++	CPU_CLVIEW,
++	CPU_TANGIER,
++	CPU_VVIEW2,
++	CPU_ANNIEDALE,
++	CPU_CHERRYVIEW
++};
++
++struct mdm_ops {
++	int	(*init)(void *data);
++	int	(*cleanup)(void *data);
++	int	(*get_cflash_delay)(void *data);
++	int	(*get_wflash_delay)(void *data);
++	int	(*power_on)(void *data, int gpio_rst, int gpio_pwr);
++	int	(*power_off)(void *data, int gpio_rst);
++	int	(*warm_reset)(void *data, int gpio_rst);
++};
++
++struct cpu_ops {
++	int	(*init)(void *data);
++	int	(*cleanup)(void *data);
++	int	(*get_mdm_state)(void *data);
++	int	(*get_irq_cdump)(void *data);
++	int	(*get_irq_rst)(void *data);
++	int	(*get_gpio_rst)(void *data);
++	int	(*get_gpio_pwr)(void *data);
++};
++
++struct pmic_ops {
++	int	(*init)(void *data);
++	int	(*cleanup)(void *data);
++	int	(*power_on_mdm)(void *data);
++	int	(*power_off_mdm)(void *data);
++	int	(*get_early_pwr_on)(void *data);
++	int	(*get_early_pwr_off)(void *data);
++};
++
++struct mcd_base_info {
++	/* modem infos */
++	int		mdm_ver;
++	struct	mdm_ops mdm;
++	void	*modem_data;
++
++	/* cpu infos */
++	int		cpu_ver;
++	struct	cpu_ops cpu;
++	void	*cpu_data;
++
++	/* pmic infos */
++	int		pmic_ver;
++	struct	pmic_ops pmic;
++	void	*pmic_data;
++
++	/* board type */
++	int		board_type;
++};
++
++/* GPIO names */
++#define GPIO_RST_OUT	"ifx_mdm_rst_out"
++#define GPIO_PWR_ON	"ifx_mdm_pwr_on"
++#define GPIO_PWR_ON_2	"xenon_trigger"
++#define GPIO_RST_BBN	"ifx_mdm_rst_pmu"
++#define GPIO_CDUMP	"modem-gpio2"
++#define GPIO_CDUMP_MRFL	"MODEM_CORE_DUMP"
++
++/* Retrieve modem parameters on ACPI framework */
++int retrieve_modem_platform_data(struct platform_device *pdev);
++int get_nb_mdms(void);
++
++int mcd_register_mdm_info(struct mcd_base_info *info,
++			  struct platform_device *pdev);
++
++void mcd_set_mdm(struct mcd_base_info *info, int mdm_ver);
++int mcd_finalize_cpu_data(struct mcd_base_info *mcd_reg_info);
++
++/* struct mcd_cpu_data
++ * @gpio_rst_out: Reset out gpio (self reset indicator)
++ * @gpio_pwr_on: Power on gpio (ON1 - Power up pin)
++ * @gpio_rst_bbn: RST_BB_N gpio (Reset pin)
++ * @gpio_cdump: CORE DUMP indicator
++ * @irq_cdump: CORE DUMP irq
++ * @irq_reset: RST_BB_N irq
++ * @gpio_rst_usbhub: USB HUB reset
++ */
++struct mdm_ctrl_cpu_data {
++	struct gpio_desc	*entries[5];
++
++	/* GPIOs */
++	char	*gpio_rst_out_name;
++	struct gpio_desc	*gpio_rst_out;
++	char	*gpio_pwr_on_name;
++	struct gpio_desc	*gpio_pwr_on;
++	char	*gpio_rst_bbn_name;
++	struct gpio_desc	*gpio_rst_bbn;
++	char	*gpio_cdump_name;
++	struct gpio_desc	*gpio_cdump;
++	char	*gpio_wwan_disable_name;
++	char	*gpio_wake_on_wwan_name;
++
++	/* NGFF specific */
++	struct gpio_desc	*gpio_wwan_disable;
++	struct gpio_desc	*gpio_rst_usbhub;
++
++	/* IRQs */
++	int	irq_cdump;
++	int	irq_reset;
++	int	irq_wake_on_wwan;
++};
++
++/* struct mdm_ctrl_pmic_data
++ * @chipctrl: PMIC base address
++ * @chipctrlon: Modem power on PMIC value
++ * @chipctrloff: Modem power off PMIC value
++ * @early_pwr_on: call to power_on on probe indicator
++ * @early_pwr_off: call to power_off on probe indicator
++ * @pwr_down_duration:Powering down duration (us)
++ */
++struct mdm_ctrl_pmic_data {
++	int		chipctrl;
++	int		chipctrlon;
++	int		chipctrloff;
++	int		chipctrl_mask;
++	bool	early_pwr_on;
++	bool	early_pwr_off;
++	int		pwr_down_duration;
++};
++
++/* struct mdm_ctrl_device_info - Board and modem infos
++ *
++ * @pre_on_delay:Delay before pulse on ON1 (us)
++ * @on_duration:Pulse on ON1 duration (us)
++ * @pre_wflash_delay:Delay before flashing window, after warm_reset (ms)
++ * @pre_cflash_delay:Delay before flashing window, after cold_reset (ms)
++ * @flash_duration:Flashing window durtion (ms)int  Not used ?
++ * @warm_rst_duration:Warm reset duration (ms)
++ */
++struct mdm_ctrl_mdm_data {
++	int	pre_on_delay;
++	int	on_duration;
++	int	pre_wflash_delay;
++	int	pre_cflash_delay;
++	int	flash_duration;
++	int	warm_rst_duration;
++	int	pre_pwr_down_delay;
++};
++#endif				/* __MDM_CTRL_BOARD_H__ */
+-- 
+1.9.1
+

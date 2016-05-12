@@ -1,0 +1,84 @@
+From 0aacb4ebf31e3dc365ac0ab54e3d2fb5db3253d9 Mon Sep 17 00:00:00 2001
+From: Dmitry Torokhov <dtor@chromium.org>
+Date: Thu, 3 Sep 2015 14:48:52 -0700
+Subject: [PATCH 625/634] net: xt_qtaguid/xt_socket: fix refcount underflow and
+ crash
+
+xt_socket_get[4|6]_sk() do not always increment sock refcount, which
+causes confusion in xt_qtaguid module which is not aware of this fact
+and drops the reference whether it should have or not. Fix it by
+changing xt_socket_get[4|6]_sk() to always increment recount of returned
+sock.
+
+This should fix the following crash:
+
+[  111.319523] BUG: failure at
+/mnt/host/source/src/third_party/kernel/v3.18/net/ipv4/inet_timewait_sock.c:90/__inet_twsk_kill()!
+[  111.331192] Kernel panic - not syncing: BUG!
+[  111.335468] CPU: 0 PID: 0 Comm: swapper/0 Tainted: G     U  W
+3.18.0-06867-g268df91 #1
+[  111.343810] Hardware name: Google Tegra210 Smaug Rev 1+ (DT)
+[  111.349463] Call trace:
+[  111.351917] [<ffffffc000207288>] dump_backtrace+0x0/0x10c
+[  111.357314] [<ffffffc0002073a4>] show_stack+0x10/0x1c
+[  111.362367] [<ffffffc000a82d1c>] dump_stack+0x74/0x94
+[  111.367414] [<ffffffc000a81824>] panic+0xec/0x238
+[  111.372116] [<ffffffc000981648>] __inet_twsk_kill+0xd0/0xf8
+[  111.377684] [<ffffffc0009817b0>] inet_twdr_do_twkill_work+0x64/0xd0
+[  111.383946] [<ffffffc000981a5c>] inet_twdr_hangman+0x2c/0xa4
+[  111.389602] [<ffffffc000271cf0>] call_timer_fn+0xac/0x160
+[  111.394995] [<ffffffc00027250c>] run_timer_softirq+0x23c/0x274
+[  111.400824] [<ffffffc000220a68>] __do_softirq+0x1a4/0x330
+[  111.406218] [<ffffffc000220e94>] irq_exit+0x70/0xd0
+[  111.411093] [<ffffffc000264e00>] __handle_domain_irq+0x84/0xa8
+[  111.416922] [<ffffffc0002003ec>] gic_handle_irq+0x4c/0x80
+
+b/22476945
+
+Originally reviewed at:
+https://chromium-review.googlesource.com/#/c/297414/
+
+Signed-off-by: Dmitry Torokhov <dtor@google.com>
+---
+ net/netfilter/xt_socket.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/net/netfilter/xt_socket.c b/net/netfilter/xt_socket.c
+index 7917696..90fcf95 100644
+--- a/net/netfilter/xt_socket.c
++++ b/net/netfilter/xt_socket.c
+@@ -184,7 +184,9 @@ xt_socket_get4_sk(const struct sk_buff *skb, struct xt_action_param *par)
+ 	}
+ #endif
+ 
+-	if (!sk)
++	if (sk)
++		atomic_inc(&sk->sk_refcnt);
++	else
+ 		sk = xt_socket_get_sock_v4(dev_net(skb->dev), protocol,
+ 					   saddr, daddr, sport, dport,
+ 					   par->in);
+@@ -225,8 +227,7 @@ socket_match(const struct sk_buff *skb, struct xt_action_param *par,
+ 				       (sk->sk_state == TCP_TIME_WAIT &&
+ 					inet_twsk(sk)->tw_transparent));
+ 
+-		if (sk != skb->sk)
+-			sock_gen_put(sk);
++		sock_gen_put(sk);
+ 
+ 		if (wildcard || !transparent)
+ 			sk = NULL;
+@@ -364,7 +365,9 @@ xt_socket_get6_sk(const struct sk_buff *skb, struct xt_action_param *par)
+ 		return NULL;
+ 	}
+ 
+-	if (!sk)
++	if (sk)
++		atomic_inc(&sk->sk_refcnt);
++	else
+ 		sk = xt_socket_get_sock_v6(dev_net(skb->dev), tproto,
+ 					   saddr, daddr, sport, dport,
+ 					   par->in);
+-- 
+1.9.1
+

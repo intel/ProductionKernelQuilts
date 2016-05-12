@@ -1,0 +1,205 @@
+From 3c8f5f938b39d2e48a67d954c3b03c0823230078 Mon Sep 17 00:00:00 2001
+Message-Id: <3c8f5f938b39d2e48a67d954c3b03c0823230078.1398812351.git.mark.gross@intel.com>
+In-Reply-To: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+References: <e87e3533536ae5eec0e06ceb7ef7428e42855790.1398812350.git.mark.gross@intel.com>
+From: Jianxun Zhang <jianxun.zhang@intel.com>
+Date: Tue, 25 Jun 2013 17:48:10 -0700
+Subject: [PATCH 272/429] Android logger: support pstore dump
+
+Save the last sections of data in every log buffer to persistent
+storage via pstore. A new module parameter is provided to limit
+the maximum size of each buffer. It co-works with pstore's extra
+limit to decide which buffer could be dumped and the size of dump.
+
+Change-Id: I6ce948adc0720ec7c5ddcdab7f0233e954d009af
+For: AXIA-3125
+original-Change-Id: Ib6deba12c5951ea121ab3c1dcd9a6ef18316d388
+Signed-off-by: Jianxun Zhang <jianxun.zhang@intel.com>
+Signed-off-by: Joakim Nordell <joakim.nordell@intel.com>
+---
+ drivers/staging/android/logger.c | 110 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 109 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/android/logger.c b/drivers/staging/android/logger.c
+index d42f578..1abcf55 100644
+--- a/drivers/staging/android/logger.c
++++ b/drivers/staging/android/logger.c
+@@ -32,6 +32,7 @@
+ #include "logger.h"
+ 
+ #include <asm/ioctls.h>
++#include <linux/pstore.h>
+ 
+ /**
+  * struct logger_log - represents a specific log, such as 'main' or 'radio'
+@@ -43,6 +44,8 @@
+  * @w_off:	The current write head offset
+  * @head:	The head, or location that readers start reading at.
+  * @size:	The size of the log
++ * @pstore_dumper: The pstore dumper of log
++ * @pstore_dumped: The total bytes dumped to pstore
+  * @logs:	The list of log channels
+  *
+  * This structure lives from module insertion until module removal, so it does
+@@ -58,9 +61,27 @@ struct logger_log {
+ 	size_t			w_off;
+ 	size_t			head;
+ 	size_t			size;
++	struct pstore_extra_dumper pstore_dumper;
++	size_t pstore_dumped;
+ 	struct list_head	logs;
+ };
+ 
++
++/* logger_pstore_size - limits total bytes dumped to pstore
++ * Size of log buffers could be much bigger then the persistent
++ * storage supported in pstore. This parameter co-works with
++ * pstore's extra limit to prevent the first log buffer grabs
++ * all the quota (e.g. if pstore 's extra dump size is 4KB and
++ * this limit is set to 1K, every log buffer will get about 1KB
++ * quota to dump.) It will NOT be reset until reboot, even
++ * pstore is cleaned.
++ */
++
++static ulong logger_pstore_size = 1500;
++module_param_named(pstore_size, logger_pstore_size, ulong, 0600);
++MODULE_PARM_DESC(pstore_size,
++		"maximum bytes of pstore dump for each log buffer");
++
+ static LIST_HEAD(log_list);
+ 
+ 
+@@ -161,6 +182,77 @@ static size_t get_user_hdr_len(int ver)
+ 		return sizeof(struct logger_entry);
+ }
+ 
++/*
++ * logger_pstore_dumper - dumping a log's buffer from the end to pstore.
++ *
++ * The total bytes of copied entries is not greater than the size of pstore's
++ * buffer.
++ *
++ * The copied entries will be flushed out from the log's buffer.
++ *
++ * It is intended to be called by pstore when a panic or a crash happens. The
++ * caller (so far, pstore) is responsible to hold locks.
++ *
++ */
++static int logger_pstore_dumper(char *pstore_buf, size_t len,
++		size_t *read, void *priv)
++{
++	size_t total;
++	size_t not_written = 0;	/* bytes not to be written this time */
++	struct logger_log *log = priv;
++	size_t begin;
++
++	if (!pstore_buf || !log || !read)
++		return -EINVAL;
++
++	if (len <= sizeof(struct logger_entry))
++		return -EINVAL;
++
++	/* use logger_offset() to get 'num' of bytes in buffer */
++	total = logger_offset(log, log->w_off - log->head);
++	if (!total) {
++		*read = 0;
++		return 0;
++	}
++
++	/* check with the per-log quota */
++	len = min(len, logger_pstore_size - log->pstore_dumped);
++
++	/* find out the offset of the first entry of the last part */
++	begin = log->head;
++
++	if (total > len) {
++		while (not_written < total - len) {
++			size_t nr = sizeof(struct logger_entry)
++					+ get_entry_msg_len(log, begin);
++			begin = logger_offset(log, begin + nr);
++			not_written += nr;
++		}
++	}
++	/* copy data */
++	if (log->w_off >= begin) {
++		*read = log->w_off - begin;
++		memcpy(pstore_buf, log->buffer + begin, *read);
++	} else {
++		size_t count = log->size - begin;
++		memcpy(pstore_buf, log->buffer + begin, count);
++		memcpy(pstore_buf + count, log->buffer, log->w_off);
++		*read = count + log->w_off;
++	}
++	/* flush dumped part from buffer because we need to remember
++	 * the new end for the next dumping section.
++	 * This is not a problem when system stops after a panic.
++	 * However, if this flushed section had not been read to user
++	 * space AND system will keep running after a crash happens,
++	 * you can only get this section in pstore dump. We just don't
++	 * bother more logic to fix this so that we keep things simple.
++	 */
++	log->w_off = begin;
++	log->pstore_dumped += *read;
++
++	return 0;
++}
++
+ static ssize_t copy_header_to_user(int ver, struct logger_entry *entry,
+ 					 char __user *buf)
+ {
+@@ -497,6 +589,10 @@ static ssize_t logger_aio_write(struct kiocb *iocb, const struct iovec *iov,
+ 	 * entry after (what will be) the new write offset. We do this now
+ 	 * because if we partially fail, we can end up with clobbered log
+ 	 * entries that encroach on readable buffer.
++	 *
++	 * But when a panic happens before all segments are written, the
++	 * parts written in buffer will still been seen in pstore because
++	 * log->w_off has been updated.
+ 	 */
+ 	fix_up_readers(log, sizeof(struct logger_entry) + header.len);
+ 
+@@ -780,6 +876,14 @@ static int __init create_log(char *log_name, int size)
+ 	log->head = 0;
+ 	log->size = size;
+ 
++	/* initialize and register pstore */
++	log->pstore_dumped = 0;
++	log->pstore_dumper.name = log->misc.name;
++	log->pstore_dumper.get_data = logger_pstore_dumper;
++	INIT_LIST_HEAD(&log->pstore_dumper.list);
++	log->pstore_dumper.priv = log;
++	pstore_register_extra_dumper(&log->pstore_dumper);
++
+ 	INIT_LIST_HEAD(&log->logs);
+ 	list_add_tail(&log->logs, &log_list);
+ 
+@@ -788,7 +892,7 @@ static int __init create_log(char *log_name, int size)
+ 	if (unlikely(ret)) {
+ 		pr_err("failed to register misc device for log '%s'!\n",
+ 				log->misc.name);
+-		goto out_free_log;
++		goto out_pstore;
+ 	}
+ 
+ 	pr_info("created %luK log '%s'\n",
+@@ -796,6 +900,9 @@ static int __init create_log(char *log_name, int size)
+ 
+ 	return 0;
+ 
++out_pstore:
++	pstore_unregister_extra_dumper(&log->pstore_dumper);
++
+ out_free_log:
+ 	kfree(log);
+ 
+@@ -834,6 +941,7 @@ static void __exit logger_exit(void)
+ 
+ 	list_for_each_entry_safe(current_log, next_log, &log_list, logs) {
+ 		/* we have to delete all the entry inside log_list */
++		pstore_unregister_extra_dumper(&current_log->pstore_dumper);
+ 		misc_deregister(&current_log->misc);
+ 		vfree(current_log->buffer);
+ 		kfree(current_log->misc.name);
+-- 
+1.8.3.2
+

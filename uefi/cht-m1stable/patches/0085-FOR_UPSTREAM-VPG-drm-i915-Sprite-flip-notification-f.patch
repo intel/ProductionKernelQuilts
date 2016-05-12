@@ -1,0 +1,392 @@
+From e21d93666571b6eb2293e665c817d3058b8ab6ed Mon Sep 17 00:00:00 2001
+Message-Id: <e21d93666571b6eb2293e665c817d3058b8ab6ed.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Vidya Srinivas <vidya.srinivas@intel.com>
+Date: Sat, 5 Jul 2014 00:38:00 +0530
+Subject: [PATCH 085/312] FOR_UPSTREAM [VPG]: drm/i915: Sprite flip
+ notification fixes
+
+The following changes have been ported:
+
+	crtc disable time flip can get stuck
+	(OriginalChangeID - Iea115f90e6b0d594af6c9b06562b465d5a57c7d5)
+	Description: Time out instead of endless wait. During suspend time a flip can be
+	queued between early suspend and suspend. By that time interrupts will
+	be disabled and flip will wait for ever. Also ensure that during flip
+	crtc is active. All this to address race conditions during suspend path.
+	Ideally HWC should not queue a flip, but kernel cant rely on that.
+
+	drm/i915: Simple workarounnd for sprite based tearing
+	Sprite plane tearing was being seen especially in low
+	memory systems as the plane that was onscreen got unpinned
+	while it was still onscreen. This means that it can be
+	removed from the GTT while it was onscreen.
+	(OriginalChangeID - Iac306b9d82fd734b8a1aebaf257eadb9fe0a8ba8)
+
+	drm/i915: Add reference counting in intel_update_plane
+	(OriginalChangeID - I23a34037d589d92cf86c960169d11eae5c16da50)
+
+	Disabled primary plane power optimization
+	(OriginalChangeID - I562b0e8db82b7110f2f60ddf59dca8e9ab8555be)
+
+Issue: GMIN-1455
+Change-Id: I0a4ad2e6480938520ca897cd4d0cdcf294086274
+Signed-off-by: Lei Zhang <lei.zhang@intel.com>
+Signed-off-by: Pallavi <pallavi.g@intel.com>
+Signed-off-by: Purushothaman, Vijay A <vijay.a.purushothaman@intel.com>
+Signed-off-by: Smith, Gary K <gary.k.smith@intel.com>
+Signed-off-by: Vandana Kannan <vandana.kannan@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    1 +
+ drivers/gpu/drm/i915/i915_irq.c      |    8 ++-
+ drivers/gpu/drm/i915/intel_display.c |   37 +++++++++++-
+ drivers/gpu/drm/i915/intel_drv.h     |    2 +-
+ drivers/gpu/drm/i915/intel_sprite.c  |  102 ++++++++++++++++++++++++++--------
+ 5 files changed, 122 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 3e3e438..df4a6e3 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1464,6 +1464,7 @@ struct drm_i915_private {
+ 	 * result in deadlocks.
+ 	 */
+ 	struct workqueue_struct *wq;
++	struct workqueue_struct *flipwq;
+ 
+ 	/* Display functions */
+ 	struct drm_i915_display_funcs display;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 6ed6ec0..facef10 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1808,6 +1808,10 @@ static void valleyview_pipestat_irq_handler(struct drm_device *dev, u32 iir)
+ 				intel_prepare_sprite_page_flip(dev, pipe);
+ 				intel_finish_sprite_page_flip(dev, pipe);
+ 		}
++		if (pipe_stats[pipe] & SPRITE1_FLIP_DONE_INT_STATUS_VLV) {
++				intel_prepare_sprite_page_flip(dev, pipe);
++				intel_finish_sprite_page_flip(dev, pipe);
++		}
+ 		if (pipe_stats[pipe] & PIPE_CRC_DONE_INTERRUPT_STATUS)
+ 			i9xx_pipe_crc_irq_handler(dev, pipe);
+ 
+@@ -3380,7 +3384,9 @@ static void valleyview_display_irqs_install(struct drm_i915_private *dev_priv)
+ 	POSTING_READ(PIPESTAT(PIPE_A));
+ 
+ 	pipestat_mask = PLANE_FLIP_DONE_INT_STATUS_VLV |
+-			PIPE_CRC_DONE_INTERRUPT_STATUS;
++			PIPE_CRC_DONE_INTERRUPT_STATUS |
++			SPRITE0_FLIP_DONE_INT_STATUS_VLV |
++			SPRITE1_FLIP_DONE_INT_STATUS_VLV;
+ 
+ 	i915_enable_pipestat(dev_priv, PIPE_A, pipestat_mask |
+ 					       PIPE_GMBUS_INTERRUPT_STATUS);
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 2dd1a74..b1e42c2 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -3792,6 +3792,9 @@ void intel_crtc_wait_for_pending_flips(struct drm_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++	struct drm_i915_gem_object *obj;
++	unsigned long flags;
+ 
+ 	if (crtc->primary->fb == NULL)
+ 		return;
+@@ -3799,10 +3802,36 @@ void intel_crtc_wait_for_pending_flips(struct drm_crtc *crtc)
+ 	flush_work(&to_intel_crtc(crtc)->vblank_work.work);
+ 
+ 	WARN_ON(waitqueue_active(&dev_priv->pending_flip_queue));
++	flush_workqueue(dev_priv->flipwq);
+ 
+-	WARN_ON(wait_event_timeout(dev_priv->pending_flip_queue,
+-				   !intel_crtc_has_pending_flip(crtc),
+-				   60*HZ) == 0);
++	obj = to_intel_framebuffer(crtc->primary->fb)->obj;
++	if (wait_event_timeout(dev_priv->pending_flip_queue,
++		!intel_crtc_has_pending_flip(crtc), 5) == 0) {
++		DRM_DEBUG_DRIVER("flip wait timed out.\n");
++
++		/* cleanup */
++		if (intel_crtc->unpin_work) {
++			intel_unpin_work_fn(&intel_crtc->unpin_work->work);
++			atomic_clear_mask(1 << intel_crtc->plane,
++					&obj->pending_flip.counter);
++
++			spin_lock_irqsave(&dev->event_lock, flags);
++			intel_crtc->unpin_work = NULL;
++			spin_unlock_irqrestore(&dev->event_lock, flags);
++		}
++
++		if (intel_crtc->sprite_unpin_work) {
++			intel_unpin_sprite_work_fn(
++				&intel_crtc->sprite_unpin_work->work);
++			obj = intel_crtc->sprite_unpin_work->old_fb_obj;
++			atomic_clear_mask(1 << intel_crtc->plane,
++				&obj->pending_flip.counter);
++
++			spin_lock_irqsave(&dev->event_lock, flags);
++			intel_crtc->sprite_unpin_work = NULL;
++			spin_unlock_irqrestore(&dev->event_lock, flags);
++		}
++	}
+ 
+ 	mutex_lock(&dev->struct_mutex);
+ 	intel_finish_fb(crtc->primary->fb);
+@@ -9686,6 +9715,7 @@ void intel_unpin_work_fn(struct work_struct *__work)
+ 	struct intel_unpin_work *work =
+ 		container_of(__work, struct intel_unpin_work, work);
+ 	struct drm_device *dev = work->crtc->dev;
++	struct drm_crtc *crtc = work->crtc;
+ 
+ 	mutex_lock(&dev->struct_mutex);
+ 	intel_unpin_fb_obj(work->old_fb_obj);
+@@ -9697,6 +9727,7 @@ void intel_unpin_work_fn(struct work_struct *__work)
+ 	 */
+ 	intel_update_drrs(dev);
+ 	intel_update_fbc(dev);
++	intel_update_watermarks(crtc);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	BUG_ON(atomic_read(&to_intel_crtc(work->crtc)->unpin_work_count) == 0);
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 1825155..58b97ca 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -444,7 +444,7 @@ struct intel_plane {
+ 	struct drm_plane base;
+ 	int plane;
+ 	enum pipe pipe;
+-	struct drm_i915_gem_object *obj;
++	struct drm_i915_gem_object *obj, *old_obj;
+ 	bool can_scale;
+ 	int max_downscale;
+ 	u32 lut_r[1024], lut_g[1024], lut_b[1024];
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 3229ba5..908e574 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -130,11 +130,14 @@ static void intel_update_primary_plane(struct intel_crtc *crtc)
+ {
+ 	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
+ 	int reg = DSPCNTR(crtc->plane);
++	int plane = crtc->plane;
+ 
+ 	if (crtc->primary_enabled)
+ 		I915_WRITE(reg, I915_READ(reg) | DISPLAY_PLANE_ENABLE);
+-	else
++	else {
+ 		I915_WRITE(reg, I915_READ(reg) & ~DISPLAY_PLANE_ENABLE);
++		I915_WRITE(DSPSURF(plane), I915_READ(DSPSURF(plane)));
++	}
+ }
+ 
+ void
+@@ -508,9 +511,10 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	I915_WRITE(SPCNTR(pipe, plane), sprctl);
+ 	I915_MODIFY_DISPBASE(SPSURF(pipe, plane),
+ 		i915_gem_obj_ggtt_offset(obj) + sprsurf_offset);
++	intel_flush_primary_plane(dev_priv, intel_crtc->plane);
++
+ 	if (event == NULL)
+ 		POSTING_READ(SPSURF(pipe, plane));
+-	intel_flush_primary_plane(dev_priv, intel_crtc->plane);
+ 
+ 	if (atomic_update)
+ 		intel_pipe_update_end(intel_crtc, start_vbl_count);
+@@ -529,7 +533,6 @@ vlv_disable_plane(struct drm_plane *dplane, struct drm_crtc *crtc)
+ 	bool atomic_update;
+ 
+ 	atomic_update = intel_pipe_update_start(intel_crtc, &start_vbl_count);
+-
+ 	intel_update_primary_plane(intel_crtc);
+ 
+ 	I915_WRITE(SPCNTR(pipe, plane), I915_READ(SPCNTR(pipe, plane)) &
+@@ -614,7 +617,6 @@ void intel_unpin_sprite_work_fn(struct work_struct *__work)
+ 	mutex_lock(&dev->struct_mutex);
+ 	if (work->old_fb_obj != NULL) {
+ 		intel_unpin_fb_obj(work->old_fb_obj);
+-		drm_gem_object_unreference(&work->old_fb_obj->base);
+ 	}
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+@@ -1201,10 +1203,10 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	struct intel_plane *intel_plane = to_intel_plane(plane);
+ 	struct intel_framebuffer *intel_fb = to_intel_framebuffer(fb);
+ 	struct drm_i915_gem_object *obj = intel_fb->obj;
+-	struct drm_i915_gem_object *old_obj = intel_plane->obj;
+-	unsigned long flags;
++	struct drm_i915_gem_object *old_obj = intel_plane->old_obj;
+ 	int ret;
+-	bool primary_enabled;
++	bool primary_enabled = false;
++	unsigned long flags;
+ 	bool visible;
+ 	int hscale, vscale;
+ 	int max_scale, min_scale;
+@@ -1376,8 +1378,11 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	 * If the sprite is completely covering the primary plane,
+ 	 * we can disable the primary and save power.
+ 	 */
+-	primary_enabled = !drm_rect_equals(&dst, &clip) || colorkey_enabled(intel_plane);
+-	WARN_ON(!primary_enabled && !visible && intel_crtc->active);
++	if (!IS_VALLEYVIEW(dev)) {
++		primary_enabled = !drm_rect_equals(&dst, &clip) ||
++			colorkey_enabled(intel_plane);
++		WARN_ON(!primary_enabled && !visible && intel_crtc->active);
++	}
+ 
+ 	if (event) {
+ 		work = kzalloc(sizeof(*work), GFP_KERNEL);
+@@ -1428,7 +1433,6 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	drm_gem_object_reference(&obj->base);
+ 	ret = intel_pin_and_fence_fb_obj(dev, obj, NULL);
+ 	mutex_unlock(&dev->struct_mutex);
+-
+ 	if (ret) {
+ 		drm_gem_object_unreference(&obj->base);
+ 		goto out_unlock;
+@@ -1442,6 +1446,7 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	intel_plane->src_y = orig.src_y;
+ 	intel_plane->src_w = orig.src_w;
+ 	intel_plane->src_h = orig.src_h;
++	intel_plane->old_obj = intel_plane->obj;
+ 	intel_plane->obj = obj;
+ 
+ 	if (intel_crtc->active) {
+@@ -1452,8 +1457,18 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 		if (primary_was_enabled != primary_enabled)
+ 			intel_crtc_wait_for_pending_flips(crtc);
+ 
+-		if (primary_was_enabled && !primary_enabled)
+-			intel_pre_disable_primary(crtc);
++		if (!IS_VALLEYVIEW(dev)) {
++			if (primary_was_enabled && !primary_enabled)
++				intel_pre_disable_primary(crtc);
++		}
++
++		if (event == NULL) {
++			/* Enable for non-VLV if required */
++			if (IS_VALLEYVIEW(dev)) {
++				intel_crtc->primary_enabled = true;
++				intel_post_enable_primary(crtc);
++			}
++		}
+ 
+ 		if (visible)
+ 			intel_plane->update_plane(plane, crtc, fb, obj,
+@@ -1462,17 +1477,26 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 		else
+ 			intel_plane->disable_plane(plane, crtc);
+ 
+-		if (!primary_was_enabled && primary_enabled)
+-			intel_post_enable_primary(crtc);
++		if (!IS_VALLEYVIEW(dev)) {
++			if (!primary_was_enabled && primary_enabled)
++				intel_post_enable_primary(crtc);
++		}
++
++		if (event != NULL) {
++			/* Enable for non-VLV if required */
++			if (IS_VALLEYVIEW(dev)) {
++				intel_crtc->primary_enabled = false;
++				intel_pre_disable_primary(crtc);
++			}
++		}
+ 	}
+ 
+ 	/* Unpin old obj after new one is active to avoid ugliness */
+ 	if (old_obj && (event == NULL)) {
+ 		intel_plane_queue_unpin(intel_plane, old_obj);
+ 		drm_gem_object_unreference(&old_obj->base);
+-		if (intel_plane->plane == 0)
+-			intel_crtc->sprite_unpin_work = NULL;
+ 	}
++
+ out_unlock:
+ 	if (event)
+ 		trace_i915_flip_request(intel_crtc->plane, obj);
+@@ -1489,12 +1513,35 @@ free_work:
+ 
+ }
+ 
++static void intel_disable_plane_unpin_work_fn(struct work_struct *__work)
++{
++	struct intel_plane *intel_plane =
++			container_of(__work, struct intel_plane, work);
++	struct drm_device *dev = intel_plane->base.dev;
++
++	intel_wait_for_vblank(dev, intel_plane->pipe);
++	if (intel_plane->obj || intel_plane->old_obj) {
++		mutex_lock(&dev->struct_mutex);
++
++		if (intel_plane->obj)
++			intel_unpin_fb_obj(intel_plane->obj);
++
++		if (intel_plane->old_obj)
++			intel_unpin_fb_obj(intel_plane->old_obj);
++
++		mutex_unlock(&dev->struct_mutex);
++	}
++
++	kfree(intel_plane);
++}
++
+ static int
+ intel_disable_plane(struct drm_plane *plane)
+ {
+ 	struct drm_device *dev = plane->dev;
+ 	struct intel_plane *intel_plane = to_intel_plane(plane);
+ 	struct intel_crtc *intel_crtc;
++	struct intel_plane *intel_plane_wq;
+ 
+ 	if (!plane->fb)
+ 		return 0;
+@@ -1503,23 +1550,32 @@ intel_disable_plane(struct drm_plane *plane)
+ 		return -EINVAL;
+ 
+ 	intel_crtc = to_intel_crtc(plane->crtc);
++	intel_plane_wq = kzalloc(sizeof(*intel_plane_wq), GFP_KERNEL);
++	if (!intel_plane_wq)
++		return -ENOMEM;
++
++	/* To support deffered plane disable */
++	INIT_WORK(&intel_plane_wq->work, intel_disable_plane_unpin_work_fn);
+ 
+ 	if (intel_crtc->active) {
+ 		bool primary_was_enabled = intel_crtc->primary_enabled;
+-
+ 		intel_crtc->primary_enabled = true;
+-
+ 		intel_plane->disable_plane(plane, plane->crtc);
+-
+ 		if (!primary_was_enabled && intel_crtc->primary_enabled)
+ 			intel_post_enable_primary(plane->crtc);
+ 	}
+ 
+ 	mutex_lock(&dev->struct_mutex);
+-	if (intel_plane->obj) {
+-		intel_plane_queue_unpin(intel_plane, intel_plane->obj);
+-		intel_plane->obj = NULL;
+-	}
++
++	intel_plane_wq->base.dev = plane->dev;
++	intel_plane_wq->old_obj = intel_plane->old_obj;
++	intel_plane_wq->obj = intel_plane->obj;
++	intel_plane_wq->pipe = intel_plane->pipe;
++
++	intel_plane->obj = NULL;
++	intel_plane->old_obj = NULL;
++
++	schedule_work(&intel_plane_wq->work);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	return 0;
+-- 
+1.7.9.5
+

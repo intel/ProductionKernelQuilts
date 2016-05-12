@@ -1,0 +1,142 @@
+From 592cb823c6591f2a95ccd76d902dc211f04c354d Mon Sep 17 00:00:00 2001
+Message-Id: <592cb823c6591f2a95ccd76d902dc211f04c354d.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Wed, 26 Mar 2014 11:36:37 -0700
+Subject: [PATCH 19/68] FROM_UPSTREAM [VPG]: drm/i915/bdw: Use dynamic
+ allocation idioms on free
+
+The page directory freer is left here for now as it's still useful given
+that GEN8 still preallocates. Once the allocation functions are broken
+up into more discrete chunks, we'll follow suit and destroy this
+leftover piece.
+
+v2: Match trace_i915_va_teardown params
+v3: Multiple rebases.
+v4: Updated to use unmap_and_free_pt.
+v5: teardown_va_range logic no longer needed.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com> (v2+)
+
+This is a backport of v4 of "PPGTT dynamic page allocations" posted in
+intel-gfx.
+
+Change-Id: I6eeff8cf1739211d61e0d0421b71804bfa57f4e7
+Upstream-repo: https://www.mail-archive.com/intel-gfx@lists.freedesktop.org/msg51908.html
+Upstream-commit: none
+Upstream-as-of-tag: none
+For: GMINL-5449
+For: VIZ-4619
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_gtt.c |   26 +++++++++----------
+ drivers/gpu/drm/i915/i915_gem_gtt.h |   47 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index f3159be..4845e96 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -545,19 +545,6 @@ static void gen8_free_page_tables(struct i915_page_directory_entry *pd, struct d
+ 	}
+ }
+ 
+-static void gen8_ppgtt_free(struct i915_hw_ppgtt *ppgtt)
+-{
+-	int i;
+-
+-	for (i = 0; i < ppgtt->num_pd_pages; i++) {
+-		if (WARN_ON(!ppgtt->pdp.page_directory[i]))
+-			continue;
+-
+-		gen8_free_page_tables(ppgtt->pdp.page_directory[i], ppgtt->base.dev);
+-		unmap_and_free_pd(ppgtt->pdp.page_directory[i]);
+-	}
+-}
+-
+ static void gen8_ppgtt_unmap_pages(struct i915_hw_ppgtt *ppgtt)
+ {
+ 	struct pci_dev *hwdev = ppgtt->base.dev->pdev;
+@@ -590,6 +577,19 @@ static void gen8_ppgtt_unmap_pages(struct i915_hw_ppgtt *ppgtt)
+ 	}
+ }
+ 
++static void gen8_ppgtt_free(struct i915_hw_ppgtt *ppgtt)
++{
++	int i;
++
++	for (i = 0; i < ppgtt->num_pd_pages; i++) {
++		if (WARN_ON(!ppgtt->pdp.page_directory[i]))
++			continue;
++
++		gen8_free_page_tables(ppgtt->pdp.page_directory[i], ppgtt->base.dev);
++		unmap_and_free_pd(ppgtt->pdp.page_directory[i]);
++	}
++}
++
+ static void gen8_ppgtt_cleanup(struct i915_address_space *vm)
+ {
+ 	struct i915_hw_ppgtt *ppgtt =
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index 66904dd..56759e2 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -364,6 +364,53 @@ static inline uint32_t gen6_pde_index(uint32_t addr)
+ 	return i915_pde_index(addr, GEN6_PDE_SHIFT);
+ }
+ 
++#define gen8_for_each_pde(pt, pd, start, length, temp, iter)		\
++	for (iter = gen8_pde_index(start), pt = (pd)->page_tables[iter]; \
++	     length > 0 && iter < GEN8_PDES_PER_PAGE;			\
++	     pt = (pd)->page_tables[++iter],				\
++	     temp = ALIGN(start+1, 1 << GEN8_PDE_SHIFT) - start,	\
++	     temp = min(temp, length),					\
++	     start += temp, length -= temp)
++
++#define gen8_for_each_pdpe(pd, pdp, start, length, temp, iter)		\
++	for (iter = gen8_pdpe_index(start), pd = (pdp)->page_directory[iter];	\
++	     length > 0 && iter < GEN8_LEGACY_PDPES;			\
++	     pd = (pdp)->page_directory[++iter],				\
++	     temp = ALIGN(start+1, 1 << GEN8_PDPE_SHIFT) - start,	\
++	     temp = min(temp, length),					\
++	     start += temp, length -= temp)
++
++/* Clamp length to the next page_directory boundary */
++static inline uint64_t gen8_clamp_pd(uint64_t start, uint64_t length)
++{
++	uint64_t next_pd = ALIGN(start + 1, 1 << GEN8_PDPE_SHIFT);
++
++	if (next_pd > (start + length))
++		return length;
++
++	return next_pd - start;
++}
++
++static inline uint32_t gen8_pte_index(uint64_t address)
++{
++	return i915_pte_index(address, GEN8_PDE_SHIFT);
++}
++
++static inline uint32_t gen8_pde_index(uint64_t address)
++{
++	return i915_pde_index(address, GEN8_PDE_SHIFT);
++}
++
++static inline uint32_t gen8_pdpe_index(uint64_t address)
++{
++	return (address >> GEN8_PDPE_SHIFT) & GEN8_PDPE_MASK;
++}
++
++static inline uint32_t gen8_pml4e_index(uint64_t address)
++{
++	BUG(); /* For 64B */
++}
++
+ int i915_gem_gtt_init(struct drm_device *dev);
+ void i915_gem_init_global_gtt(struct drm_device *dev);
+ int i915_gem_setup_global_gtt(struct drm_device *dev, unsigned long start,
+-- 
+1.7.9.5
+

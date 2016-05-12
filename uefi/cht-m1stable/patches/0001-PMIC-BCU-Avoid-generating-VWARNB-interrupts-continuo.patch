@@ -1,0 +1,130 @@
+From e35d373d2dfdf6c0dbe643e285d6146bd79659dd Mon Sep 17 00:00:00 2001
+From: Albin B <albin.bala.krishnan@intel.com>
+Date: Thu, 18 Dec 2014 16:22:44 +0530
+Subject: [PATCH 1/1] PMIC-BCU: Avoid generating VWARNB interrupts continuously
+
+When the battery is low and High power UC are running, we get repetitive
+interrupts for voltage spikes on Vsys due to repetitive crossing of
+VWARNB threshold. Based on experiments conducted 30 sec duration is good
+enough to get in normal state. Without this VWARNB interrupt will occur
+continuously (for low and recovery).
+
+Hence, masking the VWARNB interrupt for 30seconds to reduce repetitive
+interrupts.
+
+Change-Id: I8309553d878b32c4be2bd2b2fe63c8a6d8d0ba0e
+Tracked-on: https://jira01.devtools.intel.com/browse/IMINAN-14181
+Signed-off-by: Albin B <albin.bala.krishnan@intel.com>
+---
+ arch/x86/include/asm/intel_wcove_bcu.h |  3 +++
+ drivers/hwmon/intel_wcove_bcu.c        | 44 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/intel_wcove_bcu.h b/arch/x86/include/asm/intel_wcove_bcu.h
+index 851a29a2eb69..afbecdcd73fa 100644
+--- a/arch/x86/include/asm/intel_wcove_bcu.h
++++ b/arch/x86/include/asm/intel_wcove_bcu.h
+@@ -72,6 +72,9 @@
+ /* Max number register from platform config */
+ #define MAX_BCUCFG_REGS         10
+ 
++/* delay interval for unmasking vwarnb interrupt */
++#define VWARNB_INTR_EN_DELAY    (30 * HZ)
++
+ /* check whether bit is sticky or not by checking bit 2 */
+ #define IS_BCUDISB_STICKY(data)		(!!(data & B2))
+ 
+diff --git a/drivers/hwmon/intel_wcove_bcu.c b/drivers/hwmon/intel_wcove_bcu.c
+index 91687d9d6d52..63e27b46b0a1 100644
+--- a/drivers/hwmon/intel_wcove_bcu.c
++++ b/drivers/hwmon/intel_wcove_bcu.c
+@@ -45,6 +45,7 @@ static DEFINE_MUTEX(bcu_update_lock);
+ struct wcpmic_bcu_info {
+ 	struct device *dev;
+ 	struct platform_device *pdev;
++	struct delayed_work vwarnb_irq_work;
+ 	int irq;
+ };
+ 
+@@ -338,6 +339,24 @@ static inline int wcove_bcu_action_voltage_drop(void)
+ 	return 0;
+ }
+ 
++/**
++ * wcove_bcu_vwarnb_irq_work: delayed work queue function, which is used to
++ * unmask (enable) the VWARN2 interrupt after the specified delay time while
++ * scheduling.
++ */
++static void wcove_bcu_vwarnb_irq_work(struct work_struct *work)
++{
++	int ret = 0;
++	struct wcpmic_bcu_info *info = container_of(work,
++						struct wcpmic_bcu_info,
++						vwarnb_irq_work.work);
++
++	/* Unmasking BCU VWARNB Interrupt, for the next interrupt occurrence */
++	ret = intel_soc_pmic_clearb(MBCUIRQ_REG, (u8)MVWARNB);
++	if (ret)
++		dev_err(info->dev, "Error in unmasking vwarnb interrupt\n");
++}
++
+ static void wcove_bcu_handle_vwarnb_event(void *dev_data, u8 status)
+ {
+ 	int beh_data, ret;
+@@ -359,7 +378,28 @@ static void wcove_bcu_handle_vwarnb_event(void *dev_data, u8 status)
+ 			if (ret)
+ 				goto fail;
+ 		}
++	} else {
++
++		dev_warn(info->dev, "VWARNB Event has occured\n");
++		/**
++		 * Masking BCU VWARNB Interrupt, to avoid multiple VWARNB
++		 * interrupt occurrence continuously.
++		 */
++		ret = intel_soc_pmic_setb(MBCUIRQ_REG, (u8)MVWARNB);
++		if (ret) {
++			dev_err(info->dev, "Error in masking vwarnb interrupt\n");
++			goto fail;
++		}
++
++		cancel_delayed_work_sync(&info->vwarnb_irq_work);
++		/**
++		 * Schedule the work to re-enable the VWARN2 interrupt after
++		 * 30sec delay
++		 */
++		schedule_delayed_work(&info->vwarnb_irq_work,
++					VWARNB_INTR_EN_DELAY);
+ 	}
++
+ 	return;
+ fail:
+ 	dev_err(info->dev, "Register read/write failed:func:%s()\n", __func__);
+@@ -404,7 +444,6 @@ static void wcove_bcu_handle_vwarn_event(void *dev_data, int event)
+ 	dev_dbg(info->dev, "SBCUIRQ_REG: %x\n", irq_status);
+ 
+ 	if (event == VWARNB) {
+-		dev_info(info->dev, "VWARNB Event has occured\n");
+ 		wcove_bcu_handle_vwarnb_event(dev_data, irq_status);
+ 	} else if (event == VWARNA) {
+ 		dev_info(info->dev, "VWARNA Event has occured\n");
+@@ -525,6 +564,8 @@ static int wcove_bcu_probe(struct platform_device *pdev)
+ 	/* enable voltage and current trip points */
+ 	wcove_bcu_enable_trip_points(info);
+ 
++	INIT_DELAYED_WORK(&info->vwarnb_irq_work, wcove_bcu_vwarnb_irq_work);
++
+ 	/* Create debufs for the basincove bcu registers */
+ 	wcove_bcu_create_debugfs(info);
+ 	return 0;
+@@ -546,6 +587,7 @@ static int wcove_bcu_remove(struct platform_device *pdev)
+ 	if (info) {
+ 		free_irq(info->irq, info);
+ 		wcove_bcu_remove_debugfs(info);
++		cancel_delayed_work_sync(&info->vwarnb_irq_work);
+ 		hwmon_device_unregister(info->dev);
+ 		devm_kfree(&pdev->dev, (void *)info);
+ 	}
+-- 
+1.9.1
+

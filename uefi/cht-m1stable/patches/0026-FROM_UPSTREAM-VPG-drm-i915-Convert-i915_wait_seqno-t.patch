@@ -1,0 +1,305 @@
+From 5dcbb89ab5bc5551fc2034014e63ed9d7bcc07f1 Mon Sep 17 00:00:00 2001
+Message-Id: <5dcbb89ab5bc5551fc2034014e63ed9d7bcc07f1.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Wed, 26 Nov 2014 14:17:05 +0100
+Subject: [PATCH 26/63] FROM_UPSTREAM [VPG]: drm/i915: Convert i915_wait_seqno
+ to i915_wait_request
+
+Updated i915_wait_seqno() to take a request structure instead of a seqno value
+and renamed it accordingly. Internally, it just pulls the seqno out of the
+request and calls on to __wait_seqno() as before. However, all the code further
+up the stack is now simplified as it can just pass the request object straight
+through without having to peek inside.
+
+Change-Id: I2821d9bd2e1a7bba684b81f0e7a33ddc870b9570
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+[danvet: Squash in hunk from an earlier patch which was rebased
+wrongly.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: a4b3a5713d9f1ca94762b468117f918d3b15e5c4
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_drv.h         |   19 +---------------
+ drivers/gpu/drm/i915/i915_gem.c         |   38 ++++++++++++++++---------------
+ drivers/gpu/drm/i915/intel_huc_chv.c    |    8 ++++---
+ drivers/gpu/drm/i915/intel_lrc.c        |    6 ++---
+ drivers/gpu/drm/i915/intel_overlay.c    |   11 +++------
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   14 +++++-------
+ 6 files changed, 37 insertions(+), 59 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index fc1cb56b..6ae687a 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2650,8 +2650,7 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 		       u32 *seqno);
+ #define i915_add_request(ring, seqno) \
+ 	__i915_add_request(ring, NULL, NULL, seqno)
+-int __must_check i915_wait_seqno(struct intel_engine_cs *ring,
+-				 uint32_t seqno);
++int __must_check i915_wait_request(struct drm_i915_gem_request *req);
+ int i915_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+ int __must_check
+ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj,
+@@ -3241,20 +3240,4 @@ wait_remaining_ms_from_jiffies(unsigned long timestamp_jiffies, int to_wait_ms)
+ 
+ void intel_chv_huc_load(struct drm_device *dev);
+ 
+-/* XXX: Temporary solution to be removed later in patch series. */
+-static inline int __must_check i915_gem_check_ols(
+-				     struct intel_engine_cs *ring, u32 seqno)
+-{
+-	int ret;
+-
+-	WARN_ON(!mutex_is_locked(&ring->dev->struct_mutex));
+-
+-	ret = 0;
+-	if (seqno == i915_gem_request_get_seqno(ring->outstanding_lazy_request))
+-		ret = i915_add_request(ring, NULL);
+-
+-	return ret;
+-}
+-/* XXX: Temporary solution to be removed later in patch series. */
+-
+ #endif
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 4d3546b..b5b6500 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1324,31 +1324,39 @@ static int __wait_seqno(struct intel_engine_cs *ring, u32 seqno,
+ }
+ 
+ /**
+- * Waits for a sequence number to be signaled, and cleans up the
++ * Waits for a request to be signaled, and cleans up the
+  * request and object lists appropriately for that event.
+  */
+ int
+-i915_wait_seqno(struct intel_engine_cs *ring, uint32_t seqno)
++i915_wait_request(struct drm_i915_gem_request *req)
+ {
+-	struct drm_device *dev = ring->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	bool interruptible = dev_priv->mm.interruptible;
++	struct drm_device *dev;
++	struct drm_i915_private *dev_priv;
++	bool interruptible;
+ 	int ret;
+ 
++	BUG_ON(req == NULL);
++
++	dev = req->ring->dev;
++	dev_priv = dev->dev_private;
++	interruptible = dev_priv->mm.interruptible;
++
+ 	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
+-	BUG_ON(seqno == 0);
+ 
+ 	ret = i915_gem_wedged(dev, interruptible);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = i915_gem_check_ols(ring, seqno);
++	ret = i915_gem_check_olr(req);
+ 	if (ret)
+ 		return ret;
+ 
+-	return __wait_seqno(ring, seqno,
+-			    atomic_read(&dev_priv->gpu_error.reset_counter),
+-			    interruptible, NULL, NULL);
++	i915_gem_request_reference(req);
++	ret = __wait_seqno(req->ring, i915_gem_request_get_seqno(req),
++			   atomic_read(&dev_priv->gpu_error.reset_counter),
++			   interruptible, NULL, NULL);
++	i915_gem_request_unreference(req);
++	return ret;
+ }
+ 
+ static int
+@@ -1378,18 +1386,13 @@ i915_gem_object_wait_rendering(struct drm_i915_gem_object *obj,
+ 			       bool readonly)
+ {
+ 	struct drm_i915_gem_request *req;
+-	struct intel_engine_cs *ring = obj->ring;
+-	u32 seqno;
+ 	int ret;
+ 
+ 	req = readonly ? obj->last_write_req : obj->last_read_req;
+ 	if (!req)
+ 		return 0;
+ 
+-	seqno = i915_gem_request_get_seqno(req);
+-	WARN_ON(seqno == 0);
+-
+-	ret = i915_wait_seqno(ring, seqno);
++	ret = i915_wait_request(req);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -3387,8 +3390,7 @@ static int
+ i915_gem_object_wait_fence(struct drm_i915_gem_object *obj)
+ {
+ 	if (obj->last_fenced_req) {
+-		int ret = i915_wait_seqno(obj->ring,
+-			   i915_gem_request_get_seqno(obj->last_fenced_req));
++		int ret = i915_wait_request(obj->last_fenced_req);
+ 		if (ret)
+ 			return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_huc_chv.c b/drivers/gpu/drm/i915/intel_huc_chv.c
+index 6dcf727..3ea86a2 100644
+--- a/drivers/gpu/drm/i915/intel_huc_chv.c
++++ b/drivers/gpu/drm/i915/intel_huc_chv.c
+@@ -180,7 +180,7 @@ static void finish_chv_huc_load(const struct firmware *fw, void *context)
+ 	struct intel_engine_cs *ring;
+ 	struct intel_context *ctx;
+ 	struct intel_ringbuffer *ringbuf;
+-	u32 seqno;
++	struct drm_i915_gem_request *req;
+ 	u32 fw_size;
+ 	int ret;
+ 
+@@ -218,11 +218,13 @@ static void finish_chv_huc_load(const struct firmware *fw, void *context)
+ 	if (ret)
+ 		HUC_ERROR_OUT("add huc commands failed");
+ 
+-	ret = __i915_add_request(ring, NULL, ringbuf->obj, &seqno);
++	req = intel_ring_get_request(ring);
++
++	ret = __i915_add_request(ring, NULL, ringbuf->obj, NULL);
+ 	if (ret)
+ 		HUC_ERROR_OUT("Failed to add request");
+ 
+-	ret = i915_wait_seqno(ring, seqno);
++	ret = i915_wait_request(req);
+ 	if (ret)
+ 		HUC_ERROR_OUT("Commands didn't finish executing");
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 2089348..004c5a9 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1293,7 +1293,6 @@ static int logical_ring_wait_request(struct intel_ringbuffer *ringbuf,
+ {
+ 	struct intel_engine_cs *ring = ringbuf->ring;
+ 	struct drm_i915_gem_request *request;
+-	u32 seqno = 0;
+ 	int ret;
+ 
+ 	if (intel_ring_space(ringbuf) >= bytes)
+@@ -1312,15 +1311,14 @@ static int logical_ring_wait_request(struct intel_ringbuffer *ringbuf,
+ 		/* Would completion of this request free enough space? */
+ 		if (__intel_ring_space(request->tail, ringbuf->tail,
+ 				       ringbuf->size) >= bytes) {
+-			seqno = request->seqno;
+ 			break;
+ 		}
+ 	}
+ 
+-	if (seqno == 0)
++	if (&request->list == &ring->request_list)
+ 		return -ENOSPC;
+ 
+-	ret = i915_wait_seqno(ring, seqno);
++	ret = i915_wait_request(request);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_overlay.c b/drivers/gpu/drm/i915/intel_overlay.c
+index ebf8dea..2d55329 100644
+--- a/drivers/gpu/drm/i915/intel_overlay.c
++++ b/drivers/gpu/drm/i915/intel_overlay.c
+@@ -224,8 +224,7 @@ static int intel_overlay_do_wait_request(struct intel_overlay *overlay,
+ 		return ret;
+ 
+ 	overlay->flip_tail = tail;
+-	ret = i915_wait_seqno(ring,
+-			 i915_gem_request_get_seqno(overlay->last_flip_req));
++	ret = i915_wait_request(overlay->last_flip_req);
+ 	if (ret)
+ 		return ret;
+ 	i915_gem_retire_requests(dev);
+@@ -367,19 +366,15 @@ static int intel_overlay_off(struct intel_overlay *overlay)
+  * We have to be careful not to repeat work forever an make forward progess. */
+ static int intel_overlay_recover_from_interrupt(struct intel_overlay *overlay)
+ {
+-	struct drm_device *dev = overlay->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_engine_cs *ring = &dev_priv->ring[RCS];
+ 	int ret;
+ 
+ 	if (overlay->last_flip_req == NULL)
+ 		return 0;
+ 
+-	ret = i915_wait_seqno(ring,
+-			 i915_gem_request_get_seqno(overlay->last_flip_req));
++	ret = i915_wait_request(overlay->last_flip_req);
+ 	if (ret)
+ 		return ret;
+-	i915_gem_retire_requests(dev);
++	i915_gem_retire_requests(overlay->dev);
+ 
+ 	if (overlay->flip_tail)
+ 		overlay->flip_tail(overlay);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 46be344..d2d9892 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2246,7 +2246,6 @@ static int intel_ring_wait_request(struct intel_engine_cs *ring, int n)
+ {
+ 	struct intel_ringbuffer *ringbuf = ring->buffer;
+ 	struct drm_i915_gem_request *request;
+-	u32 seqno = 0;
+ 	int ret;
+ 
+ 	if (intel_ring_space(ringbuf) >= n)
+@@ -2255,15 +2254,14 @@ static int intel_ring_wait_request(struct intel_engine_cs *ring, int n)
+ 	list_for_each_entry(request, &ring->request_list, list) {
+ 		if (__intel_ring_space(request->tail, ringbuf->tail,
+ 				       ringbuf->size) >= n) {
+-			seqno = request->seqno;
+ 			break;
+ 		}
+ 	}
+ 
+-	if (seqno == 0)
++	if (&request->list == &ring->request_list)
+ 		return -ENOSPC;
+ 
+-	ret = i915_wait_seqno(ring, seqno);
++	ret = i915_wait_request(request);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2357,7 +2355,7 @@ static int intel_wrap_ring_buffer(struct intel_engine_cs *ring)
+ 
+ int intel_ring_idle(struct intel_engine_cs *ring)
+ {
+-	u32 seqno;
++	struct drm_i915_gem_request *req;
+ 	int ret;
+ 
+ 	/* We need to add any requests required to flush the objects and ring */
+@@ -2371,11 +2369,11 @@ int intel_ring_idle(struct intel_engine_cs *ring)
+ 	if (list_empty(&ring->request_list))
+ 		return 0;
+ 
+-	seqno = list_entry(ring->request_list.prev,
++	req = list_entry(ring->request_list.prev,
+ 			   struct drm_i915_gem_request,
+-			   list)->seqno;
++			   list);
+ 
+-	return i915_wait_seqno(ring, seqno);
++	return i915_wait_request(req);
+ }
+ 
+ int
+-- 
+1.7.9.5
+

@@ -1,0 +1,224 @@
+From e8889739f8e21072469cb21545d4b9d44c97903e Mon Sep 17 00:00:00 2001
+From: Jianxu Zheng <jian.xu.zheng@intel.com>
+Date: Sat, 7 Feb 2015 19:02:27 +0800
+Subject: [PATCH 262/269] atomisp2: change HPLL acquire method
+
+2 especially cases of HPLL frequency.
+One is BYT CR, HPLL frequency is 2000MHZ.
+Another is CHT, HPLL frequency is able to be acquired
+from CCK Fuse registers by Sideband.
+
+Other platforms should be 1600MHz as default.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-20951
+Change-Id: I5242a2e72bcc2fca617eadcda8938aba9ad1d55a
+Signed-off-by: Jianxu Zheng <jian.xu.zheng@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/39892
+Reviewed-by: Jing Tao <jing.tao@intel.com>
+Integrator: Wei Tao <wei.tao@intel.com>
+Approver: Wei Tao <wei.tao@intel.com>
+Build: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+Maintainer: Wei Tao <wei.tao@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp-regs.h     | 10 ++++-
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.c      | 30 ++++----------
+ .../pci/atomisp2/atomisp_driver/atomisp_internal.h |  1 +
+ .../pci/atomisp2/atomisp_driver/atomisp_v4l2.c     | 48 ++++++++++++++++------
+ 4 files changed, 52 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp-regs.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp-regs.h
+index 82edeb1..2ea28ce 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp-regs.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp-regs.h
+@@ -24,6 +24,7 @@
+ 
+ /* common register definitions */
+ #define PUNIT_PORT		0x04
++#define CCK_PORT		0x14
+ 
+ #define PCICMDSTS		0x01
+ #define INTR			0x0f
+@@ -147,8 +148,13 @@
+ #define ISP_FREQ_320MHZ				0x140
+ #define ISP_FREQ_266MHZ				0x10a
+ #define ISP_FREQ_200MHZ				0xc8
+-#define HPLL_FREQ				0x640
+-#define HPLL_FREQ_CR				0x7D0
++
++#define HPLL_FREQ_800MHZ			0x320
++#define HPLL_FREQ_1600MHZ			0x640
++#define HPLL_FREQ_2000MHZ			0x7D0
++
++#define CCK_FUSE_REG_0			0x08
++#define CCK_FUSE_HPLL_FREQ_MASK		0x03
+ 
+ #if defined(ISP2401)
+ #define ISP_FREQ_MAX	ISP_FREQ_320MHZ
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index 20f73eb..3c2a240 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -183,14 +183,12 @@ static int write_target_freq_to_hw(struct atomisp_device *isp,
+ 				   unsigned int new_freq)
+ {
+ 	unsigned int ratio, timeout, guar_ratio;
+-#ifndef CONFIG_GMIN_INTEL_MID
+-	unsigned int hpll_freq;
+-#endif
+-#ifdef CONFIG_GMIN_INTEL_MID
+-	unsigned int base_freq = atomisp_punit_hpll_freq;
+-#endif
+ 	u32 isp_sspm1 = 0;
+ 	int i;
++	if (!isp->hpll_freq) {
++		dev_err(isp->dev, "failed to get hpll_freq. no change to freq\n");
++		return -EINVAL;
++	}
+ 
+ 	isp_sspm1 = intel_mid_msgbus_read32(PUNIT_PORT, ISPSSPM1);
+ 	if (isp_sspm1 & ISP_FREQ_VALID_MASK) {
+@@ -199,23 +197,9 @@ static int write_target_freq_to_hw(struct atomisp_device *isp,
+ 				    isp_sspm1 & ~(1 << ISP_FREQ_VALID_OFFSET));
+ 	}
+ 
+-#ifndef CONFIG_GMIN_INTEL_MID
+-	if (INTEL_MID_BOARD(3, TABLET, BYT, BLK, PRO, CRV2) ||
+-		INTEL_MID_BOARD(3, TABLET, BYT, BLK, ENG, CRV2))
+-		hpll_freq = HPLL_FREQ_CR;
+-	else
+-		hpll_freq = HPLL_FREQ;
+-#endif
+-#ifndef CONFIG_GMIN_INTEL_MID
+-	ratio = (2 * hpll_freq + new_freq / 2) / new_freq - 1;
+-#else
+-	ratio =  (2 * base_freq + new_freq / 2) / new_freq - 1;
+-#endif
+-#ifndef CONFIG_GMIN_INTEL_MID
+-	guar_ratio = (2 * hpll_freq + 200 / 2) / 200 - 1;
+-#else
+-	guar_ratio = (2 * base_freq + 200 / 2) / 200 - 1;
+-#endif
++	ratio = (2 * isp->hpll_freq + new_freq / 2) / new_freq - 1;
++	guar_ratio = (2 * isp->hpll_freq + 200 / 2) / 200 - 1;
++
+ 	isp_sspm1 = intel_mid_msgbus_read32(PUNIT_PORT, ISPSSPM1);
+ 	isp_sspm1 &= ~(0x1F << ISP_REQ_FREQ_OFFSET);
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h
+index 4c2453d..aac74ea 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h
+@@ -305,6 +305,7 @@ struct atomisp_device {
+ 
+ 	unsigned int mipi_frame_size;
+ 	const struct atomisp_dfs_config *dfs;
++	unsigned int hpll_freq;
+ 
+ 	bool css_initialized;
+ };
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_v4l2.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_v4l2.c
+index 26194f7..977688e 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_v4l2.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_v4l2.c
+@@ -1180,7 +1180,7 @@ static int atomisp_pci_probe(struct pci_dev *dev,
+ 	struct atomisp_device *isp;
+ 	unsigned int start;
+ 	void __iomem *base;
+-	int err;
++	int err, val;
+ 	u32 irq;
+ 
+ 	if (!dev) {
+@@ -1190,15 +1190,6 @@ static int atomisp_pci_probe(struct pci_dev *dev,
+ 
+ 	if (!is_valid_device(dev, id))
+ 		return -ENODEV;
+-#ifdef CONFIG_GMIN_INTEL_MID
+-	/* HPLL frequency is known to be device-specific, but we don't
+-	 * have specs yet for exactly how it varies.  Default to
+-	 * BYT-CR but let provisioning set it via EFI variable */
+-	atomisp_punit_hpll_freq = gmin_get_var_int(&dev->dev, "HpllFreq",
+-			HPLL_FREQ_CR);
+-	dev_info(&dev->dev, "ISP HPLL frequency base = %d MHz\n",
+-			atomisp_punit_hpll_freq);
+-#endif
+ 	/* Pointer to struct device. */
+ 	atomisp_dev = &dev->dev;
+ 
+@@ -1271,6 +1262,7 @@ static int atomisp_pci_probe(struct pci_dev *dev,
+ 			isp->dfs = &dfs_config_merr;
+ 			break;
+ 		}
++		isp->hpll_freq = HPLL_FREQ_1600MHZ;
+ 		break;
+ 	case ATOMISP_PCI_DEVICE_SOC_BYT:
+ 		isp->media_dev.hw_revision =
+@@ -1278,10 +1270,21 @@ static int atomisp_pci_probe(struct pci_dev *dev,
+ 			 << ATOMISP_HW_REVISION_SHIFT) |
+ 			ATOMISP_HW_STEPPING_B0;
+ 		if (INTEL_MID_BOARD(3, TABLET, BYT, BLK, PRO, CRV2) ||
+-				INTEL_MID_BOARD(3, TABLET, BYT, BLK, ENG, CRV2))
++			INTEL_MID_BOARD(3, TABLET, BYT, BLK, ENG, CRV2)) {
+ 			isp->dfs = &dfs_config_byt_cr;
+-		else
++			isp->hpll_freq = HPLL_FREQ_2000MHZ;
++		} else {
+ 			isp->dfs = &dfs_config_byt;
++			isp->hpll_freq = HPLL_FREQ_1600MHZ;
++		}
++#ifdef CONFIG_GMIN_INTEL_MID
++		/* HPLL frequency is known to be device-specific, but we don't
++		 * have specs yet for exactly how it varies.  Default to
++		 * BYT-CR but let provisioning set it via EFI variable */
++		isp->hpll_freq = gmin_get_var_int(&dev->dev, "HpllFreq",
++					HPLL_FREQ_2000MHZ);
++#endif
++
+ 		/*
+ 		 * for BYT/CHT we are put isp into D3cold to avoid pci registers access
+ 		 * in power off. Set d3cold_delay to 0 since default 100ms is not
+@@ -1300,6 +1303,7 @@ static int atomisp_pci_probe(struct pci_dev *dev,
+ 		isp->media_dev.hw_revision |= isp->pdev->revision < 2 ?
+ 			ATOMISP_HW_STEPPING_A0 : ATOMISP_HW_STEPPING_B0;
+ 		isp->dfs = &dfs_config_merr;
++		isp->hpll_freq = HPLL_FREQ_1600MHZ;
+ 		break;
+ 	case ATOMISP_PCI_DEVICE_SOC_CHT:
+ 		isp->media_dev.hw_revision = (
+@@ -1314,12 +1318,32 @@ static int atomisp_pci_probe(struct pci_dev *dev,
+ 
+ 		isp->dfs = &dfs_config_cht;
+ 		isp->pdev->d3cold_delay = 0;
++
++		val = intel_mid_msgbus_read32(CCK_PORT, CCK_FUSE_REG_0);
++		switch (val & CCK_FUSE_HPLL_FREQ_MASK) {
++		case 0x00:
++			isp->hpll_freq = HPLL_FREQ_800MHZ;
++			break;
++		case 0x01:
++			isp->hpll_freq = HPLL_FREQ_1600MHZ;
++			break;
++		case 0x02:
++			isp->hpll_freq = HPLL_FREQ_2000MHZ;
++			break;
++		default:
++			isp->hpll_freq = HPLL_FREQ_1600MHZ;
++			dev_warn(isp->dev,
++				 "read HPLL from cck failed.default 1600MHz.\n");
++		}
+ 		break;
+ 	default:
+ 		dev_err(&dev->dev, "un-supported IUNIT device\n");
+ 		return -ENODEV;
+ 	}
+ 
++	dev_info(&dev->dev, "ISP HPLL frequency base = %d MHz\n",
++		 isp->hpll_freq);
++
+ 	isp->max_isr_latency = ATOMISP_MAX_ISR_LATENCY;
+ #ifndef CONFIG_GMIN_INTEL_MID /* No spid in gmin, nor CLVT support */
+ 	if (pdata &&
+-- 
+1.9.1
+

@@ -1,0 +1,116 @@
+From febe01af30a07450a3bd125e978275986fdd1167 Mon Sep 17 00:00:00 2001
+Message-Id: <febe01af30a07450a3bd125e978275986fdd1167.1432314923.git.chang-joon.lee@intel.com>
+In-Reply-To: <7faf8aeff66f21d5f967a1a95177386ec39f5187.1432314923.git.chang-joon.lee@intel.com>
+References: <7faf8aeff66f21d5f967a1a95177386ec39f5187.1432314923.git.chang-joon.lee@intel.com>
+From: Durgadoss R <durgadoss.r@intel.com>
+Date: Mon, 18 May 2015 13:47:56 +0530
+Subject: [PATCH 2/5] REVERTME: [VPG]: drm/i915: Continue Audio playback on
+ HDMI during DPMS Off
+
+Audio playback on HDMI stops when the Display goes off.
+As per our requirement, Audio should still continue on
+HDMI even when display is off.
+
+This patch ignores DPMS off on HDMI if audio status
+is busy. Once the Audio playback is done, we do the
+pending DPMS off on HDMI.
+
+Until Audio playback is done, Display cannot enter
+D0i3 since Audio driver also (apart from display)
+takes a rpm_get() for their playback.
+
+This patch is REVERTME because HDMI audio design
+is different in upstream.
+
+Change-Id: Ic1d49454de080291d086417c7ae53770c3948742
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-25957
+Signed-off-by: Durgadoss R <durgadoss.r@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |   17 ++++++++++++++++-
+ drivers/gpu/drm/i915/intel_drv.h     |    3 +++
+ drivers/gpu/drm/i915/intel_pm.c      |   21 +++++++++++++++++++++
+ 3 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 545a588..8d51ae2 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -6005,13 +6005,28 @@ void intel_connector_dpms(struct drm_connector *connector, int mode)
+ {
+ 	struct drm_device *dev = connector->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_connector *intel_connector =
++				to_intel_connector(connector);
++	struct intel_encoder *intel_encoder = intel_connector->encoder;
+ 
+ 	/* All the simple cases only support two dpms states. */
+ 	if (mode != DRM_MODE_DPMS_ON)
+ 		mode = DRM_MODE_DPMS_OFF;
+ 
+-	if (mode == connector->dpms)
++	if (mode == connector->dpms) {
++		intel_connector->dpms_off_pending = false;
+ 		return;
++	}
++
++	/* Ignore DPMS OFF on HDMI if Audio playback is active */
++	if (connector->encoder && intel_encoder->type == INTEL_OUTPUT_HDMI) {
++		intel_connector->dpms_off_pending = false;
++		if (mode == DRM_MODE_DPMS_OFF && mid_hdmi_audio_is_busy(dev)) {
++			DRM_DEBUG_KMS("HDMI Audio active, ignoring DPMS OFF\n");
++			intel_connector->dpms_off_pending = true;
++			return;
++		}
++	}
+ 
+ 	connector->dpms = mode;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 5596f7d..71e3f29 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -247,6 +247,9 @@ struct intel_connector {
+ 	/* since POLL and HPD connectors may use the same HPD line keep the native
+ 	   state of connector->polled in case hotplug storm detection changes it */
+ 	u8 polled;
++
++	/* Whether DPMS off is pending on this ? */
++	bool dpms_off_pending;
+ };
+ 
+ typedef struct dpll {
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index c7eed06..88838b5 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -727,6 +727,27 @@ EXPORT_SYMBOL(ospm_power_using_hw_begin);
+ 
+ void ospm_power_using_hw_end(int hw_island)
+ {
++	struct drm_connector *connector;
++	struct drm_device *dev = gdev;
++
++	if (!dev)
++		return;
++
++	/*
++	 * For DP and HDMI, we ignore the DPMS off if Audio is
++	 * running. Once Audio playback is done, Audio driver comes
++	 * here to drop the rpm reference that it had taken for
++	 * playback. Now, execute our (once ignored) DPMS OFF
++	 * so that Display can enter D0i3.
++	 */
++	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
++		if (connector &&
++			to_intel_connector(connector)->dpms_off_pending) {
++			DRM_DEBUG_KMS("Running the pending DPMS OFF\n");
++			intel_connector_dpms(connector, DRM_MODE_DPMS_OFF);
++		}
++	}
++
+ 	intel_runtime_pm_put(gdev->dev_private);
+ }
+ EXPORT_SYMBOL(ospm_power_using_hw_end);
+-- 
+1.7.9.5
+

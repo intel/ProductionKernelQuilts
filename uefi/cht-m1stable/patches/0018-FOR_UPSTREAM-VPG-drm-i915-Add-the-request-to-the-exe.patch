@@ -1,0 +1,128 @@
+From c41846fc437ee059413e5a6f8b8afdd1074fe596 Mon Sep 17 00:00:00 2001
+Message-Id: <c41846fc437ee059413e5a6f8b8afdd1074fe596.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 10 Dec 2014 15:04:25 +0000
+Subject: [PATCH 18/61] FOR_UPSTREAM [VPG]: drm/i915: Add the request to the
+ execbuffer params structure
+
+When the scheduler starts deferring the execution of batch buffers, the
+outstanding_lazy_request value will not necessarily bear any connection to the
+batch buffer about to be executed. Thus it is necessary to save away the request
+that tracks a given batch buffer for future reference.
+
+Change-Id: If2e3e72e260770dd8a03a272d47d9e4df0e085fe
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    1 +
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   13 +++++++++++--
+ drivers/gpu/drm/i915/intel_lrc.c           |   11 +++++++++--
+ 3 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 6d91addd..5776cdf 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1554,6 +1554,7 @@ struct i915_execbuffer_params {
+ 	uint32_t                        instp_mask;
+ 	int                             instp_mode;
+ 	struct intel_context            *ctx;
++	struct drm_i915_gem_request     *request;
+ };
+ 
+ struct drm_i915_private {
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 4ebe15b..9a2b374 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1152,6 +1152,10 @@ i915_gem_ringbuffer_submission(struct i915_execbuffer_params *params,
+ 
+ 	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 
++	/* Make sure the OLR hasn't advanced (which would indicate a flush
++	 * of the work in progress which in turn would be a Bad Thing). */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
+ 	ret = dev_priv->gt.do_execfinal(params);
+ 	if (ret)
+ 		goto error;
+@@ -1193,6 +1197,10 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++	WARN_ON(params->request == NULL);
++
+ 	/* Start watchdog timer */
+ 	if (params->args_flags & I915_EXEC_ENABLE_WATCHDOG) {
+ 		if (!intel_ring_supports_watchdog(ring)) {
+@@ -1245,7 +1253,7 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 
+ 	/* Flag this request as being active on the ring so the watchdog
+ 	 * code knows where to look if things go wrong. */
+-	ret = i915_write_active_request(ring, intel_ring_get_request(ring));
++	ret = i915_write_active_request(ring, params->request);
+ 	if (ret) {
+ 		DRM_DEBUG_DRIVER("Failed to tag request on ring %d (%d)\n",
+ 				 ring->id, ret);
+@@ -1571,6 +1579,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	ret = dev_priv->gt.alloc_request(ring, ctx);
+ 	if (ret)
+ 		goto err;
++	params->request = ring->outstanding_lazy_request;
+ 
+ 	/* Save assorted stuff away to pass through to *_submission_final() */
+ 	params->dev                     = dev;
+@@ -1608,7 +1617,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 		 * User interrupts will be enabled to make sure that
+ 		 * the timeline is signalled on completion.
+ 		 */
+-		ret = i915_sync_create_fence(ring, intel_ring_get_request(ring),
++		ret = i915_sync_create_fence(ring, params->request,
+ 					     &fd_fence_complete,
+ 					     args->flags & I915_EXEC_RING_MASK);
+ 		if (ret) {
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 26bfbbe..dac94c3 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1384,6 +1384,10 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
+ 
+ 	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 
++	/* Make sure the OLR hasn't advanced (which would indicate a flush
++	 * of the work in progress which in turn would be a Bad Thing). */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++
+ 	ret = dev_priv->gt.do_execfinal(params);
+ 	if (ret)
+ 		return ret;
+@@ -1414,6 +1418,10 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 	/* The mutex must be acquired before calling this function */
+ 	BUG_ON(!mutex_is_locked(&params->dev->struct_mutex));
+ 
++	/* Request matches? */
++	WARN_ON(ring->outstanding_lazy_request != params->request);
++	WARN_ON(params->request == NULL);
++
+ 	/* Start watchdog timer */
+ 	if (params->args_flags & I915_EXEC_ENABLE_WATCHDOG) {
+ 		if (!intel_ring_supports_watchdog(ring)) {
+@@ -1458,8 +1466,7 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 
+ 	/* Flag this request as being active on the ring so the watchdog
+ 	 * code knows where to look if things go wrong. */
+-	ret = logical_ring_write_active_request(ringbuf,
+-						intel_ring_get_request(ring));
++	ret = logical_ring_write_active_request(ringbuf, params->request);
+ 	if (ret) {
+ 		DRM_DEBUG_DRIVER("Failed to tag request on ring %d (%d)\n",
+ 				 ring->id, ret);
+-- 
+1.7.9.5
+

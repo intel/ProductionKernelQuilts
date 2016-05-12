@@ -1,0 +1,119 @@
+From 0700bb75a3725312865f527273a26acb9cc6658e Mon Sep 17 00:00:00 2001
+From: "Wu, Hao" <hao.wu@intel.com>
+Date: Mon, 24 Nov 2014 18:55:24 +0800
+Subject: [PATCH 1/1] xhci-pci: sw workaround for cherrytrail xhci spurious pme
+ issue.
+
+There is one HW issue on cherrytrail xhci, it causes endless
+spurious pme wakeups, then xhci can not stay in runtime suspended
+state. The workaround is, write 1 to PMCTRL.INT_PME_FLAG_CLR bit
+(Internal PME flag clear bit) once controller back to D0.
+
+Change-Id: Ie3c8cbdb8272c472a41aa7c44eb1279e19920b5a
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-10250
+Signed-off-by: Wu, Hao <hao.wu@intel.com>
+---
+ drivers/usb/host/xhci-intel-cap.c | 18 ++++++++++++++++++
+ drivers/usb/host/xhci-intel-cap.h |  4 ++++
+ drivers/usb/host/xhci-pci.c       | 13 +++++++++++++
+ drivers/usb/host/xhci.h           |  1 +
+ 4 files changed, 36 insertions(+)
+
+diff --git a/drivers/usb/host/xhci-intel-cap.c b/drivers/usb/host/xhci-intel-cap.c
+index 87657ed..3c047ea 100644
+--- a/drivers/usb/host/xhci-intel-cap.c
++++ b/drivers/usb/host/xhci-intel-cap.c
+@@ -107,3 +107,21 @@ int xhci_intel_phy_mux_switch(struct xhci_hcd *xhci, int is_device_on)
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(xhci_intel_phy_mux_switch);
++
++/* This function is only used as one workaround for Cherrytrail XHCI spurious
++   pme issue */
++void xhci_intel_clr_internal_pme_flag(struct xhci_hcd *xhci)
++{
++	u32	data;
++
++	if (!xhci || !xhci->phy_mux_regs)
++		return;
++
++	xhci_dbg(xhci, "spurious PME issue workaround\n");
++
++	/* clear internal PME flag, write 1 to PMCTRL.INT_PME_FLAG_CLR */
++	data = readl(xhci->phy_mux_regs + PMCTRL);
++	data |= INT_PME_FLAG_CLR;
++	writel(data, xhci->phy_mux_regs + PMCTRL);
++}
++EXPORT_SYMBOL_GPL(xhci_intel_clr_internal_pme_flag);
+diff --git a/drivers/usb/host/xhci-intel-cap.h b/drivers/usb/host/xhci-intel-cap.h
+index 4a9dbf2..f1a2c12 100644
+--- a/drivers/usb/host/xhci-intel-cap.h
++++ b/drivers/usb/host/xhci-intel-cap.h
+@@ -18,6 +18,9 @@
+ #define XHCI_EXT_CAPS_INTEL_HOST_CAP	192
+ 
+ /* register definition */
++#define PMCTRL			0x34
++#define INT_PME_FLAG_CLR	(1 << 28)
++
+ #define DUAL_ROLE_CFG0		0x68
+ #define SW_VBUS_VALID		(1 << 24)
+ #define SW_IDPIN_EN		(1 << 21)
+@@ -30,3 +33,4 @@
+ 
+ extern int xhci_intel_vendor_cap_init(struct xhci_hcd *xhci);
+ extern int xhci_intel_phy_mux_switch(struct xhci_hcd *xhci, int is_device_on);
++extern void xhci_intel_clr_internal_pme_flag(struct xhci_hcd *xhci);
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index d07968d..72d57f8 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -39,6 +39,8 @@
+ #define PCI_DEVICE_ID_INTEL_LYNXPOINT_XHCI	0x8c31
+ #define PCI_DEVICE_ID_INTEL_LYNXPOINT_LP_XHCI	0x9c31
+ 
++#define PCI_DEVICE_ID_INTEL_CHT_XHCI	0x22b5
++
+ static const char hcd_name[] = "xhci_hcd";
+ 
+ /* called after powerup, by probe or system-pm "wakeup" */
+@@ -148,6 +150,11 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
+ 
+ 		xhci->quirks |= XHCI_SPURIOUS_REBOOT;
+ 	}
++	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
++			pdev->device == PCI_DEVICE_ID_INTEL_CHT_XHCI) {
++		xhci->quirks |= XHCI_SPURIOUS_PME;
++	}
++
+ 	if (pdev->vendor == PCI_VENDOR_ID_ETRON &&
+ 			pdev->device == PCI_DEVICE_ID_ASROCK_P67) {
+ 		xhci->quirks |= XHCI_RESET_ON_RESUME;
+@@ -297,6 +304,12 @@ static int xhci_pci_resume(struct usb_hcd *hcd, bool hibernated)
+ 	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
+ 	int			retval = 0;
+ 
++	/* Due to one HW bug, XHCI will keep generating PME wakeups and fail
++	 * to stay in runtime suspended state, so required to clear the internal
++	 * PME flag once it is back to D0 as the software workaround */
++	if (xhci->quirks & XHCI_SPURIOUS_PME)
++		xhci_intel_clr_internal_pme_flag(xhci);
++
+ 	/* The BIOS on systems with the Intel Panther Point chipset may or may
+ 	 * not support xHCI natively.  That means that during system resume, it
+ 	 * may switch the ports back to EHCI so that users can use their
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 505fda3..d9fcfc0 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1555,6 +1555,7 @@ struct xhci_hcd {
+ #define XHCI_PLAT		(1 << 16)
+ #define XHCI_SLOW_SUSPEND	(1 << 17)
+ #define XHCI_SPURIOUS_WAKEUP	(1 << 18)
++#define XHCI_SPURIOUS_PME	(1 << 19)
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;
+ 	/* There are two roothubs to keep track of bus suspend info for */
+-- 
+1.9.1
+

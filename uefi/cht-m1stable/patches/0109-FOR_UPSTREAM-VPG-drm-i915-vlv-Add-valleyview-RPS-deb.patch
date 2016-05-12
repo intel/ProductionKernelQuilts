@@ -1,0 +1,196 @@
+From d5fdd7285c941424fe6412aeee1dd1a7d9fc9ea1 Mon Sep 17 00:00:00 2001
+Message-Id: <d5fdd7285c941424fe6412aeee1dd1a7d9fc9ea1.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Thu, 20 Feb 2014 14:25:33 +0530
+Subject: [PATCH 109/312] FOR_UPSTREAM [VPG]: drm/i915/vlv: Add valleyview RPS
+ debugfs disabling
+
+This patch exposes a new debugfs interface 'i915_rps_disable'
+Following 2 values shall be echoed into this file.
+'0' - RPS explicitly enabled .
+'1' - RPS explicitly disabled.
+
+This interface provides capabilty to enable/disable Turbo feature
+at runtime, which is needed for its validation.
+
+Issue: VIZ-3403
+Change-Id: Idff952a26c45fd42f1e940a030f9788a073c1bc8
+Signed-off-by: Deepak S <deepak.s@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   45 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h     |    4 ++++
+ drivers/gpu/drm/i915/intel_pm.c     |   43 ++++++++++++++++++++++++++-------
+ 3 files changed, 83 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index b4a1df4..2a72368 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4632,6 +4632,50 @@ DEFINE_SIMPLE_ATTRIBUTE(i915_rps_manual_fops,
+ 			i915_rps_manual_get, i915_rps_manual_set,
+ 			"%llu\n");
+ 
++static int i915_rps_disable_get(void *data, u64 *val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (!IS_VALLEYVIEW(dev))
++		return -ENODEV;
++
++	flush_delayed_work(&dev_priv->rps.delayed_resume_work);
++
++	*val = dev_priv->rps.rps_disable;
++
++	return 0;
++}
++
++static int i915_rps_disable_set(void *data, u64 val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int ret;
++
++	if (!IS_VALLEYVIEW(dev))
++		return -ENODEV;
++
++	flush_delayed_work(&dev_priv->rps.delayed_resume_work);
++
++	DRM_DEBUG_DRIVER("Setting RPS disable %s\n",
++			 val ? "true" : "false");
++
++	ret = mutex_lock_interruptible(&dev_priv->rps.hw_lock);
++	if (ret)
++		return ret;
++
++	vlv_set_rps_mode(dev, val);
++
++	mutex_unlock(&dev_priv->rps.hw_lock);
++
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(i915_rps_disable_fops,
++			i915_rps_disable_get, i915_rps_disable_set,
++			"%llu\n");
++
+ static int i915_rc6_disable_get(void *data, u64 *val)
+ {
+ 	struct drm_device *dev = data;
+@@ -4900,6 +4944,7 @@ static const struct i915_debugfs_files {
+ 	{"i915_min_freq", &i915_min_freq_fops},
+ 	{"i915_cur_freq", &i915_cur_freq_fops},
+ 	{"i915_rps_manual", &i915_rps_manual_fops},
++	{"i915_rps_disable", &i915_rps_disable_fops},
+ 	{"i915_rps_disable_boost", &i915_rps_disable_boost_fops},
+ 	{"i915_rc6_disable", &i915_rc6_disable_fops},
+ 	{"i915_ips_disable", &i915_ips_disable_fops},
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 1b557e7..6e499f8 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -945,6 +945,9 @@ struct intel_gen6_power_mgmt {
+ 	u32 rc6_mask;
+ 	bool rc6_disable;
+ 
++	u32 rps_mask;
++	bool rps_disable;
++
+ 	struct delayed_work delayed_resume_work;
+ 
+ 	/*
+@@ -2730,6 +2733,7 @@ extern void intel_init_pch_refclk(struct drm_device *dev);
+ extern void gen6_set_rc6_mode(struct drm_device *dev, bool disable);
+ extern void vlv_set_rc6_mode(struct drm_device *dev, bool disable);
+ extern void gen6_set_rps_mode(struct drm_device *dev, bool manual);
++extern void vlv_set_rps_mode(struct drm_device *dev, bool disable);
+ extern void gen6_set_rps(struct drm_device *dev, u8 val);
+ extern void valleyview_set_rps(struct drm_device *dev, u8 val);
+ extern int valleyview_rps_max_freq(struct drm_i915_private *dev_priv);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 4a6a743..cffd75f 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -34,6 +34,9 @@
+ #include <drm/i915_powerwell.h>
+ #include <linux/pm_runtime.h>
+ 
++static void gen6_disable_rps_interrupts(struct drm_device *dev);
++static void gen6_enable_rps_interrupts(struct drm_device *dev);
++
+ /**
+  * RC6 is a special power stage which allows the GPU to enter an very
+  * low-voltage mode when idle, using down to 0V while at this stage.  This
+@@ -3570,6 +3573,27 @@ void vlv_set_rc6_mode(struct drm_device *dev, bool disable)
+ 		I915_WRITE(GEN6_RC_CONTROL, dev_priv->rps.rc6_mask);
+ }
+ 
++void vlv_set_rps_mode(struct drm_device *dev, bool disable)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (!IS_VALLEYVIEW(dev)) {
++		DRM_DEBUG_DRIVER("RPS mode change not supported\n");
++		return;
++	}
++
++	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
++
++	dev_priv->rps.rps_disable = disable;
++
++	if (disable) {
++		I915_WRITE(GEN6_RP_CONTROL, 0);
++		gen6_disable_rps_interrupts(dev);
++	} else {
++		I915_WRITE(GEN6_RP_CONTROL, dev_priv->rps.rps_mask);
++		gen6_enable_rps_interrupts(dev);
++	}
++}
+ 
+ void gen6_set_rc6_mode(struct drm_device *dev, bool disable)
+ {
+@@ -3708,7 +3732,9 @@ static void valleyview_disable_rps(struct drm_device *dev)
+ 	/* Disable rc6 */
+ 	vlv_set_rc6_mode(dev, true);
+ 
+-	gen6_disable_rps_interrupts(dev);
++	/* Disable rps */
++	vlv_set_rps_mode(dev, true);
++
+ }
+ 
+ static void intel_print_rc6_info(struct drm_device *dev, u32 mode)
+@@ -4247,13 +4273,12 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 
+ 	I915_WRITE(GEN6_RP_IDLE_HYSTERSIS, 10);
+ 
+-	I915_WRITE(GEN6_RP_CONTROL,
+-		   GEN6_RP_MEDIA_TURBO |
+-		   GEN6_RP_MEDIA_HW_NORMAL_MODE |
+-		   GEN6_RP_MEDIA_IS_GFX |
+-		   GEN6_RP_ENABLE |
+-		   GEN6_RP_UP_BUSY_AVG |
+-		   GEN6_RP_DOWN_IDLE_CONT);
++	dev_priv->rps.rps_mask = GEN6_RP_MEDIA_TURBO |
++				   GEN6_RP_MEDIA_HW_NORMAL_MODE |
++				   GEN6_RP_MEDIA_IS_GFX |
++				   GEN6_RP_ENABLE |
++				   GEN6_RP_UP_BUSY_AVG |
++				   GEN6_RP_DOWN_IDLE_CONT;
+ 
+ 	I915_WRITE(GEN6_RC6_WAKE_RATE_LIMIT, 0x00280000);
+ 	I915_WRITE(GEN6_RC_EVALUATION_INTERVAL, 125000);
+@@ -4294,7 +4319,7 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 
+ 	valleyview_set_rps(dev_priv->dev, dev_priv->rps.efficient_freq);
+ 
+-	gen6_enable_rps_interrupts(dev);
++	vlv_set_rps_mode(dev, false);
+ 
+ 	gen6_gt_force_wake_put(dev_priv, FORCEWAKE_ALL);
+ }
+-- 
+1.7.9.5
+

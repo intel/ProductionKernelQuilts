@@ -1,0 +1,162 @@
+From 7008c65411c380ee977d37c2365d2e6a0dc556bb Mon Sep 17 00:00:00 2001
+From: "Liu, Chuansheng" <chuansheng.liu@intel.com>
+Date: Mon, 13 Apr 2015 19:41:59 +0530
+Subject: [PATCH] PM / sleep: Asynchronous threads for resume_early
+
+In analogy with commits 5af84b82701a and 97df8c12995, using
+asynchronous threads can improve the overall resume_early
+time significantly.
+
+This patch is for resume_early phase.
+Upstream Commit-ID: 9e5e7910df824ba02aedd2b5d2ca556426ea6d0b
+
+Change-Id: I85242c87b1db043f04a3d892dc7f613d3ba3826e
+Signed-off-by: Chuansheng Liu <chuansheng.liu@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-7976
+[Upstream patch backported with merge conflicts resolved... ]
+Signed-off-by: Ananth Krishna R <ananth.krishna.r@intel.com>
+---
+ drivers/base/power/main.c | 78 ++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 56 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/base/power/main.c b/drivers/base/power/main.c
+index cb0ae25..36a8398 100644
+--- a/drivers/base/power/main.c
++++ b/drivers/base/power/main.c
+@@ -570,7 +570,8 @@ static void dpm_resume_noirq(pm_message_t state)
+  *
+  * Runtime PM is disabled for @dev while this function is being executed.
+  */
+-static int device_resume_early(struct device *dev, pm_message_t state)
++static int device_resume_early(struct device *dev,
++				 pm_message_t state, bool async)
+ {
+ 	pm_callback_t callback = NULL;
+ 	char *info = NULL;
+@@ -582,6 +583,8 @@ static int device_resume_early(struct device *dev, pm_message_t state)
+ 	if (dev->power.syscore)
+ 		goto Out;
+ 
++	dpm_wait(dev->parent, async);
++
+ 	if (dev->pm_domain) {
+ 		info = "early power domain ";
+ 		callback = pm_late_early_op(&dev->pm_domain->ops, state);
+@@ -607,48 +610,85 @@ static int device_resume_early(struct device *dev, pm_message_t state)
+ 	TRACE_RESUME(error);
+ 
+ 	pm_runtime_enable(dev);
++	complete_all(&dev->power.completion);
+ 	return error;
+ }
+ 
++static bool is_async(struct device *dev)
++{
++	return dev->power.async_suspend && pm_async_enabled
++		&& !pm_trace_is_enabled();
++}
++
++static void async_resume_early(void *data, async_cookie_t cookie)
++{
++	struct device *dev = (struct device *)data;
++	int error;
++
++	error = device_resume_early(dev, pm_transition, true);
++	if (error)
++		pm_dev_err(dev, pm_transition, " async", error);
++
++	put_device(dev);
++}
++
+ /**
+  * dpm_resume_early - Execute "early resume" callbacks for all devices.
+  * @state: PM transition of the system being carried out.
+  */
+ static void dpm_resume_early(pm_message_t state)
+ {
++	struct device *dev;
+ 	ktime_t starttime = ktime_get();
+ 
+ 	trace_suspend_resume(TPS("dpm_resume_early"), state.event, true);
+ 	mutex_lock(&dpm_list_mtx);
+-	while (!list_empty(&dpm_late_early_list)) {
+-		struct device *dev = to_device(dpm_late_early_list.next);
+-		int error;
++	pm_transition = state;
++
++	/*
++	 * Advanced the async threads upfront,
++	 * in case the starting of async threads is
++	 * delayed by non-async resuming devices.
++	 */
++	list_for_each_entry(dev, &dpm_late_early_list, power.entry) {
++		reinit_completion(&dev->power.completion);
++		if (is_async(dev)) {
++			get_device(dev);
++			async_schedule(async_resume_early, dev);
++		}
++	}
+ 
++	while (!list_empty(&dpm_late_early_list)) {
++		dev = to_device(dpm_late_early_list.next);
+ 		get_device(dev);
+ 		list_move_tail(&dev->power.entry, &dpm_suspended_list);
+ 		mutex_unlock(&dpm_list_mtx);
+ 
+-		pm_suspend_dbg(PM_SUSPEND_DBG_RESUME,
+-			"PM: device[%s] driver[%s] resume early enter\n",
+-			dev_name(dev), dev_driver_string(dev));
++		if (!is_async(dev)) {
++			int error;
++			pm_suspend_dbg(PM_SUSPEND_DBG_RESUME,
++				"PM: device[%s] driver[%s] resume early enter\n",
++				dev_name(dev), dev_driver_string(dev));
+ 
+-		error = device_resume_early(dev, state);
++			error = device_resume_early(dev, state, false);
+ 
+-		pm_suspend_dbg(PM_SUSPEND_DBG_RESUME,
+-			"PM: device[%s] driver[%s] resume early exit\n",
+-			dev_name(dev), dev_driver_string(dev));
++			pm_suspend_dbg(PM_SUSPEND_DBG_RESUME,
++				"PM: device[%s] driver[%s] resume early exit\n",
++				dev_name(dev), dev_driver_string(dev));
+ 
+-		if (error) {
+-			suspend_stats.failed_resume_early++;
+-			dpm_save_failed_step(SUSPEND_RESUME_EARLY);
+-			dpm_save_failed_dev(dev_name(dev));
+-			pm_dev_err(dev, state, " early", error);
++			if (error) {
++				suspend_stats.failed_resume_early++;
++				dpm_save_failed_step(SUSPEND_RESUME_EARLY);
++				dpm_save_failed_dev(dev_name(dev));
++				pm_dev_err(dev, state, " early", error);
++			}
+ 		}
+ 
+ 		mutex_lock(&dpm_list_mtx);
+ 		put_device(dev);
+ 	}
+ 	mutex_unlock(&dpm_list_mtx);
++	async_synchronize_full();
+ 	dpm_show_time(starttime, state, "early");
+ 	trace_suspend_resume(TPS("dpm_resume_early"), state.event, false);
+ }
+@@ -773,12 +813,6 @@ static void async_resume(void *data, async_cookie_t cookie)
+ 	put_device(dev);
+ }
+ 
+-static bool is_async(struct device *dev)
+-{
+-	return dev->power.async_suspend && pm_async_enabled
+-		&& !pm_trace_is_enabled();
+-}
+-
+ /**
+  *	dpm_drv_timeout - Driver suspend / resume watchdog handler
+  *	@data: struct device which timed out
+-- 
+1.9.1
+

@@ -1,0 +1,115 @@
+From 941d4d52954094731fbd376dc06ac19550c3a377 Mon Sep 17 00:00:00 2001
+Message-Id: <941d4d52954094731fbd376dc06ac19550c3a377.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Vidya Srinivas <vidya.srinivas@intel.com>
+Date: Wed, 30 Jul 2014 19:47:44 +0530
+Subject: [PATCH 168/312] FOR_UPSTREAM [VPG]: drm/i915: Critical fixes for
+ VLV.
+
+This patch fixes issues on VLV when the
+sprites are being used
+
+Issue: GMIN-2719
+Change-Id: I1763328d33a52ef364167ae7c7e07f0832a8a16e
+Signed-off-by: Pallavi <pallavi.g@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |    3 +--
+ drivers/gpu/drm/i915/intel_drv.h     |    1 +
+ drivers/gpu/drm/i915/intel_sprite.c  |   21 +++++++++++++--------
+ 3 files changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 5631c10..fc69318 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10398,6 +10398,7 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 
+ 	work->event = event;
+ 	work->crtc = crtc;
++	work->old_fb = old_fb;
+ 	work->old_fb_obj = to_intel_framebuffer(old_fb)->obj;
+ 	INIT_WORK(&work->work, intel_unpin_work_fn);
+ 
+@@ -10411,8 +10412,6 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 		spin_unlock_irqrestore(&dev->event_lock, flags);
+ 		kfree(work);
+ 		drm_crtc_vblank_put(crtc);
+-
+-		intel_crtc->unpin_work = NULL;
+ 		DRM_DEBUG_DRIVER("flip queue: crtc already busy\n");
+ 		return -EBUSY;
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index ecd6bab..973694f 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -668,6 +668,7 @@ intel_get_crtc_for_plane(struct drm_device *dev, int plane)
+ struct intel_unpin_work {
+ 	struct work_struct work;
+ 	struct drm_crtc *crtc;
++	struct drm_framebuffer *old_fb;
+ 	struct drm_i915_gem_object *old_fb_obj;
+ 	struct drm_i915_gem_object *pending_flip_obj;
+ 	struct drm_pending_vblank_event *event;
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index acc9c77..d631527 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -633,9 +633,8 @@ void intel_unpin_sprite_work_fn(struct work_struct *__work)
+ 			container_of(__work, struct intel_unpin_work, work);
+ 	struct drm_device *dev = work->crtc->dev;
+ 	mutex_lock(&dev->struct_mutex);
+-	if (work->old_fb_obj != NULL) {
++	if (work->old_fb_obj != NULL)
+ 		intel_unpin_fb_obj(work->old_fb_obj);
+-	}
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	kfree(work);
+@@ -1448,11 +1447,11 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	 * primary plane requires 256KiB alignment with 64 PTE padding,
+ 	 * the sprite planes only require 128KiB alignment and 32 PTE padding.
+ 	 */
+-	drm_gem_object_reference(&obj->base);
+ 	ret = intel_pin_and_fence_fb_obj(dev, obj, NULL);
+ 	mutex_unlock(&dev->struct_mutex);
+ 	if (ret) {
+-		drm_gem_object_unreference(&obj->base);
++		if (event)
++			drm_vblank_put(dev, intel_crtc->pipe);
+ 		goto out_unlock;
+ 	}
+ 
+@@ -1472,8 +1471,10 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 
+ 		intel_crtc->primary_enabled = primary_enabled;
+ 
+-		if (primary_was_enabled != primary_enabled)
+-			intel_crtc_wait_for_pending_flips(crtc);
++		if (!IS_VALLEYVIEW(dev)) {
++			if (primary_was_enabled != primary_enabled)
++				intel_crtc_wait_for_pending_flips(crtc);
++		}
+ 
+ 		if (!IS_VALLEYVIEW(dev)) {
+ 			if (primary_was_enabled && !primary_enabled)
+@@ -1511,8 +1512,12 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 
+ 	/* Unpin old obj after new one is active to avoid ugliness */
+ 	if (old_obj && (event == NULL)) {
+-		intel_plane_queue_unpin(intel_plane, old_obj);
+-		drm_gem_object_unreference(&old_obj->base);
++		mutex_lock(&dev->struct_mutex);
++		if (IS_VALLEYVIEW(dev))
++			intel_unpin_fb_obj(old_obj);
++		else
++			intel_plane_queue_unpin(intel_plane, old_obj);
++		mutex_unlock(&dev->struct_mutex);
+ 	}
+ 
+ out_unlock:
+-- 
+1.7.9.5
+

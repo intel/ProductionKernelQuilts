@@ -1,0 +1,193 @@
+From d43126766c0d9cb705ee5d9ebd648ef86db91bc8 Mon Sep 17 00:00:00 2001
+Message-Id: <d43126766c0d9cb705ee5d9ebd648ef86db91bc8.1432314923.git.chang-joon.lee@intel.com>
+In-Reply-To: <7faf8aeff66f21d5f967a1a95177386ec39f5187.1432314923.git.chang-joon.lee@intel.com>
+References: <7faf8aeff66f21d5f967a1a95177386ec39f5187.1432314923.git.chang-joon.lee@intel.com>
+From: Akashdeep Sharma <akashdeep.sharma@intel.com>
+Date: Wed, 20 May 2015 00:27:40 +0530
+Subject: [PATCH 5/5] REVERTME [VPG]: drm: Take single CRTC lock
+
+The current DRM implementation, uses drm_modeset_lock_all()
+for locking, and this is used in DPMS and flip paths. This
+function takes following locks:
+a. CRTC locks on all CRTCs
+b. dev->mode_config.mutex
+c. context_lock
+
+But this can cause delays, blankouts and stuttering on dual
+display scenarios. Consider this case:
+1. DPMS off call comes on MIPI during video playback on HDMI.
+2. MIPI DPMS takes lock on all CRTCs, goes for DPMS.
+3. Flips are coming for HDMI playback, try to use drm_modeset_lock_all
+   for all CRTCs again.
+4. This thread is blocked, until MIPI display is done with DPMS off,
+   which can be as big as 500-800ms. Till this time, due to locks
+   flips will be failing on HDMI, causing a blank/stutter on display.
+
+This patch removes the lock_all() from DPMS path, and flip path,
+and replaces it with a single CRTC lock.
+
+Revertme: This situation is hadled in atomic modeset, so we need
+not to have this soution for long.
+
+Change-Id: Ife6cba9fc6338966d6b8924544b52437389946c3
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-31068
+Signed-off-by: Shashank Sharma <shashank.sharma@intel.com>
+---
+ drivers/gpu/drm/drm_crtc.c |   76 ++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 59 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index dce6c11..fb24624 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -2239,9 +2239,19 @@ int drm_mode_setplane(struct drm_device *dev, void *data,
+ 		return -ENOENT;
+ 	}
+ 
++	crtc = drm_crtc_find(dev, plane_req->crtc_id);
++	if (!crtc) {
++		DRM_DEBUG_KMS("Unknown crtc ID %d\n",
++			      plane_req->crtc_id);
++		ret = -ENOENT;
++		goto out;
++	}
++
+ 	/* No fb means shut it down */
+ 	if (!plane_req->fb_id) {
+-		drm_modeset_lock_all(dev);
++		if (drm_modeset_lock(&crtc->mutex, NULL))
++			DRM_ERROR("CRTC(%d) lock(noi fb)failed\n",
++				crtc->base.id);
+ 		old_fb = plane->fb;
+ 		ret = plane->funcs->disable_plane(plane);
+ 		if (!ret) {
+@@ -2250,15 +2260,7 @@ int drm_mode_setplane(struct drm_device *dev, void *data,
+ 		} else {
+ 			old_fb = NULL;
+ 		}
+-		drm_modeset_unlock_all(dev);
+-		goto out;
+-	}
+-
+-	crtc = drm_crtc_find(dev, plane_req->crtc_id);
+-	if (!crtc) {
+-		DRM_DEBUG_KMS("Unknown crtc ID %d\n",
+-			      plane_req->crtc_id);
+-		ret = -ENOENT;
++		drm_modeset_unlock(&crtc->mutex);
+ 		goto out;
+ 	}
+ 
+@@ -2322,7 +2324,8 @@ int drm_mode_setplane(struct drm_device *dev, void *data,
+ 		goto out;
+ 	}
+ 
+-	drm_modeset_lock_all(dev);
++	if (drm_modeset_lock(&crtc->mutex, NULL))
++		DRM_ERROR("CRTC(%d) lock failed\n", crtc->base.id);
+ 	old_fb = plane->fb;
+ 
+ 	if (plane_req->flags & DRM_MODE_PAGE_FLIP_EVENT) {
+@@ -2370,7 +2373,7 @@ int drm_mode_setplane(struct drm_device *dev, void *data,
+ 	}
+ 
+ unlock:
+-	drm_modeset_unlock_all(dev);
++	drm_modeset_unlock(&crtc->mutex);
+ 
+ out:
+ 	if (fb)
+@@ -4118,6 +4121,14 @@ out:
+ 	return ret;
+ }
+ 
++struct drm_crtc *drm_crtc_from_connector(struct
++	drm_connector * connector)
++{
++	if (connector->encoder)
++		return connector->encoder->crtc;
++	return NULL;
++}
++
+ /**
+  * drm_mode_obj_set_property_ioctl - set the current value of an object's property
+  * @dev: DRM device
+@@ -4141,14 +4152,14 @@ int drm_mode_obj_set_property_ioctl(struct drm_device *dev, void *data,
+ 	struct drm_mode_object *arg_obj;
+ 	struct drm_mode_object *prop_obj;
+ 	struct drm_property *property;
++	struct drm_crtc *crtc = NULL;
++	struct drm_mode_config *config = &dev->mode_config;
+ 	int ret = -EINVAL;
+ 	int i;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
+ 		return -EINVAL;
+ 
+-	drm_modeset_lock_all(dev);
+-
+ 	arg_obj = drm_mode_object_find(dev, arg->obj_id, arg->obj_type);
+ 	if (!arg_obj) {
+ 		ret = -ENOENT;
+@@ -4172,24 +4183,55 @@ int drm_mode_obj_set_property_ioctl(struct drm_device *dev, void *data,
+ 	}
+ 	property = obj_to_property(prop_obj);
+ 
++	/*
++	 * If we keep all the CRTCs locked for any property change,
++	 * it will block flips on other displays till the change is done,
++	 * causing stuttering/blanking. We should only lock this CRTC
++	 * which is going through property change.
++	 */
++
+ 	if (!drm_property_change_is_valid(property, arg->value))
+ 		goto out;
+ 
+ 	switch (arg_obj->type) {
+ 	case DRM_MODE_OBJECT_CONNECTOR:
+-		ret = drm_mode_connector_set_obj_prop(arg_obj, property,
+-						      arg->value);
++		crtc = drm_crtc_from_connector(obj_to_connector(arg_obj));
++		if (crtc) {
++			DRM_ERROR("CRTC from connector,CRTC={id=%d props=%d}\n",
++				crtc->base.id, crtc->base.properties ?
++					crtc->base.properties->count : 0);
++			drm_modeset_lock(&crtc->mutex, NULL);
++			mutex_lock(&config->mutex);
++			ret = drm_mode_connector_set_obj_prop(arg_obj, property,
++							arg->value);
++			mutex_unlock(&config->mutex);
++		} else {
++			DRM_ERROR("No crtc from connector, lock all\n");
++			drm_modeset_lock_all(dev);
++			ret = drm_mode_connector_set_obj_prop(arg_obj, property,
++							arg->value);
++		}
+ 		break;
+ 	case DRM_MODE_OBJECT_CRTC:
++		crtc = obj_to_crtc(arg_obj);
++		drm_modeset_lock(&crtc->mutex, NULL);
+ 		ret = drm_mode_crtc_set_obj_prop(arg_obj, property, arg->value);
+ 		break;
+ 	case DRM_MODE_OBJECT_PLANE:
++		crtc = obj_to_plane(arg_obj)->crtc;
++		if (crtc)
++			drm_modeset_lock(&crtc->mutex, NULL);
++		else
++			drm_modeset_lock_all(dev);
+ 		ret = drm_mode_plane_set_obj_prop(arg_obj, property, arg->value);
+ 		break;
+ 	}
+ 
++	if (crtc)
++		drm_modeset_unlock(&crtc->mutex);
++	else
++		drm_modeset_unlock_all(dev);
+ out:
+-	drm_modeset_unlock_all(dev);
+ 	return ret;
+ }
+ 
+-- 
+1.7.9.5
+

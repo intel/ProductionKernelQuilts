@@ -1,0 +1,122 @@
+From 3a979a523d3f22bbbc6b564e30634ba4252d5bd0 Mon Sep 17 00:00:00 2001
+From: Jenny TC <jenny.tc@intel.com>
+Date: Wed, 19 Nov 2014 18:51:39 +0530
+Subject: [PATCH 1/1] power_supply: Fix BQ242192 IRQ issue
+
+In Cherry Trail, charger is connected to  Whiskey Cove PMIC.
+Charger driver uses PMIC I2C master driver to access charger
+registers. Both charger and I2C transaction interrupts are triggered by
+PMIC which is multiplexed in PMIC mfd driver.
+
+When charger IRQ is triggered, a charger register read is issued
+from threaded IRQ handler of charger driver. To service this request,
+PMIC I2C master driver need to receive an I2C transaction interrupt
+(Write Done/Read Done) from PMIC. Since both the charger and PMIC I2C
+transaction interrupts are PMIC interrupts, PMIC mfd driver cannot
+service the second interrupt (I2C transaction IRQ) until the
+first one is serviced (charger IRQ).
+
+To avoid this race condition, BQ24192 irq handlign is done in a workqueue
+
+Change-Id: Icf4fa253a6e52d4bfa89275d6d6a4bb163d3b0ac
+Signed-off-by: Jenny TC <jenny.tc@intel.com>
+---
+ drivers/mfd/intel_soc_pmic_wc.c |  2 +-
+ drivers/power/bq24192_charger.c | 43 ++++++++++++++++++++++++-----------------
+ 2 files changed, 26 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/mfd/intel_soc_pmic_wc.c b/drivers/mfd/intel_soc_pmic_wc.c
+index 60382b8..fa49b7c 100644
+--- a/drivers/mfd/intel_soc_pmic_wc.c
++++ b/drivers/mfd/intel_soc_pmic_wc.c
+@@ -616,7 +616,7 @@ static void __init register_external_charger(void)
+ 
+ 	strncpy(i2c_info.type, "ext-charger", I2C_NAME_SIZE);
+ 	i2c_info.addr = pmic_read_tt(TT_I2CDADDR_ADDR);
+-	i2c_info.irq = INTEL_PMIC_IRQBASE + CHGR_IRQ;
++	i2c_info.irq = whiskey_cove_pmic.irq_base + CHGR_IRQ;
+ 	i2c_new_device(wcove_pmic_i2c_adapter, &i2c_info);
+ }
+ late_initcall(register_external_charger);
+diff --git a/drivers/power/bq24192_charger.c b/drivers/power/bq24192_charger.c
+index b231577..f4b3919 100644
+--- a/drivers/power/bq24192_charger.c
++++ b/drivers/power/bq24192_charger.c
+@@ -241,6 +241,7 @@ struct bq24192_chip {
+ 	struct delayed_work chrg_task_wrkr;
+ 	struct delayed_work chrg_full_wrkr;
+ 	struct delayed_work chrg_temp_wrkr;
++	struct delayed_work irq_wrkr;
+ 	struct work_struct otg_evt_work;
+ 	struct notifier_block	otg_nb;
+ 	struct list_head	otg_queue;
+@@ -1600,27 +1601,13 @@ static void bq24192_full_worker(struct work_struct *work)
+ 	schedule_delayed_work(&chip->chrg_full_wrkr, FULL_THREAD_JIFFIES);
+ }
+ 
+-/* IRQ handler for charger Interrupts configured to GPIO pin */
+-static irqreturn_t bq24192_irq_isr(int irq, void *devid)
+-{
+-	struct bq24192_chip *chip = (struct bq24192_chip *)devid;
+-
+-	/**TODO: This hanlder will be used for charger Interrupts */
+-	dev_dbg(&chip->client->dev,
+-		"IRQ Handled for charger interrupt: %d\n", irq);
+ 
+-	return IRQ_WAKE_THREAD;
+-}
+-
+-/* IRQ handler for charger Interrupts configured to GPIO pin */
+-static irqreturn_t bq24192_irq_thread(int irq, void *devid)
++static void bq24192_irq_worker(struct work_struct *work)
+ {
+-	struct bq24192_chip *chip = (struct bq24192_chip *)devid;
+ 	int reg_status, reg_fault;
+-
+-	dev_info(&chip->client->dev,
+-		"IRQ Handled for charger interrupt: %d\n", irq);
+-
++	struct bq24192_chip *chip = container_of(work,
++						    struct bq24192_chip,
++						    irq_wrkr.work);
+ 	/*
+ 	 * check the bq24192 status/fault registers to see what is the
+ 	 * source of the interrupt
+@@ -1677,7 +1664,26 @@ static irqreturn_t bq24192_irq_thread(int irq, void *devid)
+ 			"%s:Battery over temp occured!!!!\n", __func__);
+ 		schedule_delayed_work(&chip->chrg_temp_wrkr, 0);
+ 	}
++}
++
++/* IRQ handler for charger Interrupts configured to GPIO pin */
++static irqreturn_t bq24192_irq_isr(int irq, void *devid)
++{
++	struct bq24192_chip *chip = (struct bq24192_chip *)devid;
++
++	/**TODO: This hanlder will be used for charger Interrupts */
++	dev_dbg(&chip->client->dev,
++		"IRQ Handled for charger interrupt: %d\n", irq);
++
++	return IRQ_WAKE_THREAD;
++}
++
++/* IRQ handler for charger Interrupts configured to GPIO pin */
++static irqreturn_t bq24192_irq_thread(int irq, void *devid)
++{
++	struct bq24192_chip *chip = (struct bq24192_chip *)devid;
+ 
++	schedule_delayed_work(&chip->irq_wrkr, 0);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -2220,6 +2226,7 @@ static int bq24192_probe(struct i2c_client *client,
+ 	INIT_DELAYED_WORK(&chip->chrg_full_wrkr, bq24192_full_worker);
+ 	INIT_DELAYED_WORK(&chip->chrg_task_wrkr, bq24192_task_worker);
+ 	INIT_DELAYED_WORK(&chip->chrg_temp_wrkr, bq24192_temp_update_worker);
++	INIT_DELAYED_WORK(&chip->irq_wrkr, bq24192_irq_worker);
+ 	mutex_init(&chip->event_lock);
+ 
+ 	/* Initialize the wakelock */
+-- 
+1.9.1
+

@@ -1,0 +1,157 @@
+From 0da0bd2fec4f00c50cd2eff2472379f5c88cd270 Mon Sep 17 00:00:00 2001
+From: Traian Schiau <traianx.schiau@intel.com>
+Date: Fri, 11 Sep 2015 15:20:38 +0300
+Subject: [PATCH] intel_tasks_dumper: Init
+
+Add a new panic handler that will be able to dump a full tasks
+state upon various panics. Because this dump could be time
+sensitive, also temporary disable the slow consoles during this.
+By default only soft/hard lockups and Kernel watchdog warning
+interrupts are targeted, but the functionality can be extended
+to all panics or forced disable by "force_en" and "force_dis"
+module parameters.
+
+Change-Id: I3289caf04079dfb14a3361afdbd855cb76b8114e
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-15439
+Signed-off-by: Traian Schiau <traianx.schiau@intel.com>
+---
+ drivers/platform/x86/Kconfig              |   6 ++
+ drivers/platform/x86/Makefile             |   1 +
+ drivers/platform/x86/intel-tasks-dumper.c | 101 ++++++++++++++++++++++++++++++
+ 3 files changed, 108 insertions(+)
+ create mode 100644 drivers/platform/x86/intel-tasks-dumper.c
+
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index 1f607d4..353977f 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -865,4 +865,10 @@ config INTEL_PSTORE_PRAM
+ 	  Safe to say Y, will not bind if your BIOS doesn't support
+ 	  this feature.
+ 
++config INTEL_TASKS_DUMP
++	bool "Intel panic tasks dumper"
++	depends on PRINTK
++	---help---
++	  This provides a way to get full tasks dump in case of panic.
++
+ endif # X86_PLATFORM_DEVICES
+diff --git a/drivers/platform/x86/Makefile b/drivers/platform/x86/Makefile
+index 8dae6c5..c925b5e 100644
+--- a/drivers/platform/x86/Makefile
++++ b/drivers/platform/x86/Makefile
+@@ -62,3 +62,4 @@ obj-$(CONFIG_INTEL_SOC_PMIC)	+= whiskycove_pmic_cc.o
+ obj-$(CONFIG_ACPI)		+= intel_em_config.o
+ obj-$(CONFIG_INTEL_GPIO_HSIC)	+= intel-gpio-hsic.o
+ obj-$(CONFIG_INTEL_PSTORE_PRAM)	+= intel_pstore_pram.o
++obj-$(CONFIG_INTEL_TASKS_DUMP)	+= intel-tasks-dumper.o
+diff --git a/drivers/platform/x86/intel-tasks-dumper.c b/drivers/platform/x86/intel-tasks-dumper.c
+new file mode 100644
+index 0000000..5012748
+--- /dev/null
++++ b/drivers/platform/x86/intel-tasks-dumper.c
+@@ -0,0 +1,101 @@
++/*
++ * Intel Trace Hub to USB dvc-trace  driver
++ *
++ * Copyright (C) 2015, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": %s: " fmt, __func__
++
++#include <linux/module.h>
++#include <linux/console.h>
++#include <linux/sched.h>
++
++static const char const *filter[] = {
++	"Watchdog detected",	/* Hard lockup */
++	"softlockup:",		/* Soft lockup */
++	"Kernel Watchdog",	/* iTCO warning */
++};
++
++static int force_en;
++module_param(force_en, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
++MODULE_PARM_DESC(force_en, "Force enable");
++
++static int force_dis;
++module_param(force_dis, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
++MODULE_PARM_DESC(force_dis, "Force disable");
++
++/* 1 pass, 0 not*/
++static int check_filter(const char *v)
++{
++	int i;
++
++	if (force_dis)
++		return 0;
++
++	if (force_en)
++		return 1;
++
++	for (i = 0; i < (sizeof(filter) / sizeof(*filter)); i++) {
++		if (!strncmp(v, filter[i], strlen(filter[i]))) {
++			pr_debug("Matching filter[%d] %s", i, filter[i]);
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static int intel_task_panic_hndl(struct notifier_block *n,
++				 unsigned long val, void *v)
++{
++	char *buf = v;
++
++	/* for panic val is hardcoded to 0 */
++	if (val) {
++		return NOTIFY_OK;
++	} else if (!check_filter(buf)) {
++		pr_info("Skip tasks dumper.\n");
++		return NOTIFY_OK;
++	}
++
++	console_suspend_slow();
++	pr_info(" --- tasks dumper [BEGIN] ---\n");
++	show_state_filter(0);
++	pr_info(" --- tasks dumper [END] ---\n");
++	console_restore_slow();
++
++       /* maybe NOTIFY_STOP_MASK ....*/
++	return NOTIFY_OK;
++}
++
++static struct notifier_block panic_notifier = {
++	.notifier_call = intel_task_panic_hndl,
++	.priority = 2, /*Not the last one*/
++};
++
++static int __init intel_tasks_dumper_init(void)
++{
++	pr_info("Register tasks dumper\n");
++	atomic_notifier_chain_register(&panic_notifier_list, &panic_notifier);
++	return 0;
++}
++
++static void __exit intel_tasks_dumper_exit(void)
++{
++	atomic_notifier_chain_unregister(&panic_notifier_list, &panic_notifier);
++}
++
++module_init(intel_tasks_dumper_init);
++module_exit(intel_tasks_dumper_exit);
++
++MODULE_LICENSE("GPL v2");
++MODULE_AUTHOR("Traian Schiau <traianx.schiau@intel.com>");
+-- 
+1.9.1
+

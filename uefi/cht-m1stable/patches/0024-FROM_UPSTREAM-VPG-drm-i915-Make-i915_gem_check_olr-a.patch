@@ -1,0 +1,175 @@
+From 7fb3cfc583f0f58e63ff90d559a115ed7acd4a68 Mon Sep 17 00:00:00 2001
+Message-Id: <7fb3cfc583f0f58e63ff90d559a115ed7acd4a68.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:30 +0000
+Subject: [PATCH 24/63] FROM_UPSTREAM [VPG]: drm/i915: Make
+ 'i915_gem_check_olr' actually check by request not
+ seqno
+
+Updated the _check_olr() function to actually take a request object and compare
+it to the OLR rather than extracting seqnos and comparing those.
+
+Note that there is one use case where the request object being processed is no
+longer available at that point in the call stack. Hence a temporary copy of the
+original function is still present (but called _check_ols() instead). This will
+be removed in a subsequent patch.
+
+Also, downgraded a BUG_ON to a WARN_ON as apparently the former is frowned upon
+for shipping code.
+
+Change-Id: I2a2e6f747ecaffca367632c2036c7c6106234701
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: b6660d59f66835e4e99eaa772ea4cb74f96f4de3
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_drv.h      |   18 +++++++++++++++++-
+ drivers/gpu/drm/i915/i915_gem.c      |   27 +++++++++++----------------
+ drivers/gpu/drm/i915/intel_display.c |    2 +-
+ 3 files changed, 29 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index d539bf9..fc1cb56b 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2603,7 +2603,7 @@ void i915_gem_retire_requests_ring(struct intel_engine_cs *ring);
+ int __must_check i915_gem_check_wedge(struct i915_gpu_error *error,
+ 				      bool interruptible,
+ 				      struct intel_engine_cs *ring);
+-int __must_check i915_gem_check_olr(struct intel_engine_cs *ring, u32 seqno);
++int __must_check i915_gem_check_olr(struct drm_i915_gem_request *req);
+ int i915_gem_wedged(struct drm_device *dev, bool interruptible);
+ static inline bool i915_reset_in_progress(struct i915_gpu_error *error)
+ {
+@@ -3241,4 +3241,20 @@ wait_remaining_ms_from_jiffies(unsigned long timestamp_jiffies, int to_wait_ms)
+ 
+ void intel_chv_huc_load(struct drm_device *dev);
+ 
++/* XXX: Temporary solution to be removed later in patch series. */
++static inline int __must_check i915_gem_check_ols(
++				     struct intel_engine_cs *ring, u32 seqno)
++{
++	int ret;
++
++	WARN_ON(!mutex_is_locked(&ring->dev->struct_mutex));
++
++	ret = 0;
++	if (seqno == i915_gem_request_get_seqno(ring->outstanding_lazy_request))
++		ret = i915_add_request(ring, NULL);
++
++	return ret;
++}
++/* XXX: Temporary solution to be removed later in patch series. */
++
+ #endif
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 9c00915..4d3546b 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1149,19 +1149,18 @@ i915_gem_check_wedge(struct i915_gpu_error *error,
+ }
+ 
+ /*
+- * Compare seqno against outstanding lazy request. Emit a request if they are
+- * equal.
++ * Compare arbitrary request against outstanding lazy request. Emit on match.
+  */
+ int
+-i915_gem_check_olr(struct intel_engine_cs *ring, u32 seqno)
++i915_gem_check_olr(struct drm_i915_gem_request *req)
+ {
+ 	int ret;
+ 
+-	BUG_ON(!mutex_is_locked(&ring->dev->struct_mutex));
++	WARN_ON(!mutex_is_locked(&req->ring->dev->struct_mutex));
+ 
+ 	ret = 0;
+-	if (seqno == i915_gem_request_get_seqno(ring->outstanding_lazy_request))
+-		ret = i915_add_request(ring, NULL);
++	if (req == req->ring->outstanding_lazy_request)
++		ret = i915_add_request(req->ring, NULL);
+ 
+ 	return ret;
+ }
+@@ -1343,7 +1342,7 @@ i915_wait_seqno(struct intel_engine_cs *ring, uint32_t seqno)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = i915_gem_check_olr(ring, seqno);
++	ret = i915_gem_check_ols(ring, seqno);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1410,7 +1409,6 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_engine_cs *ring = obj->ring;
+ 	unsigned reset_counter;
+-	u32 seqno;
+ 	int ret;
+ 
+ 	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
+@@ -1420,21 +1418,19 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
+ 	if (!req)
+ 		return 0;
+ 
+-	seqno = i915_gem_request_get_seqno(req);
+-	WARN_ON(seqno == 0);
+-
+ 	ret = i915_gem_check_wedge(&dev_priv->gpu_error, true, ring);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = i915_gem_check_olr(ring, seqno);
++	ret = i915_gem_check_olr(req);
+ 	if (ret)
+ 		return ret;
+ 
+ 	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
+ 	i915_gem_request_reference(req);
+ 	mutex_unlock(&dev->struct_mutex);
+-	ret = __wait_seqno(ring, seqno, reset_counter, true, NULL, file_priv);
++	ret = __wait_seqno(ring, i915_gem_request_get_seqno(req),
++			   reset_counter, true, NULL, file_priv);
+ 	mutex_lock(&dev->struct_mutex);
+ 	i915_gem_request_unreference(req);
+ 	if (ret)
+@@ -2935,8 +2931,7 @@ i915_gem_object_flush_active(struct drm_i915_gem_object *obj)
+ 	int ret;
+ 
+ 	if (obj->active) {
+-		ret = i915_gem_check_olr(obj->ring,
+-			     i915_gem_request_get_seqno(obj->last_read_req));
++		ret = i915_gem_check_olr(obj->last_read_req);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -3069,7 +3064,7 @@ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 	if (seqno <= from->semaphore.sync_seqno[idx])
+ 		return 0;
+ 
+-	ret = i915_gem_check_olr(obj->ring, seqno);
++	ret = i915_gem_check_olr(obj->last_read_req);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index cef4d9a..b0bfd62 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10410,7 +10410,7 @@ static int intel_postpone_flip(struct drm_i915_gem_object *obj)
+ 			      i915_gem_request_get_seqno(obj->last_write_req)))
+ 		return 0;
+ 
+-	ret = i915_gem_check_olr(ring, i915_gem_request_get_seqno(obj->last_write_req));
++	ret = i915_gem_check_olr(obj->last_write_req);
+ 	if (ret)
+ 		return ret;
+ 
+-- 
+1.7.9.5
+

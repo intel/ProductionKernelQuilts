@@ -1,0 +1,3169 @@
+From 5c65e1e9f225870b97e1c349c0eec6cf89348291 Mon Sep 17 00:00:00 2001
+Message-Id: <5c65e1e9f225870b97e1c349c0eec6cf89348291.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 1 Dec 2014 14:54:41 +0000
+Subject: [PATCH 03/63] Revert "FOR_UPSTREAM [VPG]: drm/i915: Added gen8
+ support for Timeout Detection Recovery for engine
+ hangs"
+
+This reverts commit 961f185070a1e073aee38b22060f430946139115.
+
+Change-Id: I3875f6e25e7a1bd30aa668d0ad4ab4837d6efe5e
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |   35 +-
+ drivers/gpu/drm/i915/i915_dma.c         |   34 +-
+ drivers/gpu/drm/i915/i915_drv.c         |  214 ++------
+ drivers/gpu/drm/i915/i915_drv.h         |   64 +--
+ drivers/gpu/drm/i915/i915_gem.c         |   59 +--
+ drivers/gpu/drm/i915/i915_gem_context.c |   33 --
+ drivers/gpu/drm/i915/i915_gpu_error.c   |    2 +-
+ drivers/gpu/drm/i915/i915_irq.c         |  158 ++----
+ drivers/gpu/drm/i915/i915_params.c      |    2 +-
+ drivers/gpu/drm/i915/i915_reg.h         |    3 +-
+ drivers/gpu/drm/i915/intel_lrc.c        |  841 +++----------------------------
+ drivers/gpu/drm/i915/intel_lrc.h        |   25 -
+ drivers/gpu/drm/i915/intel_lrc_tdr.h    |   38 --
+ drivers/gpu/drm/i915/intel_ringbuffer.c |  249 +++------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |  168 +-----
+ drivers/gpu/drm/i915/intel_uncore.c     |  156 ++----
+ 16 files changed, 330 insertions(+), 1751 deletions(-)
+ delete mode 100644 drivers/gpu/drm/i915/intel_lrc_tdr.h
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 0e3075e..11bcd3b 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -2084,7 +2084,7 @@ static int i915_execlists(struct seq_file *m, void *data)
+ 		seq_printf(m, "%s\n", ring->name);
+ 
+ 		status = I915_READ(RING_EXECLIST_STATUS(ring));
+-		ctx_id = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
++		ctx_id = I915_READ(RING_EXECLIST_STATUS(ring) + 4);
+ 		seq_printf(m, "\tExeclist status: 0x%08X, context: %u\n",
+ 			   status, ctx_id);
+ 
+@@ -3900,12 +3900,6 @@ i915_wedged_set(void *data, u64 val)
+ 					  &dev_priv->ring[VECS].hangcheck, 0,
+ 					  "Manual VECS reset");
+ 			break;
+-		case VCS2:
+-			DRM_INFO("Manual VCS2 reset\n");
+-			i915_handle_error(dev,
+-					  &dev_priv->ring[VCS2].hangcheck, 0,
+-					  "Manual VCS2 reset");
+-			break;
+ 		default:
+ 			DRM_INFO("Manual global reset\n");
+ 			i915_handle_error(dev, NULL, 0, "Manual global reset");
+@@ -3982,10 +3976,37 @@ i915_ring_hangcheck_read(struct file *filp, char __user *ubuf,
+ 	return simple_read_from_buffer(ubuf, max, ppos, buf, len);
+ }
+ 
++static ssize_t
++i915_ring_hangcheck_write(struct file *filp,
++			const char __user *ubuf,
++			size_t cnt, loff_t *ppos)
++{
++	int ret;
++	int i;
++	struct drm_device *dev = filp->private_data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < I915_NUM_RINGS; i++) {
++		/* Reset the hangcheck counters */
++		dev_priv->ring[i].hangcheck.total = 0;
++		dev_priv->ring[i].hangcheck.tdr_count = 0;
++		dev_priv->ring[i].hangcheck.watchdog_count = 0;
++	}
++	dev_priv->gpu_error.total_resets = 0;
++	mutex_unlock(&dev->struct_mutex);
++
++	return cnt;
++}
++
+ static const struct file_operations i915_ring_hangcheck_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.read = i915_ring_hangcheck_read,
++	.write = i915_ring_hangcheck_write,
+ 	.llseek = default_llseek,
+ };
+ 
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 4191988..2275c0b 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1603,11 +1603,10 @@ static void intel_device_info_runtime_init(struct drm_device *dev)
+ 	}
+ }
+ 
+-static int
++static void
+ i915_hangcheck_init(struct drm_device *dev)
+ {
+ 	int i;
+-	int ret = 0;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	for (i = 0; i < I915_NUM_RINGS; i++) {
+@@ -1618,27 +1617,12 @@ i915_hangcheck_init(struct drm_device *dev)
+ 		dev_priv->ring[i].hangcheck.last_acthd = 0;
+ 		dev_priv->ring[i].hangcheck.ringid = i;
+ 		dev_priv->ring[i].hangcheck.dev = dev;
++		atomic_set(&dev_priv->ring[i].hangcheck.active, 0);
+ 
+-		INIT_DELAYED_WORK(&dev_priv->ring[i].hangcheck.work,
+-			i915_hangcheck_sample);
+-
+-		dev_priv->ring[i].hangcheck.wq = alloc_ordered_workqueue(
+-			"i915_ring_%d_hangcheck_queue", 0, i);
+-
+-		if (dev_priv->ring[i].hangcheck.wq == NULL) {
+-			DRM_ERROR("Failed to create workqueue for %s.\n",
+-				dev_priv->ring[i].name);
+-			goto hangcheck_init_error;
+-		}
++		setup_timer(&dev_priv->ring[i].hangcheck.timer,
++			i915_hangcheck_sample,
++			(unsigned long) &dev_priv->ring[i].hangcheck);
+ 	}
+-
+-	return ret;
+-
+-hangcheck_init_error:
+-	while (--i >= 0)
+-		destroy_workqueue(dev_priv->ring[i].hangcheck.wq);
+-
+-	return -ENOMEM;
+ }
+ 
+ static void
+@@ -1647,8 +1631,8 @@ i915_hangcheck_cleanup(struct drm_i915_private *dev_priv)
+ 	int i;
+ 
+ 	for (i = 0; i < I915_NUM_RINGS; i++) {
+-		cancel_delayed_work_sync(&dev_priv->ring[i].hangcheck.work);
+-		destroy_workqueue(dev_priv->ring[i].hangcheck.wq);
++		del_timer_sync(&dev_priv->ring[i].hangcheck.timer);
++		atomic_set(&dev_priv->ring[i].hangcheck.active, 0);
+ 	}
+ }
+ 
+@@ -1837,9 +1821,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 
+ 	i915_gem_load(dev);
+ 
+-	ret = i915_hangcheck_init(dev);
+-	if (ret)
+-		goto out_mtrrfree;
++	i915_hangcheck_init(dev);
+ 
+ 	/* On the 945G/GM, the chipset reports the MSI capability on the
+ 	 * integrated graphics even though the support isn't actually there
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 2cfff3a..bacfd67 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -33,7 +33,6 @@
+ #include "i915_drv.h"
+ #include "i915_trace.h"
+ #include "intel_drv.h"
+-#include "intel_lrc_tdr.h"
+ 
+ #include <linux/console.h>
+ #include <linux/module.h>
+@@ -893,14 +892,11 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 	struct intel_crtc *intel_crtc;
+ 	struct drm_i915_gem_request *request;
+ 	struct intel_unpin_work *unpin_work;
+-	struct intel_context *current_context = NULL;
+-	uint32_t hw_context_id1 = ~0u;
+-	uint32_t hw_context_id2 = ~0u;
+ 
+ 	acthd = intel_ring_get_active_head(ring);
+ 	completed_seqno = ring->get_seqno(ring, false);
+ 
+-	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
++	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
+ 
+ 	/* Take wake lock to prevent power saving mode */
+ 	gen6_gt_force_wake_get(dev_priv, FORCEWAKE_ALL);
+@@ -912,24 +908,6 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 			i915_set_reset_status(dev_priv, request->ctx, false);
+ 	}
+ 
+-	if (i915.enable_execlists) {
+-		enum context_submission_status status =
+-			i915_gem_context_get_current_context(ring,
+-					&current_context);
+-
+-		/*
+-		 * If the hardware and driver states do not coincide
+-		 * or if there for some reason is no current context
+-		 * in the process of being submitted then bail out and
+-		 * try again. Do not proceed unless we have reliable
+-		 * current context state information.
+-		 */
+-		if (status != CONTEXT_SUBMISSION_STATUS_OK) {
+-			ret = -EAGAIN;
+-			goto handle_hung_ring_error;
+-		}
+-	}
+-
+ 	/*
+ 	 * Check if the ring has hung on a MI_DISPLAY_FLIP command.
+ 	 * The pipe value will be stored in the HWS page if it has.
+@@ -950,45 +928,14 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 		dev_priv->gpu_error.stop_rings &= ~(0x1 << ringid);
+ 	}
+ 
+-	ret = intel_ring_disable(ring, current_context);
++	ret = intel_ring_disable(ring);
+ 	if (ret != 0) {
+ 		DRM_ERROR("Failed to disable ring %d\n", ringid);
+ 			goto handle_hung_ring_error;
+ 	}
+ 
+-	if (!i915.enable_execlists) {
+-		/* Sample the current ring head position */
+-		head = I915_READ_HEAD(ring) & HEAD_ADDR;
+-
+-	} else {
+-		hw_context_id1 = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
+-
+-		/* Sample the current ring head position */
+-		head = I915_READ_HEAD(ring) & HEAD_ADDR;
+-
+-		/*
+-		 * Make sure that the current context state is stable. If the
+-		 * context is changing then the MMIO head value might not be
+-		 * reliable. This is not a likely scenario but we have seen
+-		 * issues like this in the past.
+-		 */
+-		hw_context_id2 = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
+-
+-		if (hw_context_id1 != hw_context_id2) {
+-			WARN(1, "Somehow the currently running context has " \
+-				"changed (%x != %x)! Bailing and retrying!\n",
+-				hw_context_id1, hw_context_id2);
+-
+-			ret = intel_ring_enable(ring, current_context);
+-			if (ret != 0)
+-				DRM_ERROR("Failed to re-enable %s\n",
+-						ring->name);
+-
+-			ret = -EAGAIN;
+-			goto handle_hung_ring_error;
+-		}
+-	}
+-
++	/* Sample the current ring head position */
++	head = I915_READ(RING_HEAD(ring->mmio_base)) & HEAD_ADDR;
+ 	DRM_DEBUG_TDR("head 0x%08X, last_head 0x%08X\n",
+ 		head, dev_priv->ring[ringid].hangcheck.last_head);
+ 	if (head == dev_priv->ring[ringid].hangcheck.last_head) {
+@@ -1011,50 +958,41 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 	}
+ 	dev_priv->ring[ringid].hangcheck.last_head = head;
+ 
+-	ret = intel_ring_save(ring, current_context, ring_flags);
+-	if (ret == -EAGAIN) {
+-		if (intel_ring_enable(ring, current_context))
+-			DRM_ERROR("Failed to re-enable %s after " \
+-				  "deciding to retry\n", ring->name);
+-
+-		goto handle_hung_ring_error;
+-	} else if (ret != 0) {
++	ret = intel_ring_save(ring, ring_flags);
++	if (ret != 0) {
+ 		DRM_ERROR("Failed to save ring state\n");
+ 		goto handle_hung_ring_error;
+ 	}
+ 
+ 	ret = intel_gpu_engine_reset(dev, ringid);
+ 	if (ret != 0) {
+-		DRM_ERROR("Failed to reset %s\n", ring->name);
++		DRM_ERROR("Failed to reset ring\n");
+ 		goto handle_hung_ring_error;
+ 	}
+ 	DRM_DEBUG_TDR("%s reset (GPU Hang)\n", ring->name);
+ 
+-	if (!i915.enable_execlists) {
+-		ret = intel_ring_invalidate_tlb(ring);
+-		if (ret != 0) {
+-			DRM_ERROR("Failed to invalidate tlb for %s\n",
+-					ring->name);
+-			goto handle_hung_ring_error;
+-		}
++	ret = intel_ring_invalidate_tlb(ring);
++	if (ret != 0) {
++		DRM_ERROR("Failed to invalidate tlb for %s\n", ring->name);
++		goto handle_hung_ring_error;
+ 	}
+ 
+-	/* Clear last_acthd for the next hang check on this ring */
++	/* Clear last_acthd in hangcheck timer for this ring */
+ 	dev_priv->ring[ringid].hangcheck.last_acthd = 0;
+ 
+ 	/* Clear reset flags to allow future hangchecks */
+ 	atomic_set(&dev_priv->ring[ringid].hangcheck.flags, 0);
+ 
+-	ret = intel_ring_restore(ring, current_context);
++	ret = intel_ring_restore(ring);
+ 	if (ret != 0) {
+ 		DRM_ERROR("Failed to restore ring state\n");
+ 		goto handle_hung_ring_error;
+ 	}
+ 
+ 	/* Correct driver state */
+-	intel_gpu_engine_reset_resample(ring, current_context);
++	intel_ring_resample(ring);
+ 
+-	ret = intel_ring_enable(ring, current_context);
++	ret = intel_ring_enable(ring);
+ 	if (ret != 0) {
+ 		DRM_ERROR("Failed to enable ring\n");
+ 		goto handle_hung_ring_error;
+@@ -1070,7 +1008,7 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 	 */
+ 	if (pipe &&
+ 		((pipe - 1) < ARRAY_SIZE(dev_priv->pipe_to_crtc_mapping))) {
+-		/* The pipe value in the status page is offset by 1 */
++		/* The pipe value in the status page if offset by 1 */
+ 		pipe -= 1;
+ 
+ 		/* The ring hung on a page flip command so we
+@@ -1088,54 +1026,12 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 	}
+ 
+ handle_hung_ring_error:
+-	if (i915.enable_execlists)
+-		i915_gem_context_unreference(current_context);
+-
+ 	/* Release power lock */
+ 	gen6_gt_force_wake_put(dev_priv, FORCEWAKE_ALL);
+ 
+ 	return ret;
+ }
+ 
+-static int i915_reset_resubmit_contexts(struct drm_i915_private *dev_priv,
+-		struct intel_context **current_contexts)
+-{
+-	struct intel_engine_cs *ring;
+-	u32 i;
+-
+-	for_each_ring(ring, dev_priv, i) {
+-		int ret = 0;
+-		u32 tail = 0;
+-
+-		if (!current_contexts[i])
+-			continue;
+-
+-		ret = I915_READ_TAIL_CTX(ring, current_contexts[i], tail);
+-		if (ret)
+-			return ret;
+-
+-		intel_execlists_TDR_context_queue(ring, current_contexts[i],
+-					tail);
+-	}
+-
+-	return 0;
+-}
+-
+-static inline void i915_reset_unreference_contexts(struct drm_device *dev,
+-			struct intel_context **current_contexts)
+-{
+-	struct intel_engine_cs *ring;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	u32 i;
+-
+-	for_each_ring(ring, dev_priv, i) {
+-		if (!current_contexts[i])
+-			continue;
+-
+-		i915_gem_context_unreference(current_contexts[i]);
+-	}
+-}
+-
+ /**
+  * i915_reset - reset chip after a hang
+  * @dev: drm device to reset
+@@ -1155,47 +1051,22 @@ int i915_reset(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	bool simulated;
+-	int ret = 0;
+-	struct intel_engine_cs *ring;
+-	u32 i;
+-	struct intel_context *current_contexts[I915_NUM_RINGS];
++	int ret;
+ 
+ 	if (!i915.reset)
+ 		return 0;
+ 
+ 	mutex_lock(&dev->struct_mutex);
+-	memset(current_contexts, 0, sizeof(current_contexts));
+ 
+ 	DRM_ERROR("Reset GPU (GPU Hang)\n");
+ 
+-	if (i915.enable_execlists) {
+-		/*
+-		 * Store local reference to the current ring contexts before
+-		 * reset so that we can restore them after the reset breaks them
+-		 * (EXECLIST_STATUS register is clobbered by GPU reset and we
+-		 * use that register to fetch the current context, which is
+-		 * needed for final TDR context resubmission to kick off the
+-		 * hardware again post-reset)
+-		 */
+-		for_each_ring(ring, dev_priv, i) {
+-			enum context_submission_status status =
+-				i915_gem_context_get_current_context(ring,
+-					&current_contexts[i]);
+-
+-			if (status == CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED) {
+-				i915_gem_context_unreference(current_contexts[i]);
+-				current_contexts[i] = NULL;
+-			}
+-
+-		}
+-	}
+ 	i915_gem_reset(dev);
+ 
+ 	simulated = dev_priv->gpu_error.stop_rings != 0;
+ 
+ 	if (!simulated && (get_seconds() - dev_priv->gpu_error.last_reset)
+ 		< i915.gpu_reset_min_alive_period) {
+-		DRM_ERROR("GPU hanging too fast!\n");
++		DRM_ERROR("GPU hanging too fast, declaring wedged!\n");
+ 		ret = -ENODEV;
+ 	} else {
+ 		ret = intel_gpu_reset(dev);
+@@ -1215,7 +1086,8 @@ int i915_reset(struct drm_device *dev)
+ 
+ 	if (ret) {
+ 		DRM_ERROR("Failed to reset chip: %i\n", ret);
+-		goto exit_locked;
++		mutex_unlock(&dev->struct_mutex);
++		return ret;
+ 	}
+ 
+ 	/* Ok, now get things going again... */
+@@ -1225,6 +1097,9 @@ int i915_reset(struct drm_device *dev)
+ 	 * there.  Fortunately we don't need to do this unless we reset the
+ 	 * chip at a PCI level.
+ 	 *
++	 * Next we need to restore the context, but we don't use those
++	 * yet either...
++	 *
+ 	 * Ring buffer needs to be re-initialized in the KMS case, or if X
+ 	 * was running at the time of the reset (i.e. we weren't VT
+ 	 * switched away).
+@@ -1234,25 +1109,12 @@ int i915_reset(struct drm_device *dev)
+ 		dev_priv->ums.mm_suspended = 0;
+ 
+ 		ret = i915_gem_init_hw(dev);
++		mutex_unlock(&dev->struct_mutex);
+ 		if (ret) {
+ 			DRM_ERROR("Failed hw init on reset %d\n", ret);
+-			goto exit_locked;
++			return ret;
+ 		}
+ 
+-		if (i915.enable_execlists)
+-			for_each_ring(ring, dev_priv, i) {
+-				if (current_contexts[i]) {
+-					/*
+-					 * Init context state based
+-					 * on engine state
+-					 */
+-					intel_gpu_reset_resample(ring,
+-						current_contexts[i]);
+-				}
+-			}
+-
+-		mutex_unlock(&dev->struct_mutex);
+-
+ 		/*
+ 		 * FIXME: This races pretty badly against concurrent holders of
+ 		 * ring interrupts. This is possible since we've started to drop
+@@ -1273,25 +1135,7 @@ int i915_reset(struct drm_device *dev)
+ 		mutex_unlock(&dev->struct_mutex);
+ 	}
+ 
+-	if (i915.enable_execlists) {
+-		i915_reset_resubmit_contexts(dev_priv, current_contexts);
+-
+-		mutex_lock(&dev->struct_mutex);
+-		i915_reset_unreference_contexts(dev, current_contexts);
+-		mutex_unlock(&dev->struct_mutex);
+-	}
+-
+-	return ret;
+-
+-exit_locked:
+-	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
+-
+-	if (i915.enable_execlists)
+-		i915_reset_unreference_contexts(dev, current_contexts);
+-
+-	mutex_unlock(&dev->struct_mutex);
+-
+-	return ret;
++	return 0;
+ }
+ 
+ void i915_init_watchdog(struct drm_device *dev)
+@@ -1921,8 +1765,10 @@ static int intel_runtime_suspend(struct device *device)
+ 		return ret;
+ 	}
+ 
+-	for (i = 0; i < I915_NUM_RINGS; i++)
+-		cancel_delayed_work_sync(&dev_priv->ring[i].hangcheck.work);
++	for (i = 0; i < I915_NUM_RINGS; i++) {
++		del_timer_sync(&dev_priv->ring[i].hangcheck.timer);
++		atomic_set(&dev_priv->ring[i].hangcheck.active, 0);
++	}
+ 
+ 	dev_priv->pm.suspended = true;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index e34ecdd..2d90264 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1219,15 +1219,6 @@ struct i915_gem_mm {
+ 	struct delayed_work retire_work;
+ 
+ 	/**
+-	 * The hang check is piggy-backed on the retire work
+-	 * timer. In order to couple the hang check period to
+-	 * the retire timer period we need to keep track of when
+-	 * the retire work timer was scheduled so that we can
+-	 * derive the hang check period from that timestamp.
+-	 */
+-	unsigned long retire_work_timestamp;
+-
+-	/**
+ 	 * When we detect an idle GPU, we want to turn on
+ 	 * powersaving features. So once we see that there
+ 	 * are no more requests outstanding and no more
+@@ -1281,7 +1272,7 @@ struct i915_error_state_file_priv {
+ };
+ 
+ struct i915_gpu_error {
+-	/* Limits for hangcheck period */
++	/* For hangcheck timer */
+ #define DRM_I915_MIN_HANGCHECK_PERIOD 100 /* 100ms */
+ #define DRM_I915_MAX_HANGCHECK_PERIOD 30000 /* 30s */
+ #define DRM_I915_HANGCHECK_JIFFIES msecs_to_jiffies(i915.hangcheck_period)
+@@ -2150,39 +2141,6 @@ struct drm_i915_cmd_table {
+ 	int count;
+ };
+ 
+-/*
+- * Context submission status
+- *
+- * CONTEXT_SUBMISSION_STATUS_OK:
+- *	Context submitted to ELSP and state of execlist queue
+- *	is the same as the state of EXECLIST_STATUS. Software
+- *	and hardware states are stable and in sync.
+- *
+- * CONTEXT_SUBMISSION_STATUS_SUBMITTED:
+- *	Context submitted to execlist queue but the
+- *	EXECLIST_STATUS state is different from the state of
+- *	the queue. This means that the context has not been
+- *	submitted to ELSP yet or that the hardware just finished
+- *	but the request is pending removal from the execlist
+- *	queue. State not stable and is currently in transition
+- *	and cannot be trusted.
+- *
+- * CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED:
+- *	No context submitted to the execlist queue and the
+- *	EXECLIST_STATUS register shows no context being processed.
+- *
+- * CONTEXT_SUBMISSION_STATUS_NONE_UNDEFINED:
+- *	Initial state before submission status has been determined.
+- *
+- */
+-enum context_submission_status {
+-	CONTEXT_SUBMISSION_STATUS_OK = 0,
+-	CONTEXT_SUBMISSION_STATUS_SUBMITTED,
+-	CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED,
+-	CONTEXT_SUBMISSION_STATUS_UNDEFINED
+-};
+-
+-
+ #define INTEL_INFO(dev)	(&to_i915(dev)->info)
+ 
+ #define IS_I830(dev)		((dev)->pdev->device == 0x3577)
+@@ -2411,13 +2369,12 @@ int vlv_force_gfx_clock(struct drm_i915_private *dev_priv, bool on);
+ extern void intel_console_resume(struct work_struct *work);
+ 
+ /* i915_irq.c */
+-void i915_queue_hangcheck(struct drm_device *dev, u32 ringid,
+-		unsigned long retire_work_timestamp);
+-
++void i915_queue_hangcheck(struct drm_device *dev, u32 ringid);
+ __printf(4, 5)
+ void i915_handle_error(struct drm_device *dev, struct intel_ring_hangcheck *hc,
+ 		       bool watchdog, const char *fmt, ...);
+-void i915_hangcheck_sample(struct work_struct *work);
++void i915_hangcheck_sample(unsigned long data);
++
+ void gen6_set_pm_mask(struct drm_i915_private *dev_priv, u32 pm_iir,
+ 							int new_delay);
+ extern void intel_irq_init(struct drm_device *dev);
+@@ -2802,10 +2759,6 @@ int i915_gem_context_create_ioctl(struct drm_device *dev, void *data,
+ int i915_gem_context_destroy_ioctl(struct drm_device *dev, void *data,
+ 				   struct drm_file *file);
+ 
+-enum context_submission_status
+-i915_gem_context_get_current_context(struct intel_engine_cs *ring,
+-				   struct intel_context **current_context);
+-
+ /* i915_gem_evict.c */
+ int __must_check i915_gem_evict_something(struct drm_device *dev,
+ 					  struct i915_address_space *vm,
+@@ -3073,15 +3026,6 @@ void assert_force_wake_inactive(struct drm_i915_private *dev_priv);
+ int sandybridge_pcode_read(struct drm_i915_private *dev_priv, u8 mbox, u32 *val);
+ int sandybridge_pcode_write(struct drm_i915_private *dev_priv, u8 mbox, u32 val);
+ 
+-/*
+- * On gen8 it is sometimes needed to prevent GT from powering down during
+- * register access sequences. Sometimes the users also need to hold spinlocks
+- * during these sequences, which means that the gen6 implementations of these
+- * functions cannot be used since they call potentially sleeping functions.
+- */
+-void gen8_gt_force_wake_get(struct drm_i915_private *dev_priv);
+-void gen8_gt_force_wake_put(struct drm_i915_private *dev_priv);
+-
+ /* intel_sideband.c */
+ u32 vlv_punit_read(struct drm_i915_private *dev_priv, u32 addr);
+ void vlv_punit_write(struct drm_i915_private *dev_priv, u32 addr, u32 val);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 254e37f..f913453 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2448,35 +2448,6 @@ i915_gem_get_seqno(struct drm_device *dev, u32 *seqno)
+ 	return 0;
+ }
+ 
+-static void queue_retire_work(struct drm_i915_private *dev_priv,
+-			  unsigned long delay)
+-{
+-	/*
+-	 * The retire work timer needs to take the hang check period
+-	 * into account since the hang check is piggy-backed on top
+-	 * of the retire work handler. That means that if the hang
+-	 * checks are meant to happen more frequently the retire
+-	 * work timer needs to fire at least as frequently as that.
+-	 */
+-	unsigned long time = min(delay, DRM_I915_HANGCHECK_JIFFIES);
+-
+-	if (queue_delayed_work(dev_priv->wq,
+-			   &dev_priv->mm.retire_work,
+-			   time)) {
+-		/*
+-		 * If we successfully scheduled the retire work
+-		 * handler then time stamp this point in time so
+-		 * that we can figure out later how much more
+-		 * time we need to wait for the hang check
+-		 * that might follow. If the queue call was not
+-		 * successful it means that work is already
+-		 * pending - let that work expire first before
+-		 * scheduling more.
+-		 */
+-		dev_priv->mm.retire_work_timestamp = jiffies;
+-	}
+-}
+-
+ int __i915_add_request(struct intel_engine_cs *ring,
+ 		       struct drm_file *file,
+ 		       struct drm_i915_gem_object *obj,
+@@ -2578,7 +2549,9 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 
+ 	if (!dev_priv->ums.mm_suspended) {
+ 		cancel_delayed_work_sync(&dev_priv->mm.idle_work);
+-		queue_retire_work(dev_priv, round_jiffies_up_relative(HZ));
++		queue_delayed_work(dev_priv->wq,
++				   &dev_priv->mm.retire_work,
++				   round_jiffies_up_relative(HZ));
+ 		intel_mark_busy(dev_priv->dev);
+ 	}
+ 
+@@ -2893,7 +2866,6 @@ i915_gem_retire_work_handler(struct work_struct *work)
+ 		container_of(work, typeof(*dev_priv), mm.retire_work.work);
+ 	struct drm_device *dev = dev_priv->dev;
+ 	bool idle;
+-	unsigned long ts = dev_priv->mm.retire_work_timestamp;
+ 
+ 	/* Come back later if the device is busy... */
+ 	idle = false;
+@@ -2901,18 +2873,9 @@ i915_gem_retire_work_handler(struct work_struct *work)
+ 		idle = i915_gem_retire_requests(dev);
+ 		mutex_unlock(&dev->struct_mutex);
+ 	}
+-
+-	if (!idle) {
+-		struct intel_engine_cs *ring;
+-		unsigned i;
+-
+-		queue_retire_work(dev_priv, round_jiffies_up_relative(HZ));
+-
+-		for_each_ring(ring, dev_priv, i) {
+-			if (!list_empty(&ring->request_list))
+-				i915_queue_hangcheck(dev, i, ts);
+-		}
+-	}
++	if (!idle)
++		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work,
++				   round_jiffies_up_relative(HZ));
+ }
+ 
+ static void
+@@ -4223,7 +4186,8 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 		ret = __wait_seqno(ring, seqno, reset_counter, true,
+ 								NULL, NULL);
+ 		if (ret == 0)
+-			queue_retire_work(dev_priv, 0);
++			queue_delayed_work(dev_priv->wq,
++				&dev_priv->mm.retire_work, 0);
+ 	}
+ 
+ 	return ret;
+@@ -4831,9 +4795,10 @@ i915_gem_suspend(struct drm_device *dev)
+ 							     DRIVER_MODESET);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+-	for (i = 0; i < I915_NUM_RINGS; i++)
+-		cancel_delayed_work_sync(&dev_priv->ring[i].hangcheck.work);
+-
++	for (i = 0; i < I915_NUM_RINGS; i++) {
++		del_timer_sync(&dev_priv->ring[i].hangcheck.timer);
++		atomic_set(&dev_priv->ring[i].hangcheck.active, 0);
++	}
+ 	cancel_delayed_work_sync(&dev_priv->mm.retire_work);
+ 	cancel_delayed_work_sync(&dev_priv->mm.idle_work);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index efb2360..5bba965 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -88,7 +88,6 @@
+ #include <drm/drmP.h>
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+-#include "intel_lrc_tdr.h"
+ 
+ /* This is a HW constraint. The value below is the largest known requirement
+  * I've seen in a spec to date, and that was a workaround for a non-shipping
+@@ -829,35 +828,3 @@ int i915_gem_context_destroy_ioctl(struct drm_device *dev, void *data,
+ 	DRM_DEBUG_DRIVER("HW context %d destroyed\n", args->ctx_id);
+ 	return 0;
+ }
+-
+-enum context_submission_status
+-i915_gem_context_get_current_context(struct intel_engine_cs *ring,
+-				   struct intel_context **current_context)
+-{
+-	struct drm_i915_private *dev_priv;
+-	enum context_submission_status status = CONTEXT_SUBMISSION_STATUS_OK;
+-
+-	if (!current_context || !ring) {
+-		WARN(!ring, "Ring is null!\n");
+-		return CONTEXT_SUBMISSION_STATUS_UNDEFINED;
+-	}
+-
+-	dev_priv = ring->dev->dev_private;
+-
+-	if (i915.enable_execlists) {
+-		status = intel_execlists_TDR_get_submitted_context(ring,
+-				current_context);
+-	} else {
+-		*current_context = ring->last_context;
+-		if (*current_context)
+-			i915_gem_context_reference(*current_context);
+-	}
+-
+-	if (!*current_context) {
+-		/* Use default context if nothing has been submitted yet */
+-		*current_context = ring->default_context;
+-		i915_gem_context_reference(*current_context);
+-	}
+-
+-	return status;
+-}
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 1eb9c0f..2b282c7 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -984,7 +984,7 @@ static void i915_gem_record_rings(struct drm_device *dev,
+ 		} else
+ 			rbuf = ring->buffer;
+ 
+-		error->ring[i].ring_context = rbuf->FIXME_lrc_ctx;
++		error->ring[i].ring_context = rbuf->ctx;
+ 		error->ring[i].size = rbuf->size;
+ 		error->ring[i].space = rbuf->space;
+ 		error->ring[i].last_retired_head = rbuf->last_retired_head;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 5552b84..34b6d48 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -38,7 +38,6 @@
+ #include <drm/i915_adf.h>
+ #include "intel_sync.h"
+ #include "intel_drv.h"
+-#include "intel_lrc_tdr.h"
+ 
+ static const u32 hpd_ibx[] = {
+ 	[HPD_CRT] = SDE_CRT_HOTPLUG,
+@@ -2762,7 +2761,6 @@ static void i915_error_work_func(struct work_struct *work)
+ 	struct drm_i915_private *dev_priv =
+ 		container_of(error, struct drm_i915_private, gpu_error);
+ 	struct drm_device *dev = dev_priv->dev;
+-	struct intel_engine_cs *ring;
+ 	char *error_event[] = { I915_ERROR_UEVENT "=1", NULL };
+ 	char *reset_event[] = { I915_RESET_UEVENT "=1", NULL };
+ 	char *reset_done_event[] = { I915_ERROR_UEVENT "=0", NULL };
+@@ -2774,43 +2772,21 @@ static void i915_error_work_func(struct work_struct *work)
+ 	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, error_event);
+ 
+ 	/* Check each ring for a pending reset condition */
+-	for_each_ring(ring, dev_priv, i) {
++	for (i = 0; i < I915_NUM_RINGS; i++) {
+ 		/* Skip individual ring reset requests if full_reset requested*/
+ 		if (i915_reset_in_progress(error))
+ 			break;
+ 
+ 		if (atomic_read(&dev_priv->ring[i].hangcheck.flags)
+ 		    & DRM_I915_HANGCHECK_RESET) {
+-			DRM_DEBUG_TDR("resetting %s\n", ring->name);
+-
+-			ret = i915_handle_hung_ring(dev, i);
+ 
+-			/*
+-			 * -EAGAIN means that between detecting a hang (and
+-			 * also determining that the currently submitted
+-			 * context is stable and valid) and trying to recover
+-			 * from the hang the current context changed state.
+-			 * This means that we are probably not completely hung
+-			 * after all. Just fail and retry by exiting all the
+-			 * way back and wait for the next hang detection. If we
+-			 * have a true hang on our hands then we will detect it
+-			 * again, otherwise we will continue like nothing
+-			 * happened.
+-			 */
+-			if (ret == -EAGAIN) {
+-				DRM_ERROR("Reset of %s aborted due to " \
+-					  "change in context submission " \
+-					  "state - retrying!", ring->name);
+-				ret = 0;
+-			}
+-
+-			if (ret != 0) {
++			if (i915_handle_hung_ring(dev, i) != 0) {
+ 				DRM_ERROR("ring %d reset failed", i);
+ 
+ 				/* Force global reset instead */
+ 				atomic_set_mask(
+-					I915_RESET_IN_PROGRESS_FLAG,
+-					&dev_priv->gpu_error.reset_counter);
++				I915_RESET_IN_PROGRESS_FLAG,
++				&dev_priv->gpu_error.reset_counter);
+ 				break;
+ 			}
+ 		}
+@@ -2855,7 +2831,7 @@ static void i915_error_work_func(struct work_struct *work)
+ 		intel_runtime_pm_put(dev_priv);
+ 
+ 		if (ret == 0) {
+-			for_each_ring(ring, dev_priv, i)
++			for (i = 0; i < I915_NUM_RINGS; i++)
+ 				atomic_set(&dev_priv->ring[i].hangcheck.flags,
+ 					   0);
+ 
+@@ -2873,7 +2849,6 @@ static void i915_error_work_func(struct work_struct *work)
+ 			atomic_inc(&dev_priv->gpu_error.reset_counter);
+ 		} else {
+ 			/* Terminal wedge condition */
+-			WARN(1, "i915_reset failed, declaring GPU as wedged!\n");
+ 			atomic_set_mask(I915_WEDGED, &error->reset_counter);
+ 		}
+ 	}
+@@ -3067,8 +3042,6 @@ void i915_handle_error(struct drm_device *dev, struct intel_ring_hangcheck *hc,
+ 		 */
+ 		atomic_set_mask(I915_RESET_IN_PROGRESS_FLAG,
+ 			&dev_priv->gpu_error.reset_counter);
+-
+-		DRM_DEBUG_TDR("Full reset of GPU requested\n");
+ 	}
+ 
+ 	/*
+@@ -3381,20 +3354,14 @@ static bool i915_hangcheck_hung(struct intel_ring_hangcheck *hc)
+ 	 * ring which has actually hung. Give the other ring chance to
+ 	 * reset and clear the hang.
+ 	 */
+-	mbox_wait = I915_READ_CTL(ring);
+-
+-	threshold = (mbox_wait & RING_WAIT_SEMAPHORE) ?
+-		DRM_I915_MBOX_HANGCHECK_THRESHOLD :
+-		DRM_I915_HANGCHECK_THRESHOLD;
+-
++	mbox_wait = ((I915_READ(RING_CTL(ring->mmio_base)) >> 10) & 0x1);
++	threshold = mbox_wait ? DRM_I915_MBOX_HANGCHECK_THRESHOLD :
++				DRM_I915_HANGCHECK_THRESHOLD;
+ 	DRM_DEBUG_TDR("mbox_wait = %u threshold = %u", mbox_wait, threshold);
+ 
+ 	if (hc->count++ > threshold) {
+ 		bool hung = true;
+ 
+-		DRM_DEBUG_TDR("Hang check period expired... %s hung\n",
+-				ring->name);
+-
+ 		/* Reset the counter */
+ 		hc->count = 0;
+ 
+@@ -3423,11 +3390,11 @@ static bool i915_hangcheck_hung(struct intel_ring_hangcheck *hc)
+ }
+ 
+ /*
+- * This is called from the hangcheck work queue for each ring.
++ * This is called from the hangcheck timer for each ring.
+  * It samples the current state of the hardware to make
+  * sure that it is progressing.
+  */
+-void i915_hangcheck_sample(struct work_struct *work)
++void i915_hangcheck_sample(unsigned long data)
+ {
+ 	bool idle;
+ 	int empty;
+@@ -3440,18 +3407,23 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 	struct drm_device *dev;
+ 	struct drm_i915_private *dev_priv;
+ 	struct intel_engine_cs *ring;
+-	struct intel_ring_hangcheck *hc =
+-		container_of(work, typeof(*hc), work.work);
++	struct intel_ring_hangcheck *hc = (struct intel_ring_hangcheck *)data;
+ 
+ 	if (!i915.enable_hangcheck || !hc)
+ 		return;
+ 
+ 	dev = hc->dev;
+ 	dev_priv = dev->dev_private;
++
++	/* Clear the active flag *before* assessing the ring state
++	* in case new work is added just after we sample the rings.
++	* This will allow new work to re-trigger the timer even
++	* though we may see the rings as idle on this occasion.*/
++	atomic_set(&hc->active, 0);
++
+ 	ring = &dev_priv->ring[hc->ringid];
+ 
+ 	/* Sample the current state */
+-
+ 	head = I915_READ_HEAD(ring) & HEAD_ADDR;
+ 	tail = I915_READ_TAIL(ring) & TAIL_ADDR;
+ 	acthd = intel_ring_get_active_head(ring);
+@@ -3478,15 +3450,11 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 
+ 	idle = ((head == tail) && (pending_work == 0));
+ 
+-	DRM_DEBUG_TDR("[%u] HD: 0x%08x 0x%08x, ACTHD: 0x%08x 0x%08x IC: %d\n",
+-		      ring->id, (unsigned int) head, (unsigned int) hc->last_hd,
+-		      (unsigned int) acthd, (unsigned int) hc->last_acthd,
+-		      instdone_cmp);
+-	DRM_DEBUG_TDR("[%u] E:%d PW:%d TL:0x%08x Csq:0x%08x (%ld) Lsq:0x%08x " \
+-		      "(%ld) Idle: %s\n", ring->id, empty, pending_work,
+-		      (unsigned int) tail, (unsigned int) cur_seqno,
+-		      (long int) cur_seqno, (unsigned int) last_seqno,
+-		      (long int) last_seqno, (idle ? "true" : "false"));
++	DRM_DEBUG_TDR("[%d] HD: 0x%08x 0x%08x, ACTHD: 0x%08x 0x%08x IC: %d\n",
++		ring->id, head, hc->last_hd, acthd, hc->last_acthd,
++		instdone_cmp);
++	DRM_DEBUG_TDR("E:%d PW:%d TL:0x%08x Csq:0x%08x Lsq:0x%08x Idle: %d\n",
++		empty, pending_work, tail, cur_seqno, last_seqno, idle);
+ 
+ 	/* Check both head and active head.
+ 	* Neither is enough on its own - acthd can be pointing within the
+@@ -3542,82 +3510,26 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 	hc->last_acthd = acthd;
+ 	memcpy(hc->prev_instdone, instdone, sizeof(instdone));
+ 
+-	if (resched_timer) {
+-		/*
+-		 * Work is still pending! Reschedule hang check to come back
+-		 * later and do another round of hang checking.
+-		 */
+-		mod_delayed_work(dev_priv->ring[hc->ringid].hangcheck.wq,
+-				&dev_priv->ring[hc->ringid].hangcheck.work,
+-				round_jiffies_up_relative(DRM_I915_HANGCHECK_JIFFIES));
+-	}
++	if (resched_timer)
++		i915_queue_hangcheck(dev, hc->ringid);
+ }
+ 
+-void i915_queue_hangcheck(struct drm_device *dev, u32 ringid,
+-		unsigned long retire_work_timestamp)
++void i915_queue_hangcheck(struct drm_device *dev, u32 ringid)
+ {
++	int resched = 0;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_engine_cs *ring = &dev_priv->ring[ringid];
+-	uint32_t seqno;
+ 
+-	if (!ring) {
+-		WARN(1, "Ring is null! Could not queue hang check for %s!", \
+-			ring->name);
++	if (!i915.enable_hangcheck)
+ 		return;
+-	}
+ 
+-	if (!ring->get_seqno) {
+-		WARN(1, "get_seqno function not set up! " \
+-			"Could not queue hang check for %s!", ring->name);
+-		return;
+-	}
+-
+-	seqno = ring->get_seqno(ring, false);
+-
+-	if (!i915.enable_hangcheck) {
+-		dev_priv->ring[ringid].hangcheck.last_seqno = seqno;
+-		return;
+-	}
+-
+-	if (dev_priv->ring[ringid].hangcheck.last_seqno == seqno) {
+-		/*
+-		 * The seqno on this ring has not progressed since
+-		 * we last checked! Schedule a more detailed hang check.
+-		 *
+-		 * We are piggy-backing the hang check on top of the retire
+-		 * work timer so the amount of time we need to wait between
+-		 * expired retire work timer and the actual hangcheck is:
+-		 *
+-		 *	 wait_time = hangcheck_period - retire_work_period
+-		 *
+-		 * retire_work_period is the time difference between now
+-		 * and when the retire_work_timer was scheduled.
+-		 * If we have already waited the hangcheck period or more
+-		 * then simply schedule the hang check immediately.
+-		 *
+-		 * If a hang check was already rescheduled by a previous
+-		 * hang check (because there are still pending work that
+-		 * needs to be checked) and is now pending, this schedule
+-		 * call will not affect anything and the pending hang check
+-		 * will be carried out without being postponed.
+-		 */
+-		unsigned long jiffies_now = jiffies;
+-		long timediff = jiffies_now - retire_work_timestamp;
+-		unsigned long time = 0;
+-		const unsigned long zero = 0L;
+-
+-		WARN(time_after(retire_work_timestamp, jiffies_now),
+-				"Timestamp of scheduled retire work handler " \
+-				"happened in the future? (%lu > %lu)",
+-				retire_work_timestamp, jiffies_now);
+-
+-		time = max(zero, (DRM_I915_HANGCHECK_JIFFIES - timediff));
+-
+-		queue_delayed_work(dev_priv->ring[ringid].hangcheck.wq,
+-				&dev_priv->ring[ringid].hangcheck.work, time);
+-	}
++	/* Only re-schedule the timer if it is not currently active */
++	if (atomic_add_unless(&dev_priv->ring[ringid].hangcheck.active,
++			      1, 1) != 0)
++		resched = 1;
+ 
+-	dev_priv->ring[ringid].hangcheck.last_seqno = seqno;
++	if (resched)
++		mod_timer(&dev_priv->ring[ringid].hangcheck.timer,
++			  jiffies + DRM_I915_HANGCHECK_JIFFIES);
+ }
+ 
+ static void ibx_irq_reset(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/i915/i915_params.c b/drivers/gpu/drm/i915/i915_params.c
+index befebd9..4484025 100644
+--- a/drivers/gpu/drm/i915/i915_params.c
++++ b/drivers/gpu/drm/i915/i915_params.c
+@@ -227,7 +227,7 @@ static const struct kernel_param_ops hangcheck_ops = {
+ module_param_cb(hangcheck_period, &hangcheck_ops,
+ 		&i915.hangcheck_period, 0644);
+ MODULE_PARM_DESC(hangcheck_period,
+-		"The hangcheck period in milliseconds. "
++		"The hangcheck timer period in milliseconds. "
+ 		"The actual time to detect a hang may be 3 - 4 times "
+ 		"this value (default = 1000ms)");
+ 
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 6ac3416..473185c 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -117,7 +117,6 @@
+ #define  GEN6_GRDOM_MEDIA		(1 << 2)
+ #define  GEN6_GRDOM_BLT			(1 << 3)
+ #define  GEN6_GRDOM_VECS		(1 << 4)
+-#define  GEN8_GRDOM_MEDIA2		(1 << 7)
+ 
+ #define GEN8_SRID_0_2_0_PCI		0xf8
+ 
+@@ -1325,6 +1324,8 @@ enum punit_power_well {
+ # define VS_TIMER_DISPATCH				(1 << 6)
+ # define MI_FLUSH_ENABLE				(1 << 12)
+ # define ASYNC_FLIP_PERF_DISABLE			(1 << 14)
++# define MODE_IDLE					(1 << 9)
++# define STOP_RING					(1 << 8)
+ 
+ #define GEN6_GT_MODE	0x20d0
+ #define GEN7_GT_MODE	0x7008
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 36b418c..a448a68 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -137,7 +137,6 @@
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+ #include "intel_sync.h"
+-#include "intel_lrc_tdr.h"
+ 
+ #define GEN8_LR_CONTEXT_RENDER_SIZE (20 * PAGE_SIZE)
+ #define GEN8_LR_CONTEXT_OTHER_SIZE (2 * PAGE_SIZE)
+@@ -279,6 +278,7 @@ static void execlists_elsp_write(struct intel_engine_cs *ring,
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	uint64_t temp = 0;
+ 	uint32_t desc[4];
++	unsigned long flags;
+ 
+ 	/* XXX: You must always write both descriptors in the order below. */
+ 	if (ctx_obj1)
+@@ -299,7 +299,20 @@ static void execlists_elsp_write(struct intel_engine_cs *ring,
+ 	 * because that function calls intel_runtime_pm_get(), which might sleep.
+ 	 * Instead, we do the runtime_pm_get/put when creating/destroying requests.
+ 	 */
+-	gen8_gt_force_wake_get(dev_priv);
++	spin_lock_irqsave(&dev_priv->uncore.lock, flags);
++	if (IS_CHERRYVIEW(dev_priv->dev)) {
++		if (dev_priv->uncore.fw_rendercount++ == 0)
++			dev_priv->uncore.funcs.force_wake_get(dev_priv,
++							      FORCEWAKE_RENDER);
++		if (dev_priv->uncore.fw_mediacount++ == 0)
++			dev_priv->uncore.funcs.force_wake_get(dev_priv,
++							      FORCEWAKE_MEDIA);
++	} else {
++		if (dev_priv->uncore.forcewake_count++ == 0)
++			dev_priv->uncore.funcs.force_wake_get(dev_priv,
++							      FORCEWAKE_ALL);
++	}
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, flags);
+ 
+ 	I915_WRITE(RING_ELSP(ring), desc[1]);
+ 	I915_WRITE(RING_ELSP(ring), desc[0]);
+@@ -311,167 +324,23 @@ static void execlists_elsp_write(struct intel_engine_cs *ring,
+ 	POSTING_READ(RING_EXECLIST_STATUS(ring));
+ 
+ 	/* Release Force Wakeup (see the big comment above). */
+-	gen8_gt_force_wake_put(dev_priv);
+-}
+-
+-/*
+- * execlist_get_context_reg_page
+- *
+- * Get memory page for context object belonging to context running on a given
+- * engine.
+- *
+- * engine: engine
+- * ctx: context running on engine
+- * page: returned page
+- *
+- * Returns:
+- * 0 if successful, otherwise propagates error codes.
+- */
+-static inline int execlist_get_context_reg_page(struct intel_engine_cs *engine,
+-		struct intel_context *ctx,
+-		struct page **page)
+-{
+-	struct drm_i915_gem_object *ctx_obj;
+-
+-	if (!page)
+-		return -EINVAL;
+-
+-	if (!ctx)
+-		ctx = engine->default_context;
+-
+-	ctx_obj = ctx->engine[engine->id].state;
+-
+-	if (!ctx_obj) {
+-		WARN(1, "Error while getting context register page: " \
+-			"Context object not set up!");
+-		return -EINVAL;
+-	}
+-
+-	WARN(!i915_gem_obj_is_pinned(ctx_obj),
+-	     "Error while getting context register page: " \
+-	     "Context object is not pinned!");
+-
+-	*page = i915_gem_object_get_page(ctx_obj, 1);
+-
+-	if (!*page) {
+-		WARN(1, "Error while getting context register page: " \
+-			"Context object page could not be resolved!");
+-		return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+-
+-static inline int execlists_write_context_reg(struct intel_engine_cs *engine,
+-		struct intel_context *ctx, u32 ctx_reg, u32 mmio_reg_addr,
+-		u32 val)
+-{
+-	struct page *page = NULL;
+-	uint32_t *reg_state;
+-
+-	int ret = execlist_get_context_reg_page(engine, ctx, &page);
+-	if (ret) {
+-		WARN(1, "Failed to write %u to register %u for %s!",
+-			(unsigned int) val, (unsigned int) ctx_reg,
+-			engine->name);
+-		return ret;
+-	}
+-
+-	reg_state = kmap_atomic(page);
+-
+-	WARN(reg_state[ctx_reg] != mmio_reg_addr,
+-	     "Context register address (%x) differs from MMIO register address (%x)!",
+-	     (unsigned int) reg_state[ctx_reg], (unsigned int) mmio_reg_addr);
+-
+-	reg_state[ctx_reg+1] = val;
+-	kunmap_atomic(reg_state);
+-
+-	return ret;
+-}
+-
+-static inline int execlists_read_context_reg(struct intel_engine_cs *engine,
+-		struct intel_context *ctx, u32 ctx_reg, u32 mmio_reg_addr,
+-		u32 *val)
+-{
+-	struct page *page = NULL;
+-	uint32_t *reg_state;
+-	int ret = 0;
+-
+-	if (!val)
+-		return -EINVAL;
+-
+-	ret = execlist_get_context_reg_page(engine, ctx, &page);
+-	if (ret) {
+-		WARN(1, "Failed to read from register %u for %s!",
+-			(unsigned int) ctx_reg, engine->name);
+-		return ret;
++	spin_lock_irqsave(&dev_priv->uncore.lock, flags);
++	if (IS_CHERRYVIEW(dev_priv->dev)) {
++		if (--dev_priv->uncore.fw_rendercount == 0)
++			dev_priv->uncore.funcs.force_wake_put(dev_priv,
++							      FORCEWAKE_RENDER);
++		if (--dev_priv->uncore.fw_mediacount == 0)
++			dev_priv->uncore.funcs.force_wake_put(dev_priv,
++							      FORCEWAKE_MEDIA);
++	} else {
++		if (--dev_priv->uncore.forcewake_count == 0)
++			dev_priv->uncore.funcs.force_wake_put(dev_priv,
++							      FORCEWAKE_ALL);
+ 	}
+ 
+-	reg_state = kmap_atomic(page);
+-
+-	WARN(reg_state[ctx_reg] != mmio_reg_addr,
+-	     "Context register address (%x) differs from MMIO register address (%x)!",
+-	     (unsigned int) reg_state[ctx_reg], (unsigned int) mmio_reg_addr);
+-
+-	*val = reg_state[ctx_reg+1];
+-	kunmap_atomic(reg_state);
+-
+-	return ret;
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, flags);
+ }
+ 
+-/*
+- * Generic macros for generating function implementation for context register
+- * read/write functions.
+- *
+- * Macro parameters
+- * ----------------
+- * reg_name: Designated name of context register (e.g. tail, head, buffer_ctl)
+- *
+- * reg_def: Context register macro definition (e.g. CTX_RING_TAIL)
+- *
+- * mmio_reg_def: Name of macro function used to determine the address
+- *		 of the corresponding MMIO register (e.g. RING_TAIL, RING_HEAD).
+- *		 This macro function is assumed to be defined on the form of:
+- *
+- *			#define mmio_reg_def(base) (base+register_offset)
+- *
+- *		 Where "base" is the MMIO base address of the respective ring
+- *		 and "register_offset" is the offset relative to "base".
+- *
+- * Function parameters
+- * -------------------
+- * engine: The engine that the context is running on
+- * ctx: The context of the register that is to be accessed
+- * reg_name: Value to be written/read to/from the register.
+- */
+-#define INTEL_EXECLISTS_WRITE_REG(reg_name, reg_def, mmio_reg_def) \
+-	int intel_execlists_write_##reg_name(struct intel_engine_cs *engine, \
+-					     struct intel_context *ctx, \
+-					     u32 reg_name) \
+-{ \
+-	return execlists_write_context_reg(engine, ctx, (reg_def), \
+-			mmio_reg_def(engine->mmio_base), (reg_name)); \
+-}
+-
+-#define INTEL_EXECLISTS_READ_REG(reg_name, reg_def, mmio_reg_def) \
+-	int intel_execlists_read_##reg_name(struct intel_engine_cs *engine, \
+-					    struct intel_context *ctx, \
+-					    u32 *reg_name) \
+-{ \
+-	return execlists_read_context_reg(engine, ctx, (reg_def), \
+-			mmio_reg_def(engine->mmio_base), (reg_name)); \
+-}
+-
+-INTEL_EXECLISTS_WRITE_REG(tail, CTX_RING_TAIL, RING_TAIL)
+-INTEL_EXECLISTS_READ_REG(tail, CTX_RING_TAIL, RING_TAIL)
+-INTEL_EXECLISTS_WRITE_REG(head, CTX_RING_HEAD, RING_HEAD)
+-INTEL_EXECLISTS_READ_REG(head, CTX_RING_HEAD, RING_HEAD)
+-INTEL_EXECLISTS_WRITE_REG(buffer_ctl, CTX_RING_BUFFER_CONTROL, RING_CTL)
+-INTEL_EXECLISTS_READ_REG(buffer_ctl, CTX_RING_BUFFER_CONTROL, RING_CTL)
+-
+-#undef INTEL_EXECLISTS_READ_REG
+-#undef INTEL_EXECLISTS_WRITE_REG
+-
+ static void perfmon_send_config(
+ 	struct intel_ringbuffer *ringbuf,
+ 	struct drm_i915_perfmon_config *config)
+@@ -626,6 +495,20 @@ unlock:
+ 	mutex_unlock(&dev_priv->perfmon.config.lock);
+ 	return ret;
+ }
++static int execlists_ctx_write_tail(struct drm_i915_gem_object *ctx_obj, u32 tail)
++{
++	struct page *page;
++	uint32_t *reg_state;
++
++	page = i915_gem_object_get_page(ctx_obj, 1);
++	reg_state = kmap_atomic(page);
++
++	reg_state[CTX_RING_TAIL+1] = tail;
++
++	kunmap_atomic(reg_state);
++
++	return 0;
++}
+ 
+ static int execlists_submit_context(struct intel_engine_cs *ring,
+ 				    struct intel_context *to0, u32 tail0,
+@@ -636,13 +519,16 @@ static int execlists_submit_context(struct intel_engine_cs *ring,
+ 
+ 	ctx_obj0 = to0->engine[ring->id].state;
+ 	BUG_ON(!ctx_obj0);
++	WARN_ON(!i915_gem_obj_is_pinned(ctx_obj0));
+ 
+-	intel_execlists_write_tail(ring, to0, tail0);
++	execlists_ctx_write_tail(ctx_obj0, tail0);
+ 
+ 	if (to1) {
+ 		ctx_obj1 = to1->engine[ring->id].state;
+ 		BUG_ON(!ctx_obj1);
+-		intel_execlists_write_tail(ring, to1, tail1);
++		WARN_ON(!i915_gem_obj_is_pinned(ctx_obj1));
++
++		execlists_ctx_write_tail(ctx_obj1, tail1);
+ 	}
+ 
+ 	execlists_elsp_write(ring, ctx_obj0, ctx_obj1);
+@@ -650,52 +536,34 @@ static int execlists_submit_context(struct intel_engine_cs *ring,
+ 	return 0;
+ }
+ 
+-static void execlists_fetch_requests(struct intel_engine_cs *ring,
+-			struct intel_ctx_submit_request **req0,
+-			struct intel_ctx_submit_request **req1)
++static void execlists_context_unqueue(struct intel_engine_cs *ring)
+ {
++	struct intel_ctx_submit_request *req0 = NULL, *req1 = NULL;
+ 	struct intel_ctx_submit_request *cursor = NULL, *tmp = NULL;
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 
+-	if (!req0)
+-		return;
+-
+-	*req0 = NULL;
++	assert_spin_locked(&ring->execlist_lock);
+ 
+-	if (req1)
+-		*req1 = NULL;
++	if (list_empty(&ring->execlist_queue))
++		return;
+ 
+ 	/* Try to read in pairs */
+ 	list_for_each_entry_safe(cursor, tmp, &ring->execlist_queue,
+-			execlist_link) {
+-		if (!(*req0))
+-			*req0 = cursor;
+-		else if ((*req0)->ctx == cursor->ctx) {
+-			/*
+-			 * Same ctx: ignore first request, as second request
+-			 * will update tail past first request's workload
+-			 */
+-			cursor->elsp_submitted = (*req0)->elsp_submitted;
+-			list_del(&(*req0)->execlist_link);
+-			queue_work(dev_priv->wq, &(*req0)->work);
+-			*req0 = cursor;
++				 execlist_link) {
++		if (!req0) {
++			req0 = cursor;
++		} else if (req0->ctx == cursor->ctx) {
++			/* Same ctx: ignore first request, as second request
++			 * will update tail past first request's workload */
++			cursor->elsp_submitted = req0->elsp_submitted;
++			list_del(&req0->execlist_link);
++			queue_work(dev_priv->wq, &req0->work);
++			req0 = cursor;
+ 		} else {
+-			if (req1)
+-				*req1 = cursor;
++			req1 = cursor;
+ 			break;
+ 		}
+ 	}
+-}
+-
+-static void execlists_context_unqueue(struct intel_engine_cs *ring)
+-{
+-	struct intel_ctx_submit_request *req0 = NULL, *req1 = NULL;
+-
+-	assert_spin_locked(&ring->execlist_lock);
+-	if (list_empty(&ring->execlist_queue))
+-		return;
+-
+-	execlists_fetch_requests(ring, &req0, &req1);
+ 
+ 	WARN_ON(req1 && req1->elsp_submitted);
+ 
+@@ -708,132 +576,6 @@ static void execlists_context_unqueue(struct intel_engine_cs *ring)
+ 		req1->elsp_submitted++;
+ }
+ 
+-/*
+- * execlists_TDR_context_unqueue is a TDR-specific variant of the
+- * ordinary unqueue function used exclusively by the TDR.
+- *
+- * When doing TDR context resubmission we only want to resubmit the hung
+- * context and nothing else, thus only fetch one request from the queue.
+- * The exception being if the second element in the queue already has been
+- * submitted, in which case we need to submit that one too. Also, don't
+- * increment the elsp_submitted counter following submission since lite restore
+- * context event interrupts do not not happen if the engine is hung, which
+- * would normally happen in the case of a context resubmission. If we increment
+- * the elsp_counter in this special case the execlist state machine would
+- * expect a corresponding lite restore interrupt, which is never produced.
+- */
+-static void execlists_TDR_context_unqueue(struct intel_engine_cs *ring)
+-{
+-	struct intel_ctx_submit_request *req0 = NULL, *req1 = NULL;
+-
+-	assert_spin_locked(&ring->execlist_lock);
+-	if (list_empty(&ring->execlist_queue))
+-		return;
+-
+-	execlists_fetch_requests(ring, &req0, &req1);
+-
+-	/*
+-	 * If the second head element was not already submitted we do not have
+-	 * to resubmit it. Let the interrupt handler unqueue it at an
+-	 * appropriate time. If it was already submitted it needs to go in
+-	 * again to allow the hardware to switch over to it as expected.
+-	 * Otherwise the interrupt handler will do another unqueue of the same
+-	 * context and we will end up with a desync between number of
+-	 * submissions and interrupts and thus wait endlessly for an interrupt
+-	 * that will never come.
+-	 */
+-	if (req1 && !req1->elsp_submitted)
+-		req1 = NULL;
+-
+-	WARN_ON(execlists_submit_context(ring, req0->ctx, req0->tail,
+-					 req1 ? req1->ctx : NULL,
+-					 req1 ? req1->tail : 0));
+-}
+-
+-/**
+- * intel_execlists_TDR_get_submitted_context() - return context currently
+- * processed by engine
+- *
+- * @ring: Engine currently running context to be returned.
+- * @ctx: Output parameter containing current context. May be null if
+- *		 no valid context has been submitted to the execlist queue of
+- *		 this engine.
+- *
+- * Return:
+- *	CONTEXT_SUBMISSION_STATUS_OK if context is found to be submitted and is
+- *	currently running on engine.
+- *
+- *	CONTEXT_SUBMISSION_STATUS_SUBMITTED if context is found to be submitted
+- *	but not in a state that is consistent with current hardware state for
+- *	the given engine. This happens in two cases:
+- *
+- *		1. Before the engine has switched to this context after it has
+- *		been submitted to the execlist queue.
+- *
+- *		2. After the engine has switched away from this context but
+- *		before the context has been removed from the execlist queue.
+- *
+- *	CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED if no context has been found
+- *	to be submitted to the execlist queue and if the hardware is idle.
+- *
+- *	CONTEXT_SUBMISSION_STATUS_UNDEFINED if the passed context was null
+- *
+- */
+-enum context_submission_status
+-intel_execlists_TDR_get_submitted_context(struct intel_engine_cs *ring,
+-		struct intel_context **ctx)
+-{
+-	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+-	unsigned long flags;
+-	struct intel_ctx_submit_request *req;
+-	unsigned hw_context = 0;
+-	enum context_submission_status status =
+-			CONTEXT_SUBMISSION_STATUS_UNDEFINED;
+-
+-	if (!ctx)
+-		return CONTEXT_SUBMISSION_STATUS_UNDEFINED;
+-
+-	gen8_gt_force_wake_get(dev_priv);
+-	spin_lock_irqsave(&ring->execlist_lock, flags);
+-	hw_context = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
+-
+-	req = list_first_entry_or_null(&ring->execlist_queue,
+-		struct intel_ctx_submit_request, execlist_link);
+-
+-	*ctx = NULL;
+-	if (req) {
+-		if (req->ctx) {
+-			*ctx = req->ctx;
+-			i915_gem_context_reference(*ctx);
+-		} else {
+-			WARN(1, "No context in request %p", req);
+-		}
+-	}
+-
+-	if (*ctx) {
+-		unsigned sw_context =
+-			intel_execlists_ctx_id((*ctx)->engine[ring->id].state);
+-
+-		status = ((hw_context == sw_context) && (0 != hw_context)) ?
+-			CONTEXT_SUBMISSION_STATUS_OK :
+-			CONTEXT_SUBMISSION_STATUS_SUBMITTED;
+-	} else {
+-		/*
+-		 * If we don't have any queue entries and the
+-		 * EXECLIST_STATUS register points to zero we are
+-		 * clearly not processing any context right now
+-		 */
+-		status = hw_context ?
+-			CONTEXT_SUBMISSION_STATUS_SUBMITTED :
+-			CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED;
+-	}
+-
+-	spin_unlock_irqrestore(&ring->execlist_lock, flags);
+-	gen8_gt_force_wake_put(dev_priv);
+-
+-	return status;
+-}
+-
+ static bool execlists_check_remove_request(struct intel_engine_cs *ring,
+ 					   u32 request_id)
+ {
+@@ -990,138 +732,6 @@ static int execlists_context_queue(struct intel_engine_cs *ring,
+ 	return 0;
+ }
+ 
+-/**
+- * intel_execlists_TDR_context_queue() - ELSP context submission bypassing
+- * queue
+- *
+- * Context submission mechanism exclusively used by TDR that bypasses the
+- * execlist queue. This is necessary since at the point of TDR hang recovery
+- * the hardware will be hung and resubmitting a fixed context (the context that
+- * the TDR has identified as hung and fixed up in order to move past the
+- * blocking batch buffer) to a hung execlist queue will lock up the TDR.
+- * Instead, opt for direct ELSP submission without depending on the rest of the
+- * driver.
+- * If execlist queue is empty we fall back to ordinary queue-based submission
+- * since we require the context under submission to be present in the queue
+- * (yes, this happens sometimes - e.g. during full GPU reset in which case the
+- * queues are reinitialized).
+- *
+- * @ring: engine to submit context to
+- * @to: context to be resubmitted
+- * @tail: position in ring to submit to
+- *
+- * Return:
+- *	0 if successful, otherwise propagate error code.
+- */
+-int intel_execlists_TDR_context_queue(struct intel_engine_cs *ring,
+-			struct intel_context *to,
+-			u32 tail)
+-{
+-	struct intel_ctx_submit_request *req = NULL;
+-	unsigned long flags;
+-	int ret = 0;
+-
+-	spin_lock_irqsave(&ring->execlist_lock, flags);
+-
+-	if (list_empty(&ring->execlist_queue)) {
+-		spin_unlock_irqrestore(&ring->execlist_lock, flags);
+-
+-		/*
+-		 * Fallback path in case the execlist queue is empty - just use
+-		 * ordinary queue-based submission.
+-		 *
+-		 * At first glance this looks like a possible race since
+-		 * someone might add an entry to the queue after we enter
+-		 * this if statement and before we end up in
+-		 * execlists_context_queue to add a new queue entry expecting
+-		 * it to be immediately unqueued. However, TDR should hold
+-		 * precendence during hang recovery and all other request
+-		 * submitters should call i915_mutex_lock_interruptible to
+-		 * acquire the struct_mutex before submitting new work. This
+-		 * way of acquiring the mutex takes TDR into account and makes
+-		 * sure that nobody else is allowed to submit work to a hung
+-		 * execlist queue during an ongoing hang recovery.
+-		 */
+-		ret = execlists_context_queue(ring, to, tail);
+-
+-	} else {
+-		/*
+-		 * Submission path used for hang recovery bypassing execlist
+-		 * queue. When a context needs to be resubmitted for lite
+-		 * restore during hang recovery we cannot use the execlist
+-		 * queue since it will be hung just like its corresponding ring
+-		 * engine. Instead go for direct submission to ELSP.
+-		 */
+-		struct intel_context *c = NULL;
+-		struct drm_i915_gem_object *ctx_obj = NULL;
+-		u32 c_ctxid = 0;
+-		u32 to_ctxid = 0;
+-
+-		req = list_first_entry(&ring->execlist_queue,
+-			typeof(*req),
+-			execlist_link);
+-
+-		if (!req) {
+-			WARN(1, "Request is null, " \
+-				"context resubmission to %s failed!",
+-					ring->name);
+-
+-			return -EINVAL;
+-		}
+-
+-		c = req->ctx;
+-
+-		if (!c) {
+-			WARN(1, "Context null for request %p, " \
+-				"context resubmission to %s failed",
+-				req, ring->name);
+-
+-			return -EINVAL;
+-		}
+-
+-		ctx_obj = c->engine[ring->id].state;
+-
+-		if (!ctx_obj) {
+-			WARN(1, "Context object null for context %p, " \
+-				"context resubmission to %s failed", c,
+-				ring->name);
+-
+-			return -EINVAL;
+-		}
+-
+-		WARN(req->elsp_submitted == 0,
+-			"Allegedly hung request has never been submitted " \
+-			"to ELSP\n");
+-
+-		c_ctxid = intel_execlists_ctx_id(c->engine[ring->id].state);
+-		to_ctxid = intel_execlists_ctx_id(to->engine[ring->id].state);
+-
+-		/*
+-		 * At the beginning of hang recovery the TDR asks for the
+-		 * currently submitted context (which has been determined to be
+-		 * hung at that point). This should be the context at the head
+-		 * of the execlist queue. If we reach a point during the
+-		 * recovery where we need to do a lite restore of the hung
+-		 * context only to discover that the head context of the
+-		 * execlist queue has changed, what do we do? The least we can
+-		 * do is produce a warning.
+-		 */
+-		WARN(c_ctxid != to_ctxid,
+-		    "Context (%x) at head of execlist queue for %s " \
+-		    "is not the suspected hung context (%x)! Was execlist " \
+-		    "queue reordered during hang recovery?",
+-		    (unsigned int) c_ctxid, ring->name,
+-		    (unsigned int) to_ctxid);
+-
+-		execlists_TDR_context_unqueue(ring);
+-
+-		spin_unlock_irqrestore(&ring->execlist_lock, flags);
+-	}
+-
+-	return ret;
+-}
+-
+-
+ static int logical_ring_invalidate_all_caches(struct intel_ringbuffer *ringbuf)
+ {
+ 	struct intel_engine_cs *ring = ringbuf->ring;
+@@ -1536,14 +1146,13 @@ void intel_logical_ring_stop(struct intel_engine_cs *ring)
+ 		DRM_ERROR("failed to quiesce %s whilst cleaning up: %d\n",
+ 			  ring->name, ret);
+ 
+-	/* FIXME: Stopping rings through MI_MODE is not defined for execlists */
+-
+-	I915_WRITE_MODE(ring, _MASKED_BIT_ENABLE(RING_MODE_STOP));
+-	if (wait_for_atomic((I915_READ_MODE(ring) & RING_MODE_IDLE) != 0, 1000)) {
++	/* TODO: Is this correct with Execlists enabled? */
++	I915_WRITE_MODE(ring, _MASKED_BIT_ENABLE(STOP_RING));
++	if (wait_for_atomic((I915_READ_MODE(ring) & MODE_IDLE) != 0, 1000)) {
+ 		DRM_ERROR("%s :timed out trying to stop ring\n", ring->name);
+ 		return;
+ 	}
+-	I915_WRITE_MODE(ring, _MASKED_BIT_DISABLE(RING_MODE_STOP));
++	I915_WRITE_MODE(ring, _MASKED_BIT_DISABLE(STOP_RING));
+ }
+ 
+ int logical_ring_flush_all_caches(struct intel_ringbuffer *ringbuf)
+@@ -1575,9 +1184,17 @@ void intel_logical_ring_advance_and_submit(struct intel_ringbuffer *ringbuf)
+ {
+ 	struct intel_engine_cs *ring = ringbuf->ring;
+ 	struct intel_context *ctx = ringbuf->FIXME_lrc_ctx;
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 
+ 	intel_logical_ring_advance(ringbuf);
+ 
++	/* Re-schedule the hangcheck timer each time the ring is given new work
++	* so that we can detect hangs caused by commands inserted directly
++	* to the ring as well as bad batch buffers */
++	if (!dev_priv->ums.mm_suspended &&
++	    dev_priv->ring[RCS].default_context->rcs_initialized)
++		i915_queue_hangcheck(ring->dev, ring->id);
++
+ 	if (intel_ring_stopped(ring))
+ 		return;
+ 
+@@ -1641,7 +1258,7 @@ static int logical_ring_wait_for_space(struct intel_ringbuffer *ringbuf,
+ 	/* Force the context submission in case we have been skipping it */
+ 	intel_logical_ring_advance_and_submit(ringbuf);
+ 
+-	/* With GEM the hang check should kick us out of the loop,
++	/* With GEM the hangcheck timer should kick us out of the loop,
+ 	 * leaving it early runs the risk of corrupting GEM state (due
+ 	 * to running on almost untested codepaths). But on resume
+ 	 * timers don't work yet, so prevent a complete hang in that
+@@ -2004,290 +1621,6 @@ static int gen8_emit_request(struct intel_ringbuffer *ringbuf)
+ 	return 0;
+ }
+ 
+-static int
+-gen8_ring_disable(struct intel_engine_cs *ring, struct intel_context *ctx)
+-{
+-	struct drm_i915_private *dev_priv = (ring->dev)->dev_private;
+-	uint32_t ring_ctl = 0;
+-	int ret = 0;
+-
+-	/* Request the ring to go idle */
+-	I915_WRITE_MODE(ring, _MASKED_BIT_ENABLE(RING_MODE_STOP));
+-
+-	/* Disable the ring */
+-	ret = I915_READ_CTL_CTX(ring, ctx, ring_ctl);
+-	if (ret)
+-		return ret;
+-
+-	ring_ctl &= (RING_NR_PAGES | RING_REPORT_MASK);
+-	I915_WRITE_CTL_CTX_MMIO(ring, ctx, ring_ctl);
+-	ring_ctl = I915_READ_CTL(ring);  /* Barrier read */
+-
+-	WARN(!((ring_ctl & RING_VALID) == 0), "Failed to disable %s!",
+-		ring->name);
+-
+-	return 0;
+-}
+-
+-static int
+-gen8_ring_enable(struct intel_engine_cs *ring, struct intel_context *ctx)
+-{
+-	struct drm_i915_private *dev_priv = (ring->dev)->dev_private;
+-	uint32_t mode = 0;
+-	uint32_t ring_ctl = 0;
+-	uint32_t tail = 0;
+-	int ret = 0;
+-
+-	ret = I915_READ_TAIL_CTX(ring, ctx, tail);
+-	if (ret)
+-		return ret;
+-
+-	/* Clear the MI_MODE stop bit */
+-	I915_WRITE_MODE(ring, _MASKED_BIT_DISABLE(RING_MODE_STOP));
+-	mode = I915_READ_MODE(ring);    /* Barrier read */
+-
+-	/* Enable the ring */
+-	ret = I915_READ_CTL_CTX(ring, ctx, ring_ctl);
+-	if (ret)
+-		return ret;
+-
+-	ring_ctl &= (RING_NR_PAGES | RING_REPORT_MASK);
+-	I915_WRITE_CTL_CTX_MMIO(ring, ctx, ring_ctl | RING_VALID);
+-	ring_ctl = I915_READ_CTL(ring); /* Barrier read */
+-
+-	/*
+-	 * After enabling the ring and updating the ring context
+-	 * do context resubmission to kick off hardware again.
+-	 */
+-	intel_execlists_TDR_context_queue(ring, ctx, tail);
+-
+-	return 0;
+-}
+-
+-/*
+- * gen8_ring_save()
+- *
+- * Saves part of engine/context state to scratch memory while
+- * engine is reset and reinitialized. The saved engine/context state
+- * is as follows (in the stated order):
+- *
+- *	Context buffer control register of the currently hung context
+- *
+- *	Context tail register of the currently hung context
+- *
+- *	Nudged head MMIO register value of the currently hung engine.
+- *	Before saving the head MMIO register we nudge it to be correctly
+- *	aligned with a QWORD boundary. The reason this works even though
+- *	the head register points to the first instruction following the
+- *	hung batch buffer is that the driver also pads the instruction
+- *	stream so that the third DWORD of the BB_START instruction is
+- *	followed by a MI_NOOP. That means that we're skipping the MI_NOOP
+- *	and end up at the first interesting instruction after the MI_NOOP.
+- *
+- * ring: engine under reset
+- * ctx: context currently running on engine
+- * data: scratch memory that holds state temporarily during reset.
+- * size: number of 32-bit words stored in data
+- * flags: information on how to nudge head when saving it to state memory
+- */
+-static int
+-gen8_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+-		uint32_t *data, uint32_t data_size, u32 flags)
+-{
+-	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+-	struct intel_ringbuffer *ringbuf = NULL;
+-	int ret = 0;
+-	int clamp_to_tail = 0;
+-	uint32_t ctl;
+-	uint32_t head;
+-	uint32_t tail;
+-	uint32_t head_addr;
+-	uint32_t tail_addr;
+-	uint32_t hw_context_id1 = ~0u;
+-	uint32_t hw_context_id2 = ~0u;
+-
+-	/*
+-	 * Expect no less space than for three registers:
+-	 * head, tail and ring buffer control
+-	 */
+-	if (data_size < GEN8_RING_CONTEXT_SIZE) {
+-		DRM_ERROR("State size is too small! (%u)\n", data_size);
+-		return -EINVAL;
+-	}
+-
+-	if (!ring || !ctx) {
+-		WARN(!ring, "Ring is null! Ring state save failed!\n");
+-		WARN(!ctx, "Context is null! Ring state save failed!\n");
+-		return -EINVAL;
+-	}
+-
+-	ringbuf = ctx->engine[ring->id].ringbuf;
+-
+-	hw_context_id1 = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
+-
+-	/*
+-	 * Read head from MMIO register since it contains the
+-	 * most up to date value of head at this point.
+-	 */
+-	head = I915_READ_HEAD(ring);
+-
+-	hw_context_id2 = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
+-
+-	if (hw_context_id1 != hw_context_id2) {
+-		WARN(1, "Somehow the currently running context has changed " \
+-			"beneath our feet (%x != %x)! Bailing and retrying!\n",
+-			(unsigned int) hw_context_id1,
+-			(unsigned int) hw_context_id2);
+-
+-		return -EAGAIN;
+-	}
+-
+-	/*
+-	 * Read tail from the context because the execlist queue
+-	 * updates the tail value there first during submission.
+-	 * The MMIO tail register is not be updated until the actual
+-	 * ring submission is completed.
+-	 */
+-	ret = I915_READ_TAIL_CTX(ring, ctx, tail);
+-	if (ret)
+-		return ret;
+-
+-	/*
+-	 * head_addr and tail_addr are the head and tail values
+-	 * excluding ring wrapping information and aligned to DWORD
+-	 * boundary
+-	 */
+-	head_addr = head & HEAD_ADDR;
+-	tail_addr = tail & TAIL_ADDR;
+-
+-	/*
+-	 * The head must always chase the tail.
+-	 * If the tail is beyond the head then do not allow
+-	 * the head to overtake it. If the tail is less than
+-	 * the head then the tail has already wrapped and
+-	 * there is no problem in advancing the head or even
+-	 * wrapping the head back to 0 as worst case it will
+-	 * become equal to tail
+-	 */
+-	if (head_addr <= tail_addr)
+-		clamp_to_tail = 1;
+-
+-	if (flags & FORCE_ADVANCE) {
+-
+-		/* Force head pointer to next QWORD boundary */
+-		head_addr &= ~0x7;
+-		head_addr += 8;
+-		DRM_DEBUG_TDR("Forced head to 0x%08x\n", (unsigned int) head_addr);
+-
+-	} else if (head & 0x7) {
+-
+-		/* Ensure head pointer is pointing to a QWORD boundary */
+-		DRM_DEBUG_TDR("Rounding up head 0x%08x\n", (unsigned int) head);
+-		head += 0x7;
+-		head &= ~0x7;
+-		head_addr = head;
+-	}
+-
+-	if (clamp_to_tail && (head_addr > tail_addr)) {
+-		head_addr = tail_addr;
+-	} else if (head_addr >= ringbuf->size) {
+-		/* Wrap head back to start if it exceeds ring size*/
+-		head_addr = 0;
+-	}
+-
+-	/* Update the register */
+-	head &= ~HEAD_ADDR;
+-	head |= (head_addr & HEAD_ADDR);
+-
+-	/* Save ring control register */
+-	ret = I915_READ_CTL_CTX(ring, ctx, ctl);
+-	if (ret)
+-		return ret;
+-	ctl &= (RING_NR_PAGES | RING_REPORT_MASK);
+-
+-	/* Save head and tail as 0 so they are reset on restore */
+-	if (flags & RESET_HEAD_TAIL)
+-		head = tail = 0;
+-
+-	data[0] = ctl;
+-	data[1] = tail;
+-
+-	/*
+-	 * Head will already have advanced to next instruction location
+-	 * even if the current instruction caused a hang, so we just
+-	 * save the current value as the value to restart at
+-	 */
+-	data[2] = head;
+-
+-	return 0;
+-}
+-
+-static int
+-gen8_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx,
+-		uint32_t *data, uint32_t data_size)
+-{
+-	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+-	uint32_t head;
+-	uint32_t tail;
+-	uint32_t ctl;
+-
+-	/*
+-	 * Expect no less space than for three registers:
+-	 * head, tail and ring buffer control
+-	 */
+-	if (data_size < GEN8_RING_CONTEXT_SIZE) {
+-		DRM_ERROR("State size is too small! (%u)\n", data_size);
+-		return -EINVAL;
+-	}
+-
+-	/* Re-initialize ring */
+-	if (ring->init) {
+-		int ret = ring->init(ring);
+-		if (ret != 0) {
+-			DRM_ERROR("Failed to re-initialize %s\n",
+-					ring->name);
+-			return ret;
+-		}
+-	} else {
+-		DRM_ERROR("ring init function pointer not set up\n");
+-		return -EINVAL;
+-	}
+-
+-	if (ring->id == RCS) {
+-		/*
+-		 * These register reinitializations are only located here
+-		 * temporarily until they are moved out of the
+-		 * init_clock_gating function to some function we can
+-		 * call from here.
+-		 */
+-
+-		/* WaVSRefCountFullforceMissDisable:chv */
+-		/* WaDSRefCountFullforceMissDisable:chv */
+-		I915_WRITE(GEN7_FF_THREAD_MODE,
+-			   I915_READ(GEN7_FF_THREAD_MODE) &
+-			   ~(GEN8_FF_DS_REF_CNT_FFME | GEN7_FF_VS_REF_CNT_FFME));
+-
+-		I915_WRITE(_3D_CHICKEN3,
+-			   _3D_CHICKEN_SDE_LIMIT_FIFO_POLY_DEPTH(2));
+-
+-		/* WaSwitchSolVfFArbitrationPriority:bdw */
+-		I915_WRITE(GAM_ECOCHK, I915_READ(GAM_ECOCHK) | HSW_ECOCHK_ARB_PRIO_SOL);
+-	}
+-
+-	ctl = data[0];
+-	tail = data[1];
+-	head = data[2];
+-
+-	/* Restore head, tail and ring buffer control */
+-
+-	I915_WRITE_HEAD_CTX_MMIO(ring, ctx, head);
+-	I915_WRITE_TAIL(ring, tail);
+-	I915_WRITE_CTL_CTX_MMIO(ring, ctx, ctl);
+-
+-	return 0;
+-}
+-
+-
+ /**
+  * intel_logical_ring_cleanup() - deallocate the Engine Command Streamer
+  *
+@@ -2302,7 +1635,7 @@ void intel_logical_ring_cleanup(struct intel_engine_cs *ring)
+ 		return;
+ 
+ 	intel_logical_ring_stop(ring);
+-	WARN_ON((I915_READ_MODE(ring) & RING_MODE_IDLE) == 0);
++	WARN_ON((I915_READ_MODE(ring) & MODE_IDLE) == 0);
+ 
+ 	i915_sync_timeline_advance(ring);
+ 	i915_sync_timeline_destroy(ring);
+@@ -2385,10 +1718,6 @@ static int logical_render_ring_init(struct drm_device *dev)
+ 	ring->irq_get = gen8_logical_ring_get_irq;
+ 	ring->irq_put = gen8_logical_ring_put_irq;
+ 	ring->emit_bb_start = gen8_emit_bb_start;
+-	ring->enable = gen8_ring_enable;
+-	ring->disable = gen8_ring_disable;
+-	ring->save = gen8_ring_save;
+-	ring->restore = gen8_ring_restore;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+@@ -2414,10 +1743,6 @@ static int logical_bsd_ring_init(struct drm_device *dev)
+ 	ring->irq_get = gen8_logical_ring_get_irq;
+ 	ring->irq_put = gen8_logical_ring_put_irq;
+ 	ring->emit_bb_start = gen8_emit_bb_start;
+-	ring->enable = gen8_ring_enable;
+-	ring->disable = gen8_ring_disable;
+-	ring->save = gen8_ring_save;
+-	ring->restore = gen8_ring_restore;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+@@ -2443,10 +1768,6 @@ static int logical_bsd2_ring_init(struct drm_device *dev)
+ 	ring->irq_get = gen8_logical_ring_get_irq;
+ 	ring->irq_put = gen8_logical_ring_put_irq;
+ 	ring->emit_bb_start = gen8_emit_bb_start;
+-	ring->enable = gen8_ring_enable;
+-	ring->disable = gen8_ring_disable;
+-	ring->save = gen8_ring_save;
+-	ring->restore = gen8_ring_restore;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+@@ -2472,10 +1793,6 @@ static int logical_blt_ring_init(struct drm_device *dev)
+ 	ring->irq_get = gen8_logical_ring_get_irq;
+ 	ring->irq_put = gen8_logical_ring_put_irq;
+ 	ring->emit_bb_start = gen8_emit_bb_start;
+-	ring->enable = gen8_ring_enable;
+-	ring->disable = gen8_ring_disable;
+-	ring->save = gen8_ring_save;
+-	ring->restore = gen8_ring_restore;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+@@ -2501,10 +1818,6 @@ static int logical_vebox_ring_init(struct drm_device *dev)
+ 	ring->irq_get = gen8_logical_ring_get_irq;
+ 	ring->irq_put = gen8_logical_ring_put_irq;
+ 	ring->emit_bb_start = gen8_emit_bb_start;
+-	ring->enable = gen8_ring_enable;
+-	ring->disable = gen8_ring_disable;
+-	ring->save = gen8_ring_save;
+-	ring->restore = gen8_ring_restore;
+ 
+ 	return logical_ring_init(dev, ring);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index eaeeeb3..33c3b4b 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -27,7 +27,6 @@
+ /* Execlists regs */
+ #define RING_ELSP(ring)			((ring)->mmio_base+0x230)
+ #define RING_EXECLIST_STATUS(ring)	((ring)->mmio_base+0x234)
+-#define RING_EXECLIST_STATUS_CTX_ID(ring)	(RING_EXECLIST_STATUS(ring)+4)
+ #define RING_CONTEXT_CONTROL(ring)	((ring)->mmio_base+0x244)
+ #define RING_CONTEXT_STATUS_BUF(ring)	((ring)->mmio_base+0x370)
+ #define RING_CONTEXT_STATUS_PTR(ring)	((ring)->mmio_base+0x3a0)
+@@ -112,28 +111,4 @@ struct intel_ctx_submit_request {
+ 
+ void intel_execlists_handle_ctx_events(struct intel_engine_cs *ring);
+ 
+-int intel_execlists_write_buffer_ctl(struct intel_engine_cs *ring,
+-				struct intel_context *ctx,
+-				u32 ctl);
+-
+-int intel_execlists_read_buffer_ctl(struct intel_engine_cs *ring,
+-				struct intel_context *ctx,
+-				u32 *ctl);
+-
+-int intel_execlists_write_tail(struct intel_engine_cs *ring,
+-			  struct intel_context *ctx,
+-			  u32 tail);
+-
+-int intel_execlists_read_tail(struct intel_engine_cs *ring,
+-			 struct intel_context *ctx,
+-			 u32 *tail);
+-
+-int intel_execlists_write_head(struct intel_engine_cs *ring,
+-			  struct intel_context *ctx,
+-			  u32 head);
+-
+-int intel_execlists_read_head(struct intel_engine_cs *ring,
+-			 struct intel_context *ctx,
+-			 u32 *head);
+-
+ #endif /* _INTEL_LRC_H_ */
+diff --git a/drivers/gpu/drm/i915/intel_lrc_tdr.h b/drivers/gpu/drm/i915/intel_lrc_tdr.h
+deleted file mode 100644
+index 95949a0..0000000
+--- a/drivers/gpu/drm/i915/intel_lrc_tdr.h
++++ /dev/null
+@@ -1,38 +0,0 @@
+-/*
+- * Copyright © 2014 Intel Corporation
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice (including the next
+- * paragraph) shall be included in all copies or substantial portions of the
+- * Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+- * DEALINGS IN THE SOFTWARE.
+- */
+-
+-#ifndef _INTEL_LRC_TDR_H_
+-#define _INTEL_LRC_TDR_H_
+-
+-/* Privileged execlist API used exclusively by TDR */
+-
+-int intel_execlists_TDR_context_queue(struct intel_engine_cs *ring,
+-		struct intel_context *to,
+-		u32 tail);
+-
+-enum context_submission_status
+-intel_execlists_TDR_get_submitted_context(struct intel_engine_cs *ring,
+-		struct intel_context **ctx);
+-
+-#endif /* _INTEL_LRC_TDR_H_ */
+-
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 7aa90ed..7171813 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -84,10 +84,18 @@ bool intel_ring_stopped(struct intel_engine_cs *ring)
+ 
+ void __intel_ring_advance(struct intel_engine_cs *ring)
+ {
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	struct intel_ringbuffer *ringbuf = ring->buffer;
+ 
+ 	intel_ring_advance(ring);
+ 
++	/* Re-schedule the hangcheck timer each time the ring is given new work
++	* so that we can detect hangs caused by commands inserted directly
++	* to the ring as well as bad batch buffers */
++	if (!dev_priv->ums.mm_suspended &&
++	    dev_priv->ring[RCS].default_context->legacy_hw_ctx.initialized)
++		i915_queue_hangcheck(ring->dev, ring->id);
++
+ 	if (intel_ring_stopped(ring))
+ 		return;
+ 	ring->write_tail(ring, ringbuf->tail);
+@@ -452,10 +460,10 @@ static void ring_write_tail(struct intel_engine_cs *ring,
+ 	I915_WRITE_TAIL(ring, value);
+ }
+ 
+-int intel_ring_disable(struct intel_engine_cs *ring, struct intel_context *ctx)
++int intel_ring_disable(struct intel_engine_cs *ring)
+ {
+ 	if (ring && ring->disable)
+-		return ring->disable(ring, ctx);
++		return ring->disable(ring);
+ 	else {
+ 		DRM_ERROR("ring disable not supported\n");
+ 		return -EINVAL;
+@@ -463,7 +471,7 @@ int intel_ring_disable(struct intel_engine_cs *ring, struct intel_context *ctx)
+ }
+ 
+ static int
+-gen6_ring_disable(struct intel_engine_cs *ring, struct intel_context *ctx)
++gen6_ring_disable(struct intel_engine_cs *ring)
+ {
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -493,10 +501,10 @@ gen6_ring_disable(struct intel_engine_cs *ring, struct intel_context *ctx)
+ 	return ((ring_ctl & RING_VALID) == 0) ? 0 : -EIO;
+ }
+ 
+-int intel_ring_enable(struct intel_engine_cs *ring, struct intel_context *ctx)
++int intel_ring_enable(struct intel_engine_cs *ring)
+ {
+ 	if (ring && ring->enable)
+-		return ring->enable(ring, ctx);
++		return ring->enable(ring);
+ 	else {
+ 		DRM_ERROR("ring enable not supported\n");
+ 		return -EINVAL;
+@@ -504,7 +512,7 @@ int intel_ring_enable(struct intel_engine_cs *ring, struct intel_context *ctx)
+ }
+ 
+ static int
+-gen6_ring_enable(struct intel_engine_cs *ring, struct intel_context *ctx)
++gen6_ring_enable(struct intel_engine_cs *ring)
+ {
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -524,11 +532,10 @@ gen6_ring_enable(struct intel_engine_cs *ring, struct intel_context *ctx)
+ 	return ((ring_ctl & RING_VALID) == 0) ? -EIO : 0;
+ }
+ 
+-int intel_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+-		u32 flags)
++int intel_ring_save(struct intel_engine_cs *ring, u32 flags)
+ {
+ 	if (ring && ring->save)
+-		return ring->save(ring, ctx, ring->saved_state,
++		return ring->save(ring, ring->saved_state,
+ 			I915_RING_CONTEXT_SIZE, flags);
+ 	else {
+ 		DRM_ERROR("ring save not supported\n");
+@@ -537,8 +544,8 @@ int intel_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ }
+ 
+ static int
+-gen6_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+-			   uint32_t *data, uint32_t data_size, u32 flags)
++gen6_ring_save(struct intel_engine_cs *ring, uint32_t *data, uint32_t max,
++		u32 flags)
+ {
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -555,59 +562,49 @@ gen6_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 	WARN_ON(gen < 7);
+ 
+ 	/* Save common registers */
+-	if (data_size < GEN7_COMMON_RING_CTX_SIZE)
++	if (max < COMMON_RING_CTX_SIZE)
+ 		return -EINVAL;
+ 
+ 	head = I915_READ_HEAD(ring);
+ 	tail = I915_READ_TAIL(ring);
+ 
+-	/*
+-	 * head_addr and tail_addr are the head and tail values
+-	 * excluding ring wrapping information and aligned to DWORD
+-	 * boundary
+-	 */
+ 	head_addr = head & HEAD_ADDR;
+ 	tail_addr = tail & TAIL_ADDR;
+ 
+-	/*
+-	 * The head must always chase the tail.
+-	 * If the tail is beyond the head then do not allow
+-	 * the head to overtake it. If the tail is less than
+-	 * the head then the tail has already wrapped and
+-	 * there is no problem in advancing the head or even
+-	 * wrapping the head back to 0 as worst case it will
+-	 * become equal to tail
+-	 */
+-	if (head_addr <= tail_addr)
+-		clamp_to_tail = 1;
+-
+ 	if (flags & FORCE_ADVANCE) {
+-
+-		/* Force head pointer to next QWORD boundary */
++		/* The head must always chase the tail.
++		* If the tail is beyond the head then do not allow
++		* the head to overtake it. If the tail is less than
++		* the head then the tail has already wrapped and
++		* there is no problem in advancing the head or even
++		* wrapping the head back to 0 as worst case it will
++		* become equal to tail */
++		if (head_addr <= tail_addr)
++			clamp_to_tail = 1;
++
++		/* Force head to next QWORD boundary */
+ 		head_addr &= ~0x7;
+ 		head_addr += 8;
+-		DRM_DEBUG_TDR("Forced head to 0x%08x\n", (unsigned int) head_addr);
+ 
+-	} else if (head & 0x7) {
++		if (clamp_to_tail && (head_addr > tail_addr)) {
++			head_addr = tail_addr;
++		} else if (head_addr >= ringbuf->size) {
++			/* Wrap head back to start if it exceeds ring size*/
++			head_addr = 0;
++		}
++
++		/* Update the register */
++		head &= ~HEAD_ADDR;
++		head |= (head_addr & HEAD_ADDR);
+ 
++		DRM_DEBUG_TDR("Forced head to 0x%08x\n", head);
++	} else if (head & 0x7) {
+ 		/* Ensure head pointer is pointing to a QWORD boundary */
+-		DRM_DEBUG_TDR("Rounding up head 0x%08x\n", (unsigned int) head);
++		DRM_DEBUG_TDR("Rounding up head 0x%08x\n", head);
+ 		head += 0x7;
+ 		head &= ~0x7;
+-		head_addr = head;
+ 	}
+ 
+-	if (clamp_to_tail && (head_addr > tail_addr)) {
+-		head_addr = tail_addr;
+-	} else if (head_addr >= ringbuf->size) {
+-		/* Wrap head back to start if it exceeds ring size*/
+-		head_addr = 0;
+-	}
+-
+-	/* Update the register */
+-	head &= ~HEAD_ADDR;
+-	head |= (head_addr & HEAD_ADDR);
+-
+ 	/* Saved with enable = 0 */
+ 	data[idx++] = I915_READ_CTL(ring) & (RING_NR_PAGES | RING_REPORT_MASK);
+ 
+@@ -636,7 +633,7 @@ gen6_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 
+ 	switch (ring->id) {
+ 	case RCS:
+-		if (data_size < (GEN7_COMMON_RING_CTX_SIZE + GEN7_RCS_RING_CTX_SIZE))
++		if (max < (COMMON_RING_CTX_SIZE + RCS_RING_CTX_SIZE))
+ 			return -EINVAL;
+ 
+ 		data[idx++] = I915_READ(RENDER_HWS_PGA_GEN7);
+@@ -656,7 +653,7 @@ gen6_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 		break;
+ 
+ 	case VCS:
+-		if (data_size < (GEN7_COMMON_RING_CTX_SIZE + GEN7_VCS_RING_CTX_SIZE))
++		if (max < (COMMON_RING_CTX_SIZE + VCS_RING_CTX_SIZE))
+ 			return -EINVAL;
+ 
+ 		data[idx++] = I915_READ(BSD_HWS_PGA_GEN7);
+@@ -672,7 +669,7 @@ gen6_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 		break;
+ 
+ 	case BCS:
+-		if (data_size < (GEN7_COMMON_RING_CTX_SIZE + GEN7_BCS_RING_CTX_SIZE))
++		if (max < (COMMON_RING_CTX_SIZE + BCS_RING_CTX_SIZE))
+ 			return -EINVAL;
+ 
+ 		data[idx++] = I915_READ(BLT_HWS_PGA_GEN7);
+@@ -689,7 +686,7 @@ gen6_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 		break;
+ 
+ 	case VECS:
+-		if (data_size < (GEN7_COMMON_RING_CTX_SIZE + GEN7_VECS_RING_CTX_SIZE))
++		if (max < (COMMON_RING_CTX_SIZE + VECS_RING_CTX_SIZE))
+ 			return -EINVAL;
+ 
+ 		data[idx++] = I915_READ(VEBOX_HWS_PGA_GEN7);
+@@ -710,10 +707,10 @@ gen6_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 	return 0;
+ }
+ 
+-int intel_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx)
++int intel_ring_restore(struct intel_engine_cs *ring)
+ {
+ 	if (ring && ring->restore)
+-		return ring->restore(ring, ctx, ring->saved_state,
++		return ring->restore(ring, ring->saved_state,
+ 			I915_RING_CONTEXT_SIZE);
+ 	else {
+ 		DRM_ERROR("ring restore not supported\n");
+@@ -722,8 +719,8 @@ int intel_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx)
+ }
+ 
+ static int
+-gen6_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx,
+-		uint32_t *data, uint32_t data_size)
++gen6_ring_restore(struct intel_engine_cs *ring, uint32_t *data,
++			uint32_t max)
+ {
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -734,10 +731,10 @@ gen6_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 	* they were saved. */
+ 	switch (ring->id) {
+ 	case RCS:
+-		if (data_size < (GEN7_COMMON_RING_CTX_SIZE + GEN7_RCS_RING_CTX_SIZE))
++		if (max < (COMMON_RING_CTX_SIZE + RCS_RING_CTX_SIZE))
+ 			return -EINVAL;
+ 
+-		idx = GEN7_COMMON_RING_CTX_SIZE + GEN7_RCS_RING_CTX_SIZE - 1;
++		idx = COMMON_RING_CTX_SIZE + RCS_RING_CTX_SIZE - 1;
+ 
+ 		I915_WRITE(FF_SLICE_CS_CHICKEN2(ring->mmio_base),
+ 			_MASKED_BIT_ENABLE_ALL(data[idx--]));
+@@ -764,10 +761,10 @@ gen6_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 		break;
+ 
+ 	case VCS:
+-		if (data_size < (GEN7_COMMON_RING_CTX_SIZE + GEN7_VCS_RING_CTX_SIZE))
++		if (max < (COMMON_RING_CTX_SIZE + VCS_RING_CTX_SIZE))
+ 			return -EINVAL;
+ 
+-		idx = GEN7_COMMON_RING_CTX_SIZE + GEN7_VCS_RING_CTX_SIZE - 1;
++		idx = COMMON_RING_CTX_SIZE + VCS_RING_CTX_SIZE - 1;
+ 		I915_WRITE(RING_MAX_IDLE(ring->mmio_base), data[idx--]);
+ 		I915_WRITE(GEN6_VRSYNC, data[idx--]);
+ 		I915_WRITE(RING_MODE_GEN7(ring),
+@@ -785,10 +782,10 @@ gen6_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 		break;
+ 
+ 	case BCS:
+-		if (data_size < (GEN7_COMMON_RING_CTX_SIZE + GEN7_BCS_RING_CTX_SIZE))
++		if (max < (COMMON_RING_CTX_SIZE + BCS_RING_CTX_SIZE))
+ 			return -EINVAL;
+ 
+-		idx = GEN7_COMMON_RING_CTX_SIZE + GEN7_BCS_RING_CTX_SIZE - 1;
++		idx = COMMON_RING_CTX_SIZE + BCS_RING_CTX_SIZE - 1;
+ 
+ 		I915_WRITE(RING_MAX_IDLE(ring->mmio_base), data[idx--]);
+ 		I915_WRITE(GEN6_BVSYNC, data[idx--]);
+@@ -808,10 +805,10 @@ gen6_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 		break;
+ 
+ 	case VECS:
+-		if (data_size < (GEN7_COMMON_RING_CTX_SIZE + GEN7_VECS_RING_CTX_SIZE))
++		if (max < (COMMON_RING_CTX_SIZE + VECS_RING_CTX_SIZE))
+ 			return -EINVAL;
+ 
+-		idx = GEN7_COMMON_RING_CTX_SIZE + GEN7_VECS_RING_CTX_SIZE - 1;
++		idx = COMMON_RING_CTX_SIZE + VECS_RING_CTX_SIZE - 1;
+ 
+ 		I915_WRITE(GEN6_VEVSYNC, data[idx--]);
+ 		I915_WRITE(RING_MODE_GEN7(ring),
+@@ -833,10 +830,10 @@ gen6_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 	}
+ 
+ 	/* Restore common registers */
+-	if (data_size < GEN7_COMMON_RING_CTX_SIZE)
++	if (max < COMMON_RING_CTX_SIZE)
+ 		return -EINVAL;
+ 
+-	idx = GEN7_COMMON_RING_CTX_SIZE - 1;
++	idx = COMMON_RING_CTX_SIZE - 1;
+ 
+ 	I915_WRITE(RING_PP_DIR_BASE(ring), data[idx--]);
+ 	I915_WRITE(RING_PP_DIR_DCLV(ring), data[idx--]);
+@@ -861,95 +858,19 @@ int intel_ring_invalidate_tlb(struct intel_engine_cs *ring)
+ 	}
+ }
+ 
+-void intel_gpu_reset_resample(struct intel_engine_cs *ring,
+-		struct intel_context *ctx)
+-{
+-	if (!ring) {
+-		WARN(!ring, "Ring is null! Could not resample!");
+-		return;
+-	}
+-
+-	if (i915.enable_execlists) {
+-		struct drm_i915_private *dev_priv = ring->dev->dev_private;
+-		uint32_t ring_tail;
+-		uint32_t ring_head;
+-		struct intel_ringbuffer *ringbuf;
+-
+-		if (!ctx) {
+-			WARN(!ring, "Context is null! Could not resample!");
+-			return;
+-		}
+-
+-		/* Reset context based on ring state */
+-		ring_tail = I915_READ_TAIL(ring) & TAIL_ADDR;
+-		ring_head = I915_READ_HEAD(ring) & HEAD_ADDR;
+-		ringbuf = ctx->engine[ring->id].ringbuf;
+-
+-		I915_WRITE_HEAD_CTX(ring, ctx, ring_head);
+-		I915_WRITE_TAIL_CTX(ring, ctx, ring_tail);
+-		ringbuf->head = ring_head;
+-		ringbuf->tail = ring_tail;
+-		ringbuf->last_retired_head = -1;
+-		intel_ring_update_space(ringbuf);
+-	}
+-}
+-
+-void intel_gpu_engine_reset_resample(struct intel_engine_cs *ring,
+-		struct intel_context *ctx)
++void intel_ring_resample(struct intel_engine_cs *ring)
+ {
+-	struct intel_ringbuffer *ringbuf = NULL;
+-	struct drm_i915_private *dev_priv;
+-
+-	if (!ring) {
+-		WARN(1, "Ring is null! Could not resample!");
+-		return;
+-	}
+-
+-	dev_priv = ring->dev->dev_private;
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_ringbuffer *ringbuf = ring->buffer;
+ 
+ 	if (!drm_core_check_feature(ring->dev, DRIVER_MODESET))
+ 		i915_kernel_lost_context(ring->dev);
+ 	else {
+-
+-		if (i915.enable_execlists) {
+-			if (!ctx) {
+-				WARN(1, "Context is null! Could not resample!");
+-				return;
+-			}
+-
+-			ringbuf = ctx->engine[ring->id].ringbuf;
+-
+-			/*
+-			 * In gen8+ context head is restored during reset and
+-			 * we can use it as a reference to set up the new
+-			 * driver state.
+-			 */
+-			I915_READ_HEAD_CTX(ring, ctx, ringbuf->head);
+-
+-			/*
+-			 * Do not resample tail in execlist mode.
+-			 *
+-			 * If we run in execlist mode there will be an execlist
+-			 * queue in place to manage ring submissions. In that
+-			 * case the hardware (and the current ring context
+-			 * state) will be lagging behind the execlist queue.
+-			 * Since the execlist queue depends on the tail value
+-			 * of the ring buffer to keep track of the most recent
+-			 * submission to the execlist queue we would be
+-			 * breaking the execlist queue by overwriting this
+-			 * value with the older tail value currently set in the
+-			 * ring. Let the execlist queue handle the up to date
+-			 * tail value and don't overwrite it with older values
+-			 * from the current ring state.
+-			 */
+-		} else {
+-			ringbuf = ring->buffer;
+-			ringbuf->head = I915_READ_HEAD(ring);
+-			ringbuf->tail = I915_READ_TAIL(ring) & TAIL_ADDR;
+-		}
+-
++		ringbuf->head = I915_READ_HEAD(ring);
++		ringbuf->tail = I915_READ_TAIL(ring) & TAIL_ADDR;
++		ringbuf->space = intel_ring_space(ringbuf);
+ 		ringbuf->last_retired_head = -1;
+-		intel_ring_update_space(ringbuf);
+ 	}
+ }
+ 
+@@ -983,28 +904,22 @@ static void ring_setup_phys_status_page(struct intel_engine_cs *ring)
+ static bool stop_ring(struct intel_engine_cs *ring)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(ring->dev);
+-	struct intel_context *ctx = ring->default_context;
+ 
+ 	if (!IS_GEN2(ring->dev)) {
+-		I915_WRITE_MODE(ring, _MASKED_BIT_ENABLE(RING_MODE_STOP));
+-		if (wait_for_atomic((I915_READ_MODE(ring) & RING_MODE_IDLE) != 0,
+-				1000)) {
++		I915_WRITE_MODE(ring, _MASKED_BIT_ENABLE(STOP_RING));
++		if (wait_for_atomic((I915_READ_MODE(ring) & MODE_IDLE) != 0, 1000)) {
+ 			DRM_ERROR("%s :timed out trying to stop ring\n", ring->name);
+ 			return false;
+ 		}
+ 	}
+ 
+-	if (I915_WRITE_CTL_CTX_MMIO(ring, ctx, 0))
+-			return false;
+-
+-	if (I915_WRITE_HEAD_CTX_MMIO(ring, ctx, 0))
+-			return false;
+-
++	I915_WRITE_CTL(ring, 0);
++	I915_WRITE_HEAD(ring, 0);
+ 	ring->write_tail(ring, 0);
+ 
+ 	if (!IS_GEN2(ring->dev)) {
+ 		(void)I915_READ_CTL(ring);
+-		I915_WRITE_MODE(ring, _MASKED_BIT_DISABLE(RING_MODE_STOP));
++		I915_WRITE_MODE(ring, _MASKED_BIT_DISABLE(STOP_RING));
+ 	}
+ 
+ 	return (I915_READ_HEAD(ring) & HEAD_ADDR) == 0;
+@@ -1716,8 +1631,7 @@ static int gen6_ring_invalidate_tlb(struct intel_engine_cs *ring)
+ 	u32 reg;
+ 	int ret;
+ 
+-	if ((INTEL_INFO(dev)->gen < 6) || (INTEL_INFO(dev)->gen >= 8) ||
+-			(!ring->stop) || (!ring->start))
++	if ((INTEL_INFO(dev)->gen < 6) || (!ring->stop) || (!ring->start))
+ 		return -EINVAL;
+ 
+ 	/* stop the ring before sync_flush */
+@@ -1727,10 +1641,6 @@ static int gen6_ring_invalidate_tlb(struct intel_engine_cs *ring)
+ 
+ 	/* Invalidate TLB */
+ 	reg = RING_INSTPM(ring->mmio_base);
+-
+-	/* ring should be idle before issuing a sync flush */
+-	WARN_ON((I915_READ_MODE(ring) & RING_MODE_IDLE) == 0);
+-
+ 	I915_WRITE(reg, _MASKED_BIT_ENABLE(INSTPM_TLB_INVALIDATE |
+ 				INSTPM_SYNC_FLUSH));
+ 	if (wait_for((I915_READ(reg) & INSTPM_SYNC_FLUSH) == 0, 1000))
+@@ -1794,7 +1704,7 @@ void intel_ring_setup_status_page(struct intel_engine_cs *ring)
+ 		u32 reg = RING_INSTPM(ring->mmio_base);
+ 
+ 		/* ring should be idle before issuing a sync flush*/
+-		WARN_ON((I915_READ_MODE(ring) & RING_MODE_IDLE) == 0);
++		WARN_ON((I915_READ_MODE(ring) & MODE_IDLE) == 0);
+ 
+ 		I915_WRITE(reg,
+ 			   _MASKED_BIT_ENABLE(INSTPM_TLB_INVALIDATE |
+@@ -2266,8 +2176,7 @@ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring)
+ 		return;
+ 
+ 	intel_stop_ring_buffer(ring);
+-	WARN_ON(!IS_GEN2(ring->dev) &&
+-			(I915_READ_MODE(ring) & RING_MODE_IDLE) == 0);
++	WARN_ON(!IS_GEN2(ring->dev) && (I915_READ_MODE(ring) & MODE_IDLE) == 0);
+ 
+ 	i915_sync_timeline_advance(ring);
+ 	i915_sync_timeline_destroy(ring);
+@@ -2352,13 +2261,11 @@ static int ring_wait_for_space(struct intel_engine_cs *ring, int n)
+ 	/* force the tail write in case we have been skipping them */
+ 	__intel_ring_advance(ring);
+ 
+-	/*
+-	 * With GEM the hang check should kick us out of the loop,
++	/* With GEM the hangcheck timer should kick us out of the loop,
+ 	 * leaving it early runs the risk of corrupting GEM state (due
+ 	 * to running on almost untested codepaths). But on resume
+ 	 * timers don't work yet, so prevent a complete hang in that
+-	 * case by choosing an insanely large timeout.
+-	 */
++	 * case by choosing an insanely large timeout. */
+ 	end = jiffies + 60 * HZ;
+ 
+ 	ret = 0;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index f401290..145c956 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -30,39 +30,21 @@ struct  intel_hw_status_page {
+ };
+ 
+ /*
+- * Gen7:
+  * These values must match the requirements of the ring save/restore functions
+  * which may need to change for different versions of the chip
+  */
+-#define GEN7_COMMON_RING_CTX_SIZE 6
+-#define GEN7_RCS_RING_CTX_SIZE 14
+-#define GEN7_VCS_RING_CTX_SIZE 10
+-#define GEN7_BCS_RING_CTX_SIZE 11
+-#define GEN7_VECS_RING_CTX_SIZE 8
++#define COMMON_RING_CTX_SIZE 6
++#define RCS_RING_CTX_SIZE 14
++#define VCS_RING_CTX_SIZE 10
++#define BCS_RING_CTX_SIZE 11
++#define VECS_RING_CTX_SIZE 8
+ #define MAX_CTX(a, b) (((a) > (b)) ? (a) : (b))
+ 
+ /* Largest of individual rings + common */
+-#define GEN7_RING_CONTEXT_SIZE (GEN7_COMMON_RING_CTX_SIZE +	 \
+-			MAX_CTX(MAX_CTX(GEN7_RCS_RING_CTX_SIZE,	 \
+-					GEN7_VCS_RING_CTX_SIZE), \
+-				GEN7_BCS_RING_CTX_SIZE))
+-
+-
+-/*
+- * Gen8:
+- * Ring state maintained throughout ring reset contains
+- * the following registers:
+- *     Head
+- *     Tail
+- *     Ring buffer control
+- *
+- * The remaining registers are reinitialized, not restored.
+- */
+-#define GEN8_RING_CONTEXT_SIZE 3
+-
+-#define I915_RING_CONTEXT_SIZE \
+-		MAX_CTX(GEN7_RING_CONTEXT_SIZE, \
+-			GEN8_RING_CONTEXT_SIZE)
++#define I915_RING_CONTEXT_SIZE (COMMON_RING_CTX_SIZE +		    \
++				MAX_CTX(MAX_CTX(RCS_RING_CTX_SIZE,  \
++						VCS_RING_CTX_SIZE), \
++						BCS_RING_CTX_SIZE))
+ 
+ #define WATCHDOG_ENABLE 0
+ #define RCS_WATCHDOG_DISABLE 1
+@@ -86,97 +68,6 @@ struct  intel_hw_status_page {
+ #define I915_READ_MODE(ring) I915_READ(RING_MI_MODE((ring)->mmio_base))
+ #define I915_WRITE_MODE(ring, val) I915_WRITE(RING_MI_MODE((ring)->mmio_base), val)
+ 
+-
+-
+-#define __INTEL_READ_CTX_OR_MMIO__(engine, ctx, outval, ctxreg, mmioreg) \
+-({ \
+-	int __ret = 0; \
+-	if (i915.enable_execlists) \
+-		__ret = intel_execlists_read_##ctxreg((engine), \
+-						      (ctx), \
+-						      &(outval)); \
+-	else \
+-		((outval) = I915_READ_##mmioreg(engine)); \
+-	__ret; \
+-})
+-
+-#define __INTEL_WRITE_CTX_OR_MMIO__(engine, ctx, val, ctxreg, mmioreg) \
+-({ \
+-	int __ret = 0; \
+-	if (i915.enable_execlists) \
+-		__ret = intel_execlists_write_##ctxreg((engine), \
+-						       (ctx), \
+-						       (val)); \
+-	else \
+-		(I915_WRITE_##mmioreg((engine), (val))); \
+-	__ret; \
+-})
+-
+-#define __INTEL_WRITE_CTX_AND_MMIO__(engine, ctx, val, ctxreg, mmioreg) \
+-({ \
+-	int __ret = 0; \
+-	(I915_WRITE_##mmioreg((engine), (val))); \
+-	if (i915.enable_execlists) \
+-		__ret = intel_execlists_write_##ctxreg((engine), \
+-						       (ctx), \
+-						       (val)); \
+-	__ret; \
+-})
+-
+-/*
+- * Unified context/MMIO register access macros
+- *
+- * Macros for accessing context registers or MMIO registers depending on mode.
+- * The macros depend on the global i915.execlists_enabled flag to determine
+- * which macro/function to use.
+- *
+- * engine: Engine that context belongs to
+- * ctx: Context to access value from
+- * val/outval: Name of scalar variable to be written/read
+- *
+- * WARNING! These macros are semantically different from their
+- * legacy MMIO-register counterparts above in that these macros return
+- * error codes (0 for OK or otherwise various kernel error codes) instead
+- * of returning the read value as the return value.
+- */
+-#define I915_READ_TAIL_CTX(engine, ctx, outval) \
+-	__INTEL_READ_CTX_OR_MMIO__((engine), (ctx), (outval), tail, TAIL)
+-
+-#define I915_WRITE_TAIL_CTX(engine, ctx, val) \
+-	__INTEL_WRITE_CTX_OR_MMIO__((engine), (ctx), (val), tail, TAIL)
+-
+-#define I915_READ_HEAD_CTX(engine, ctx, outval) \
+-	__INTEL_READ_CTX_OR_MMIO__((engine), (ctx), (outval), head, HEAD)
+-
+-#define I915_WRITE_HEAD_CTX(engine, ctx, val) \
+-	__INTEL_WRITE_CTX_OR_MMIO__((engine), (ctx), (val), head, HEAD)
+-
+-#define I915_READ_CTL_CTX(engine, ctx, outval) \
+-	__INTEL_READ_CTX_OR_MMIO__((engine), (ctx), (outval), buffer_ctl, CTL)
+-
+-#define I915_WRITE_CTL_CTX(engine, ctx, val) \
+-	__INTEL_WRITE_CTX_OR_MMIO__((engine), (ctx), (val), buffer_ctl, CTL)
+-
+-/*
+- * Coordinated context/MMIO register write macros
+- *
+- * We need to do coordinated writes to both a context register and a MMIO
+- * register in a number of places. These macros will write to both sets of
+- * registers.
+- *
+- * engine: The engine to write to
+- * ctx: Context to write to
+- * val: Value to write
+- */
+-#define I915_WRITE_TAIL_CTX_MMIO(engine, ctx, val) \
+-	__INTEL_WRITE_CTX_AND_MMIO__((engine), (ctx), (val), tail, TAIL)
+-
+-#define I915_WRITE_HEAD_CTX_MMIO(engine, ctx, val) \
+-	__INTEL_WRITE_CTX_AND_MMIO__((engine), (ctx), (val), head, HEAD)
+-
+-#define I915_WRITE_CTL_CTX_MMIO(engine, ctx, val) \
+-	__INTEL_WRITE_CTX_AND_MMIO__((engine), (ctx), (val), buffer_ctl, CTL)
+-
+ enum intel_ring_hangcheck_action {
+ 	HANGCHECK_IDLE = 0,
+ 	HANGCHECK_WAIT,
+@@ -197,9 +88,8 @@ struct intel_ring_hangcheck {
+ 	/* Parent drm_device */
+ 	struct drm_device *dev;
+ 
+-	/* Work queue for this ring only */
+-	struct delayed_work work;
+-	struct workqueue_struct *wq;
++	/* Timer for this ring only */
++	struct timer_list timer;
+ 
+ 	/* Count of consecutive hang detections
+ 	 * (reset flag set once count exceeds threshold) */
+@@ -237,12 +127,7 @@ struct intel_ring_hangcheck {
+ 	/* Number of watchdog hang detections for this ring */
+ 	u32 watchdog_count;
+ 
+-	/*
+-	 * Ring seqno recorded by the most recent hang check.
+-	 * Used as a first, coarse step to determine ring
+-	 * idleness
+-	 */
+-	u32 last_seqno;
++	atomic_t active;
+ };
+ 
+ struct intel_ringbuffer {
+@@ -328,14 +213,14 @@ struct intel_engine_cs {
+ #define I915_DISPATCH_SECURE 0x1
+ #define I915_DISPATCH_PINNED 0x2
+ 	void		(*cleanup)(struct intel_engine_cs *ring);
+-	int (*enable)(struct intel_engine_cs *ring, struct intel_context *ctx);
+-	int (*disable)(struct intel_engine_cs *ring, struct intel_context *ctx);
++	int (*enable)(struct intel_engine_cs *ring);
++	int (*disable)(struct intel_engine_cs *ring);
+ 	int (*start)(struct intel_engine_cs *ring);
+ 	int (*stop)(struct intel_engine_cs *ring);
+-	int (*save)(struct intel_engine_cs *ring, struct intel_context *ctx,
+-		    uint32_t *data, uint32_t data_size, u32 flags);
+-	int (*restore)(struct intel_engine_cs *ring, struct intel_context *ctx,
+-		       uint32_t *data, uint32_t data_size);
++	int (*save)(struct intel_engine_cs *ring,
++		    uint32_t *data, uint32_t max, u32 flags);
++	int (*restore)(struct intel_engine_cs *ring,
++		       uint32_t *data, uint32_t max);
+ 	int (*invalidate_tlb)(struct intel_engine_cs *ring);
+ 
+ 	struct {
+@@ -551,18 +436,11 @@ void intel_ring_update_space(struct intel_ringbuffer *ringbuf);
+ int intel_ring_space(struct intel_ringbuffer *ringbuf);
+ bool intel_ring_stopped(struct intel_engine_cs *ring);
+ void __intel_ring_advance(struct intel_engine_cs *ring);
+-void intel_gpu_engine_reset_resample(struct intel_engine_cs *ring,
+-		struct intel_context *ctx);
+-void intel_gpu_reset_resample(struct intel_engine_cs *ring,
+-		struct intel_context *ctx);
+-int intel_ring_disable(struct intel_engine_cs *ring,
+-		struct intel_context *ctx);
+-int intel_ring_enable(struct intel_engine_cs *ring,
+-		struct intel_context *ctx);
+-int intel_ring_save(struct intel_engine_cs *ring,
+-		struct intel_context *ctx, u32 flags);
+-int intel_ring_restore(struct intel_engine_cs *ring,
+-		struct intel_context *ctx);
++void intel_ring_resample(struct intel_engine_cs *ring);
++int intel_ring_disable(struct intel_engine_cs *ring);
++int intel_ring_enable(struct intel_engine_cs *ring);
++int intel_ring_save(struct intel_engine_cs *ring, u32 flags);
++int intel_ring_restore(struct intel_engine_cs *ring);
+ int intel_ring_invalidate_tlb(struct intel_engine_cs *ring);
+ 
+ static inline int intel_ring_supports_watchdog(struct intel_engine_cs *ring)
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index 3d589c6..f482da7 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -446,59 +446,6 @@ out:
+ 		intel_runtime_pm_put(dev_priv);
+ }
+ 
+-/*
+- * Typically, gen6_gt_force_wake_get is preferred since it's called
+- * implicitly by the register read function. However, if we need GT not to
+- * power down during a prolonged sequence and if we also need a force wake
+- * function that can be called while holding spinlocks (i.e. that does not
+- * call functions that could potentially sleep) then this force wake function
+- * does the job. Call gen8_gt_force_wake_get at the beginning of the sequence
+- * and gen8_gt_force_wake_put at the end.
+- */
+-void gen8_gt_force_wake_get(struct drm_i915_private *dev_priv)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&dev_priv->uncore.lock, flags);
+-	if (IS_CHERRYVIEW(dev_priv->dev)) {
+-		if (dev_priv->uncore.fw_rendercount++ == 0)
+-			dev_priv->uncore.funcs.force_wake_get(dev_priv,
+-							      FORCEWAKE_RENDER);
+-		if (dev_priv->uncore.fw_mediacount++ == 0)
+-			dev_priv->uncore.funcs.force_wake_get(dev_priv,
+-							      FORCEWAKE_MEDIA);
+-	} else {
+-		if (dev_priv->uncore.forcewake_count++ == 0)
+-			dev_priv->uncore.funcs.force_wake_get(dev_priv,
+-							      FORCEWAKE_ALL);
+-	}
+-	spin_unlock_irqrestore(&dev_priv->uncore.lock, flags);
+-}
+-
+-/*
+- * see gen8_gt_force_wake_get()
+- */
+-void gen8_gt_force_wake_put(struct drm_i915_private *dev_priv)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&dev_priv->uncore.lock, flags);
+-	if (IS_CHERRYVIEW(dev_priv->dev)) {
+-		if (--dev_priv->uncore.fw_rendercount == 0)
+-			dev_priv->uncore.funcs.force_wake_put(dev_priv,
+-							      FORCEWAKE_RENDER);
+-		if (--dev_priv->uncore.fw_mediacount == 0)
+-			dev_priv->uncore.funcs.force_wake_put(dev_priv,
+-							      FORCEWAKE_MEDIA);
+-	} else {
+-		if (--dev_priv->uncore.forcewake_count == 0)
+-			dev_priv->uncore.funcs.force_wake_put(dev_priv,
+-							      FORCEWAKE_ALL);
+-	}
+-	spin_unlock_irqrestore(&dev_priv->uncore.lock, flags);
+-}
+-
+-
+ void assert_force_wake_inactive(struct drm_i915_private *dev_priv)
+ {
+ 	if (!dev_priv->uncore.funcs.force_wake_get)
+@@ -1171,34 +1118,6 @@ static int ironlake_do_reset(struct drm_device *dev)
+ 	return 0;
+ }
+ 
+-static inline int wait_for_gpu_reset(struct drm_i915_private *dev_priv)
+-{
+-#define _CND ((__raw_i915_read32(dev_priv, GEN6_GDRST) & GEN6_GRDOM_FULL) == 0)
+-
+-	/*
+-	 * Spin waiting for the device to ack the reset request.
+-	 * Times out after 500 ms
+-	 * */
+-	return wait_for(_CND, 500);
+-
+-#undef _CND
+-}
+-
+-static inline int wait_for_engine_reset(struct drm_i915_private *dev_priv,
+-		unsigned int grdom)
+-{
+-#define _CND ((__raw_i915_read32(dev_priv, GEN6_GDRST) & grdom) == 0)
+-
+-	/*
+-	 * Spin waiting for the device to ack the reset request.
+-	 * Times out after 500 us
+-	 * */
+-	return wait_for_atomic_us(_CND, 500);
+-
+-#undef _CND
+-}
+-
+-
+ static int gen6_do_reset(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1211,7 +1130,10 @@ static int gen6_do_reset(struct drm_device *dev)
+ 	 * the read
+ 	 */
+ 	__raw_i915_write32(dev_priv, GEN6_GDRST, GEN6_GRDOM_FULL);
+-	ret = wait_for_gpu_reset(dev_priv);
++
++	/* Spin waiting for the device to ack the reset request */
++	ret = wait_for((__raw_i915_read32(dev_priv, GEN6_GDRST) &
++					GEN6_GRDOM_FULL) == 0, 500);
+ 
+ 	intel_uncore_forcewake_reset(dev, true);
+ 
+@@ -1245,16 +1167,6 @@ int intel_gpu_reset(struct drm_device *dev)
+ 	dev_priv->gpu_error.total_resets++;
+ 	DRM_DEBUG_TDR("total_resets %ld\n", dev_priv->gpu_error.total_resets);
+ 
+-	if (!ret) {
+-		char *reset_event[2];
+-
+-		reset_event[1] = NULL;
+-		reset_event[0] = kasprintf(GFP_KERNEL, "%s", "GPU RESET=0");
+-		kobject_uevent_env(&dev->primary->kdev->kobj,
+-				KOBJ_CHANGE, reset_event);
+-		kfree(reset_event[0]);
+-	}
+-
+ 	return ret;
+ }
+ 
+@@ -1264,6 +1176,8 @@ static int gen6_do_engine_reset(struct drm_device *dev,
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int ret = -ENODEV;
+ 	unsigned long irqflags;
++	char *reset_event[2];
++	reset_event[1] = NULL;
+ 
+ 	/* Hold uncore.lock across reset to prevent any register access
+ 	 * with forcewake not set correctly
+@@ -1280,64 +1194,54 @@ static int gen6_do_engine_reset(struct drm_device *dev,
+ 		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN6_GRDOM_RENDER);
+ 		dev_priv->ring[RCS].hangcheck.total++;
+ 
+-		ret = wait_for_engine_reset(dev_priv, GEN6_GRDOM_RENDER);
+-
+-		DRM_DEBUG_TDR("RCS Reset\n");
++		/* Spin waiting for the device to ack the reset request */
++		ret = wait_for_atomic_us((__raw_i915_read32(dev_priv,
++			GEN6_GDRST)
++			& GEN6_GRDOM_RENDER) == 0, 500);
+ 		break;
+ 
+ 	case BCS:
+ 		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN6_GRDOM_BLT);
+ 		dev_priv->ring[BCS].hangcheck.total++;
+ 
+-		ret = wait_for_engine_reset(dev_priv, GEN6_GRDOM_BLT);
+-
+-		DRM_DEBUG_TDR("BCS Reset\n");
++		/* Spin waiting for the device to ack the reset request */
++		ret = wait_for_atomic_us((__raw_i915_read32(dev_priv,
++			GEN6_GDRST)
++			& GEN6_GRDOM_BLT) == 0, 500);
+ 		break;
+ 
+ 	case VCS:
+ 		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN6_GRDOM_MEDIA);
+ 		dev_priv->ring[VCS].hangcheck.total++;
+ 
+-		ret = wait_for_engine_reset(dev_priv, GEN6_GRDOM_MEDIA);
+-
+-		DRM_DEBUG_TDR("VCS Reset\n");
++		/* Spin waiting for the device to ack the reset request */
++		ret = wait_for_atomic_us((__raw_i915_read32(dev_priv,
++			GEN6_GDRST)
++			& GEN6_GRDOM_MEDIA) == 0, 500);
+ 		break;
+ 
+ 	case VECS:
+ 		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN6_GRDOM_VECS);
+ 		dev_priv->ring[VECS].hangcheck.total++;
+ 
+-		ret = wait_for_engine_reset(dev_priv, GEN6_GRDOM_VECS);
+-
+-		DRM_DEBUG_TDR("VECS Reset\n");
+-		break;
+-
+-	case VCS2:
+-		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN8_GRDOM_MEDIA2);
+-		dev_priv->ring[VCS2].hangcheck.total++;
+-
+-		ret = wait_for_engine_reset(dev_priv, GEN8_GRDOM_MEDIA2);
+-
+-		DRM_DEBUG_TDR("VCS2 Reset\n");
++		/* Spin waiting for the device to ack the reset request */
++		ret = wait_for_atomic_us((__raw_i915_read32(dev_priv,
++			GEN6_GDRST)
++			& GEN6_GRDOM_VECS) == 0, 500);
+ 		break;
+ 
+ 	default:
+-		DRM_ERROR("Unexpected Engine %d\n", engine);
++		DRM_ERROR("Unexpected Engine\n");
+ 		break;
+ 	}
+ 
+ 	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
+ 
+-	if (!ret) {
+-		char *reset_event[2];
+-
+-		/* Do uevent outside of spinlock as uevent can sleep */
+-		reset_event[1] = NULL;
+-		reset_event[0] = kasprintf(GFP_KERNEL, "RESET RING=%d", engine);
+-		kobject_uevent_env(&dev->primary->kdev->kobj,
+-			KOBJ_CHANGE, reset_event);
+-		kfree(reset_event[0]);
+-	}
++	/* Do uevent outside of spinlock as uevent can sleep */
++	reset_event[0] = kasprintf(GFP_KERNEL, "RESET RING=%d", engine);
++	kobject_uevent_env(&dev->primary->kdev->kobj,
++		KOBJ_CHANGE, reset_event);
++	kfree(reset_event[0]);
+ 
+ 	return ret;
+ }
+@@ -1347,8 +1251,10 @@ int intel_gpu_engine_reset(struct drm_device *dev, enum intel_ring_id engine)
+ 	/* Reset an individual engine */
+ 	int ret = -ENODEV;
+ 
++	if (!dev)
++		return -EINVAL;
++
+ 	switch (INTEL_INFO(dev)->gen) {
+-	case 8:
+ 	case 7:
+ 	case 6:
+ 		ret = gen6_do_engine_reset(dev, engine);
+-- 
+1.7.9.5
+

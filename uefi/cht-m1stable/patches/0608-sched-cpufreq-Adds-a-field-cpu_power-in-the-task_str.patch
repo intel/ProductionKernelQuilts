@@ -1,0 +1,139 @@
+From 7679ab4a35d30a10574e42b6b1ab4514fd9b7fef Mon Sep 17 00:00:00 2001
+From: Ruchi Kandoi <kandoiruchi@google.com>
+Date: Fri, 17 Apr 2015 16:33:29 -0700
+Subject: [PATCH 608/634] sched: cpufreq: Adds a field cpu_power in the
+ task_struct
+
+cpu_power has been added to keep track of amount of power each task is
+consuming. cpu_power is updated whenever stime and utime are updated for
+a task. power is computed by taking into account the frequency at which
+the current core was running and the current for cpu actively
+running at hat frequency.
+
+Change-Id: Ic535941e7b339aab5cae9081a34049daeb44b248
+Signed-off-by: Ruchi Kandoi <kandoiruchi@google.com>
+---
+ drivers/cpufreq/cpufreq_stats.c | 19 +++++++++++++++++++
+ include/linux/cpufreq.h         |  8 ++++++++
+ include/linux/sched.h           |  1 +
+ kernel/fork.c                   |  1 +
+ kernel/sched/cputime.c          |  7 +++++++
+ 5 files changed, 36 insertions(+)
+
+diff --git a/drivers/cpufreq/cpufreq_stats.c b/drivers/cpufreq/cpufreq_stats.c
+index 7f8e5a1..3811168 100644
+--- a/drivers/cpufreq/cpufreq_stats.c
++++ b/drivers/cpufreq/cpufreq_stats.c
+@@ -15,6 +15,7 @@
+ #include <linux/slab.h>
+ #include <linux/sort.h>
+ #include <linux/of.h>
++#include <linux/sched.h>
+ #include <asm/cputime.h>
+ 
+ static spinlock_t cpufreq_stats_lock;
+@@ -125,6 +126,24 @@ static int get_index_all_cpufreq_stat(struct all_cpufreq_stats *all_stat,
+ 	return -1;
+ }
+ 
++void acct_update_power(struct task_struct *task, cputime_t cputime) {
++	struct cpufreq_power_stats *powerstats;
++	struct cpufreq_stats *stats;
++	unsigned int cpu_num, curr;
++
++	if (!task)
++		return;
++	cpu_num = task_cpu(task);
++	powerstats = per_cpu(cpufreq_power_stats, cpu_num);
++	stats = per_cpu(cpufreq_stats_table, cpu_num);
++	if (!powerstats || !stats)
++		return;
++
++	curr = powerstats->curr[stats->last_index];
++	task->cpu_power += curr * cputime_to_usecs(cputime);
++}
++EXPORT_SYMBOL_GPL(acct_update_power);
++
+ static ssize_t show_current_in_state(struct kobject *kobj,
+ 		struct kobj_attribute *attr, char *buf)
+ {
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index b0d360c..a15944d 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -17,6 +17,8 @@
+ #include <linux/kobject.h>
+ #include <linux/notifier.h>
+ #include <linux/sysfs.h>
++#include <asm/cputime.h>
++
+ 
+ /*********************************************************************
+  *                        CPUFREQ INTERFACE                          *
+@@ -509,4 +511,10 @@ static inline int cpufreq_generic_exit(struct cpufreq_policy *policy)
+ 	return 0;
+ }
+ 
++/*********************************************************************
++ *                         CPUFREQ STATS                             *
++ *********************************************************************/
++
++void acct_update_power(struct task_struct *p, cputime_t cputime);
++
+ #endif /* _LINUX_CPUFREQ_H */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 7259737..9c5715a 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1297,6 +1297,7 @@ struct task_struct {
+ 
+ 	cputime_t utime, stime, utimescaled, stimescaled;
+ 	cputime_t gtime;
++	unsigned long long cpu_power;
+ #ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ 	struct cputime prev_cputime;
+ #endif
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 9f47fe7..f87117f 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1301,6 +1301,7 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 
+ 	p->utime = p->stime = p->gtime = 0;
+ 	p->utimescaled = p->stimescaled = 0;
++	p->cpu_power = 0;
+ #ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ 	p->prev_cputime.utime = p->prev_cputime.stime = 0;
+ #endif
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index cfe2f268af..8735bdd 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -1,3 +1,4 @@
++#include <linux/cpufreq.h>
+ #include <linux/export.h>
+ #include <linux/sched.h>
+ #include <linux/tsacct_kern.h>
+@@ -149,6 +150,9 @@ void account_user_time(struct task_struct *p, cputime_t cputime,
+ 
+ 	/* Account for user time used */
+ 	acct_account_cputime(p);
++
++	/* Account power usage for user time */
++	acct_update_power(p, cputime);
+ }
+ 
+ /*
+@@ -199,6 +203,9 @@ void __account_system_time(struct task_struct *p, cputime_t cputime,
+ 
+ 	/* Account for system time used */
+ 	acct_account_cputime(p);
++
++	/* Account power usage for system time */
++	acct_update_power(p, cputime);
+ }
+ 
+ /*
+-- 
+1.9.1
+

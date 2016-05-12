@@ -1,0 +1,371 @@
+From 52c51fc0e5dd66f40520f1a9474c8a3b9223f3c5 Mon Sep 17 00:00:00 2001
+Message-Id: <52c51fc0e5dd66f40520f1a9474c8a3b9223f3c5.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Jeff McGee <jeff.mcgee@intel.com>
+Date: Mon, 13 Jan 2014 14:56:55 -0600
+Subject: [PATCH 054/312] MUST_REBASE [VPG]: drm/i915: Add DPST debugfs
+ disabling
+
+DPST can be disabled through debugfs file i915_dpst_disable. The
+implementation completely disables DPST functionality at the kernel
+and hardware level. User mode will continue unaware, though its
+processing will effectively end with the cessation of histogram
+event signals from the kernel. Also add debugfs file i915_dpst_status
+which can be read to get hardware enable/disable state.
+
+i915_dpst_status: read-only, return hardware enable/disable state
+
+i915_dpst_disable:
+'0' - DPST is enabled or disabled according to user control
+'1' - DPST is to be disabled at the kernel and harware levels
+
+Issue: APDEV-722
+Change-Id: Ibfccb1d0a11b279ebdfbea8009fe07dfa88ca0ec
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+(cherry picked from commit f41a911ef64a1355858e210b8049f9a305719eb2)
+
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   77 +++++++++++++++++++
+ drivers/gpu/drm/i915/i915_dpst.c    |  143 +++++++++++++++++++++++++++++++----
+ drivers/gpu/drm/i915/i915_drv.h     |    9 ++-
+ 3 files changed, 213 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 8430a90..769de64 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -1686,6 +1686,81 @@ DEFINE_SIMPLE_ATTRIBUTE(i915_sr_disable_fops,
+ 			i915_sr_disable_get, i915_sr_disable_set,
+ 			"%llu\n");
+ 
++static int i915_dpst_status(struct seq_file *m, void *unused)
++{
++	struct drm_info_node *node = (struct drm_info_node *) m->private;
++	struct drm_device *dev = node->minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int i;
++	const int columns = 4;
++	u32 blm_hist_ctl, blm_hist_guard;
++
++	if (!I915_HAS_DPST(dev)) {
++		seq_puts(m, "not supported\n");
++		return 0;
++	}
++
++	mutex_lock(&dev_priv->dpst.ioctl_lock);
++
++	blm_hist_ctl = I915_READ(BLM_HIST_CTL);
++	blm_hist_guard = I915_READ(BLM_HIST_GUARD);
++
++	seq_printf(m, "histogram logic: %s\n",
++		   blm_hist_ctl & IE_HISTOGRAM_ENABLE ?
++		   "enabled" : "disabled");
++
++	seq_printf(m, "histogram interrupts: %s\n",
++		   blm_hist_guard & HISTOGRAM_INTERRUPT_ENABLE ?
++		   "enabled" : "disabled");
++
++	seq_printf(m, "backlight adjustment: %u%%\n",
++		   dev_priv->dpst.blc_adjustment * 100 / DPST_MAX_FACTOR);
++
++	seq_printf(m, "IE modification table: %s\n",
++		   blm_hist_ctl & IE_MOD_TABLE_ENABLE ?
++		   "enabled" : "disabled");
++
++	blm_hist_ctl |= BIN_REG_FUNCTION_SELECT_IE;
++	blm_hist_ctl &= ~BIN_REGISTER_INDEX_MASK;
++	I915_WRITE(BLM_HIST_CTL, blm_hist_ctl);
++
++	seq_puts(m, "IE modification table values...");
++	for (i = 0; i < DPST_DIET_ENTRY_COUNT; i++) {
++		if (i % columns == 0)
++			seq_printf(m, "\nbins %02d-%02d:", i, i + columns - 1);
++		seq_printf(m, "%10x", I915_READ(BLM_HIST_BIN));
++	}
++	seq_puts(m, "\n");
++
++	mutex_unlock(&dev_priv->dpst.ioctl_lock);
++
++	return 0;
++}
++
++static int i915_dpst_disable_get(void *data, u64 *val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	*val = dev_priv->dpst.kernel_disable;
++
++	return 0;
++}
++
++static int i915_dpst_disable_set(void *data, u64 val)
++{
++	struct drm_device *dev = data;
++
++	DRM_DEBUG_DRIVER("Setting DPST disable %s\n",
++			 val ? "true" : "false");
++
++	return i915_dpst_set_kernel_disable(dev, val);
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(i915_dpst_disable_fops,
++			i915_dpst_disable_get, i915_dpst_disable_set,
++			"%llu\n");
++
+ static int i915_emon_status(struct seq_file *m, void *unused)
+ {
+ 	struct drm_info_node *node = m->private;
+@@ -4104,6 +4179,7 @@ static const struct drm_info_list i915_debugfs_list[] = {
+ 	{"i915_fbc_status", i915_fbc_status, 0},
+ 	{"i915_ips_status", i915_ips_status, 0},
+ 	{"i915_sr_status", i915_sr_status, 0},
++	{"i915_dpst_status", i915_dpst_status, 0},
+ 	{"i915_opregion", i915_opregion, 0},
+ 	{"i915_gem_framebuffer", i915_gem_framebuffer_info, 0},
+ 	{"i915_context_status", i915_context_status, 0},
+@@ -4133,6 +4209,7 @@ static const struct i915_debugfs_files {
+ 	{"i915_ips_disable", &i915_ips_disable_fops},
+ 	{"i915_fbc_disable", &i915_fbc_disable_fops},
+ 	{"i915_sr_disable", &i915_sr_disable_fops},
++	{"i915_dpst_disable", &i915_dpst_disable_fops},
+ 	{"i915_cache_sharing", &i915_cache_sharing_fops},
+ 	{"i915_ring_stop", &i915_ring_stop_fops},
+ 	{"i915_ring_missed_irq", &i915_ring_missed_irq_fops},
+diff --git a/drivers/gpu/drm/i915/i915_dpst.c b/drivers/gpu/drm/i915/i915_dpst.c
+index 43f5375..5828a56 100644
+--- a/drivers/gpu/drm/i915/i915_dpst.c
++++ b/drivers/gpu/drm/i915/i915_dpst.c
+@@ -152,6 +152,27 @@ i915_dpst_disable_hist_interrupt(struct drm_device *dev)
+ }
+ 
+ static int
++i915_dpst_set_user_enable(struct drm_device *dev, bool enable)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	dev_priv->dpst.user_enable = enable;
++
++	if (enable) {
++		if (!dev_priv->dpst.kernel_disable && !dev_priv->dpst.enabled)
++			return i915_dpst_enable_hist_interrupt(dev);
++	} else {
++		/* User disabling invalidates any saved settings */
++		dev_priv->dpst.saved.is_valid = false;
++
++		if (dev_priv->dpst.enabled)
++			return i915_dpst_disable_hist_interrupt(dev);
++	}
++
++	return 0;
++}
++
++static int
+ i915_dpst_apply_luma(struct drm_device *dev,
+ 		struct dpst_initialize_context *ioctl_data)
+ {
+@@ -167,16 +188,16 @@ i915_dpst_apply_luma(struct drm_device *dev,
+ 		return -EINVAL;
+ 	panel = &i_connector->panel;
+ 
+-	if (!dev_priv->dpst.enabled)
++	/* This is an invalid call if we are disabled by the user */
++	if (!dev_priv->dpst.user_enable)
+ 		return -EINVAL;
+ 
+-	/* Backlight settings */
+-	dev_priv->dpst.blc_adjustment =
+-	ioctl_data->ie_container.dpst_blc_factor;
+-
+-	spin_lock_irqsave(&dev_priv->backlight_lock, spin_lock_flags);
+-	i915_dpst_set_brightness(dev, panel->backlight.level);
+-	spin_unlock_irqrestore(&dev_priv->backlight_lock, spin_lock_flags);
++	/* This is not an invalid call if we are disabled by the kernel,
++	 * because kernel disabling is transparent to the user and can easily
++	 * occur before user has completed in-progress adjustments. If in fact
++	 * we are disabled by the kernel, we must store the incoming values for
++	 * later restore. Image enhancement values are stored on the hardware,
++	 * because they will be safely ignored if the table is not enabled. */
+ 
+ 	/* Setup register to access image enhancement value from
+ 	 * index 0.*/
+@@ -192,6 +213,21 @@ i915_dpst_apply_luma(struct drm_device *dev,
+ 		I915_WRITE(BLM_HIST_BIN, diet_factor);
+ 	}
+ 
++	if (dev_priv->dpst.kernel_disable) {
++		dev_priv->dpst.saved.is_valid = true;
++		dev_priv->dpst.saved.blc_adjustment =
++			ioctl_data->ie_container.dpst_blc_factor;
++		return 0;
++	}
++
++	/* Backlight settings */
++	dev_priv->dpst.blc_adjustment =
++	ioctl_data->ie_container.dpst_blc_factor;
++
++	spin_lock_irqsave(&dev_priv->backlight_lock, spin_lock_flags);
++	i915_dpst_set_brightness(dev, panel->backlight.level);
++	spin_unlock_irqrestore(&dev_priv->backlight_lock, spin_lock_flags);
++
+ 	/* Enable Image Enhancement Table */
+ 	blm_hist_ctl = I915_READ(BLM_HIST_CTL);
+ 	blm_hist_ctl |= IE_MOD_TABLE_ENABLE | ENHANCEMENT_MODE_MULT;
+@@ -200,6 +236,53 @@ i915_dpst_apply_luma(struct drm_device *dev,
+ 	return 0;
+ }
+ 
++static void
++i915_dpst_save_luma(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* Only save if user mode has indeed applied valid settings which
++	 * we determine by checking that the IE mod table was enabled */
++	if (!(I915_READ(BLM_HIST_CTL) & IE_MOD_TABLE_ENABLE))
++		return;
++
++	/* IE mod table entries are saved in the hardware even if the table
++	 * is disabled, so we only need to save the backlight adjustment */
++	dev_priv->dpst.saved.is_valid = true;
++	dev_priv->dpst.saved.blc_adjustment = dev_priv->dpst.blc_adjustment;
++}
++
++static void
++i915_dpst_restore_luma(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_panel *panel;
++	struct intel_connector *i_connector;
++	u32 blm_hist_ctl;
++	unsigned long spin_lock_flags;
++
++	i_connector = get_intel_connector_on_edp(dev);
++	if (NULL == i_connector)
++		return;
++	panel = &i_connector->panel;
++
++	/* Only restore if valid settings were previously saved */
++	if (!dev_priv->dpst.saved.is_valid)
++		return;
++
++	dev_priv->dpst.blc_adjustment = dev_priv->dpst.saved.blc_adjustment;
++
++	spin_lock_irqsave(&dev_priv->backlight_lock, spin_lock_flags);
++	i915_dpst_set_brightness(dev, panel->backlight.level);
++	spin_unlock_irqrestore(&dev_priv->backlight_lock, spin_lock_flags);
++
++	/* IE mod table entries are saved in the hardware even if the table
++	 * is disabled, so we only need to re-enable the table */
++	blm_hist_ctl = I915_READ(BLM_HIST_CTL);
++	blm_hist_ctl |= IE_MOD_TABLE_ENABLE | ENHANCEMENT_MODE_MULT;
++	I915_WRITE(BLM_HIST_CTL, blm_hist_ctl);
++}
++
+ static int
+ i915_dpst_get_bin_data(struct drm_device *dev,
+ 		struct dpst_initialize_context *ioctl_data)
+@@ -208,7 +291,12 @@ i915_dpst_get_bin_data(struct drm_device *dev,
+ 	u32 blm_hist_ctl, blm_hist_bin;
+ 	int index;
+ 
+-	if (!dev_priv->dpst.enabled)
++	/* We may be disabled by request from kernel or user. Kernel mode
++	 * disablement is without user mode knowledge. Kernel mode disablement
++	 * can occur between the signal to user and user's follow-up call to
++	 * retrieve the data, so return the data as usual. User mode
++	 * disablement makes this an invalid call, so return error. */
++	if (!dev_priv->dpst.enabled && !dev_priv->dpst.user_enable)
+ 		return -EINVAL;
+ 
+ 	/* Setup register to access bin data from index 0 */
+@@ -270,10 +358,8 @@ i915_dpst_init(struct drm_device *dev,
+ 			| ioctl_data->init_data.threshold_gb;
+ 	I915_WRITE(BLM_HIST_GUARD, blm_hist_guard);
+ 
+-	/* Enable histogram interrupts */
+-	i915_dpst_enable_hist_interrupt(dev);
+-
+-	return 0;
++	/* Init is complete so request enablement */
++	return i915_dpst_set_user_enable(dev, true);
+ }
+ 
+ 
+@@ -349,11 +435,11 @@ i915_dpst_context(struct drm_device *dev, void *data,
+ 	ioctl_data = (struct dpst_initialize_context *) data;
+ 	switch (ioctl_data->dpst_ioctl_type) {
+ 	case DPST_ENABLE:
+-		ret = i915_dpst_enable_hist_interrupt(dev);
++		ret = i915_dpst_set_user_enable(dev, true);
+ 	break;
+ 
+ 	case DPST_DISABLE:
+-		ret = i915_dpst_disable_hist_interrupt(dev);
++		ret = i915_dpst_set_user_enable(dev, false);
+ 	break;
+ 
+ 	case DPST_INIT_DATA:
+@@ -380,3 +466,30 @@ i915_dpst_context(struct drm_device *dev, void *data,
+ 	mutex_unlock(&dev_priv->dpst.ioctl_lock);
+ 	return ret;
+ }
++
++int
++i915_dpst_set_kernel_disable(struct drm_device *dev, bool disable)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int ret = 0;
++
++	if (!I915_HAS_DPST(dev))
++		return -EINVAL;
++
++	mutex_lock(&dev_priv->dpst.ioctl_lock);
++
++	dev_priv->dpst.kernel_disable = disable;
++
++	if (disable && dev_priv->dpst.enabled) {
++		i915_dpst_save_luma(dev);
++		ret = i915_dpst_disable_hist_interrupt(dev);
++	} else if (!disable && dev_priv->dpst.user_enable) {
++		ret = i915_dpst_enable_hist_interrupt(dev);
++		if (!ret)
++			i915_dpst_restore_luma(dev);
++	}
++
++	mutex_unlock(&dev_priv->dpst.ioctl_lock);
++
++	return ret;
++}
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 223bd27..ce58e30 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1470,7 +1470,13 @@ struct drm_i915_private {
+ 		struct task_struct *task;
+ 		u32 signal;
+ 		u32 blc_adjustment;
+-		bool enabled;
++		bool user_enable;	/* user client wishes to enable */
++		bool kernel_disable;	/* kernel override wishes to disable */
++		bool enabled;		/* actual functional state */
++		struct {
++			bool is_valid;
++			u32 blc_adjustment;
++		} saved;
+ 		struct mutex ioctl_lock;
+ 	} dpst;
+ 
+@@ -2623,6 +2629,7 @@ int i915_dpst_context(struct drm_device *dev, void *data,
+ u32 i915_dpst_get_brightness(struct drm_device *dev);
+ void i915_dpst_set_brightness(struct drm_device *dev, u32 brightness_val);
+ void i915_dpst_irq_handler(struct drm_device *dev);
++int i915_dpst_set_kernel_disable(struct drm_device *dev, bool km_disable);
+ void intel_panel_actually_set_backlight(struct intel_connector *conn, u32 level);
+ 
+ /* intel_acpi.c */
+-- 
+1.7.9.5
+

@@ -1,0 +1,305 @@
+From 060e2d49b3db2c31118d6e4f456c04c7019ba3dc Mon Sep 17 00:00:00 2001
+From: Mythri P K <mythri.p.k@intel.com>
+Date: Mon, 28 Apr 2014 18:49:32 +0530
+Subject: [PATCH 29/39] ASoC: DFW: platform: Parse the gain control from dfw
+ binary
+
+Issue: GMINL-3680
+
+Parse the gain controls from the builtin DFW binary in the platform driver
+
+Change-Id: Id7b91cff8250a657f24348e550018869bc5d3f66
+Signed-off-by: Mythri P K <mythri.p.k@intel.com>
+---
+ sound/soc/intel/platform-libs/controls_v2_dpcm.c | 105 ++++++++++++++++++++--
+ sound/soc/intel/platform-libs/sst_vendor.h       | 107 +++++++++++++++++++++++
+ sound/soc/intel/platform-libs/sst_widgets.h      |   7 +-
+ 3 files changed, 204 insertions(+), 15 deletions(-)
+ create mode 100644 sound/soc/intel/platform-libs/sst_vendor.h
+
+diff --git a/sound/soc/intel/platform-libs/controls_v2_dpcm.c b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+index c664a14..cea7739 100644
+--- a/sound/soc/intel/platform-libs/controls_v2_dpcm.c
++++ b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+@@ -23,6 +23,8 @@
+ #include <asm/platform_sst_audio.h>
+ #include <sound/soc.h>
+ #include <sound/tlv.h>
++#include <linux/firmware.h>
++#include <sound/soc-fw.h>
+ #include "../platform_ipc_v2.h"
+ #include "../sst_platform.h"
+ #include "../sst_platform_pvt.h"
+@@ -1651,6 +1653,7 @@ static const struct snd_kcontrol_new sst_probe_controls[] = {
+ 		SST_MODULE_ID_VOLUME, path_id, instance, task_id,			\
+ 		sst_gain_tlv_common, gain_var)
+ 
++
+ #define SST_NUM_GAINS 36
+ static struct sst_gain_value sst_gains[SST_NUM_GAINS];
+ 
+@@ -2014,6 +2017,88 @@ static int sst_map_modules_to_pipe(struct snd_soc_platform *platform)
+ 	return 0;
+ }
+ 
++const struct snd_soc_fw_kcontrol_ops control_ops[] = {
++	{SOC_CONTROL_IO_SST_GAIN, sst_gain_get, sst_gain_put, snd_soc_info_volsw},
++	{SOC_CONTROL_IO_SST_MUTE, sst_gain_get, sst_gain_put, snd_soc_info_bool_ext},
++};
++
++static int sst_copy_gain_control(struct snd_soc_platform *platform,
++		struct soc_mixer_control *sm, struct snd_soc_fw_mixer_control *mc)
++{
++	struct sst_gain_data *mc_pvt;
++	struct sst_dfw_gain_data *gc = (struct sst_dfw_gain_data *)mc->pvt_data;
++	mc_pvt = devm_kzalloc(platform->dev, sizeof(*mc_pvt), GFP_KERNEL);
++	if (!mc_pvt) {
++		pr_err("kzalloc failed\n");
++		return -ENOMEM;
++	}
++	/* Fill private data */
++	mc_pvt->stereo = gc->stereo;
++	mc_pvt->type = gc->type;
++	/* TODO: Dynamic allocation of sst_gains BZ: 194894 */
++	mc_pvt->gain_val = &sst_gains[gc->gain_val_index];
++	mc_pvt->max = gc->max;
++	mc_pvt->min = gc->min;
++	mc_pvt->instance_id = gc->instance_id;
++	mc_pvt->module_id = gc->module_id;
++	mc_pvt->pipe_id = gc->pipe_id;
++	mc_pvt->task_id = gc->task_id;
++	strncpy(mc_pvt->pname, gc->pname, SND_SOC_GAIN_CONTROL_NAME);
++	switch (gc->type) {
++	case SST_GAIN_TLV:
++		sst_gains[gc->gain_val_index].l_gain = gc->l_gain;
++		sst_gains[gc->gain_val_index].r_gain = gc->r_gain;
++		break;
++	case SST_GAIN_MUTE:
++		sst_gains[gc->gain_val_index].mute = gc->mute;
++		break;
++	case SST_GAIN_RAMP_DURATION:
++		sst_gains[gc->gain_val_index].ramp_duration = gc->ramp_duration;
++		break;
++	}
++	sm->pvt_data  = (char *)mc_pvt;
++	sm->pvt_data_len = sizeof(*mc_pvt);
++	return 0;
++}
++int sst_fw_kcontrol_find_io(struct snd_soc_platform *platform,
++		u32 io_type, const struct snd_soc_fw_kcontrol_ops *ops,
++		int num_ops, unsigned long sm, unsigned long mc)
++{
++	int i;
++
++	pr_info("number of ops = %d %x io_type\n", num_ops, io_type);
++	for (i = 0; i < num_ops; i++) {
++		if ((SOC_CONTROL_GET_ID_PUT(ops[i].id) ==
++			SOC_CONTROL_GET_ID_PUT(io_type) && ops[i].put)
++			&& (SOC_CONTROL_GET_ID_GET(ops[i].id) ==
++			 SOC_CONTROL_GET_ID_GET(io_type) && ops[i].get)) {
++			switch (SOC_CONTROL_GET_ID_PUT(ops[i].id)) {
++			case SOC_CONTROL_TYPE_SST_GAIN:
++				sst_copy_gain_control(platform, (struct soc_mixer_control *)sm,
++						(struct snd_soc_fw_mixer_control *)mc);
++				break;
++			default:
++				break;
++			}
++		}
++	}
++
++	return 0;
++}
++
++static int sst_pvt_load(struct snd_soc_platform *platform,
++			u32 io_type, unsigned long sm, unsigned long mc)
++{
++	return sst_fw_kcontrol_find_io(platform, io_type,
++			control_ops, ARRAY_SIZE(control_ops), sm, mc);
++}
++
++static struct snd_soc_fw_platform_ops soc_fw_ops = {
++	.pvt_load = sst_pvt_load,
++	.io_ops = control_ops,
++	.io_ops_count = ARRAY_SIZE(control_ops),
++};
++
+ int sst_dsp_init_v2_dpcm(struct snd_soc_platform *platform)
+ {
+ 	int i, ret = 0;
+@@ -2077,6 +2162,7 @@ int sst_dsp_init_v2_dpcm(struct snd_soc_platform *platform)
+ int sst_dsp_init_v2_dpcm_dfw(struct snd_soc_platform *platform)
+ {
+ 	int i, ret = 0;
++	const struct firmware *fw;
+ 	struct sst_data *sst = snd_soc_platform_get_drvdata(platform);
+ 
+ 	sst->byte_stream = devm_kzalloc(platform->dev,
+@@ -2099,16 +2185,17 @@ int sst_dsp_init_v2_dpcm_dfw(struct snd_soc_platform *platform)
+ 			ARRAY_SIZE(intercon));
+ 	snd_soc_dapm_new_widgets(platform->dapm.card);
+ 
+-	for (i = 0; i < SST_NUM_GAINS; i++) {
+-		sst_gains[i].mute = SST_GAIN_MUTE_DEFAULT;
+-		sst_gains[i].l_gain = SST_GAIN_VOLUME_DEFAULT;
+-		sst_gains[i].r_gain = SST_GAIN_VOLUME_DEFAULT;
+-		sst_gains[i].ramp_duration = SST_GAIN_RAMP_DURATION_DEFAULT;
++	ret = request_firmware(&fw, "dfw_sst.bin", platform->dev);
++	if (fw == NULL) {
++		pr_err("config firmware request failed with %d\n", ret);
++		return ret;
++	}
++	/* Index is for each config load */
++	ret = snd_soc_fw_load_platform(platform, &soc_fw_ops, fw, 0);
++	if (ret < 0) {
++		pr_err("Control load failed%d\n", ret);
++		return -EINVAL;
+ 	}
+-
+-	snd_soc_add_platform_controls(platform, sst_gain_controls,
+-			ARRAY_SIZE(sst_gain_controls));
+-
+ 	snd_soc_add_platform_controls(platform, sst_algo_controls,
+ 			ARRAY_SIZE(sst_algo_controls));
+ 	snd_soc_add_platform_controls(platform, sst_slot_controls,
+diff --git a/sound/soc/intel/platform-libs/sst_vendor.h b/sound/soc/intel/platform-libs/sst_vendor.h
+new file mode 100644
+index 0000000..d31cf7d
+--- /dev/null
++++ b/sound/soc/intel/platform-libs/sst_vendor.h
+@@ -0,0 +1,107 @@
++/*
++ *  sst_vendor.h - Intel sst fw private data
++ *
++ *  Copyright (C) 2014 Intel Corp
++ *  Author: Subhransu S. Prusty<subhransu.s.prusty@intel.com>
++ *  Author: Mythri P K <mythri.p.k@intel.com>
++ *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; version 2 of the License.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ */
++
++#ifndef __SST_VENDOR_H__
++#define __SST_VENDOR_H__
++
++/* Default types range from 0~12. type can range from 0 to 0xff
++ * SST types start at higher to avoid any overlapping in future */
++
++#define SOC_CONTROL_TYPE_SST_GAIN		100
++#define SOC_CONTROL_TYPE_SST_MUTE		101
++
++/* REVISIT: Define sst kcontrol index */
++#define SOC_CONTROL_IO_SST_GAIN\
++	SOC_CONTROL_ID(SOC_CONTROL_TYPE_SST_GAIN, \
++		SOC_CONTROL_TYPE_SST_GAIN, \
++		SOC_CONTROL_TYPE_VOLSW)
++
++#define SOC_CONTROL_IO_SST_MUTE\
++	SOC_CONTROL_ID(SOC_CONTROL_TYPE_SST_GAIN, \
++		SOC_CONTROL_TYPE_SST_GAIN, \
++		SOC_CONTROL_TYPE_BOOL_EXT)
++
++#define SND_SOC_GAIN_CONTROL_NAME 44
++
++enum sst_vendor_type {
++	SND_SOC_FW_SST_CONTROLS = 0x1000,
++	SND_SOC_FW_SST_WIDGETS,
++};
++
++enum sst_gain_kcontrol_type {
++	SST_GAIN_TLV,
++	SST_GAIN_MUTE,
++	SST_GAIN_RAMP_DURATION,
++};
++
++struct sst_dfw_gain_data {
++	u8 stereo;
++	enum sst_gain_kcontrol_type type;
++	u32 gain_val_index;
++	s32 max;
++	s32 min;
++	u16 instance_id;
++	u16 module_id;
++	u16 pipe_id;
++	u16 task_id;
++	u16 ramp_duration;
++	s16 l_gain;
++	s16 r_gain;
++	u8 mute;
++	char pname[44];
++} __packed;
++
++#if 0
++/* sst_fw_config: FW config data organization
++ * For vendor specific:
++ *	hdr_xxx->size: data following header in bytes
++ *	hdr_xxx->type:
++ *		ex: SND_SOC_FW_MIXER, SND_SOC_FW_DAPM_WIDGET,...
++ *	hdr_xxx->venodr_type: SND_SOC_FW_SST_CONTROLS, SND_SOC_FW_SST_WIDGETS
++ *
++ * For Generic:
++ *	hdr_xxx->type: generic types for
++ *		ex: SND_SOC_FW_MIXER, SND_SOC_FW_DAPM_WIDGET,...
++ *
++ *	hdr_xxx->vendor_type: 0
++ */
++struct sst_fw_config {
++	struct snd_soc_fw_hdr hdr_controls;
++	struct snd_soc_fw_kcontrol num_controls;
++	struct snd_soc_fw_gain_control gain_control[];
++	struct snd_soc_fw_algo_control algo_control[];
++	struct snd_soc_fw_slot_control slot_control[];
++	struct snd_soc_fw_mux_control mux_control[];
++	struct snd_soc_fw_probe_control probe_control[];
++
++	struct snd_soc_fw_hdr hdr_gen;	/* generic control types */
++	struct snd_soc_fw_kcontrol num_gen_control;
++	struct snd_soc_fw_mixer_control gen_mixer_control[];
++
++	/* TODO: Add widgets */
++	struct snd_soc_fw_hdr hdr_widgets;
++	struct snd_soc_fw_dapm_elems num_widgets;
++	struct snd_soc_fw_aifin_widget aifin_widget[];
++
++	/* TODO: Add intercon */
++} __packed;
++#endif
++
++#endif
+diff --git a/sound/soc/intel/platform-libs/sst_widgets.h b/sound/soc/intel/platform-libs/sst_widgets.h
+index 533d4a6..8bc9a79 100644
+--- a/sound/soc/intel/platform-libs/sst_widgets.h
++++ b/sound/soc/intel/platform-libs/sst_widgets.h
+@@ -22,6 +22,7 @@
+ 
+ #include <sound/soc.h>
+ #include <sound/tlv.h>
++#include "sst_vendor.h"
+ 
+ #define SST_MODULE_GAIN 1
+ #define SST_MODULE_ALGO 2
+@@ -142,12 +143,6 @@ struct sst_ids {
+ 					    .reg = wreg }				\
+ }
+ 
+-enum sst_gain_kcontrol_type {
+-	SST_GAIN_TLV,
+-	SST_GAIN_MUTE,
+-	SST_GAIN_RAMP_DURATION,
+-};
+-
+ struct sst_gain_data {
+ 	bool stereo;
+ 	enum sst_gain_kcontrol_type type;
+-- 
+1.9.1
+

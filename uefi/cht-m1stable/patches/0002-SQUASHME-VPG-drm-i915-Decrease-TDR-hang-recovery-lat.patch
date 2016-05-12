@@ -1,0 +1,164 @@
+From f6e00419792a49005b23058e093f2c8f96309825 Mon Sep 17 00:00:00 2001
+Message-Id: <f6e00419792a49005b23058e093f2c8f96309825.1440106296.git.chang-joon.lee@intel.com>
+In-Reply-To: <1f426693c14c79e65ad8e62ef6bb4b07d6484040.1440106296.git.chang-joon.lee@intel.com>
+References: <1f426693c14c79e65ad8e62ef6bb4b07d6484040.1440106296.git.chang-joon.lee@intel.com>
+From: Tomas Elf <tomas.elf@intel.com>
+Date: Thu, 16 Jul 2015 16:02:24 +0100
+Subject: [PATCH 02/11] SQUASHME! [VPG]: drm/i915: Decrease TDR hang recovery
+ latency
+
+When scheduling/rescheduling hang detection we round up to an integral number
+of seconds. This is not so good when rounding from just above one second since
+it then becomes exactly two seconds in between hang checks. The resulting hang
+detection latency goes from 3*1=3 seconds to 3*2=6 seconds, which is way too
+long for certain applications such as userland HW compositor, which sometimes
+results in broken flips and frozen display. In this change we remove this
+rounding.
+
+Another change is that we remove the seqno pre-check in queue_hangcheck that
+adds another stage before the real hang check. Basically, this adds one hang
+check period on top of what is already specified, which is not necessary. The
+reason why it was originally added was to reduce the amounts of false positives
+but as it turns out we've had more problems with hang recovery latency and not
+so much problems with false positives so there's no reason for it to still be
+in there.
+
+    SQUASHME! - This patch should be squashed into the following patch:
+    	Author: Tomas Elf <tomas.elf@intel.com>
+    	Change-Id: I45de965b4a81d93c135a74248eb22a8a5c816e9f
+    	FOR_UPSTREAM [VPG]: drm/i915: Added gen8 support for Timeout Detection Recovery for engine hangs
+
+Change-Id: I192729693a8541e152fb3dacf793e0f0f69f505f
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-14282
+Signed-off-by: Tomas Elf <tomas.elf@intel.com>
+---
+ drivers/gpu/drm/i915/i915_irq.c         | 82 +++++++++++----------------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |  7 ---
+ 2 files changed, 26 insertions(+), 63 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 22f1b40..cef484c 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -3703,7 +3703,7 @@ void i915_hangcheck_sample(struct work_struct *work)
+ 		 */
+ 		mod_delayed_work(dev_priv->ring[hc->ringid].hangcheck.wq,
+ 				&dev_priv->ring[hc->ringid].hangcheck.work,
+-				round_jiffies_up_relative(DRM_I915_HANGCHECK_JIFFIES));
++				DRM_I915_HANGCHECK_JIFFIES);
+ 	}
+ }
+ 
+@@ -3712,66 +3712,36 @@ void i915_queue_hangcheck(struct drm_device *dev, u32 ringid,
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_engine_cs *ring = &dev_priv->ring[ringid];
+-	uint32_t seqno;
++	long timediff;
++	unsigned long time = 0;
+ 
+-	if (!ring) {
+-		WARN(1, "Ring is null! Could not queue hang check for %s!", \
+-			ring->name);
+-		return;
+-	}
+-
+-	if (!ring->get_seqno) {
+-		WARN(1, "get_seqno function not set up! " \
+-			"Could not queue hang check for %s!", ring->name);
+-		return;
+-	}
+-
+-	seqno = ring->get_seqno(ring, false);
+-
+-	if (!i915.enable_hangcheck) {
+-		dev_priv->ring[ringid].hangcheck.last_seqno = seqno;
++	if (!i915.enable_hangcheck)
+ 		return;
+-	}
+ 
+-	if (dev_priv->ring[ringid].hangcheck.last_seqno == seqno) {
+-		/*
+-		 * The seqno on this ring has not progressed since
+-		 * we last checked! Schedule a more detailed hang check.
+-		 *
+-		 * We are piggy-backing the hang check on top of the retire
+-		 * work timer so the amount of time we need to wait between
+-		 * expired retire work timer and the actual hangcheck is:
+-		 *
+-		 *	 wait_time = hangcheck_period - retire_work_period
+-		 *
+-		 * retire_work_period is the time difference between now
+-		 * and when the retire_work_timer was scheduled.
+-		 * If we have already waited the hangcheck period or more
+-		 * then simply schedule the hang check immediately.
+-		 *
+-		 * If a hang check was already rescheduled by a previous
+-		 * hang check (because there are still pending work that
+-		 * needs to be checked) and is now pending, this schedule
+-		 * call will not affect anything and the pending hang check
+-		 * will be carried out without being postponed.
+-		 */
+-		unsigned long jiffies_now = jiffies;
+-		long timediff = jiffies_now - retire_work_timestamp;
+-		unsigned long time = 0;
+-		const unsigned long zero = 0L;
+-
+-		WARN(time_after(retire_work_timestamp, jiffies_now),
+-				"Timestamp of scheduled retire work handler " \
+-				"happened in the future? (%lu > %lu)",
+-				retire_work_timestamp, jiffies_now);
+-
+-		time = max(zero, (DRM_I915_HANGCHECK_JIFFIES - timediff));
++	/*
++	 * We are piggy-backing the hang check on top of the retire
++	 * work timer so the amount of time we need to wait between
++	 * expired retire work timer and the actual hangcheck is:
++	 *
++	 *	 wait_time = hangcheck_period - retire_work_period
++	 *
++	 * retire_work_period is the time difference between now
++	 * and when the retire_work_timer was scheduled.
++	 * If we have already waited the hangcheck period or more
++	 * then simply schedule the hang check immediately.
++	 *
++	 * If a hang check was already rescheduled by a previous
++	 * hang check (because there are still pending work that
++	 * needs to be checked) and is now pending, this schedule
++	 * call will not affect anything and the pending hang check
++	 * will be carried out without being postponed.
++	 */
++	timediff = jiffies - retire_work_timestamp;
+ 
+-		queue_delayed_work(dev_priv->ring[ringid].hangcheck.wq,
+-				&dev_priv->ring[ringid].hangcheck.work, time);
+-	}
++	if (DRM_I915_HANGCHECK_JIFFIES > timediff)
++		time = DRM_I915_HANGCHECK_JIFFIES - timediff;
+ 
+-	dev_priv->ring[ringid].hangcheck.last_seqno = seqno;
++	queue_delayed_work(ring->hangcheck.wq, &ring->hangcheck.work, time);
+ }
+ 
+ static void ibx_irq_reset(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 28bf311..b275dd5 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -242,13 +242,6 @@ struct intel_ring_hangcheck {
+ 	/* Number of watchdog hang detections for this ring */
+ 	u32 watchdog_count;
+ 
+-	/*
+-	 * Ring seqno recorded by the most recent hang check.
+-	 * Used as a first, coarse step to determine ring
+-	 * idleness
+-	 */
+-	u32 last_seqno;
+-
+ 	/* Forced resubmission counter */
+ 	u32 forced_resubmission_cnt;
+ 
+-- 
+1.9.1
+

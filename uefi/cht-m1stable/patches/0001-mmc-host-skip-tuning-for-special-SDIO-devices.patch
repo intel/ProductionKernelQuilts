@@ -1,0 +1,112 @@
+From 07d26c1b77138a748ce5c76bae1167f703f886de Mon Sep 17 00:00:00 2001
+From: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Date: Wed, 31 Dec 2014 11:54:04 +0800
+Subject: [PATCH 1/1] mmc: host: skip tuning for special SDIO devices
+
+Some SDIO devices like BCM devices cannot response tuning command in
+some special cases, like sleep mode. So we cannot send the tuning command
+in this case, thus needs to send the normal CMD52 first. But as runtime
+PM, SDIO host still needs tuning to make sure tuning process successfully.
+
+To make this happen, driver has to send the tuning command after a failed CMD52
+so that the tuning process is possible success. But if tuning still cannot
+successfully, we have to do the retuning again
+
+Change-Id: If9701f956d0abfc1e59411468a38f9a2a13ff571
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-15295
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+---
+ drivers/mmc/core/sdio_ops.c | 25 +++++++++++++++++--------
+ drivers/mmc/host/sdhci.c    | 11 +++++++----
+ include/linux/mmc/core.h    |  2 ++
+ 3 files changed, 26 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/mmc/core/sdio_ops.c b/drivers/mmc/core/sdio_ops.c
+index 7a1a3e7..cf2593c 100644
+--- a/drivers/mmc/core/sdio_ops.c
++++ b/drivers/mmc/core/sdio_ops.c
+@@ -84,15 +84,24 @@ static int mmc_io_rw_direct_host(struct mmc_host *host, int write, unsigned fn,
+ 	cmd.arg |= (write && out) ? 0x08000000 : 0x00000000;
+ 	cmd.arg |= addr << 9;
+ 	cmd.arg |= in;
+-	cmd.flags = MMC_RSP_SPI_R5 | MMC_RSP_R5 | MMC_CMD_AC;
+-
+-	if (host->card &&
+-		(host->card->quirks & MMC_QUIRK_NO_TUNING_IN_SLEEP))
+-		err = mmc_wait_for_cmd(host, &cmd, 1);
++	if (host->card && (host->card->quirks & MMC_QUIRK_NO_TUNING_IN_SLEEP))
++		cmd.flags = MMC_RSP_SPI_R5 | MMC_RSP_R5 | MMC_CMD_AC |
++			MMC_SKIP_TUNING;
+ 	else
+-		err = mmc_wait_for_cmd(host, &cmd, 0);
+-	if (err)
+-		return err;
++		cmd.flags = MMC_RSP_SPI_R5 | MMC_RSP_R5 | MMC_CMD_AC;
++
++	err = mmc_wait_for_cmd(host, &cmd, 0);
++	if (err) {
++		if (err != -ETIMEDOUT && (cmd.flags & MMC_SKIP_TUNING)) {
++			cmd.error = 0;
++			/* retry with doing tuning first */
++			cmd.flags &= ~MMC_SKIP_TUNING;
++			err = mmc_wait_for_cmd(host, &cmd, 0);
++			if (err)
++				return err;
++		} else
++			return err;
++	}
+ 
+ 	if (mmc_host_is_spi(host)) {
+ 		/* host driver already reported errors */
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index caf1b69..dd5ffea 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -1406,10 +1406,7 @@ static void sdhci_request(struct mmc_host *mmc, struct mmc_request *mrq)
+ 		    !(present_state & (SDHCI_DOING_WRITE | SDHCI_DOING_READ)) &&
+ 		    (present_state & SDHCI_DATA_0_LVL_MASK)) {
+ 			if (mmc->card) {
+-				if (mmc_card_sdio(mmc->card) &&
+-					(mmc->card->quirks & MMC_QUIRK_NO_TUNING_IN_SLEEP) &&
+-					(mrq->cmd->opcode == SD_IO_RW_DIRECT) &&
+-					(mrq->cmd->retries > 0))
++				if (mrq->cmd->flags & MMC_SKIP_TUNING)
+ 					goto end_tuning;
+ 				if ((mmc->card->ext_csd.part_config & 0x07) ==
+ 					EXT_CSD_PART_CONFIG_ACC_RPMB)
+@@ -2042,6 +2039,9 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 			ctrl &= ~SDHCI_CTRL_EXEC_TUNING;
+ 			sdhci_writew(host, ctrl, SDHCI_HOST_CONTROL2);
+ 
++			sdhci_reset(host, SDHCI_RESET_CMD);
++			sdhci_reset(host, SDHCI_RESET_DATA);
++
+ 			err = -EIO;
+ 			goto out;
+ 		}
+@@ -2084,6 +2084,9 @@ out:
+ 			host->tuning_count * HZ);
+ 		/* Tuning mode 1 limits the maximum data length to 4MB */
+ 		mmc->max_blk_count = (4 * 1024 * 1024) / mmc->max_blk_size;
++	} else if (err && host->mmc->card && (host->mmc->card->quirks &
++				MMC_QUIRK_NO_TUNING_IN_SLEEP)) {
++		pr_debug("%s: will do retuning\n", mmc_hostname(host->mmc));
+ 	} else if (host->flags & SDHCI_USING_RETUNING_TIMER) {
+ 		host->flags &= ~SDHCI_NEEDS_RETUNING;
+ 		/* Reload the new initial value for timer */
+diff --git a/include/linux/mmc/core.h b/include/linux/mmc/core.h
+index 4270bf2..94a7568 100644
+--- a/include/linux/mmc/core.h
++++ b/include/linux/mmc/core.h
+@@ -40,6 +40,8 @@ struct mmc_command {
+ #define MMC_RSP_SPI_B4	(1 << 9)		/* four data bytes */
+ #define MMC_RSP_SPI_BUSY (1 << 10)		/* card may send busy */
+ 
++#define MMC_SKIP_TUNING (1 << 11)		/* skip tuning for this cmd */
++
+ /*
+  * These are the native response types, and correspond to valid bit
+  * patterns of the above flags.  One additional valid pattern
+-- 
+1.9.1
+

@@ -1,0 +1,133 @@
+From ef1bf2fa7bae67950b987994d6f0cd2a29a755cc Mon Sep 17 00:00:00 2001
+From: zhengq <qi.zheng@intel.com>
+Date: Thu, 23 Apr 2015 23:38:31 +0800
+Subject: [PATCH] PCIe: Add quirks operation for Cherryview.
+
+Enable the runtime PM support for PCIe port 0/1 on
+Cherrview. Also set the flag "ignore_children" only
+for PCIe port 1.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1501
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-33486
+Change-Id: I3753de233eaa5e4bb1796fe93ac5064755d9de0b
+Signed-off-by: zhengq <qi.zheng@intel.com>
+---
+ drivers/pci/pcie/portdrv_pci.c | 20 --------------------
+ drivers/pci/quirks.c           | 37 +++++++++++++++++++++++++++++++++++++
+ include/linux/pci_ids.h        |  2 ++
+ 3 files changed, 39 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/pci/pcie/portdrv_pci.c b/drivers/pci/pcie/portdrv_pci.c
+index 7fb614eda35d..0d8fdc48e642 100644
+--- a/drivers/pci/pcie/portdrv_pci.c
++++ b/drivers/pci/pcie/portdrv_pci.c
+@@ -185,17 +185,6 @@ static const struct dev_pm_ops pcie_portdrv_pm_ops = {
+ #endif /* !PM */
+ 
+ /*
+- * PCIe port runtime suspend is broken for some chipsets, so use a
+- * enable list to enable runtime PM only for good chipsets.
+- */
+-static const struct pci_device_id port_runtime_pm_enable_list[] = {
+-	/*Cherryview*/
+-	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x22c8),},
+-
+-	{ /* end: all zeroes */ }
+-};
+-
+-/*
+  * pcie_portdrv_probe - Probe PCI-Express port devices
+  * @dev: PCI-Express port device being probed
+  *
+@@ -228,20 +217,11 @@ static int pcie_portdrv_probe(struct pci_dev *dev,
+ 	 * it by default.
+ 	 */
+ 	dev->d3cold_allowed = false;
+-	if (pci_match_id(port_runtime_pm_enable_list, dev)) {
+-		pm_runtime_put_noidle(&dev->dev);
+-		pm_runtime_allow(&dev->dev);
+-	}
+-
+ 	return 0;
+ }
+ 
+ static void pcie_portdrv_remove(struct pci_dev *dev)
+ {
+-	if (pci_match_id(port_runtime_pm_enable_list, dev)) {
+-		pm_runtime_forbid(&dev->dev);
+-		pm_runtime_get_noresume(&dev->dev);
+-	}
+ 	pcie_port_device_remove(dev);
+ }
+ 
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 26f067de6612..76ef064fe990 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -25,6 +25,7 @@
+ #include <linux/sched.h>
+ #include <linux/ktime.h>
+ #include <linux/mm.h>
++#include <linux/pm_runtime.h>
+ #include <asm/dma.h>	/* isa_dma_bridge_buggy */
+ #include "pci.h"
+ #include <linux/usb.h>
+@@ -2908,6 +2909,42 @@ static void quirk_intel_ntb(struct pci_dev *dev)
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x0e08, quirk_intel_ntb);
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x0e0d, quirk_intel_ntb);
+ 
++
++/*PCIe port 0 on Cherryview should support runtime PM*/
++static void quirk_pcie_enable_rtpm(struct pci_dev *dev)
++{
++	dev_info(&dev->dev, "enable runtime PM\n");
++	pm_runtime_put_noidle(&dev->dev);
++	pm_runtime_allow(&dev->dev);
++}
++DECLARE_PCI_FIXUP_ENABLE(PCI_VENDOR_ID_INTEL,
++	PCI_DEVICE_ID_INTEL_CHV_PCIe_0, quirk_pcie_enable_rtpm);
++
++static int pci_disbale_dev_pme_poll(struct pci_dev *pdev, void *data)
++{
++	pdev->pme_poll = false;
++}
++
++/*PCIEe port 1 on Cherryview should support runtime PM and ignore children*/
++static void quirk_pcie_enable_rtpm_ignore_children(struct pci_dev *dev)
++{
++	dev_info(&dev->dev, "enable runtime PM and ignore children\n");
++	pm_suspend_ignore_children(&dev->dev, true);
++	/*
++	 * If any subordinate device needs pme poll, we should keep
++	 * the port in D0, because we need port in D0 to poll it.
++	 * But for this special case, we need this PCIe port enter D3
++	 * no matter the status of child device.
++	 * Set device pme_poll as false.
++	 */
++	pci_walk_bus(dev->subordinate, pci_disbale_dev_pme_poll, NULL);
++	pm_runtime_put_noidle(&dev->dev);
++	pm_runtime_allow(&dev->dev);
++}
++
++DECLARE_PCI_FIXUP_ENABLE(PCI_VENDOR_ID_INTEL,
++	PCI_DEVICE_ID_INTEL_CHV_PCIe_1, quirk_pcie_enable_rtpm_ignore_children);
++
+ static ktime_t fixup_debug_start(struct pci_dev *dev,
+ 				 void (*fn)(struct pci_dev *dev))
+ {
+diff --git a/include/linux/pci_ids.h b/include/linux/pci_ids.h
+index 3be827e82ec8..e362ed89ef10 100644
+--- a/include/linux/pci_ids.h
++++ b/include/linux/pci_ids.h
+@@ -2581,6 +2581,8 @@
+ #define PCI_DEVICE_ID_INTEL_PANTHERPOINT_XHCI	0x1e31
+ #define PCI_DEVICE_ID_INTEL_PANTHERPOINT_LPC_MIN	0x1e40
+ #define PCI_DEVICE_ID_INTEL_PANTHERPOINT_LPC_MAX	0x1e5f
++#define PCI_DEVICE_ID_INTEL_CHV_PCIe_0	0x22c8
++#define PCI_DEVICE_ID_INTEL_CHV_PCIe_1	0x22ca
+ #define PCI_DEVICE_ID_INTEL_DH89XXCC_LPC_MIN	0x2310
+ #define PCI_DEVICE_ID_INTEL_DH89XXCC_LPC_MAX	0x231f
+ #define PCI_DEVICE_ID_INTEL_82801AA_0	0x2410
+-- 
+1.9.1
+

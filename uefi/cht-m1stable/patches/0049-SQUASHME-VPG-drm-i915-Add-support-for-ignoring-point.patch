@@ -1,0 +1,148 @@
+From 37874c19cc4348d72176f43ce11f860f985e46f3 Mon Sep 17 00:00:00 2001
+Message-Id: <37874c19cc4348d72176f43ce11f860f985e46f3.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 8 Apr 2015 17:58:40 +0100
+Subject: [PATCH 49/68] SQUASHME! [VPG]: drm/i915: Add support for ignoring
+ pointless fences
+
+Android (or maybe OGL) has a habit of requesting a native sync point
+for the completion of each batch buffer submitted and then submitting
+the next batch buffer with that same sync point as a 'wait until this
+is signalled before starting'. When the waits were being done
+synchronously in user land, this caused a significant performance
+problem, especially for the Flatland benchmark. Basically, batch
+buffers could not be queued up - each must finish before the next one
+can be submitted.
+
+A work around was added to inspect the incoming wait fence and if it
+was solely an i915 owned sync point that referred to the same ring
+then it was ignored.
+
+This patch adds the same optimisation to the scheduler. The advantage
+is pretty small though as the scheduler had already decoupled the
+batch buffer submission from the stall. Thus although batch buffers
+were still being fed singly to the hardware, the were still being
+queued up in software. Thus the application did not see the
+synchronous stall and resultant performance issue.
+
+This patch could be squashed in to the one that originally added the
+scheduler:
+  commit c64b5c1f236ee9c9362f06a675b4bc906ad3cb04
+  Author: John Harrison <John.C.Harrison@Intel.com>
+  Date:   Thu Apr 10 10:58:56 2014 +0100
+  Subject: FOR_UPSTREAM [VPG]: drm/i915: Added trace points to scheduler
+  Change-Id: I9886390cfc7897bc1faf50a104bc651d8baed8a5
+
+Change-Id: Ifae7f2f6bbd08d24cfbc67fa4720f4330e1cfca8
+For: VIZ-1587
+For: VIZ-4741
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c   |    1 +
+ drivers/gpu/drm/i915/i915_scheduler.c |    5 +++++
+ drivers/gpu/drm/i915/i915_scheduler.h |    1 +
+ drivers/gpu/drm/i915/intel_sync.c     |   35 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_sync.h     |    2 ++
+ 5 files changed, 44 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 9ed303f..8bfdcc6 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -3040,6 +3040,7 @@ static int i915_scheduler_info(struct seq_file *m, void *unused)
+ 	PRINT_VAR("  ExecFinal killed",     "u", stats[r].exec_dead);
+ 	PRINT_VAR("  Fence wait",           "u", stats[r].fence_wait);
+ 	PRINT_VAR("  Fence wait again",     "u", stats[r].fence_again);
++	PRINT_VAR("  Fence wait ignore",    "u", stats[r].fence_ignore);
+ 	PRINT_VAR("  Fence supplied",       "u", stats[r].fence_got);
+ 	PRINT_VAR("  Hung flying",          "u", stats[r].kill_flying);
+ 	PRINT_VAR("  Hung queued",          "u", stats[r].kill_queued);
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 968792b..786de77 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -1336,6 +1336,11 @@ static int i915_scheduler_pop_from_queue_locked(struct intel_engine_cs *ring,
+ 			signalled = node->params.fence_wait->status != 0;
+ 		else
+ 			signalled = true;
++
++		if (!signalled) {
++			signalled = i915_safe_to_ignore_fence(ring, node->params.fence_wait);
++			scheduler->stats[node->params.ring->id].fence_ignore++;
++		}
+ #endif
+ 
+ 		has_local  = false;
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 4e0d813..a3fd7eb 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -112,6 +112,7 @@ struct i915_scheduler_stats {
+ 
+ 	uint32_t            fence_wait;
+ 	uint32_t            fence_again;
++	uint32_t            fence_ignore;
+ 	uint32_t            fence_got;
+ };
+ 
+diff --git a/drivers/gpu/drm/i915/intel_sync.c b/drivers/gpu/drm/i915/intel_sync.c
+index c231708..73ef2e0 100644
+--- a/drivers/gpu/drm/i915/intel_sync.c
++++ b/drivers/gpu/drm/i915/intel_sync.c
+@@ -339,3 +339,38 @@ void i915_sync_hung_ring(struct intel_engine_cs *ring)
+ 	i915_sync_timeline_advance(req->ctx, req->ring, req->sync_value);
+ 	timeline->pvt.killed_at = 0;
+ }
++
++bool i915_safe_to_ignore_fence(struct intel_engine_cs *ring, struct sync_fence *fence)
++{
++	struct i915_sync_timeline *timeline;
++	struct sync_pt *pt;
++	bool ignore;
++
++	if (fence->status != 0)
++		return true;
++
++	ignore = true;
++	list_for_each_entry(pt, &fence->pt_list_head, pt_list) {
++		/* No need to worry about dead points: */
++		if (pt->status != 0)
++			continue;
++
++		/* Can't ignore other people's points: */
++		if(pt->parent->ops != &i915_sync_timeline_ops) {
++			ignore = false;
++			break;
++		}
++
++		timeline = container_of(pt->parent, struct i915_sync_timeline, obj);
++
++		/* Can't ignore points on other rings: */
++		if (timeline->pvt.ring != ring) {
++			ignore = false;
++			break;
++		}
++
++		/* Same ring means guaranteed to be in order so ignore it. */
++	}
++
++	return ignore;
++}
+diff --git a/drivers/gpu/drm/i915/intel_sync.h b/drivers/gpu/drm/i915/intel_sync.h
+index d660bd7..41d9297 100644
+--- a/drivers/gpu/drm/i915/intel_sync.h
++++ b/drivers/gpu/drm/i915/intel_sync.h
+@@ -60,6 +60,8 @@ struct i915_sync_pt {
+ 	struct drm_i915_gem_syncpt_driver_data pvt;
+ };
+ 
++bool i915_safe_to_ignore_fence(struct intel_engine_cs *ring, struct sync_fence *fence);
++
+ #ifdef CONFIG_DRM_I915_SYNC
+ 
+ int i915_sync_timeline_create(struct drm_device *dev,
+-- 
+1.7.9.5
+

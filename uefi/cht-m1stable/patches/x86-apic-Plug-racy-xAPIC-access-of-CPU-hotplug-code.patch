@@ -1,0 +1,81 @@
+From bdc26421225695a1335b108e70fa88cc474e2435 Mon Sep 17 00:00:00 2001
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Mon, 27 Jan 2014 20:14:06 +0100
+Subject: [PATCH 14/14] x86/apic: Plug racy xAPIC access of CPU hotplug code
+
+apic_icr_write() and its users in smpboot.c were apparently
+written under the assumption that this code would only run
+during early boot. But nowadays we also execute it when onlining
+a CPU later on while the system is fully running. That will make
+wakeup_cpu_via_init_nmi and, thus, also native_apic_icr_write
+run in plain process context. If we migrate the caller to a
+different CPU at the wrong time or interrupt it and write to
+ICR/ICR2 to send unrelated IPIs, we can end up sending INIT,
+SIPI or NMIs to wrong CPUs.
+
+Fix this by disabling interrupts during the write to the ICR
+halves and disable preemption around waiting for ICR
+availability and using it.
+
+Change-Id: I3e9d44a477b832e6d8a452c84715d6e4db226fcf
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-15682
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-on: https://android.intel.com:443/444957
+---
+ arch/x86/kernel/apic/apic.c |  4 ++++
+ arch/x86/kernel/smpboot.c   | 11 +++++++++--
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index 4f87f70..f2438af 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -283,8 +283,12 @@ u32 native_safe_apic_wait_icr_idle(void)
+ 
+ void native_apic_icr_write(u32 low, u32 id)
+ {
++	unsigned long flags;
++
++	local_irq_save(flags);
+ 	apic_write(APIC_ICR2, SET_APIC_DEST_FIELD(id));
+ 	apic_write(APIC_ICR, low);
++	local_irq_restore(flags);
+ }
+ 
+ u64 native_apic_icr_read(void)
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index fdaef88..b7c92a1 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -708,11 +708,15 @@ wakeup_cpu_via_init_nmi(int cpu, unsigned long start_ip, int apicid,
+ 	int id;
+ 	int boot_error;
+ 
++	preempt_disable();
++
+ 	/*
+ 	 * Wake up AP by INIT, INIT, STARTUP sequence.
+ 	 */
+-	if (cpu)
+-		return wakeup_secondary_cpu_via_init(apicid, start_ip);
++	if (cpu) {
++		boot_error = wakeup_secondary_cpu_via_init(apicid, start_ip);
++		goto out;
++	}
+ 
+ 	/*
+ 	 * Wake up BSP by nmi.
+@@ -732,6 +736,9 @@ wakeup_cpu_via_init_nmi(int cpu, unsigned long start_ip, int apicid,
+ 		boot_error = wakeup_secondary_cpu_via_nmi(id, start_ip);
+ 	}
+ 
++out:
++	preempt_enable();
++
+ 	return boot_error;
+ }
+ 
+-- 
+1.9.1
+

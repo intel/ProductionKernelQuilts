@@ -1,0 +1,192 @@
+From eb9f71a155423e0f5a124f7022990741fe1c7df6 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Date: Tue, 4 Mar 2014 16:17:25 +0000
+Subject: [PATCH 141/351] ASoC: florida: Add special handling for headphone
+ enable without DRE
+
+To ensure a smooth enable of the headphone path when DRE is not enabled
+some additional steps are required.
+
+Change-Id: Idc921e29bc8dea754bfe41ab7f664137acaa385e
+Signed-off-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Signed-off-by: Nikesh Oswal <Nikesh.Oswal@wolfsonmicro.com>
+---
+ sound/soc/codecs/arizona.c |   89 ++++++++++++++++++++++++++++++++++++++++++++
+ sound/soc/codecs/florida.c |   29 ++++++++++++++-
+ 2 files changed, 116 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/codecs/arizona.c b/sound/soc/codecs/arizona.c
+index 96bbe80..f010ad6 100644
+--- a/sound/soc/codecs/arizona.c
++++ b/sound/soc/codecs/arizona.c
+@@ -774,15 +774,95 @@ int arizona_in_ev(struct snd_soc_dapm_widget *w, struct snd_kcontrol *kcontrol,
+ }
+ EXPORT_SYMBOL_GPL(arizona_in_ev);
+ 
++int florida_hp_pre_enable(struct snd_soc_dapm_widget *w)
++{
++	unsigned int val = snd_soc_read(w->codec, ARIZONA_DRE_ENABLE);
++
++	switch (w->shift) {
++	case ARIZONA_OUT1L_ENA_SHIFT:
++		if (!(val & ARIZONA_DRE1L_ENA_MASK))
++			snd_soc_update_bits(w->codec,
++					    ARIZONA_OUTPUT_PATH_CONFIG_1L,
++					    ARIZONA_OUT1L_PGA_VOL_MASK,
++					    0x56);
++		break;
++	case ARIZONA_OUT1R_ENA_SHIFT:
++		if (!(val & ARIZONA_DRE1R_ENA_MASK))
++			snd_soc_update_bits(w->codec,
++					    ARIZONA_OUTPUT_PATH_CONFIG_1R,
++					    ARIZONA_OUT1R_PGA_VOL_MASK,
++					    0x56);
++		break;
++
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++int florida_hp_post_enable(struct snd_soc_dapm_widget *w)
++{
++	unsigned int wseq = 0;
++	unsigned int val = snd_soc_read(w->codec, ARIZONA_DRE_ENABLE);
++
++	switch (w->shift) {
++	case ARIZONA_OUT1L_ENA_SHIFT:
++		if (!(val & ARIZONA_DRE1L_ENA_MASK)) {
++			snd_soc_write(w->codec,
++				      ARIZONA_WRITE_SEQUENCER_CTRL_0,
++				      ARIZONA_WSEQ_ENA | ARIZONA_WSEQ_START |
++				      0x12E);
++			msleep(10);
++			snd_soc_update_bits(w->codec,
++					    ARIZONA_OUTPUT_PATH_CONFIG_1L,
++					    ARIZONA_OUT1L_PGA_VOL_MASK,
++					    0x80);
++		}
++		break;
++	case ARIZONA_OUT1R_ENA_SHIFT:
++		if (!(val & ARIZONA_DRE1R_ENA_MASK)) {
++			snd_soc_write(w->codec,
++				      ARIZONA_WRITE_SEQUENCER_CTRL_0,
++				      ARIZONA_WSEQ_ENA | ARIZONA_WSEQ_START |
++				      0x133);
++			msleep(10);
++			snd_soc_update_bits(w->codec,
++					    ARIZONA_OUTPUT_PATH_CONFIG_1R,
++					    ARIZONA_OUT1R_PGA_VOL_MASK,
++					    0x80);
++		}
++		break;
++
++	default:
++		break;
++	}
++
++	return 0;
++}
++
+ int arizona_out_ev(struct snd_soc_dapm_widget *w,
+ 		   struct snd_kcontrol *kcontrol,
+ 		   int event)
+ {
++	struct arizona_priv *priv = snd_soc_codec_get_drvdata(w->codec);
++
+ 	switch (event) {
+ 	case SND_SOC_DAPM_POST_PMU:
+ 		switch (w->shift) {
+ 		case ARIZONA_OUT1L_ENA_SHIFT:
+ 		case ARIZONA_OUT1R_ENA_SHIFT:
++			msleep(17);
++
++			switch (priv->arizona->type) {
++			case WM5110:
++				florida_hp_post_enable(w);
++				break;
++			default:
++				break;
++			}
++
++			break;
+ 		case ARIZONA_OUT2L_ENA_SHIFT:
+ 		case ARIZONA_OUT2R_ENA_SHIFT:
+ 		case ARIZONA_OUT3L_ENA_SHIFT:
+@@ -810,6 +890,15 @@ int arizona_hp_ev(struct snd_soc_dapm_widget *w,
+ 	unsigned int val;
+ 
+ 	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		switch (priv->arizona->type) {
++		case WM5110:
++			florida_hp_pre_enable(w);
++			break;
++		default:
++			break;
++		}
++		return 0;
+ 	case SND_SOC_DAPM_POST_PMU:
+ 		val = mask;
+ 		break;
+diff --git a/sound/soc/codecs/florida.c b/sound/soc/codecs/florida.c
+index a810706..8859986 100644
+--- a/sound/soc/codecs/florida.c
++++ b/sound/soc/codecs/florida.c
+@@ -145,6 +145,25 @@ static const struct reg_default florida_sysclk_revd_patch[] = {
+ 	{ 0x33fb, 0xfe00 },
+ };
+ 
++static const struct reg_default florida_sysclk_reve_patch[] = {
++	{ 0x325C, 0xE410 },
++	{ 0x325D, 0x3066 },
++	{ 0x325E, 0xE410 },
++	{ 0x325F, 0x3070 },
++	{ 0x3260, 0xE410 },
++	{ 0x3261, 0x3078 },
++	{ 0x3262, 0xE410 },
++	{ 0x3263, 0x3080 },
++	{ 0x3266, 0xE414 },
++	{ 0x3267, 0x3066 },
++	{ 0x3268, 0xE414 },
++	{ 0x3269, 0x3070 },
++	{ 0x326A, 0xE414 },
++	{ 0x326B, 0x3078 },
++	{ 0x326C, 0xE414 },
++	{ 0x326D, 0x3080 },
++};
++
+ static int florida_sysclk_ev(struct snd_soc_dapm_widget *w,
+ 			    struct snd_kcontrol *kcontrol, int event)
+ {
+@@ -159,6 +178,10 @@ static int florida_sysclk_ev(struct snd_soc_dapm_widget *w,
+ 		patch = florida_sysclk_revd_patch;
+ 		patch_size = ARRAY_SIZE(florida_sysclk_revd_patch);
+ 		break;
++	case 4:
++		patch = florida_sysclk_reve_patch;
++		patch_size = ARRAY_SIZE(florida_sysclk_reve_patch);
++		break;
+ 	default:
+ 		return 0;
+ 	}
+@@ -958,10 +981,12 @@ SND_SOC_DAPM_AIF_IN("AIF3RX2", NULL, 0,
+ 
+ SND_SOC_DAPM_PGA_E("OUT1L", SND_SOC_NOPM,
+ 		   ARIZONA_OUT1L_ENA_SHIFT, 0, NULL, 0, arizona_hp_ev,
+-		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
++		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_PRE_PMU |
++		   SND_SOC_DAPM_POST_PMU),
+ SND_SOC_DAPM_PGA_E("OUT1R", SND_SOC_NOPM,
+ 		   ARIZONA_OUT1R_ENA_SHIFT, 0, NULL, 0, arizona_hp_ev,
+-		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
++		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_PRE_PMU |
++		   SND_SOC_DAPM_POST_PMU),
+ SND_SOC_DAPM_PGA_E("OUT2L", ARIZONA_OUTPUT_ENABLES_1,
+ 		   ARIZONA_OUT2L_ENA_SHIFT, 0, NULL, 0, arizona_out_ev,
+ 		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
+-- 
+1.7.9.5
+

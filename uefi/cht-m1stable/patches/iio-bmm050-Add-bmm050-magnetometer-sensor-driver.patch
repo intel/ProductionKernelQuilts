@@ -1,0 +1,3634 @@
+From 366d18374fa4d09551776ea1c6611947448373a5 Mon Sep 17 00:00:00 2001
+From: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@intel.com>
+Date: Sat, 3 May 2014 22:28:47 -0700
+Subject: iio: bmm050: Add bmm050 magnetometer sensor driver
+
+This patch adds a new driver for bosch BMM050 accel sensor.
+
+Also this driver can be used for BMC150 magnetometer module
+support. BMC150 is a integrated chip contains both accel and
+magnetometer sensors.
+
+Original driver is written bosch sensortec team and on
+top of that following changes have been made.
+
+1. Replaced alloc with devm_alloc functions whenever possible.
+
+2. Replaced EXTRA_CFLAGS usage with appropriate ccflags-y option.
+
+3. Fixed few minor compilation & checkpatch issues.
+
+Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@intel.com>
+---
+ drivers/iio/magnetometer/Kconfig          |    6 +
+ drivers/iio/magnetometer/Makefile         |    4 +
+ drivers/iio/magnetometer/bmm050_api.c     | 1162 ++++++++++++++++++++++
+ drivers/iio/magnetometer/bmm050_buffer.c  |  123 +++
+ drivers/iio/magnetometer/bmm050_driver.c  | 1521 +++++++++++++++++++++++++++++
+ drivers/iio/magnetometer/bmm050_iio.h     |  664 +++++++++++++
+ drivers/iio/magnetometer/bmm050_trigger.c |   68 ++
+ 7 files changed, 3548 insertions(+)
+ create mode 100644 drivers/iio/magnetometer/bmm050_api.c
+ create mode 100644 drivers/iio/magnetometer/bmm050_buffer.c
+ create mode 100644 drivers/iio/magnetometer/bmm050_driver.c
+ create mode 100644 drivers/iio/magnetometer/bmm050_iio.h
+ create mode 100644 drivers/iio/magnetometer/bmm050_trigger.c
+
+diff --git a/drivers/iio/magnetometer/Kconfig b/drivers/iio/magnetometer/Kconfig
+index b2dba9e..b964e8d 100644
+--- a/drivers/iio/magnetometer/Kconfig
++++ b/drivers/iio/magnetometer/Kconfig
+@@ -79,4 +79,10 @@ config IIO_ST_MAGN_SPI_3AXIS
+ 	depends on IIO_ST_MAGN_3AXIS
+ 	depends on IIO_ST_SENSORS_SPI
+ 
++config SENSORS_BMM050
++	tristate "BMM050 Magnetic Sensor Driver"
++	select IIO_TRIGGERED_BUFFER if IIO_BUFFER
++	depends on I2C
++	help
++	 BMM050 Magnetic Sensor Driver implemented by Bosch-Sensortec.
+ endmenu
+diff --git a/drivers/iio/magnetometer/Makefile b/drivers/iio/magnetometer/Makefile
+index 8526873..67c4f06 100644
+--- a/drivers/iio/magnetometer/Makefile
++++ b/drivers/iio/magnetometer/Makefile
+@@ -14,3 +14,7 @@ st_magn-$(CONFIG_IIO_BUFFER) += st_magn_buffer.o
+ 
+ obj-$(CONFIG_IIO_ST_MAGN_I2C_3AXIS) += st_magn_i2c.o
+ obj-$(CONFIG_IIO_ST_MAGN_SPI_3AXIS) += st_magn_spi.o
++
++bmm050-y := bmm050_driver.o bmm050_api.o bmm050_buffer.o bmm050_trigger.o
++obj-$(CONFIG_SENSORS_BMM050)    += bmm050.o
++ccflags-$(CONFIG_SENSORS_BMM050)    += -DBMM_USE_BASIC_I2C_FUNC
+diff --git a/drivers/iio/magnetometer/bmm050_api.c b/drivers/iio/magnetometer/bmm050_api.c
+new file mode 100644
+index 0000000..8c30e7d
+--- /dev/null
++++ b/drivers/iio/magnetometer/bmm050_api.c
+@@ -0,0 +1,1162 @@
++/*!
++ * @section LICENSE
++ * (C) Copyright 2011~2014 Bosch Sensortec GmbH All Rights Reserved
++ *
++ * This software program is licensed subject to the GNU General
++ * Public License (GPL).Version 2,June 1991,
++ * available at http://www.fsf.org/copyleft/gpl.html
++ *
++ *
++ * @filename    bmm050_api.c
++ * @date        "Thu Apr 24 10:40:36 2014 +0800"
++ * @id          "6d0d027"
++ * @version     v1.0.1
++ * @brief       BMM050 Sensor API
++ */
++
++#include "bmm050_iio.h"
++
++static struct bmm050 *p_bmm050;
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_init(struct bmm050 *bmm050)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char a_data_u8r[2];
++	p_bmm050 = bmm050;
++
++	p_bmm050->dev_addr = BMM050_I2C_ADDRESS;
++
++	/* set device from suspend into sleep mode */
++	bmm050_set_powermode(BMM050_ON);
++
++	/* wait two millisecond for bmc to settle */
++	p_bmm050->delay_msec(BMM050_DELAY_SETTLING_TIME);
++
++	/*Read CHIP_ID and REv. info */
++	comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_CHIP_ID, a_data_u8r, 1);
++	p_bmm050->company_id = a_data_u8r[0];
++
++	/* Function to initialise trim values */
++	bmm050_init_trim_registers();
++	bmm050_set_presetmode(BMM050_PRESETMODE_REGULAR);
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_presetmode(unsigned char mode)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	switch (mode) {
++	case BMM050_PRESETMODE_LOWPOWER:
++		/* Set the data rate for Low Power mode */
++		comres = bmm050_set_datarate(BMM050_LOWPOWER_DR);
++		/* Set the XY-repetitions number for Low Power mode */
++		comres |= bmm050_set_repetitions_XY(BMM050_LOWPOWER_REPXY);
++		/* Set the Z-repetitions number  for Low Power mode */
++		comres |= bmm050_set_repetitions_Z(BMM050_LOWPOWER_REPZ);
++		break;
++	case BMM050_PRESETMODE_REGULAR:
++		/* Set the data rate for Regular mode */
++		comres = bmm050_set_datarate(BMM050_REGULAR_DR);
++		/* Set the XY-repetitions number for Regular mode */
++		comres |= bmm050_set_repetitions_XY(BMM050_REGULAR_REPXY);
++		/* Set the Z-repetitions number  for Regular mode */
++		comres |= bmm050_set_repetitions_Z(BMM050_REGULAR_REPZ);
++		break;
++	case BMM050_PRESETMODE_HIGHACCURACY:
++		/* Set the data rate for High Accuracy mode */
++		comres = bmm050_set_datarate(BMM050_HIGHACCURACY_DR);
++		/* Set the XY-repetitions number for High Accuracy mode */
++		comres |= bmm050_set_repetitions_XY(BMM050_HIGHACCURACY_REPXY);
++		/* Set the Z-repetitions number  for High Accuracyr mode */
++		comres |= bmm050_set_repetitions_Z(BMM050_HIGHACCURACY_REPZ);
++		break;
++	case BMM050_PRESETMODE_ENHANCED:
++		/* Set the data rate for Enhanced Accuracy mode */
++		comres = bmm050_set_datarate(BMM050_ENHANCED_DR);
++		/* Set the XY-repetitions number for High Enhanced mode */
++		comres |= bmm050_set_repetitions_XY(BMM050_ENHANCED_REPXY);
++		/* Set the Z-repetitions number  for High Enhanced mode */
++		comres |= bmm050_set_repetitions_Z(BMM050_ENHANCED_REPZ);
++		break;
++	default:
++		comres = E_BMM050_OUT_OF_RANGE;
++		break;
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_functional_state(
++		unsigned char functional_state)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data1_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		switch (functional_state) {
++		case BMM050_NORMAL_MODE:
++			comres = bmm050_get_powermode(&v_data1_u8r);
++			if (v_data1_u8r == BMM050_OFF) {
++				comres |= bmm050_set_powermode(BMM050_ON);
++				p_bmm050->delay_msec(
++						BMM050_DELAY_SUSPEND_SLEEP);
++			}
++			{
++				comres |= p_bmm050->BMM050_BUS_READ_FUNC(
++						p_bmm050->dev_addr,
++						BMM050_CNTL_OPMODE__REG,
++						&v_data1_u8r, 1);
++				v_data1_u8r = BMM050_SET_BITSLICE(
++						v_data1_u8r,
++						BMM050_CNTL_OPMODE,
++						BMM050_NORMAL_MODE);
++				comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++						p_bmm050->dev_addr,
++						BMM050_CNTL_OPMODE__REG,
++						&v_data1_u8r, 1);
++			}
++			break;
++		case BMM050_SUSPEND_MODE:
++			comres = bmm050_set_powermode(BMM050_OFF);
++			break;
++		case BMM050_FORCED_MODE:
++			comres = bmm050_get_powermode(&v_data1_u8r);
++			if (v_data1_u8r == BMM050_OFF) {
++				comres = bmm050_set_powermode(BMM050_ON);
++				p_bmm050->delay_msec(
++						BMM050_DELAY_SUSPEND_SLEEP);
++			}
++			comres |= p_bmm050->BMM050_BUS_READ_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_OPMODE__REG,
++					&v_data1_u8r, 1);
++			v_data1_u8r = BMM050_SET_BITSLICE(
++					v_data1_u8r,
++					BMM050_CNTL_OPMODE, BMM050_ON);
++			comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_OPMODE__REG,
++					&v_data1_u8r, 1);
++			break;
++		case BMM050_SLEEP_MODE:
++			bmm050_get_powermode(&v_data1_u8r);
++			if (v_data1_u8r == BMM050_OFF) {
++				comres = bmm050_set_powermode(BMM050_ON);
++				p_bmm050->delay_msec(
++						BMM050_DELAY_SUSPEND_SLEEP);
++			}
++			comres |= p_bmm050->BMM050_BUS_READ_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_OPMODE__REG,
++					&v_data1_u8r, 1);
++			v_data1_u8r = BMM050_SET_BITSLICE(
++					v_data1_u8r,
++					BMM050_CNTL_OPMODE,
++					BMM050_SLEEP_MODE);
++			comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_OPMODE__REG,
++					&v_data1_u8r, 1);
++			break;
++		default:
++			comres = E_BMM050_OUT_OF_RANGE;
++			break;
++		}
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_functional_state(
++		unsigned char *functional_state)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_CNTL_OPMODE__REG,
++				&v_data_u8r, 1);
++		*functional_state = BMM050_GET_BITSLICE(
++				v_data_u8r, BMM050_CNTL_OPMODE);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ(struct bmm050_mdata *mdata)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres;
++
++	unsigned char a_data_u8r[8];
++
++	struct {
++		BMM050_S16 raw_dataX;
++		BMM050_S16 raw_dataY;
++		BMM050_S16 raw_dataZ;
++		BMM050_U16 raw_dataR;
++	} raw_dataXYZ;
++
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++				BMM050_DATAX_LSB, a_data_u8r, 8);
++
++		/* Reading data for X axis */
++		a_data_u8r[0] = BMM050_GET_BITSLICE(a_data_u8r[0],
++				BMM050_DATAX_LSB_VALUEX);
++		raw_dataXYZ.raw_dataX = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[1])) <<
++					SHIFT_LEFT_5_POSITION) | a_data_u8r[0]);
++
++		/* Reading data for Y axis */
++		a_data_u8r[2] = BMM050_GET_BITSLICE(a_data_u8r[2],
++				BMM050_DATAY_LSB_VALUEY);
++		raw_dataXYZ.raw_dataY = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[3])) <<
++					SHIFT_LEFT_5_POSITION) | a_data_u8r[2]);
++
++		/* Reading data for Z axis */
++		a_data_u8r[4] = BMM050_GET_BITSLICE(a_data_u8r[4],
++				BMM050_DATAZ_LSB_VALUEZ);
++		raw_dataXYZ.raw_dataZ = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[5])) <<
++					SHIFT_LEFT_7_POSITION) | a_data_u8r[4]);
++
++		/* Reading data for Resistance*/
++		a_data_u8r[6] = BMM050_GET_BITSLICE(a_data_u8r[6],
++				BMM050_R_LSB_VALUE);
++		raw_dataXYZ.raw_dataR = (BMM050_U16)((((BMM050_U16)
++						a_data_u8r[7]) <<
++					SHIFT_LEFT_6_POSITION) | a_data_u8r[6]);
++
++		/* Compensation for X axis */
++		mdata->datax = bmm050_compensate_X(raw_dataXYZ.raw_dataX,
++				raw_dataXYZ.raw_dataR);
++
++		/* Compensation for Y axis */
++		mdata->datay = bmm050_compensate_Y(raw_dataXYZ.raw_dataY,
++				raw_dataXYZ.raw_dataR);
++
++		/* Compensation for Z axis */
++		mdata->dataz = bmm050_compensate_Z(raw_dataXYZ.raw_dataZ,
++				raw_dataXYZ.raw_dataR);
++
++		/* Output raw resistance value */
++		mdata->resistance = raw_dataXYZ.raw_dataR;
++
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ_s32(
++	struct bmm050_mdata_s32 *mdata)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres;
++
++	unsigned char a_data_u8r[8] = "";
++
++	struct {
++		BMM050_S16 raw_dataX;
++		BMM050_S16 raw_dataY;
++		BMM050_S16 raw_dataZ;
++		BMM050_U16 raw_dataR;
++	} raw_dataXYZ;
++
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++				BMM050_DATAX_LSB, a_data_u8r, 8);
++
++		/* Reading data for X axis */
++		a_data_u8r[0] = BMM050_GET_BITSLICE(a_data_u8r[0],
++				BMM050_DATAX_LSB_VALUEX);
++		raw_dataXYZ.raw_dataX = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[1])) <<
++					SHIFT_LEFT_5_POSITION) | a_data_u8r[0]);
++
++		/* Reading data for Y axis */
++		a_data_u8r[2] = BMM050_GET_BITSLICE(a_data_u8r[2],
++				BMM050_DATAY_LSB_VALUEY);
++		raw_dataXYZ.raw_dataY = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[3])) <<
++					SHIFT_LEFT_5_POSITION) | a_data_u8r[2]);
++
++		/* Reading data for Z axis */
++		a_data_u8r[4] = BMM050_GET_BITSLICE(a_data_u8r[4],
++				BMM050_DATAZ_LSB_VALUEZ);
++		raw_dataXYZ.raw_dataZ = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[5])) <<
++					SHIFT_LEFT_7_POSITION) | a_data_u8r[4]);
++
++		/* Reading data for Resistance*/
++		if (!comres)
++			mdata->drdy = BMM050_GET_BITSLICE(a_data_u8r[6],
++					BMM050_DATA_RDYSTAT);
++
++		a_data_u8r[6] = BMM050_GET_BITSLICE(a_data_u8r[6],
++				BMM050_R_LSB_VALUE);
++		raw_dataXYZ.raw_dataR = (BMM050_U16)((((BMM050_U16)
++						a_data_u8r[7]) <<
++					SHIFT_LEFT_6_POSITION) | a_data_u8r[6]);
++
++		/* Compensation for X axis */
++		mdata->datax = bmm050_compensate_X_s32(raw_dataXYZ.raw_dataX,
++				raw_dataXYZ.raw_dataR);
++
++		/* Compensation for Y axis */
++		mdata->datay = bmm050_compensate_Y_s32(raw_dataXYZ.raw_dataY,
++				raw_dataXYZ.raw_dataR);
++
++		/* Compensation for Z axis */
++		mdata->dataz = bmm050_compensate_Z_s32(raw_dataXYZ.raw_dataZ,
++				raw_dataXYZ.raw_dataR);
++
++		/* Output raw resistance value */
++		mdata->resistance = raw_dataXYZ.raw_dataR;
++	}
++	return comres;
++}
++
++#ifdef ENABLE_FLOAT
++BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ_float(
++	struct bmm050_mdata_float *mdata)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres;
++
++	unsigned char a_data_u8r[8];
++
++	struct {
++		BMM050_S16 raw_dataX;
++		BMM050_S16 raw_dataY;
++		BMM050_S16 raw_dataZ;
++		BMM050_U16 raw_dataR;
++	} raw_dataXYZ;
++
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++				BMM050_DATAX_LSB, a_data_u8r, 8);
++
++		/* Reading data for X axis */
++		a_data_u8r[0] = BMM050_GET_BITSLICE(a_data_u8r[0],
++				BMM050_DATAX_LSB_VALUEX);
++		raw_dataXYZ.raw_dataX = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[1])) <<
++					SHIFT_LEFT_5_POSITION) | a_data_u8r[0]);
++
++		/* Reading data for Y axis */
++		a_data_u8r[2] = BMM050_GET_BITSLICE(a_data_u8r[2],
++				BMM050_DATAY_LSB_VALUEY);
++		raw_dataXYZ.raw_dataY = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[3])) <<
++					SHIFT_LEFT_5_POSITION) | a_data_u8r[2]);
++
++		/* Reading data for Z axis */
++		a_data_u8r[4] = BMM050_GET_BITSLICE(a_data_u8r[4],
++				BMM050_DATAZ_LSB_VALUEZ);
++		raw_dataXYZ.raw_dataZ = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[5])) <<
++					SHIFT_LEFT_7_POSITION) | a_data_u8r[4]);
++
++		/* Reading data for Resistance*/
++		a_data_u8r[6] = BMM050_GET_BITSLICE(a_data_u8r[6],
++				BMM050_R_LSB_VALUE);
++		raw_dataXYZ.raw_dataR = (BMM050_U16)((((BMM050_U16)
++						a_data_u8r[7]) <<
++					SHIFT_LEFT_6_POSITION) | a_data_u8r[6]);
++
++		/* Compensation for X axis */
++		mdata->datax = bmm050_compensate_X_float(raw_dataXYZ.raw_dataX,
++				raw_dataXYZ.raw_dataR);
++
++		/* Compensation for Y axis */
++		mdata->datay = bmm050_compensate_Y_float(raw_dataXYZ.raw_dataY,
++				raw_dataXYZ.raw_dataR);
++
++		/* Compensation for Z axis */
++		mdata->dataz = bmm050_compensate_Z_float(raw_dataXYZ.raw_dataZ,
++				raw_dataXYZ.raw_dataR);
++
++		/* Output raw resistance value */
++		mdata->resistance = raw_dataXYZ.raw_dataR;
++	}
++	return comres;
++}
++#endif
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_read_register(unsigned char addr,
++		unsigned char *data, unsigned char len)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			addr, data, len);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_write_register(unsigned char addr,
++	    unsigned char *data, unsigned char len)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_WRITE_FUNC(p_bmm050->dev_addr,
++			addr, data, len);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_selftest(unsigned char selftest)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data1_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr, BMM050_CNTL_S_TEST__REG,
++				&v_data1_u8r, 1);
++		v_data1_u8r = BMM050_SET_BITSLICE(
++				v_data1_u8r, BMM050_CNTL_S_TEST, selftest);
++		comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++				p_bmm050->dev_addr, BMM050_CNTL_S_TEST__REG,
++				&v_data1_u8r, 1);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_self_test_XYZ(
++		unsigned char *self_testxyz)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char a_data_u8r[5], v_result_u8r = 0x00;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr, BMM050_DATAX_LSB_TESTX__REG,
++				a_data_u8r, 5);
++
++		v_result_u8r = BMM050_GET_BITSLICE(a_data_u8r[4],
++				BMM050_DATAZ_LSB_TESTZ);
++
++		v_result_u8r = (v_result_u8r << 1);
++		v_result_u8r = (v_result_u8r | BMM050_GET_BITSLICE(
++					a_data_u8r[2], BMM050_DATAY_LSB_TESTY));
++
++		v_result_u8r = (v_result_u8r << 1);
++		v_result_u8r = (v_result_u8r | BMM050_GET_BITSLICE(
++					a_data_u8r[0], BMM050_DATAX_LSB_TESTX));
++
++		*self_testxyz = v_result_u8r;
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_spi3(unsigned char value)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data1_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_POWER_CNTL_SPI3_EN__REG, &v_data1_u8r, 1);
++		v_data1_u8r = BMM050_SET_BITSLICE(v_data1_u8r,
++			BMM050_POWER_CNTL_SPI3_EN, value);
++		comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(p_bmm050->dev_addr,
++		    BMM050_POWER_CNTL_SPI3_EN__REG, &v_data1_u8r, 1);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_datarate(unsigned char data_rate)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data1_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_CNTL_DR__REG,
++				&v_data1_u8r, 1);
++		v_data1_u8r = BMM050_SET_BITSLICE(v_data1_u8r,
++				BMM050_CNTL_DR, data_rate);
++		comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_CNTL_DR__REG,
++				&v_data1_u8r, 1);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_datarate(unsigned char *data_rate)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_CNTL_DR__REG,
++				&v_data_u8r, 1);
++		*data_rate = BMM050_GET_BITSLICE(v_data_u8r,
++				BMM050_CNTL_DR);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_perform_advanced_selftest(
++		BMM050_S16 *diff_z)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres;
++	BMM050_S16 result_positive, result_negative;
++	struct bmm050_mdata mdata;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		/* set sleep mode to prepare for forced measurement.
++		 * If sensor is off, this will turn it on
++		 * and respect needed delays. */
++		comres = bmm050_set_functional_state(BMM050_SLEEP_MODE);
++
++		/* set normal accuracy mode */
++		comres |= bmm050_set_repetitions_Z(BMM050_LOWPOWER_REPZ);
++		/* 14 repetitions Z in normal accuracy mode */
++
++		/* disable X, Y channel */
++		comres |= bmm050_set_control_measurement_x(
++				BMM050_CHANNEL_DISABLE);
++		comres |= bmm050_set_control_measurement_y(
++				BMM050_CHANNEL_DISABLE);
++
++		/* enable positive current and force a
++		 * measurement with positive field */
++		comres |= bmm050_set_adv_selftest(
++				BMM050_ADVANCED_SELFTEST_POSITIVE);
++		comres |= bmm050_set_functional_state(BMM050_FORCED_MODE);
++		/* wait for measurement to complete */
++		p_bmm050->delay_msec(4);
++
++		/* read result from positive field measurement */
++		comres |= bmm050_read_mdataXYZ(&mdata);
++		result_positive = mdata.dataz;
++
++		/* enable negative current and force a
++		 * measurement with negative field */
++		comres |= bmm050_set_adv_selftest(
++				BMM050_ADVANCED_SELFTEST_NEGATIVE);
++		comres |= bmm050_set_functional_state(BMM050_FORCED_MODE);
++		p_bmm050->delay_msec(4); /* wait for measurement to complete */
++
++		/* read result from negative field measurement */
++		comres |= bmm050_read_mdataXYZ(&mdata);
++		result_negative = mdata.dataz;
++
++		/* turn off self test current */
++		comres |= bmm050_set_adv_selftest(
++				BMM050_ADVANCED_SELFTEST_OFF);
++
++		/* enable X, Y channel */
++		comres |= bmm050_set_control_measurement_x(
++				BMM050_CHANNEL_ENABLE);
++		comres |= bmm050_set_control_measurement_y(
++				BMM050_CHANNEL_ENABLE);
++
++		/* write out difference in positive and negative field.
++		 * This should be ~ 200 mT = 3200 LSB */
++		*diff_z = (result_positive - result_negative);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_init_trim_registers(void)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char a_data_u8r[2];
++	comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_X1, (unsigned char *)&p_bmm050->dig_x1, 1);
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_Y1, (unsigned char *)&p_bmm050->dig_y1, 1);
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_X2, (unsigned char *)&p_bmm050->dig_x2, 1);
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_Y2, (unsigned char *)&p_bmm050->dig_y2, 1);
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_XY1, (unsigned char *)&p_bmm050->dig_xy1, 1);
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_XY2, (unsigned char *)&p_bmm050->dig_xy2, 1);
++
++	/* shorts can not be recasted into (unsigned char*)
++	 * due to possible mixup between trim data
++	 * arrangement and memory arrangement */
++
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_Z1_LSB, a_data_u8r, 2);
++	p_bmm050->dig_z1 = (BMM050_U16)((((BMM050_U16)((unsigned char)
++						a_data_u8r[1])) <<
++				SHIFT_LEFT_8_POSITION) | a_data_u8r[0]);
++
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_Z2_LSB, a_data_u8r, 2);
++	p_bmm050->dig_z2 = (BMM050_S16)((((BMM050_S16)(
++						(signed char)a_data_u8r[1])) <<
++				SHIFT_LEFT_8_POSITION) | a_data_u8r[0]);
++
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_Z3_LSB, a_data_u8r, 2);
++	p_bmm050->dig_z3 = (BMM050_S16)((((BMM050_S16)(
++						(signed char)a_data_u8r[1])) <<
++				SHIFT_LEFT_8_POSITION) | a_data_u8r[0]);
++
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_Z4_LSB, a_data_u8r, 2);
++	p_bmm050->dig_z4 = (BMM050_S16)((((BMM050_S16)(
++						(signed char)a_data_u8r[1])) <<
++				SHIFT_LEFT_8_POSITION) | a_data_u8r[0]);
++
++	comres |= p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_DIG_XYZ1_LSB, a_data_u8r, 2);
++	a_data_u8r[1] = BMM050_GET_BITSLICE(a_data_u8r[1], BMM050_DIG_XYZ1_MSB);
++	p_bmm050->dig_xyz1 = (BMM050_U16)((((BMM050_U16)
++					((unsigned char)a_data_u8r[1])) <<
++				SHIFT_LEFT_8_POSITION) | a_data_u8r[0]);
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_adv_selftest(unsigned char adv_selftest)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data1_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		switch (adv_selftest) {
++		case BMM050_ADVANCED_SELFTEST_OFF:
++			comres = p_bmm050->BMM050_BUS_READ_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_ADV_ST__REG,
++					&v_data1_u8r, 1);
++			v_data1_u8r = BMM050_SET_BITSLICE(
++					v_data1_u8r,
++					BMM050_CNTL_ADV_ST,
++					BMM050_ADVANCED_SELFTEST_OFF);
++			comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_ADV_ST__REG,
++					&v_data1_u8r, 1);
++			break;
++		case BMM050_ADVANCED_SELFTEST_POSITIVE:
++			comres = p_bmm050->BMM050_BUS_READ_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_ADV_ST__REG,
++					&v_data1_u8r, 1);
++			v_data1_u8r = BMM050_SET_BITSLICE(
++					v_data1_u8r,
++					BMM050_CNTL_ADV_ST,
++					BMM050_ADVANCED_SELFTEST_POSITIVE);
++			comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_ADV_ST__REG,
++					&v_data1_u8r, 1);
++			break;
++		case BMM050_ADVANCED_SELFTEST_NEGATIVE:
++			comres = p_bmm050->BMM050_BUS_READ_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_ADV_ST__REG,
++					&v_data1_u8r, 1);
++			v_data1_u8r = BMM050_SET_BITSLICE(
++					v_data1_u8r,
++					BMM050_CNTL_ADV_ST,
++					BMM050_ADVANCED_SELFTEST_NEGATIVE);
++			comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++					p_bmm050->dev_addr,
++					BMM050_CNTL_ADV_ST__REG,
++					&v_data1_u8r, 1);
++			break;
++		default:
++			break;
++		}
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_adv_selftest(unsigned char *adv_selftest)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++			BMM050_CNTL_ADV_ST__REG, &v_data_u8r, 1);
++		*adv_selftest = BMM050_GET_BITSLICE(v_data_u8r,
++			BMM050_CNTL_ADV_ST);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_presetmode(
++	unsigned char *mode)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char data_rate = 0;
++	unsigned char repetitionsxy = 0;
++	unsigned char repetitionsz = 0;
++
++	/* Get the current data rate */
++	comres = bmm050_get_datarate(&data_rate);
++	/* Get the preset number of XY Repetitions */
++	comres |= bmm050_get_repetitions_XY(&repetitionsxy);
++	/* Get the preset number of Z Repetitions */
++	comres |= bmm050_get_repetitions_Z(&repetitionsz);
++	if ((data_rate == BMM050_LOWPOWER_DR) && (
++		repetitionsxy == BMM050_LOWPOWER_REPXY) && (
++		repetitionsz == BMM050_LOWPOWER_REPZ)) {
++		*mode = BMM050_PRESETMODE_LOWPOWER;
++	} else {
++		if ((data_rate == BMM050_REGULAR_DR) && (
++			repetitionsxy == BMM050_REGULAR_REPXY) && (
++			repetitionsz == BMM050_REGULAR_REPZ)) {
++			*mode = BMM050_PRESETMODE_REGULAR;
++		} else {
++			if ((data_rate == BMM050_HIGHACCURACY_DR) && (
++				repetitionsxy == BMM050_HIGHACCURACY_REPXY) && (
++				repetitionsz == BMM050_HIGHACCURACY_REPZ)) {
++					*mode = BMM050_PRESETMODE_HIGHACCURACY;
++			} else {
++				if ((data_rate == BMM050_ENHANCED_DR) && (
++				repetitionsxy == BMM050_ENHANCED_REPXY) && (
++				repetitionsz == BMM050_ENHANCED_REPZ)) {
++					*mode = BMM050_PRESETMODE_ENHANCED;
++				} else {
++					*mode = E_BMM050_UNDEFINED_MODE;
++				}
++			}
++		}
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_powermode(unsigned char *mode)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_POWER_CNTL_PCB__REG,
++				&v_data_u8r, 1);
++		*mode = BMM050_GET_BITSLICE(v_data_u8r,
++				BMM050_POWER_CNTL_PCB);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_powermode(unsigned char mode)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_POWER_CNTL_PCB__REG,
++				&v_data_u8r, 1);
++		v_data_u8r = BMM050_SET_BITSLICE(v_data_u8r,
++				BMM050_POWER_CNTL_PCB, mode);
++		comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_POWER_CNTL_PCB__REG,
++				&v_data_u8r, 1);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_repetitions_XY(
++		unsigned char *no_repetitions_xy)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_NO_REPETITIONS_XY,
++				&v_data_u8r, 1);
++		*no_repetitions_xy = v_data_u8r;
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_repetitions_XY(
++		unsigned char no_repetitions_xy)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		v_data_u8r = no_repetitions_xy;
++		comres = p_bmm050->BMM050_BUS_WRITE_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_NO_REPETITIONS_XY,
++				&v_data_u8r, 1);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_repetitions_Z(
++		unsigned char *no_repetitions_z)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_NO_REPETITIONS_Z,
++				&v_data_u8r, 1);
++		*no_repetitions_z = v_data_u8r;
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_repetitions_Z(
++		unsigned char no_repetitions_z)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		v_data_u8r = no_repetitions_z;
++		comres = p_bmm050->BMM050_BUS_WRITE_FUNC(p_bmm050->dev_addr,
++				BMM050_NO_REPETITIONS_Z, &v_data_u8r, 1);
++	}
++	return comres;
++}
++
++BMM050_S16 bmm050_compensate_X(BMM050_S16 mdata_x, BMM050_U16 data_R)
++{
++	BMM050_S16 inter_retval;
++	if (mdata_x != BMM050_FLIP_OVERFLOW_ADCVAL  /* no overflow */
++	   ) {
++		inter_retval = ((BMM050_S16)(((BMM050_U16)
++				((((BMM050_S32)p_bmm050->dig_xyz1) << 14) /
++				 (data_R != 0 ? data_R : p_bmm050->dig_xyz1))) -
++				((BMM050_U16)0x4000)));
++		inter_retval = ((BMM050_S16)((((BMM050_S32)mdata_x) *
++				((((((((BMM050_S32)p_bmm050->dig_xy2) *
++			      ((((BMM050_S32)inter_retval) *
++				((BMM050_S32)inter_retval)) >> 7)) +
++			     (((BMM050_S32)inter_retval) *
++			      ((BMM050_S32)(((BMM050_S16)p_bmm050->dig_xy1)
++			      << 7)))) >> 9) +
++			   ((BMM050_S32)0x100000)) *
++			  ((BMM050_S32)(((BMM050_S16)p_bmm050->dig_x2) +
++			  ((BMM050_S16)0xA0)))) >> 12)) >> 13)) +
++			(((BMM050_S16)p_bmm050->dig_x1) << 3);
++	} else {
++		/* overflow */
++		inter_retval = BMM050_OVERFLOW_OUTPUT;
++	}
++	return inter_retval;
++}
++
++BMM050_S32 bmm050_compensate_X_s32 (BMM050_S16 mdata_x, BMM050_U16 data_R)
++{
++	BMM050_S32 retval;
++
++	retval = bmm050_compensate_X(mdata_x, data_R);
++	if (retval == (BMM050_S32)BMM050_OVERFLOW_OUTPUT)
++		retval = BMM050_OVERFLOW_OUTPUT_S32;
++	return retval;
++}
++
++#ifdef ENABLE_FLOAT
++float bmm050_compensate_X_float (BMM050_S16 mdata_x, BMM050_U16 data_R)
++{
++	float inter_retval;
++	if (mdata_x != BMM050_FLIP_OVERFLOW_ADCVAL/* no overflow */
++	   ) {
++		if (data_R != 0) {
++			inter_retval = ((((float)p_bmm050->dig_xyz1)*16384.0f
++				/data_R)-16384.0f);
++		} else {
++			inter_retval = 0;
++		}
++		inter_retval = (((mdata_x * ((((((float)p_bmm050->dig_xy2) *
++			(inter_retval*inter_retval / 268435456.0f) +
++			inter_retval*((float)p_bmm050->dig_xy1)/16384.0f))
++			+ 256.0f) * (((float)p_bmm050->dig_x2) + 160.0f)))
++			/ 8192.0f) + (((float)p_bmm050->dig_x1) * 8.0f))/16.0f;
++	} else {
++		inter_retval = BMM050_OVERFLOW_OUTPUT_FLOAT;
++	}
++	return inter_retval;
++}
++#endif
++
++BMM050_S16 bmm050_compensate_Y(BMM050_S16 mdata_y, BMM050_U16 data_R)
++{
++	BMM050_S16 inter_retval;
++	if (mdata_y != BMM050_FLIP_OVERFLOW_ADCVAL  /* no overflow */
++	   ) {
++		inter_retval = ((BMM050_S16)(((BMM050_U16)(((
++			(BMM050_S32)p_bmm050->dig_xyz1) << 14) /
++			(data_R != 0 ?
++			 data_R : p_bmm050->dig_xyz1))) -
++			((BMM050_U16)0x4000)));
++		inter_retval = ((BMM050_S16)((((BMM050_S32)mdata_y) *
++				((((((((BMM050_S32)
++				       p_bmm050->dig_xy2) *
++				      ((((BMM050_S32) inter_retval) *
++					((BMM050_S32)inter_retval)) >> 7)) +
++				     (((BMM050_S32)inter_retval) *
++				      ((BMM050_S32)(((BMM050_S16)
++				      p_bmm050->dig_xy1) << 7)))) >> 9) +
++				   ((BMM050_S32)0x100000)) *
++				  ((BMM050_S32)(((BMM050_S16)p_bmm050->dig_y2)
++					  + ((BMM050_S16)0xA0))))
++				 >> 12)) >> 13)) +
++			(((BMM050_S16)p_bmm050->dig_y1) << 3);
++	} else {
++		/* overflow */
++		inter_retval = BMM050_OVERFLOW_OUTPUT;
++	}
++	return inter_retval;
++}
++
++BMM050_S32 bmm050_compensate_Y_s32 (BMM050_S16 mdata_y, BMM050_U16 data_R)
++{
++	BMM050_S32 retval;
++
++	retval = bmm050_compensate_Y(mdata_y, data_R);
++	if (retval == BMM050_OVERFLOW_OUTPUT)
++		retval = BMM050_OVERFLOW_OUTPUT_S32;
++	return retval;
++}
++
++#ifdef ENABLE_FLOAT
++float bmm050_compensate_Y_float(BMM050_S16 mdata_y, BMM050_U16 data_R)
++{
++	float inter_retval;
++	if (mdata_y != BMM050_FLIP_OVERFLOW_ADCVAL /* no overflow */
++	   ) {
++		if (data_R != 0) {
++			inter_retval = ((((float)p_bmm050->dig_xyz1)*16384.0f
++			/data_R)-16384.0f);
++		} else {
++			inter_retval = 0;
++		}
++		inter_retval = (((mdata_y * ((((((float)p_bmm050->dig_xy2) *
++			(inter_retval*inter_retval / 268435456.0f) +
++			inter_retval * ((float)p_bmm050->dig_xy1)/16384.0f)) +
++			256.0f) * (((float)p_bmm050->dig_y2) + 160.0f)))
++			/ 8192.0f) + (((float)p_bmm050->dig_y1) * 8.0f))/16.0f;
++	} else {
++		/* overflow, set output to 0.0f */
++		inter_retval = BMM050_OVERFLOW_OUTPUT_FLOAT;
++	}
++	return inter_retval;
++}
++#endif
++
++BMM050_S16 bmm050_compensate_Z(BMM050_S16 mdata_z, BMM050_U16 data_R)
++{
++	BMM050_S32 retval;
++	if ((mdata_z != BMM050_HALL_OVERFLOW_ADCVAL) /* no overflow */
++	   ) {
++		retval = (((((BMM050_S32)(mdata_z - p_bmm050->dig_z4)) << 15) -
++					((((BMM050_S32)p_bmm050->dig_z3) *
++					  ((BMM050_S32)(((BMM050_S16)data_R) -
++						  ((BMM050_S16)
++						   p_bmm050->dig_xyz1))))>>2)) /
++				(p_bmm050->dig_z2 +
++				 ((BMM050_S16)(((((BMM050_S32)
++					 p_bmm050->dig_z1) *
++					 ((((BMM050_S16)data_R) << 1)))+
++						 (1<<15))>>16))));
++		/* saturate result to +/- 2 mT */
++		if (retval > BMM050_POSITIVE_SATURATION_Z) {
++			retval =  BMM050_POSITIVE_SATURATION_Z;
++		} else {
++			if (retval < BMM050_NEGATIVE_SATURATION_Z)
++				retval = BMM050_NEGATIVE_SATURATION_Z;
++		}
++	} else {
++		/* overflow */
++		retval = BMM050_OVERFLOW_OUTPUT;
++	}
++	return (BMM050_S16)retval;
++}
++
++BMM050_S32 bmm050_compensate_Z_s32(BMM050_S16 mdata_z, BMM050_U16 data_R)
++{
++	BMM050_S32 retval;
++	if (mdata_z != BMM050_HALL_OVERFLOW_ADCVAL) {
++		retval = (((((BMM050_S32)(mdata_z - p_bmm050->dig_z4)) << 15) -
++			((((BMM050_S32)p_bmm050->dig_z3) *
++			((BMM050_S32)(((BMM050_S16)data_R) -
++			((BMM050_S16)p_bmm050->dig_xyz1))))>>2)) /
++			(p_bmm050->dig_z2 +
++			((BMM050_S16)(((((BMM050_S32)p_bmm050->dig_z1) *
++			((((BMM050_S16)data_R) << 1)))+(1<<15))>>16))));
++	} else {
++		retval = BMM050_OVERFLOW_OUTPUT_S32;
++	}
++	return retval;
++}
++
++#ifdef ENABLE_FLOAT
++float bmm050_compensate_Z_float (BMM050_S16 mdata_z, BMM050_U16 data_R)
++{
++	float inter_retval;
++	if (mdata_z != BMM050_HALL_OVERFLOW_ADCVAL /* no overflow */
++	   ) {
++		inter_retval = ((((((float)mdata_z)-((float)p_bmm050->dig_z4))*
++		131072.0f)-(((float)p_bmm050->dig_z3)*(((float)data_R)-
++		((float)p_bmm050->dig_xyz1))))/((((float)p_bmm050->dig_z2)+
++		((float)p_bmm050->dig_z1)*((float)data_R)/32768.0)*4.0))/16.0;
++	} else {
++		/* overflow, set output to 0.0f */
++		inter_retval = BMM050_OVERFLOW_OUTPUT_FLOAT;
++	}
++	return inter_retval;
++}
++#endif
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_control_measurement_x(
++		unsigned char enable_disable)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data1_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_SENS_CNTL_CHANNELX__REG,
++				&v_data1_u8r, 1);
++		v_data1_u8r = BMM050_SET_BITSLICE(v_data1_u8r,
++				BMM050_SENS_CNTL_CHANNELX,
++				enable_disable);
++		comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_SENS_CNTL_CHANNELX__REG,
++				&v_data1_u8r, 1);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_control_measurement_y(
++		unsigned char enable_disable)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data1_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_SENS_CNTL_CHANNELY__REG,
++				&v_data1_u8r, 1);
++		v_data1_u8r = BMM050_SET_BITSLICE(
++				v_data1_u8r,
++				BMM050_SENS_CNTL_CHANNELY,
++				enable_disable);
++		comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_SENS_CNTL_CHANNELY__REG,
++				&v_data1_u8r, 1);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_soft_reset(void)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres = 0;
++	unsigned char v_data_u8r;
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		v_data_u8r = BMM050_ON;
++
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_POWER_CNTL_SRST7__REG,
++				&v_data_u8r, 1);
++		v_data_u8r = BMM050_SET_BITSLICE(v_data_u8r,
++				BMM050_POWER_CNTL_SRST7,
++				BMM050_SOFT_RESET7_ON);
++		comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_POWER_CNTL_SRST7__REG, &v_data_u8r, 1);
++
++		comres |= p_bmm050->BMM050_BUS_READ_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_POWER_CNTL_SRST1__REG,
++				&v_data_u8r, 1);
++		v_data_u8r = BMM050_SET_BITSLICE(v_data_u8r,
++				BMM050_POWER_CNTL_SRST1,
++				BMM050_SOFT_RESET1_ON);
++		comres |= p_bmm050->BMM050_BUS_WRITE_FUNC(
++				p_bmm050->dev_addr,
++				BMM050_POWER_CNTL_SRST1__REG,
++				&v_data_u8r, 1);
++
++		p_bmm050->delay_msec(BMM050_DELAY_SOFTRESET);
++	}
++	return comres;
++}
++
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_raw_xyz(struct bmm050_mdata *mdata)
++{
++	BMM050_RETURN_FUNCTION_TYPE comres;
++	unsigned char a_data_u8r[6];
++	if (p_bmm050 == BMM050_NULL) {
++		comres = E_BMM050_NULL_PTR;
++	} else {
++		comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
++				BMM050_DATAX_LSB, a_data_u8r, 6);
++
++		a_data_u8r[0] = BMM050_GET_BITSLICE(a_data_u8r[0],
++				BMM050_DATAX_LSB_VALUEX);
++		mdata->datax = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[1]))
++					<< SHIFT_LEFT_5_POSITION)
++				| a_data_u8r[0]);
++
++		a_data_u8r[2] = BMM050_GET_BITSLICE(a_data_u8r[2],
++				BMM050_DATAY_LSB_VALUEY);
++		mdata->datay = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[3]))
++					<< SHIFT_LEFT_5_POSITION)
++				| a_data_u8r[2]);
++
++		a_data_u8r[4] = BMM050_GET_BITSLICE(a_data_u8r[4],
++				BMM050_DATAZ_LSB_VALUEZ);
++		mdata->dataz = (BMM050_S16)((((BMM050_S16)
++						((signed char)a_data_u8r[5]))
++					<< SHIFT_LEFT_7_POSITION)
++				| a_data_u8r[4]);
++	}
++	return comres;
++}
+diff --git a/drivers/iio/magnetometer/bmm050_buffer.c b/drivers/iio/magnetometer/bmm050_buffer.c
+new file mode 100644
+index 0000000..79b8714
+--- /dev/null
++++ b/drivers/iio/magnetometer/bmm050_buffer.c
+@@ -0,0 +1,123 @@
++/*!
++ * @section LICENSE
++ * (C) Copyright 2011~2014 Bosch Sensortec GmbH All Rights Reserved
++ *
++ * This software program is licensed subject to the GNU General
++ * Public License (GPL).Version 2,June 1991,
++ * available at http://www.fsf.org/copyleft/gpl.html
++ *
++ * @filename    bmm050_buffer.c
++ * @date        "Thu Apr 24 10:40:36 2014 +0800"
++ * @id          "6d0d027"
++ * @version     v1.0
++ *
++ * @brief       BMM050 Linux IIO Driver
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/stat.h>
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/delay.h>
++#include <linux/iio/iio.h>
++#include <linux/iio/buffer.h>
++#include <linux/iio/trigger_consumer.h>
++#include <linux/iio/triggered_buffer.h>
++
++#include "bmm050_iio.h"
++
++static int bmm_get_buffer(struct iio_dev *indio_dev, u8 *buf)
++{
++	unsigned char addr[BMM_NUMBER_DATA_CHANNELS] = {0, 0, 0};
++	int i, count = 0, len = 0;
++	 struct bmm_client_data *client_data = iio_priv(indio_dev);
++
++	for (i = 0; i < BMM_NUMBER_DATA_CHANNELS; i++) {
++		if (test_bit(i, indio_dev->active_scan_mask)) {
++			addr[count] = indio_dev->channels[i].address;
++			count++;
++		}
++	}
++
++	switch (count) {
++	case 1:
++		len = i2c_smbus_read_i2c_block_data(client_data->client,
++						addr[0], 2, buf);
++		break;
++	case 2:
++		if ((addr[1] - addr[0]) == BMM_BYTE_PRE_CHANNEL) {
++			len =  i2c_smbus_read_i2c_block_data(
++				client_data->client,
++				addr[0], BMM_BYTE_PRE_CHANNEL*count, buf);
++		} else {
++			u8 raw_data_tmp[
++					BMM_BYTE_PRE_CHANNEL *
++					BMM_NUMBER_DATA_CHANNELS];
++			len = i2c_smbus_read_i2c_block_data(
++				client_data->client, addr[0],
++				BMM_BYTE_PRE_CHANNEL * BMM_NUMBER_DATA_CHANNELS,
++				raw_data_tmp);
++			if (len < 0)
++				return len;
++			for (i = 0; i < count * BMM_NUMBER_DATA_CHANNELS; i++) {
++				if (i < count)
++					buf[i] = raw_data_tmp[i];
++				else
++					buf[i] = raw_data_tmp[count + i];
++			}
++			len = BMM_BYTE_PRE_CHANNEL * count;
++		}
++		break;
++	case 3:
++		len = i2c_smbus_read_i2c_block_data(client_data->client,
++			addr[0],
++			BMM_BYTE_PRE_CHANNEL * BMM_NUMBER_DATA_CHANNELS, buf);
++		break;
++	default:
++		len =  -EINVAL;
++		goto read_data_err;
++
++	}
++
++	if (len != BMM_BYTE_PRE_CHANNEL * count) {
++		len = -EIO;
++		goto read_data_err;
++	}
++
++read_data_err:
++	return len;
++}
++
++irqreturn_t bmm_buffer_handler(int irq, void *p)
++{
++	 struct iio_poll_func *pf = p;
++	 struct iio_dev *indio_dev = pf->indio_dev;
++
++	 int len;
++	unsigned char buffer_data[10];
++
++	 len = bmm_get_buffer(indio_dev, buffer_data);
++	if (len < 0)
++		goto err_get_buffer;
++
++	if (indio_dev->scan_timestamp)
++		*(s64 *)((u8 *)buffer_data + ALIGN(len, sizeof(s64))) =
++					pf->timestamp;
++
++	iio_push_to_buffers(indio_dev, buffer_data);
++
++err_get_buffer:
++	iio_trigger_notify_done(indio_dev->trig);
++
++	return IRQ_HANDLED;
++
++}
++
++
++void bmm_deallocate_ring(struct iio_dev *indio_dev)
++{
++	iio_triggered_buffer_cleanup(indio_dev);
++}
++
++
+diff --git a/drivers/iio/magnetometer/bmm050_driver.c b/drivers/iio/magnetometer/bmm050_driver.c
+new file mode 100644
+index 0000000..2fd3587
+--- /dev/null
++++ b/drivers/iio/magnetometer/bmm050_driver.c
+@@ -0,0 +1,1521 @@
++/*!
++ * @section LICENSE
++ * (C) Copyright 2011~2014 Bosch Sensortec GmbH All Rights Reserved
++ *
++ * This software program is licensed subject to the GNU General
++ * Public License (GPL).Version 2,June 1991,
++ * available at http://www.fsf.org/copyleft/gpl.html
++ *
++ * @filename    bmm050_driver.c
++ * @date        "Thu Apr 24 10:40:36 2014 +0800"
++ * @id          "6d0d027"
++ * @version     v1.0
++ *
++ * @brief       BMM050 Linux IIO Driver
++ */
++
++#include <linux/version.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/of.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++
++#ifdef __KERNEL__
++#include <linux/kernel.h>
++#include <linux/unistd.h>
++#include <linux/types.h>
++#include <linux/string.h>
++#else
++#include <unistd.h>
++#include <sys/types.h>
++#include <string.h>
++#endif
++
++#include <linux/iio/iio.h>
++#include <linux/iio/sysfs.h>
++#include <asm/unaligned.h>
++#include <linux/iio/iio.h>
++#include <linux/iio/buffer.h>
++#include <linux/iio/sysfs.h>
++#include <linux/iio/kfifo_buf.h>
++#include <linux/iio/trigger.h>
++#include <linux/iio/triggered_buffer.h>
++#include <linux/iio/trigger_consumer.h>
++
++
++
++#include "bmm050_iio.h"
++
++/* sensor specific */
++#define SENSOR_NAME "bmm050"
++
++#define SENSOR_CHIP_ID_BMM (0x32)
++
++#define BMM_REG_NAME(name) BMM050_##name
++#define BMM_VAL_NAME(name) BMM050_##name
++#define BMM_CALL_API(name) bmm050_##name
++
++#define BMM_I2C_WRITE_DELAY_TIME 1
++
++#define BMM_DEFAULT_REPETITION_XY BMM_VAL_NAME(REGULAR_REPXY)
++#define BMM_DEFAULT_REPETITION_Z BMM_VAL_NAME(REGULAR_REPZ)
++#define BMM_DEFAULT_ODR BMM_VAL_NAME(REGULAR_DR)
++/* generic */
++#define BMM_MAX_RETRY_I2C_XFER (100)
++#define BMM_MAX_RETRY_WAKEUP (5)
++#define BMM_MAX_RETRY_WAIT_DRDY (100)
++
++#define BMM_DELAY_MIN (1)
++#define BMM_DELAY_DEFAULT (200)
++
++#define MAG_VALUE_MAX (32767)
++#define MAG_VALUE_MIN (-32768)
++
++#define BYTES_PER_LINE (16)
++
++#define BMM_SELF_TEST 1
++#define BMM_ADV_TEST 2
++
++#define BMM_OP_MODE_UNKNOWN (-1)
++
++
++#define BMM_SENSORS_12_BITS		12
++#define BMM_SENSORS_13_BITS		13
++#define BMM_SENSORS_14_BITS		14
++#define BMM_SENSORS_15_BITS		15
++#define BMM_SENSORS_16_BITS		16
++
++#define BMM_DATA_SHIFT_RIGHT_2_BIT                2
++
++/*! Bosch sensor unknown place*/
++#define BOSCH_SENSOR_PLACE_UNKNOWN (-1)
++/*! Bosch sensor remapping table size P0~P7*/
++#define MAX_AXIS_REMAP_TAB_SZ 8
++
++#ifdef CONFIG_BMM_USE_PLATFORM_DATA
++struct bosch_sensor_specific {
++	char *name;
++	/* 0 to 7 */
++	unsigned int place;
++	int irq;
++};
++#endif
++/*!
++ * we use a typedef to hide the detail,
++ * because this type might be changed
++ */
++struct bosch_sensor_axis_remap {
++	/* src means which source will be mapped to target x, y, z axis */
++	/* if an target OS axis is remapped from (-)x,
++	 * src is 0, sign_* is (-)1 */
++	/* if an target OS axis is remapped from (-)y,
++	 * src is 1, sign_* is (-)1 */
++	/* if an target OS axis is remapped from (-)z,
++	 * src is 2, sign_* is (-)1 */
++	int src_x:3;
++	int src_y:3;
++	int src_z:3;
++
++	int sign_x:2;
++	int sign_y:2;
++	int sign_z:2;
++};
++
++struct bosch_sensor_data {
++	union {
++		int16_t v[3];
++		struct {
++			int16_t x;
++			int16_t y;
++			int16_t z;
++		};
++	};
++};
++
++static const u8 odr_map[] = {10, 2, 6, 8, 15, 20, 25, 30};
++static const long op_mode_maps[] = {
++	BMM_VAL_NAME(NORMAL_MODE),
++	BMM_VAL_NAME(FORCED_MODE),
++	BMM_VAL_NAME(SUSPEND_MODE),
++	BMM_VAL_NAME(SLEEP_MODE)
++};
++
++
++
++#define BMM_MAG_CHANNELS_CONFIG(device_type, si, mod, \
++							endian, bits, addr) \
++	{ \
++		.type = device_type, \
++		.modified = 1, \
++		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW), \
++		.scan_index = si, \
++		.channel2 = mod, \
++		.address = addr, \
++		.scan_type = { \
++			.sign = 's', \
++			.realbits = bits, \
++			.shift = 16 - bits, \
++			.storagebits = 16, \
++			.endianness = endian, \
++		}, \
++	}
++
++#define BMM_BYTE_FOR_PER_AXIS_CHANNEL		2
++#define BMM_BYTE_FOR_PER_RES_CHANNEL		2
++#define VALUE_VALID                                                           1
++#define VALUE_INVALID                                                       0
++
++/*iio chan spec for BMM050 mag sensor*/
++static const struct iio_chan_spec bmm050_raw_channels[] = {
++	BMM_MAG_CHANNELS_CONFIG(IIO_MAGN, BMM_SCAN_MAG_X,
++	IIO_MOD_X, IIO_LE, BMM_SENSORS_13_BITS, BMM050_DATAX_LSB),
++	BMM_MAG_CHANNELS_CONFIG(IIO_MAGN, BMM_SCAN_MAG_Y,
++	IIO_MOD_Y, IIO_LE, BMM_SENSORS_13_BITS, BMM050_DATAY_LSB),
++	BMM_MAG_CHANNELS_CONFIG(IIO_MAGN, BMM_SCAN_MAG_Z,
++	IIO_MOD_Z, IIO_LE, BMM_SENSORS_15_BITS, BMM050_DATAZ_LSB),
++	IIO_CHAN_SOFT_TIMESTAMP(BMM_SCAN_TIMESTAMP),
++
++};
++
++static struct i2c_client *bmm_client;
++/* i2c operation for API */
++static void bmm_delay(u32 msec);
++static char bmm_i2c_read(struct i2c_client *client, u8 reg_addr,
++		u8 *data, u8 len);
++static char bmm_i2c_write(struct i2c_client *client, u8 reg_addr,
++		u8 *data, u8 len);
++
++static void bmm_dump_reg(struct i2c_client *client);
++static int bmm_wakeup(struct i2c_client *client);
++static int bmm_check_chip_id(struct i2c_client *client);
++
++static int bmm_pre_suspend(struct i2c_client *client);
++static int bmm_post_resume(struct i2c_client *client);
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++static void bmm_early_suspend(struct early_suspend *handler);
++static void bmm_late_resume(struct early_suspend *handler);
++#endif
++
++static int bmm_restore_hw_cfg(struct i2c_client *client);
++
++static const struct bosch_sensor_axis_remap
++bst_axis_remap_tab_dft[MAX_AXIS_REMAP_TAB_SZ] = {
++	/* src_x src_y src_z  sign_x  sign_y  sign_z */
++	{  0,    1,    2,     1,      1,      1 }, /* P0 */
++	{  1,    0,    2,     1,     -1,      1 }, /* P1 */
++	{  0,    1,    2,    -1,     -1,      1 }, /* P2 */
++	{  1,    0,    2,    -1,      1,      1 }, /* P3 */
++
++	{  0,    1,    2,    -1,      1,     -1 }, /* P4 */
++	{  1,    0,    2,    -1,     -1,     -1 }, /* P5 */
++	{  0,    1,    2,     1,     -1,     -1 }, /* P6 */
++	{  1,    0,    2,     1,      1,     -1 }, /* P7 */
++};
++
++static void bst_remap_sensor_data(struct bosch_sensor_data *data,
++		const struct bosch_sensor_axis_remap *remap)
++{
++	struct bosch_sensor_data tmp;
++
++	tmp.x = data->v[remap->src_x] * remap->sign_x;
++	tmp.y = data->v[remap->src_y] * remap->sign_y;
++	tmp.z = data->v[remap->src_z] * remap->sign_z;
++
++	memcpy(data, &tmp, sizeof(*data));
++}
++
++static void bst_remap_sensor_data_dft_tab(struct bosch_sensor_data *data,
++		int place)
++{
++	/* sensor with place 0 needs not to be remapped */
++	if ((place <= 0) || (place >= MAX_AXIS_REMAP_TAB_SZ))
++		return;
++
++	bst_remap_sensor_data(data, &bst_axis_remap_tab_dft[place]);
++}
++
++static void bmm_remap_sensor_data(struct bmm050_mdata_s32 *val,
++		struct bmm_client_data *client_data)
++{
++#ifdef CONFIG_BMM_USE_PLATFORM_DATA
++	struct bosch_sensor_data bsd;
++
++	if (NULL == client_data->bst_pd)
++		return;
++
++	bsd.x = val->datax;
++	bsd.y = val->datay;
++	bsd.z = val->dataz;
++
++	bst_remap_sensor_data_dft_tab(&bsd,
++			client_data->bst_pd->place);
++
++	val->datax = bsd.x;
++	val->datay = bsd.y;
++	val->dataz = bsd.z;
++#else
++	(void)val;
++	(void)client_data;
++#endif
++}
++
++static int bmm_check_chip_id(struct i2c_client *client)
++{
++	int err = 0;
++	u8 chip_id = 0;
++
++	bmm_i2c_read(client, BMM_REG_NAME(CHIP_ID), &chip_id, 1);
++	dev_info(&client->dev, "read chip id result: %#x", chip_id);
++
++	if ((chip_id & 0xff) != SENSOR_CHIP_ID_BMM)
++		err = -1;
++
++	return err;
++}
++
++static void bmm_delay(u32 msec)
++{
++	mdelay(msec);
++}
++
++static inline int bmm_get_forced_drdy_time(int rept_xy, int rept_z)
++{
++	return  (145 * rept_xy + 500 * rept_z + 980 + (1000 - 1)) / 1000;
++}
++
++
++static void bmm_dump_reg(struct i2c_client *client)
++{
++#ifdef DEBUG
++	int i;
++	u8 dbg_buf[64];
++	u8 dbg_buf_str[64 * 3 + 1] = "";
++
++	for (i = 0; i < BYTES_PER_LINE; i++) {
++		dbg_buf[i] = i;
++		sprintf(dbg_buf_str + i * 3, "%02x%c",
++				dbg_buf[i],
++				(((i + 1) % BYTES_PER_LINE == 0) ? '\n' : ' '));
++	}
++
++	dev_dbg(&client->dev, "%s\n", dbg_buf_str);
++
++	bmm_i2c_read(client, BMM_REG_NAME(CHIP_ID), dbg_buf, 64);
++	for (i = 0; i < 64; i++) {
++		sprintf(dbg_buf_str + i * 3, "%02x%c",
++				dbg_buf[i],
++				(((i + 1) % BYTES_PER_LINE == 0) ? '\n' : ' '));
++	}
++	dev_dbg(&client->dev, "%s\n", dbg_buf_str);
++#endif
++}
++
++static int bmm_wakeup(struct i2c_client *client)
++{
++	int err = 0;
++	int try_times = BMM_MAX_RETRY_WAKEUP;
++	const u8 value = 0x01;
++	u8 dummy;
++
++	dev_dbg(&client->dev, "waking up the chip...");
++
++	while (try_times) {
++		err = bmm_i2c_write(client,
++				BMM_REG_NAME(POWER_CNTL), (u8 *)&value, 1);
++		mdelay(BMM_I2C_WRITE_DELAY_TIME);
++		dummy = 0;
++		err = bmm_i2c_read(client, BMM_REG_NAME(POWER_CNTL), &dummy, 1);
++		if (value == dummy)
++			break;
++
++		try_times--;
++	}
++
++	dev_info(&client->dev, "wake up result: %s, tried times: %d",
++			(try_times > 0) ? "succeed" : "fail",
++			BMM_MAX_RETRY_WAKEUP - try_times + 1);
++
++	err = (try_times > 0) ? 0 : -1;
++
++	return err;
++}
++
++/*i2c read routine for API*/
++static char bmm_i2c_read(struct i2c_client *client, u8 reg_addr,
++		u8 *data, u8 len)
++{
++#if !defined BMM_USE_BASIC_I2C_FUNC
++	s32 dummy;
++	if (NULL == client)
++		return -1;
++
++	while (0 != len--) {
++#ifdef BMM_SMBUS
++		dummy = i2c_smbus_read_byte_data(client, reg_addr);
++		if (dummy < 0) {
++			dev_err(&client->dev, "i2c bus read error");
++			return -1;
++		}
++		*data = (u8)(dummy & 0xff);
++#else
++		dummy = i2c_master_send(client, (char *)&reg_addr, 1);
++		if (dummy < 0)
++			return -1;
++
++		dummy = i2c_master_recv(client, (char *)data, 1);
++		if (dummy < 0)
++			return -1;
++#endif
++		reg_addr++;
++		data++;
++	}
++	return 0;
++#else
++	int retry;
++
++	struct i2c_msg msg[] = {
++		{
++		 .addr = client->addr,
++		 .flags = 0,
++		 .len = 1,
++		 .buf = &reg_addr,
++		},
++
++		{
++		 .addr = client->addr,
++		 .flags = I2C_M_RD,
++		 .len = len,
++		 .buf = data,
++		 },
++	};
++
++	for (retry = 0; retry < BMM_MAX_RETRY_I2C_XFER; retry++) {
++		if (i2c_transfer(client->adapter, msg, ARRAY_SIZE(msg)) > 0)
++			break;
++		else
++			mdelay(BMM_I2C_WRITE_DELAY_TIME);
++	}
++
++	if (BMM_MAX_RETRY_I2C_XFER <= retry) {
++		dev_err(&client->dev, "I2C xfer error");
++		return -EIO;
++	}
++
++	return 0;
++#endif
++}
++
++/*i2c write routine for */
++static char bmm_i2c_write(struct i2c_client *client, u8 reg_addr,
++		u8 *data, u8 len)
++{
++#if !defined BMM_USE_BASIC_I2C_FUNC
++	s32 dummy;
++
++#ifndef BMM_SMBUS
++	u8 buffer[2];
++#endif
++
++	if (NULL == client)
++		return -1;
++
++	while (0 != len--) {
++#ifdef BMM_SMBUS
++		dummy = i2c_smbus_write_byte_data(client, reg_addr, *data);
++#else
++		buffer[0] = reg_addr;
++		buffer[1] = *data;
++		dummy = i2c_master_send(client, (char *)buffer, 2);
++#endif
++		reg_addr++;
++		data++;
++		if (dummy < 0) {
++			dev_err(&client->dev, "error writing i2c bus");
++			return -1;
++		}
++
++	}
++	return 0;
++#else
++	u8 buffer[2];
++	int retry;
++	struct i2c_msg msg[] = {
++		{
++			.addr = client->addr,
++			.flags = 0,
++			.len = 2,
++			.buf = buffer,
++		},
++	};
++
++	while (0 != len--) {
++		buffer[0] = reg_addr;
++		buffer[1] = *data;
++		for (retry = 0; retry < BMM_MAX_RETRY_I2C_XFER; retry++) {
++			if (i2c_transfer(client->adapter, msg,
++						ARRAY_SIZE(msg)) > 0) {
++				break;
++			} else {
++				mdelay(BMM_I2C_WRITE_DELAY_TIME);
++			}
++		}
++		if (BMM_MAX_RETRY_I2C_XFER <= retry) {
++			dev_err(&client->dev, "I2C xfer error");
++			return -EIO;
++		}
++		reg_addr++;
++		data++;
++	}
++
++	return 0;
++#endif
++}
++
++static char bmm_i2c_read_wrapper(u8 dev_addr, u8 reg_addr, u8 *data, u8 len)
++{
++	char err = 0;
++	err = bmm_i2c_read(bmm_client, reg_addr, data, len);
++	return err;
++}
++
++static char bmm_i2c_write_wrapper(u8 dev_addr, u8 reg_addr, u8 *data, u8 len)
++{
++	char err = 0;
++	err = bmm_i2c_write(bmm_client, reg_addr, data, len);
++	return err;
++}
++
++/* this function exists for optimization of speed,
++ * because it is frequently called */
++static inline int bmm_set_forced_mode(struct i2c_client *client)
++{
++	int err = 0;
++
++	/* FORCED_MODE */
++	const u8 value = 0x02;
++	err = bmm_i2c_write(client, BMM_REG_NAME(CONTROL), (u8 *)&value, 1);
++
++	return err;
++}
++
++static void bmm_work_func(struct work_struct *work)
++{
++	struct bmm_client_data *client_data =
++		container_of((struct delayed_work *)work,
++			struct bmm_client_data, work);
++	struct i2c_client *client = client_data->client;
++	unsigned long delay =
++		msecs_to_jiffies(atomic_read(&client_data->delay));
++
++	mutex_lock(&client_data->mutex_value);
++
++	mutex_lock(&client_data->mutex_op_mode);
++	if (BMM_VAL_NAME(NORMAL_MODE) != client_data->op_mode)
++		bmm_set_forced_mode(client);
++
++	mutex_unlock(&client_data->mutex_op_mode);
++
++	BMM_CALL_API(read_mdataXYZ_s32)(&client_data->value);
++	bmm_remap_sensor_data(&client_data->value, client_data);
++
++	input_report_abs(client_data->input, ABS_X, client_data->value.datax);
++	input_report_abs(client_data->input, ABS_Y, client_data->value.datay);
++	input_report_abs(client_data->input, ABS_Z, client_data->value.dataz);
++	mutex_unlock(&client_data->mutex_value);
++
++	input_sync(client_data->input);
++
++	schedule_delayed_work(&client_data->work, delay);
++}
++
++
++static int bmm_set_odr(u8 odr)
++{
++	int err = 0;
++
++	err = BMM_CALL_API(set_datarate)(odr);
++	mdelay(BMM_I2C_WRITE_DELAY_TIME);
++
++	return err;
++}
++
++static int bmm_get_odr(u8 *podr)
++{
++	int err = 0;
++	u8 value;
++
++	err = BMM_CALL_API(get_datarate)(&value);
++	if (!err)
++		*podr = value;
++
++	return err;
++}
++
++static ssize_t bmm_show_chip_id(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%d\n", SENSOR_CHIP_ID_BMM);
++}
++
++static ssize_t bmm_show_op_mode(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	int ret;
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++
++	u8 op_mode = 0xff;
++	u8 power_mode;
++
++	mutex_lock(&indio_dev->mlock);
++	BMM_CALL_API(get_powermode)(&power_mode);
++	if (power_mode)
++		BMM_CALL_API(get_functional_state)(&op_mode);
++	else
++		op_mode = BMM_VAL_NAME(SUSPEND_MODE);
++
++	mutex_unlock(&indio_dev->mlock);
++
++	dev_dbg(dev, "op_mode: %d", op_mode);
++
++	ret = sprintf(buf, "%d\n", op_mode);
++
++	return ret;
++}
++
++
++static inline int bmm_get_op_mode_idx(u8 op_mode)
++{
++	int i = 0;
++
++	for (i = 0; i < ARRAY_SIZE(op_mode_maps); i++) {
++		if (op_mode_maps[i] == op_mode)
++			break;
++	}
++
++	if (i < ARRAY_SIZE(op_mode_maps))
++		return i;
++	else
++		return -1;
++}
++
++
++static int bmm_set_op_mode(struct bmm_client_data *client_data, int op_mode)
++{
++	int err = 0;
++
++	err = BMM_CALL_API(set_functional_state)(
++			op_mode);
++
++	if (BMM_VAL_NAME(SUSPEND_MODE) == op_mode)
++		atomic_set(&client_data->in_suspend, 1);
++	else
++		atomic_set(&client_data->in_suspend, 0);
++
++	return err;
++}
++
++static ssize_t bmm_store_op_mode(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	int err = 0;
++	int i;
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++	long op_mode;
++
++	err = kstrtoul(buf, 10, &op_mode);
++	if (err)
++		return err;
++
++
++	i = bmm_get_op_mode_idx(op_mode);
++
++	if (i != -1) {
++		mutex_lock(&indio_dev->mlock);
++		if (op_mode != client_data->op_mode) {
++			if (BMM_VAL_NAME(FORCED_MODE) == op_mode) {
++				/* special treat of forced mode
++				 * for optimization */
++				err = bmm_set_forced_mode(client_data->client);
++			} else {
++				err = bmm_set_op_mode(client_data, op_mode);
++			}
++
++			if (!err) {
++				if (BMM_VAL_NAME(FORCED_MODE) == op_mode)
++					client_data->op_mode =
++						BMM_OP_MODE_UNKNOWN;
++				else
++					client_data->op_mode = op_mode;
++			}
++		}
++		mutex_unlock(&indio_dev->mlock);
++	} else {
++		err = -EINVAL;
++	}
++
++
++	if (err)
++		return err;
++	else
++		return count;
++}
++
++static ssize_t bmm_show_odr(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	unsigned char data = 0;
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++
++	int err;
++	u8 power_mode;
++
++	mutex_lock(&client_data->mutex_power_mode);
++	BMM_CALL_API(get_powermode)(&power_mode);
++	if (power_mode) {
++		mutex_lock(&indio_dev->mlock);
++		err = bmm_get_odr(&data);
++		mutex_unlock(&indio_dev->mlock);
++	} else {
++		err = -EIO;
++	}
++	mutex_unlock(&client_data->mutex_power_mode);
++
++	if (!err) {
++		if (data < ARRAY_SIZE(odr_map))
++			err = sprintf(buf, "%d\n", odr_map[data]);
++		else
++			err = -EINVAL;
++	}
++
++	return err;
++}
++
++static ssize_t bmm_store_odr(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long tmp;
++	unsigned char data;
++	int err;
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++
++	u8 power_mode;
++	int i;
++
++	err = kstrtoul(buf, 10, &tmp);
++	if (err)
++		return err;
++
++	if (tmp > 255)
++		return -EINVAL;
++
++	data = (unsigned char)tmp;
++
++	mutex_lock(&client_data->mutex_power_mode);
++	BMM_CALL_API(get_powermode)(&power_mode);
++	if (power_mode) {
++		for (i = 0; i < ARRAY_SIZE(odr_map); i++) {
++			if (odr_map[i] == data)
++				break;
++		}
++
++		if (i < ARRAY_SIZE(odr_map)) {
++			mutex_lock(&indio_dev->mlock);
++			err = bmm_set_odr(i);
++			if (!err)
++				client_data->odr = i;
++
++			mutex_unlock(&indio_dev->mlock);
++		} else {
++			err = -EINVAL;
++		}
++	} else {
++		err = -EIO;
++	}
++
++	mutex_unlock(&client_data->mutex_power_mode);
++	if (err)
++		return err;
++
++	return count;
++}
++
++static ssize_t bmm_show_value(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++	int count;
++	struct bmm050_mdata_s32 value = {0, 0, 0, 0, 0};
++
++	BMM_CALL_API(read_mdataXYZ_s32)(&value);
++	if (value.drdy) {
++		bmm_remap_sensor_data(&value, client_data);
++		client_data->value = value;
++	} else
++		dev_err(dev, "data not ready");
++
++	count = sprintf(buf, "%d %d %d\n",
++			client_data->value.datax,
++			client_data->value.datay,
++			client_data->value.dataz);
++
++	return count;
++}
++
++
++static ssize_t bmm_show_value_raw(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct bmm050_mdata value;
++	int count;
++
++	BMM_CALL_API(get_raw_xyz)(&value);
++
++	count = sprintf(buf, "%hd %hd %hd\n",
++			value.datax,
++			value.datay,
++			value.dataz);
++
++	return count;
++}
++
++
++static ssize_t bmm_show_enable(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++
++	int err;
++
++	mutex_lock(&client_data->mutex_enable);
++	err = sprintf(buf, "%d\n", client_data->enable);
++	mutex_unlock(&client_data->mutex_enable);
++	return err;
++}
++
++static ssize_t bmm_store_enable(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long data;
++	int err;
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++
++
++	err = kstrtoul(buf, 10, &data);
++	if (err)
++		return err;
++
++	data = data ? 1 : 0;
++	mutex_lock(&client_data->mutex_enable);
++	if (data != client_data->enable) {
++		if (data) {
++			schedule_delayed_work(
++					&client_data->work,
++					msecs_to_jiffies(atomic_read(
++							&client_data->delay)));
++		} else {
++			cancel_delayed_work_sync(&client_data->work);
++		}
++
++		client_data->enable = data;
++	}
++	mutex_unlock(&client_data->mutex_enable);
++
++	return count;
++}
++
++static ssize_t bmm_show_delay(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++
++	return sprintf(buf, "%d\n", atomic_read(&client_data->delay));
++
++}
++
++static ssize_t bmm_store_delay(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long data;
++	int err;
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++
++	err = kstrtoul(buf, 10, &data);
++	if (err)
++		return err;
++
++	if (data < BMM_DELAY_MIN)
++		data = BMM_DELAY_MIN;
++
++	atomic_set(&client_data->delay, data);
++
++	return count;
++}
++
++static ssize_t bmm_show_test(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++
++	int err;
++
++	err = sprintf(buf, "%d\n", client_data->result_test);
++	return err;
++}
++
++static ssize_t bmm_store_test(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long data;
++	int err;
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++
++	u8 dummy;
++
++	err = kstrtoul(buf, 10, &data);
++	if (err)
++		return err;
++
++	/* the following code assumes the work thread is not running */
++	if (BMM_SELF_TEST == data) {
++		/* self test */
++		err = bmm_set_op_mode(client_data, BMM_VAL_NAME(SLEEP_MODE));
++		mdelay(3);
++		err = BMM_CALL_API(set_selftest)(1);
++		mdelay(3);
++		err = BMM_CALL_API(get_self_test_XYZ)(&dummy);
++		client_data->result_test = dummy;
++	} else if (BMM_ADV_TEST == data) {
++		/* advanced self test */
++		err = BMM_CALL_API(perform_advanced_selftest)(
++				&client_data->result_test);
++	} else {
++		err = -EINVAL;
++	}
++
++	if (!err) {
++		BMM_CALL_API(soft_reset)();
++		mdelay(BMM_I2C_WRITE_DELAY_TIME);
++		bmm_restore_hw_cfg(client_data->client);
++	}
++
++	if (err)
++		count = -1;
++
++	return count;
++}
++
++static ssize_t bmm_show_place(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++#ifdef CONFIG_BMM_USE_PLATFORM_DATA
++	struct iio_dev *indio_dev = dev_get_drvdata(dev);
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++#endif
++	int place = BOSCH_SENSOR_PLACE_UNKNOWN;
++
++#ifdef CONFIG_BMM_USE_PLATFORM_DATA
++	if (NULL != client_data->bst_pd)
++		place = client_data->bst_pd->place;
++#endif
++	return sprintf(buf, "%d\n", place);
++}
++
++static int bmm_read_axis_data(struct iio_dev *indio_dev,
++	struct iio_chan_spec const *ch, struct bmm050_iio_mdata_s32 *raw_data)
++{
++	int ret = 0;
++	unsigned char res_data_arr[BMM_BYTE_FOR_PER_RES_CHANNEL];
++	struct bmm050_mdata_s32 value = {0, 0, 0, 0, 0};
++	struct  bmm_client_data *client_data = iio_priv(indio_dev);
++	struct  i2c_client *client = client_data->client;
++
++	/*Reading data for Resistance*/
++	ret = bmm_i2c_read(client_data->client, BMM050_R_LSB,
++			res_data_arr, BMM_BYTE_FOR_PER_RES_CHANNEL);
++	if (ret < 0)
++		return ret;
++	/*Get Data ready status bit*/
++	raw_data->drdy = BMM050_GET_BITSLICE(res_data_arr[0],
++					BMM050_DATA_RDYSTAT);
++	if (raw_data->drdy) {
++		BMM_CALL_API(read_mdataXYZ_s32)(&value);
++#ifdef CONFIG_BMM_USE_PLATFORM_DATA
++		bmm_remap_sensor_data(&value, client_data);
++#endif
++		client_data->value = value;
++		client_data->iio_mdata.value_x_valid = VALUE_VALID;
++		client_data->iio_mdata.value_y_valid = VALUE_VALID;
++		client_data->iio_mdata.value_z_valid = VALUE_VALID;
++	}
++
++	switch (ch->scan_index) {
++	case BMM_SCAN_MAG_X:
++		/* x aixs data */
++		if (!client_data->iio_mdata.value_x_valid)
++			dev_err(&client->dev, "x data not updata!\n");
++		raw_data->data = client_data->value.datax;
++		client_data->iio_mdata.value_x_valid = VALUE_INVALID;
++		break;
++	case BMM_SCAN_MAG_Y:
++		/* y aixs data */
++		if (!client_data->iio_mdata.value_y_valid)
++			dev_err(&client->dev, "y data not updata!\n");
++		raw_data->data = client_data->value.datay;
++		client_data->iio_mdata.value_y_valid = VALUE_INVALID;
++		break;
++	case BMM_SCAN_MAG_Z:
++		/* z aixs data */
++		if (!client_data->iio_mdata.value_z_valid)
++			dev_err(&client->dev, "z data not updata!\n");
++		raw_data->data = client_data->value.dataz;
++		client_data->iio_mdata.value_z_valid = VALUE_INVALID;
++		break;
++
++	default:
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
++static int bmm_read_raw(struct iio_dev *indio_dev,
++			struct iio_chan_spec const *ch, int *val,
++							int *val2, long mask)
++{
++	int ret, result;
++	struct bmm050_iio_mdata_s32 raw_data = {0, 0};
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++	{
++		result = 0;
++		ret = IIO_VAL_INT;
++		mutex_lock(&indio_dev->mlock);
++		switch (ch->type) {
++		case IIO_MAGN:
++			result = bmm_read_axis_data(indio_dev, ch, &raw_data);
++			*val  = raw_data.data;
++			break;
++		default:
++			ret = -EINVAL;
++			break;
++		}
++		mutex_unlock(&indio_dev->mlock);
++	if (result < 0)
++		return result;
++	return ret;
++	}
++	default:
++		return -EINVAL;
++	}
++
++}
++
++static IIO_DEVICE_ATTR(chip_id, S_IRUGO,
++		bmm_show_chip_id, NULL, 0);
++static IIO_DEVICE_ATTR(op_mode, S_IRUGO|S_IWUSR,
++		bmm_show_op_mode, bmm_store_op_mode, 0);
++static IIO_DEVICE_ATTR(odr, S_IRUGO|S_IWUSR,
++		bmm_show_odr, bmm_store_odr, 0);
++static IIO_DEVICE_ATTR(value, S_IRUGO,
++		bmm_show_value, NULL, 0);
++static IIO_DEVICE_ATTR(value_raw, S_IRUGO,
++		bmm_show_value_raw, NULL, 0);
++static IIO_DEVICE_ATTR(enable, S_IRUGO|S_IWUSR,
++		bmm_show_enable, bmm_store_enable, 0);
++static IIO_DEVICE_ATTR(delay, S_IRUGO|S_IWUSR,
++		bmm_show_delay, bmm_store_delay, 0);
++static IIO_DEVICE_ATTR(test, S_IRUGO|S_IWUSR,
++		bmm_show_test, bmm_store_test, 0);
++static IIO_DEVICE_ATTR(place, S_IRUGO,
++		bmm_show_place, NULL, 0);
++
++static struct attribute *bmm_attributes[] = {
++	&iio_dev_attr_chip_id.dev_attr.attr,
++	&iio_dev_attr_op_mode.dev_attr.attr,
++	&iio_dev_attr_odr.dev_attr.attr,
++	&iio_dev_attr_value.dev_attr.attr,
++	&iio_dev_attr_value_raw.dev_attr.attr,
++	&iio_dev_attr_enable.dev_attr.attr,
++	&iio_dev_attr_delay.dev_attr.attr,
++	&iio_dev_attr_test.dev_attr.attr,
++	&iio_dev_attr_place.dev_attr.attr,
++	NULL,
++};
++
++
++static struct attribute_group bmm_attribute_group = {
++	.attrs = bmm_attributes
++};
++
++static const struct iio_info bmm_iio_info = {
++	.driver_module = THIS_MODULE,
++	.attrs = &bmm_attribute_group,
++	.read_raw = &bmm_read_raw,
++};
++
++static int bmm_input_init(struct bmm_client_data *client_data)
++{
++	struct input_dev *dev;
++	int err = 0;
++
++	dev = input_allocate_device();
++	if (NULL == dev)
++		return -ENOMEM;
++
++	dev->name = SENSOR_NAME;
++	dev->id.bustype = BUS_I2C;
++
++	input_set_capability(dev, EV_ABS, ABS_MISC);
++	input_set_abs_params(dev, ABS_X, MAG_VALUE_MIN, MAG_VALUE_MAX, 0, 0);
++	input_set_abs_params(dev, ABS_Y, MAG_VALUE_MIN, MAG_VALUE_MAX, 0, 0);
++	input_set_abs_params(dev, ABS_Z, MAG_VALUE_MIN, MAG_VALUE_MAX, 0, 0);
++	input_set_drvdata(dev, client_data);
++
++	err = input_register_device(dev);
++	if (err < 0) {
++		input_free_device(dev);
++		return err;
++	}
++	client_data->input = dev;
++
++	return 0;
++}
++
++static void bmm_input_destroy(struct bmm_client_data *client_data)
++{
++	struct input_dev *dev = client_data->input;
++
++	input_unregister_device(dev);
++	input_free_device(dev);
++}
++
++static int bmm_restore_hw_cfg(struct i2c_client *client)
++{
++	int err = 0;
++	u8 value;
++	struct bmm_client_data *client_data =
++		(struct bmm_client_data *)i2c_get_clientdata(client);
++	int op_mode;
++
++	mutex_lock(&client_data->mutex_op_mode);
++	err = bmm_set_op_mode(client_data, BMM_VAL_NAME(SLEEP_MODE));
++
++	if (bmm_get_op_mode_idx(client_data->op_mode) != -1)
++		err = bmm_set_op_mode(client_data, client_data->op_mode);
++
++	op_mode = client_data->op_mode;
++	mutex_unlock(&client_data->mutex_op_mode);
++
++	if (BMM_VAL_NAME(SUSPEND_MODE) == op_mode)
++		return err;
++
++	dev_info(&client->dev, "app did not close this sensor before suspend");
++
++	mutex_lock(&client_data->mutex_odr);
++	BMM_CALL_API(set_datarate)(client_data->odr);
++	mdelay(BMM_I2C_WRITE_DELAY_TIME);
++	mutex_unlock(&client_data->mutex_odr);
++
++	mutex_lock(&client_data->mutex_rept_xy);
++	err = bmm_i2c_write(client, BMM_REG_NAME(NO_REPETITIONS_XY),
++			&client_data->rept_xy, 1);
++	mdelay(BMM_I2C_WRITE_DELAY_TIME);
++	err = bmm_i2c_read(client, BMM_REG_NAME(NO_REPETITIONS_XY), &value, 1);
++	dev_dbg(&client->dev, "BMM_NO_REPETITIONS_XY: %02x", value);
++	mutex_unlock(&client_data->mutex_rept_xy);
++
++	mutex_lock(&client_data->mutex_rept_z);
++	err = bmm_i2c_write(client, BMM_REG_NAME(NO_REPETITIONS_Z),
++			&client_data->rept_z, 1);
++	mdelay(BMM_I2C_WRITE_DELAY_TIME);
++	err = bmm_i2c_read(client, BMM_REG_NAME(NO_REPETITIONS_Z), &value, 1);
++	dev_info(&client->dev, "BMM_NO_REPETITIONS_Z: %02x", value);
++	mutex_unlock(&client_data->mutex_rept_z);
++
++	mutex_lock(&client_data->mutex_op_mode);
++	if (BMM_OP_MODE_UNKNOWN == client_data->op_mode) {
++		bmm_set_forced_mode(client);
++		dev_dbg(&client->dev, "set forced mode after hw_restore");
++		mdelay(bmm_get_forced_drdy_time(client_data->rept_xy,
++					client_data->rept_z));
++	}
++	mutex_unlock(&client_data->mutex_op_mode);
++
++
++	dev_dbg(&client->dev, "register dump after init");
++	bmm_dump_reg(client);
++
++	return err;
++}
++
++static int bmm_probe(struct i2c_client *client, const struct i2c_device_id *id)
++{
++	int err = 0;
++	int dummy;
++	struct iio_dev *indio_dev;
++	struct bmm_client_data *client_data = NULL;
++	#ifdef CONFIG_BMM_USE_PLATFORM_DATA
++	struct device_node *np = client->dev.of_node;
++	#endif
++	dev_info(&client->dev, "bmm function entrance");
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
++		dev_err(&client->dev, "i2c_check_functionality error!");
++		return -EIO;
++	}
++
++	if (!bmm_client)
++		bmm_client = client;
++	else {
++		dev_err(&client->dev,
++			"this driver does not support multiple clients");
++		return -EBUSY;
++	}
++
++	/* wake up the chip */
++	dummy = bmm_wakeup(client);
++	if (dummy < 0) {
++		dev_err(&client->dev,
++			"Cannot wake up %s, I2C xfer error", SENSOR_NAME);
++		err = -EIO;
++		goto exit_err_clean;
++	}
++
++	dev_info(&client->dev, "register dump after waking up");
++	bmm_dump_reg(client);
++
++	/* check chip id */
++	err = bmm_check_chip_id(client);
++	if (!err) {
++		dev_info(&client->dev, "Bosch Sensortec Device %s detected: %#x",
++				SENSOR_NAME, client->addr);
++	} else {
++		dev_err(&client->dev,
++			"Bosch Sensortec Device not found, chip id mismatch");
++		err = -ENXIO;
++		goto exit_err_clean;
++	}
++
++	indio_dev = devm_iio_device_alloc(&client->dev, sizeof(*client_data));
++	if (!indio_dev)
++		return -ENOMEM;
++
++	client_data = iio_priv(indio_dev);
++	client_data->client = client;
++	i2c_set_clientdata(client, client_data);
++
++	mutex_init(&client_data->mutex_power_mode);
++	mutex_init(&client_data->mutex_op_mode);
++	mutex_init(&client_data->mutex_enable);
++	mutex_init(&client_data->mutex_odr);
++	mutex_init(&client_data->mutex_rept_xy);
++	mutex_init(&client_data->mutex_value);
++
++	/* input device init */
++	err = bmm_input_init(client_data);
++	if (err < 0)
++		goto exit_err_clean;
++
++	indio_dev->dev.parent = &client->dev;
++	indio_dev->name = client->name;
++	indio_dev->channels = bmm050_raw_channels;
++	indio_dev->num_channels = ARRAY_SIZE(bmm050_raw_channels);
++	indio_dev->info = &bmm_iio_info;
++	indio_dev->modes = INDIO_DIRECT_MODE;
++
++
++#ifdef CONFIG_BMM_USE_PLATFORM_DATA
++	client_data->bst_pd = kzalloc(sizeof(*client_data->bst_pd),
++					GFP_KERNEL);
++	if (NULL != client_data->bst_pd) {
++		/*read some parameter from DTS*/
++		of_property_read_u32(np, "place",
++					&(client_data->bst_pd->place));
++		dev_dbg(&client->dev,
++				"platform data of bmm %s: place: %d, irq: %d",
++				client_data->bst_pd->name,
++				client_data->bst_pd->place,
++				client_data->bst_pd->irq);
++	}
++#endif
++
++	/* workqueue init */
++	INIT_DELAYED_WORK(&client_data->work, bmm_work_func);
++	atomic_set(&client_data->delay, BMM_DELAY_DEFAULT);
++
++	/* h/w init */
++	client_data->device.bus_read = bmm_i2c_read_wrapper;
++	client_data->device.bus_write = bmm_i2c_write_wrapper;
++	client_data->device.delay_msec = bmm_delay;
++	BMM_CALL_API(init)(&client_data->device);
++
++	bmm_dump_reg(client);
++
++	client_data->enable = 0;
++	/* now it's power on which is considered as resuming from suspend */
++	client_data->op_mode = BMM_VAL_NAME(SUSPEND_MODE);
++	client_data->odr = BMM_DEFAULT_ODR;
++	client_data->rept_xy = BMM_DEFAULT_REPETITION_XY;
++	client_data->rept_z = BMM_DEFAULT_REPETITION_Z;
++
++	err = iio_triggered_buffer_setup(indio_dev,
++					    &iio_pollfunc_store_time,
++					    &bmm_buffer_handler,
++					    NULL);
++	if (err) {
++		dev_err(indio_dev->dev.parent,
++				"bmm configure buffer fail %d\n", err);
++		return err;
++	}
++	err = bmm_probe_trigger(indio_dev);
++	if (err < 0) {
++		dev_err(indio_dev->dev.parent, "trigger probe fail %d\n", err);
++		goto err_unreg_ring;
++	}
++
++#if 0
++	err = bmm_restore_hw_cfg(client);
++#else
++
++	err = bmm_set_op_mode(client_data, BMM_VAL_NAME(SUSPEND_MODE));
++	if (err) {
++		dev_err(&client->dev, "fail to init h/w of %s", SENSOR_NAME);
++		err = -EIO;
++		goto exit_err_sysfs;
++	}
++#endif
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	client_data->early_suspend_handler.level =
++		EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
++	client_data->early_suspend_handler.suspend = bmm_early_suspend;
++	client_data->early_suspend_handler.resume = bmm_late_resume;
++	register_early_suspend(&client_data->early_suspend_handler);
++#endif
++	err = iio_device_register(indio_dev);
++	if (err) {
++		dev_err(indio_dev->dev.parent,
++				"bmm IIO device register failed %d\n", err);
++		return -EIO;
++	}
++	dev_info(&client->dev, "sensor %s probed successfully", SENSOR_NAME);
++
++	dev_dbg(&client->dev,
++		"i2c_client: %p client_data: %p i2c_device: %p input: %p",
++		client, client_data, &client->dev, client_data->input);
++
++	return 0;
++
++
++exit_err_sysfs:
++	if (err)
++		bmm_input_destroy(client_data);
++err_unreg_ring:
++	bmm_deallocate_ring(indio_dev);
++exit_err_clean:
++	if (err)
++		bmm_client = NULL;
++
++	return err;
++}
++
++static int bmm_pre_suspend(struct i2c_client *client)
++{
++	int err = 0;
++	struct bmm_client_data *client_data =
++		(struct bmm_client_data *)i2c_get_clientdata(client);
++	dev_dbg(&client->dev, "function entrance");
++
++	mutex_lock(&client_data->mutex_enable);
++	if (client_data->enable) {
++		cancel_delayed_work_sync(&client_data->work);
++		dev_dbg(&client->dev, "cancel work");
++	}
++	mutex_unlock(&client_data->mutex_enable);
++
++	return err;
++}
++
++static int bmm_post_resume(struct i2c_client *client)
++{
++	int err = 0;
++	struct bmm_client_data *client_data =
++		(struct bmm_client_data *)i2c_get_clientdata(client);
++
++	mutex_lock(&client_data->mutex_enable);
++	if (client_data->enable) {
++		schedule_delayed_work(&client_data->work,
++				msecs_to_jiffies(
++					atomic_read(&client_data->delay)));
++	}
++	mutex_unlock(&client_data->mutex_enable);
++
++	return err;
++}
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++devm_static void bmm_early_suspend(struct early_suspend *handler)
++{
++	struct bmm_client_data *client_data =
++		(struct bmm_client_data *)container_of(handler,
++			struct bmm_client_data, early_suspend_handler);
++	struct i2c_client *client = client_data->client;
++	u8 power_mode;
++	dev_dbg(&client->dev, "function entrance");
++
++	mutex_lock(&client_data->mutex_power_mode);
++	BMM_CALL_API(get_powermode)(&power_mode);
++	if (power_mode) {
++		bmm_pre_suspend(client);
++		bmm_set_op_mode(client_data, BMM_VAL_NAME(SUSPEND_MODE));
++	}
++	mutex_unlock(&client_data->mutex_power_mode);
++
++}
++
++static void bmm_late_resume(struct early_suspend *handler)
++{
++	struct bmm_client_data *client_data =
++		(struct bmm_client_data *)container_of(handler,
++			struct bmm_client_data, early_suspend_handler);
++	struct i2c_client *client = client_data->client;
++	dev_dbg(&client->dev, "function entrance");
++
++	mutex_lock(&client_data->mutex_power_mode);
++
++	bmm_restore_hw_cfg(client);
++	/* post resume operation */
++	bmm_post_resume(client);
++
++	mutex_unlock(&client_data->mutex_power_mode);
++}
++#else
++#ifdef CONFIG_PM
++static int bmm_suspend(struct i2c_client *client, pm_message_t mesg)
++{
++	int err = 0;
++	struct bmm_client_data *client_data =
++		(struct bmm_client_data *)i2c_get_clientdata(client);
++	u8 power_mode;
++
++	dev_dbg(&client->dev, "function entrance");
++
++	mutex_lock(&client_data->mutex_power_mode);
++	BMM_CALL_API(get_powermode)(&power_mode);
++	if (power_mode) {
++		err = bmm_pre_suspend(client);
++		err = bmm_set_op_mode(client_data, BMM_VAL_NAME(SUSPEND_MODE));
++	}
++	mutex_unlock(&client_data->mutex_power_mode);
++
++	return err;
++}
++
++static int bmm_resume(struct i2c_client *client)
++{
++	int err = 0;
++	struct bmm_client_data *client_data =
++		(struct bmm_client_data *)i2c_get_clientdata(client);
++
++	dev_dbg(&client->dev, "function entrance");
++
++	mutex_lock(&client_data->mutex_power_mode);
++	err = bmm_restore_hw_cfg(client);
++	/* post resume operation */
++	bmm_post_resume(client);
++
++	mutex_unlock(&client_data->mutex_power_mode);
++
++	return err;
++}
++#endif /* CONFIG_PM */
++#endif
++
++static int bmm_remove(struct i2c_client *client)
++{
++	int err = 0;
++	struct  iio_dev *indio_dev = i2c_get_clientdata(client);
++	struct bmm_client_data *client_data  = iio_priv(indio_dev);
++
++	if (NULL != client_data) {
++#ifdef CONFIG_HAS_EARLYSUSPEND
++		unregister_early_suspend(&client_data->early_suspend_handler);
++#endif
++
++		mutex_lock(&client_data->mutex_op_mode);
++		if (BMM_VAL_NAME(NORMAL_MODE) == client_data->op_mode) {
++			cancel_delayed_work_sync(&client_data->work);
++			dev_dbg(&client->dev, "cancel work");
++		}
++		mutex_unlock(&client_data->mutex_op_mode);
++
++		err = bmm_set_op_mode(client_data, BMM_VAL_NAME(SUSPEND_MODE));
++		mdelay(BMM_I2C_WRITE_DELAY_TIME);
++
++		bmm_input_destroy(client_data);
++
++#ifdef CONFIG_BMM_USE_PLATFORM_DATA
++			if (NULL != client_data->bst_pd) {
++				kfree(client_data->bst_pd);
++				client_data->bst_pd = NULL;
++			}
++#endif
++		iio_device_unregister(indio_dev);
++
++		bmm_client = NULL;
++	}
++
++	return err;
++}
++
++static const struct i2c_device_id bmm_id[] = {
++	{SENSOR_NAME, 0},
++	{}
++};
++MODULE_DEVICE_TABLE(i2c, bmm_id);
++
++static struct i2c_driver bmm_driver = {
++	.driver = {
++		.owner = THIS_MODULE,
++		.name = SENSOR_NAME,
++	},
++	.class = I2C_CLASS_HWMON,
++	.id_table = bmm_id,
++	.probe = bmm_probe,
++	.remove = bmm_remove,
++#if defined(CONFIG_PM) && !defined(CONFIG_HAS_EARLYSUSPEND)
++	.suspend = bmm_suspend,
++	.resume = bmm_resume,
++#endif
++};
++module_i2c_driver(bmm_driver);
++
++MODULE_AUTHOR("contact@bosch.sensortec.com");
++MODULE_DESCRIPTION("driver for " SENSOR_NAME);
++MODULE_LICENSE("GPL");
+diff --git a/drivers/iio/magnetometer/bmm050_iio.h b/drivers/iio/magnetometer/bmm050_iio.h
+new file mode 100644
+index 0000000..2a18597
+--- /dev/null
++++ b/drivers/iio/magnetometer/bmm050_iio.h
+@@ -0,0 +1,664 @@
++/*!
++ * @section LICENSE
++ * (C) Copyright 2011~2014 Bosch Sensortec GmbH All Rights Reserved
++ *
++ * This software program is licensed subject to the GNU General
++ * Public License (GPL).Version 2,June 1991,
++ * available at http://www.fsf.org/copyleft/gpl.html
++ *
++ * @filename    bmm050_iio.h
++ * @date        "Thu Apr 24 10:40:36 2014 +0800"
++ * @id          "6d0d027"
++ * @version     v1.0
++ * @brief	BMM050 Linux IIO Driver Head File
++ */
++#ifndef __BMM050_IIO_H__
++#define __BMM050_IIO_H__
++
++#include <linux/delay.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/iio/iio.h>
++#include <linux/iio/buffer.h>
++#include <linux/iio/sysfs.h>
++#include <linux/iio/trigger.h>
++#include <linux/iio/triggered_buffer.h>
++#include <linux/iio/trigger_consumer.h>
++
++
++#define BMM050_U16 unsigned short
++#define BMM050_S16 signed short
++#define BMM050_S32 signed int
++
++
++#define BMM050_BUS_WR_RETURN_TYPE char
++#define BMM050_BUS_WR_PARAM_TYPES\
++	unsigned char, unsigned char, unsigned char *, unsigned char
++#define BMM050_BUS_WR_PARAM_ORDER\
++	(device_addr, register_addr, register_data, wr_len)
++#define BMM050_BUS_WRITE_FUNC(\
++		device_addr, register_addr, register_data, wr_len)\
++	bus_write(device_addr, register_addr, register_data, wr_len)
++
++#define BMM050_BUS_RD_RETURN_TYPE char
++
++#define BMM050_BUS_RD_PARAM_TYPES\
++	unsigned char, unsigned char, unsigned char *, unsigned char
++
++#define BMM050_BUS_RD_PARAM_ORDER (device_addr, register_addr, register_data)
++
++#define BMM050_BUS_READ_FUNC(device_addr, register_addr, register_data, rd_len)\
++	bus_read(device_addr, register_addr, register_data, rd_len)
++
++
++#define BMM050_DELAY_RETURN_TYPE void
++
++#define BMM050_DELAY_PARAM_TYPES unsigned int
++
++#define BMM050_DELAY_FUNC(delay_in_msec)\
++	delay_func(delay_in_msec)
++
++#define BMM050_DELAY_POWEROFF_SUSPEND      1
++#define BMM050_DELAY_SUSPEND_SLEEP         2
++#define BMM050_DELAY_SLEEP_ACTIVE          1
++#define BMM050_DELAY_ACTIVE_SLEEP          1
++#define BMM050_DELAY_SLEEP_SUSPEND         1
++#define BMM050_DELAY_ACTIVE_SUSPEND        1
++#define BMM050_DELAY_SLEEP_POWEROFF        1
++#define BMM050_DELAY_ACTIVE_POWEROFF       1
++#define BMM050_DELAY_SETTLING_TIME         2
++
++
++#define BMM050_RETURN_FUNCTION_TYPE        char
++#define BMM050_I2C_ADDRESS                 0x10
++
++/*General Info datas*/
++#define BMM050_SOFT_RESET7_ON              1
++#define BMM050_SOFT_RESET1_ON              1
++#define BMM050_SOFT_RESET7_OFF             0
++#define BMM050_SOFT_RESET1_OFF             0
++#define BMM050_DELAY_SOFTRESET             1
++
++/* Fixed Data Registers */
++#define BMM050_CHIP_ID                     0x40
++
++/* Data Registers */
++#define BMM050_DATAX_LSB                   0x42
++#define BMM050_DATAX_MSB                   0x43
++#define BMM050_DATAY_LSB                   0x44
++#define BMM050_DATAY_MSB                   0x45
++#define BMM050_DATAZ_LSB                   0x46
++#define BMM050_DATAZ_MSB                   0x47
++#define BMM050_R_LSB                       0x48
++#define BMM050_R_MSB                       0x49
++
++/* Status Registers */
++#define BMM050_INT_STAT                    0x4A
++
++/* Control Registers */
++#define BMM050_POWER_CNTL                  0x4B
++#define BMM050_CONTROL                     0x4C
++#define BMM050_INT_CNTL                    0x4D
++#define BMM050_SENS_CNTL                   0x4E
++#define BMM050_LOW_THRES                   0x4F
++#define BMM050_HIGH_THRES                  0x50
++#define BMM050_NO_REPETITIONS_XY           0x51
++#define BMM050_NO_REPETITIONS_Z            0x52
++
++/* Trim Extended Registers */
++#define BMM050_DIG_X1                      0x5D
++#define BMM050_DIG_Y1                      0x5E
++#define BMM050_DIG_Z4_LSB                  0x62
++#define BMM050_DIG_Z4_MSB                  0x63
++#define BMM050_DIG_X2                      0x64
++#define BMM050_DIG_Y2                      0x65
++#define BMM050_DIG_Z2_LSB                  0x68
++#define BMM050_DIG_Z2_MSB                  0x69
++#define BMM050_DIG_Z1_LSB                  0x6A
++#define BMM050_DIG_Z1_MSB                  0x6B
++#define BMM050_DIG_XYZ1_LSB                0x6C
++#define BMM050_DIG_XYZ1_MSB                0x6D
++#define BMM050_DIG_Z3_LSB                  0x6E
++#define BMM050_DIG_Z3_MSB                  0x6F
++#define BMM050_DIG_XY2                     0x70
++#define BMM050_DIG_XY1                     0x71
++
++
++/* Data X LSB Regsiter */
++#define BMM050_DATAX_LSB_VALUEX__POS        3
++#define BMM050_DATAX_LSB_VALUEX__LEN        5
++#define BMM050_DATAX_LSB_VALUEX__MSK        0xF8
++#define BMM050_DATAX_LSB_VALUEX__REG        BMM050_DATAX_LSB
++
++#define BMM050_DATAX_LSB_TESTX__POS         0
++#define BMM050_DATAX_LSB_TESTX__LEN         1
++#define BMM050_DATAX_LSB_TESTX__MSK         0x01
++#define BMM050_DATAX_LSB_TESTX__REG         BMM050_DATAX_LSB
++
++/* Data Y LSB Regsiter */
++#define BMM050_DATAY_LSB_VALUEY__POS        3
++#define BMM050_DATAY_LSB_VALUEY__LEN        5
++#define BMM050_DATAY_LSB_VALUEY__MSK        0xF8
++#define BMM050_DATAY_LSB_VALUEY__REG        BMM050_DATAY_LSB
++
++#define BMM050_DATAY_LSB_TESTY__POS         0
++#define BMM050_DATAY_LSB_TESTY__LEN         1
++#define BMM050_DATAY_LSB_TESTY__MSK         0x01
++#define BMM050_DATAY_LSB_TESTY__REG         BMM050_DATAY_LSB
++
++/* Data Z LSB Regsiter */
++#define BMM050_DATAZ_LSB_VALUEZ__POS        1
++#define BMM050_DATAZ_LSB_VALUEZ__LEN        7
++#define BMM050_DATAZ_LSB_VALUEZ__MSK        0xFE
++#define BMM050_DATAZ_LSB_VALUEZ__REG        BMM050_DATAZ_LSB
++
++#define BMM050_DATAZ_LSB_TESTZ__POS         0
++#define BMM050_DATAZ_LSB_TESTZ__LEN         1
++#define BMM050_DATAZ_LSB_TESTZ__MSK         0x01
++#define BMM050_DATAZ_LSB_TESTZ__REG         BMM050_DATAZ_LSB
++
++/* Hall Resistance LSB Regsiter */
++#define BMM050_R_LSB_VALUE__POS             2
++#define BMM050_R_LSB_VALUE__LEN             6
++#define BMM050_R_LSB_VALUE__MSK             0xFC
++#define BMM050_R_LSB_VALUE__REG             BMM050_R_LSB
++
++#define BMM050_DATA_RDYSTAT__POS            0
++#define BMM050_DATA_RDYSTAT__LEN            1
++#define BMM050_DATA_RDYSTAT__MSK            0x01
++#define BMM050_DATA_RDYSTAT__REG            BMM050_R_LSB
++
++/* Interupt Status Register */
++#define BMM050_INT_STAT_DOR__POS            7
++#define BMM050_INT_STAT_DOR__LEN            1
++#define BMM050_INT_STAT_DOR__MSK            0x80
++#define BMM050_INT_STAT_DOR__REG            BMM050_INT_STAT
++
++#define BMM050_INT_STAT_OVRFLOW__POS        6
++#define BMM050_INT_STAT_OVRFLOW__LEN        1
++#define BMM050_INT_STAT_OVRFLOW__MSK        0x40
++#define BMM050_INT_STAT_OVRFLOW__REG        BMM050_INT_STAT
++
++#define BMM050_INT_STAT_HIGH_THZ__POS       5
++#define BMM050_INT_STAT_HIGH_THZ__LEN       1
++#define BMM050_INT_STAT_HIGH_THZ__MSK       0x20
++#define BMM050_INT_STAT_HIGH_THZ__REG       BMM050_INT_STAT
++
++#define BMM050_INT_STAT_HIGH_THY__POS       4
++#define BMM050_INT_STAT_HIGH_THY__LEN       1
++#define BMM050_INT_STAT_HIGH_THY__MSK       0x10
++#define BMM050_INT_STAT_HIGH_THY__REG       BMM050_INT_STAT
++
++#define BMM050_INT_STAT_HIGH_THX__POS       3
++#define BMM050_INT_STAT_HIGH_THX__LEN       1
++#define BMM050_INT_STAT_HIGH_THX__MSK       0x08
++#define BMM050_INT_STAT_HIGH_THX__REG       BMM050_INT_STAT
++
++#define BMM050_INT_STAT_LOW_THZ__POS        2
++#define BMM050_INT_STAT_LOW_THZ__LEN        1
++#define BMM050_INT_STAT_LOW_THZ__MSK        0x04
++#define BMM050_INT_STAT_LOW_THZ__REG        BMM050_INT_STAT
++
++#define BMM050_INT_STAT_LOW_THY__POS        1
++#define BMM050_INT_STAT_LOW_THY__LEN        1
++#define BMM050_INT_STAT_LOW_THY__MSK        0x02
++#define BMM050_INT_STAT_LOW_THY__REG        BMM050_INT_STAT
++
++#define BMM050_INT_STAT_LOW_THX__POS        0
++#define BMM050_INT_STAT_LOW_THX__LEN        1
++#define BMM050_INT_STAT_LOW_THX__MSK        0x01
++#define BMM050_INT_STAT_LOW_THX__REG        BMM050_INT_STAT
++
++/* Power Control Register */
++#define BMM050_POWER_CNTL_SRST7__POS       7
++#define BMM050_POWER_CNTL_SRST7__LEN       1
++#define BMM050_POWER_CNTL_SRST7__MSK       0x80
++#define BMM050_POWER_CNTL_SRST7__REG       BMM050_POWER_CNTL
++
++#define BMM050_POWER_CNTL_SPI3_EN__POS     2
++#define BMM050_POWER_CNTL_SPI3_EN__LEN     1
++#define BMM050_POWER_CNTL_SPI3_EN__MSK     0x04
++#define BMM050_POWER_CNTL_SPI3_EN__REG     BMM050_POWER_CNTL
++
++#define BMM050_POWER_CNTL_SRST1__POS       1
++#define BMM050_POWER_CNTL_SRST1__LEN       1
++#define BMM050_POWER_CNTL_SRST1__MSK       0x02
++#define BMM050_POWER_CNTL_SRST1__REG       BMM050_POWER_CNTL
++
++#define BMM050_POWER_CNTL_PCB__POS         0
++#define BMM050_POWER_CNTL_PCB__LEN         1
++#define BMM050_POWER_CNTL_PCB__MSK         0x01
++#define BMM050_POWER_CNTL_PCB__REG         BMM050_POWER_CNTL
++
++/* Control Register */
++#define BMM050_CNTL_ADV_ST__POS            6
++#define BMM050_CNTL_ADV_ST__LEN            2
++#define BMM050_CNTL_ADV_ST__MSK            0xC0
++#define BMM050_CNTL_ADV_ST__REG            BMM050_CONTROL
++
++#define BMM050_CNTL_DR__POS                3
++#define BMM050_CNTL_DR__LEN                3
++#define BMM050_CNTL_DR__MSK                0x38
++#define BMM050_CNTL_DR__REG                BMM050_CONTROL
++
++#define BMM050_CNTL_OPMODE__POS            1
++#define BMM050_CNTL_OPMODE__LEN            2
++#define BMM050_CNTL_OPMODE__MSK            0x06
++#define BMM050_CNTL_OPMODE__REG            BMM050_CONTROL
++
++#define BMM050_CNTL_S_TEST__POS            0
++#define BMM050_CNTL_S_TEST__LEN            1
++#define BMM050_CNTL_S_TEST__MSK            0x01
++#define BMM050_CNTL_S_TEST__REG            BMM050_CONTROL
++
++/* Interupt Control Register */
++#define BMM050_INT_CNTL_DOR_EN__POS            7
++#define BMM050_INT_CNTL_DOR_EN__LEN            1
++#define BMM050_INT_CNTL_DOR_EN__MSK            0x80
++#define BMM050_INT_CNTL_DOR_EN__REG            BMM050_INT_CNTL
++
++#define BMM050_INT_CNTL_OVRFLOW_EN__POS        6
++#define BMM050_INT_CNTL_OVRFLOW_EN__LEN        1
++#define BMM050_INT_CNTL_OVRFLOW_EN__MSK        0x40
++#define BMM050_INT_CNTL_OVRFLOW_EN__REG        BMM050_INT_CNTL
++
++#define BMM050_INT_CNTL_HIGH_THZ_EN__POS       5
++#define BMM050_INT_CNTL_HIGH_THZ_EN__LEN       1
++#define BMM050_INT_CNTL_HIGH_THZ_EN__MSK       0x20
++#define BMM050_INT_CNTL_HIGH_THZ_EN__REG       BMM050_INT_CNTL
++
++#define BMM050_INT_CNTL_HIGH_THY_EN__POS       4
++#define BMM050_INT_CNTL_HIGH_THY_EN__LEN       1
++#define BMM050_INT_CNTL_HIGH_THY_EN__MSK       0x10
++#define BMM050_INT_CNTL_HIGH_THY_EN__REG       BMM050_INT_CNTL
++
++#define BMM050_INT_CNTL_HIGH_THX_EN__POS       3
++#define BMM050_INT_CNTL_HIGH_THX_EN__LEN       1
++#define BMM050_INT_CNTL_HIGH_THX_EN__MSK       0x08
++#define BMM050_INT_CNTL_HIGH_THX_EN__REG       BMM050_INT_CNTL
++
++#define BMM050_INT_CNTL_LOW_THZ_EN__POS        2
++#define BMM050_INT_CNTL_LOW_THZ_EN__LEN        1
++#define BMM050_INT_CNTL_LOW_THZ_EN__MSK        0x04
++#define BMM050_INT_CNTL_LOW_THZ_EN__REG        BMM050_INT_CNTL
++
++#define BMM050_INT_CNTL_LOW_THY_EN__POS        1
++#define BMM050_INT_CNTL_LOW_THY_EN__LEN        1
++#define BMM050_INT_CNTL_LOW_THY_EN__MSK        0x02
++#define BMM050_INT_CNTL_LOW_THY_EN__REG        BMM050_INT_CNTL
++
++#define BMM050_INT_CNTL_LOW_THX_EN__POS        0
++#define BMM050_INT_CNTL_LOW_THX_EN__LEN        1
++#define BMM050_INT_CNTL_LOW_THX_EN__MSK        0x01
++#define BMM050_INT_CNTL_LOW_THX_EN__REG        BMM050_INT_CNTL
++
++/* Sensor Control Register */
++#define BMM050_SENS_CNTL_DRDY_EN__POS          7
++#define BMM050_SENS_CNTL_DRDY_EN__LEN          1
++#define BMM050_SENS_CNTL_DRDY_EN__MSK          0x80
++#define BMM050_SENS_CNTL_DRDY_EN__REG          BMM050_SENS_CNTL
++
++#define BMM050_SENS_CNTL_IE__POS               6
++#define BMM050_SENS_CNTL_IE__LEN               1
++#define BMM050_SENS_CNTL_IE__MSK               0x40
++#define BMM050_SENS_CNTL_IE__REG               BMM050_SENS_CNTL
++
++#define BMM050_SENS_CNTL_CHANNELZ__POS         5
++#define BMM050_SENS_CNTL_CHANNELZ__LEN         1
++#define BMM050_SENS_CNTL_CHANNELZ__MSK         0x20
++#define BMM050_SENS_CNTL_CHANNELZ__REG         BMM050_SENS_CNTL
++
++#define BMM050_SENS_CNTL_CHANNELY__POS         4
++#define BMM050_SENS_CNTL_CHANNELY__LEN         1
++#define BMM050_SENS_CNTL_CHANNELY__MSK         0x10
++#define BMM050_SENS_CNTL_CHANNELY__REG         BMM050_SENS_CNTL
++
++#define BMM050_SENS_CNTL_CHANNELX__POS         3
++#define BMM050_SENS_CNTL_CHANNELX__LEN         1
++#define BMM050_SENS_CNTL_CHANNELX__MSK         0x08
++#define BMM050_SENS_CNTL_CHANNELX__REG         BMM050_SENS_CNTL
++
++#define BMM050_SENS_CNTL_DR_POLARITY__POS      2
++#define BMM050_SENS_CNTL_DR_POLARITY__LEN      1
++#define BMM050_SENS_CNTL_DR_POLARITY__MSK      0x04
++#define BMM050_SENS_CNTL_DR_POLARITY__REG      BMM050_SENS_CNTL
++
++#define BMM050_SENS_CNTL_INTERRUPT_LATCH__POS            1
++#define BMM050_SENS_CNTL_INTERRUPT_LATCH__LEN            1
++#define BMM050_SENS_CNTL_INTERRUPT_LATCH__MSK            0x02
++#define BMM050_SENS_CNTL_INTERRUPT_LATCH__REG            BMM050_SENS_CNTL
++
++#define BMM050_SENS_CNTL_INTERRUPT_POLARITY__POS         0
++#define BMM050_SENS_CNTL_INTERRUPT_POLARITY__LEN         1
++#define BMM050_SENS_CNTL_INTERRUPT_POLARITY__MSK         0x01
++#define BMM050_SENS_CNTL_INTERRUPT_POLARITY__REG         BMM050_SENS_CNTL
++
++/* Register 6D */
++#define BMM050_DIG_XYZ1_MSB__POS         0
++#define BMM050_DIG_XYZ1_MSB__LEN         7
++#define BMM050_DIG_XYZ1_MSB__MSK         0x7F
++#define BMM050_DIG_XYZ1_MSB__REG         BMM050_DIG_XYZ1_MSB
++
++
++#define BMM050_X_AXIS               0
++#define BMM050_Y_AXIS               1
++#define BMM050_Z_AXIS               2
++#define BMM050_RESISTANCE           3
++#define BMM050_X                    1
++#define BMM050_Y                    2
++#define BMM050_Z                    4
++#define BMM050_XYZ                  7
++
++/* Constants */
++#define BMM050_NULL                             0
++#define BMM050_DISABLE                          0
++#define BMM050_ENABLE                           1
++#define BMM050_CHANNEL_DISABLE                  1
++#define BMM050_CHANNEL_ENABLE                   0
++#define BMM050_INTPIN_LATCH_ENABLE              1
++#define BMM050_INTPIN_LATCH_DISABLE             0
++#define BMM050_OFF                              0
++#define BMM050_ON                               1
++
++#define BMM050_NORMAL_MODE                      0x00
++#define BMM050_FORCED_MODE                      0x01
++#define BMM050_SUSPEND_MODE                     0x02
++#define BMM050_SLEEP_MODE                       0x03
++
++#define BMM050_ADVANCED_SELFTEST_OFF            0
++#define BMM050_ADVANCED_SELFTEST_NEGATIVE       2
++#define BMM050_ADVANCED_SELFTEST_POSITIVE       3
++
++#define BMM050_NEGATIVE_SATURATION_Z            -32767
++#define BMM050_POSITIVE_SATURATION_Z            32767
++
++#define BMM050_SPI_RD_MASK                      0x80
++#define BMM050_READ_SET                         0x01
++
++#define E_BMM050_NULL_PTR                       ((char)-127)
++#define E_BMM050_COMM_RES                       ((char)-1)
++#define E_BMM050_OUT_OF_RANGE                   ((char)-2)
++#define E_BMM050_UNDEFINED_MODE                 0
++
++#define BMM050_WR_FUNC_PTR\
++	char (*bus_write)(unsigned char, unsigned char,\
++			unsigned char *, unsigned char)
++
++#define BMM050_RD_FUNC_PTR\
++	char (*bus_read)(unsigned char, unsigned char,\
++			unsigned char *, unsigned char)
++#define BMM050_MDELAY_DATA_TYPE unsigned int
++
++/*Shifting Constants*/
++#define SHIFT_RIGHT_1_POSITION                  1
++#define SHIFT_RIGHT_2_POSITION                  2
++#define SHIFT_RIGHT_3_POSITION                  3
++#define SHIFT_RIGHT_4_POSITION                  4
++#define SHIFT_RIGHT_5_POSITION                  5
++#define SHIFT_RIGHT_6_POSITION                  6
++#define SHIFT_RIGHT_7_POSITION                  7
++#define SHIFT_RIGHT_8_POSITION                  8
++
++#define SHIFT_LEFT_1_POSITION                   1
++#define SHIFT_LEFT_2_POSITION                   2
++#define SHIFT_LEFT_3_POSITION                   3
++#define SHIFT_LEFT_4_POSITION                   4
++#define SHIFT_LEFT_5_POSITION                   5
++#define SHIFT_LEFT_6_POSITION                   6
++#define SHIFT_LEFT_7_POSITION                   7
++#define SHIFT_LEFT_8_POSITION                   8
++
++/* Conversion factors*/
++#define BMM050_CONVFACTOR_LSB_UT                6
++
++/* get bit slice  */
++#define BMM050_GET_BITSLICE(regvar, bitname)\
++	((regvar & bitname##__MSK) >> bitname##__POS)
++
++/* Set bit slice */
++#define BMM050_SET_BITSLICE(regvar, bitname, val)\
++	((regvar & ~bitname##__MSK) | ((val<<bitname##__POS)&bitname##__MSK))
++
++/* compensated output value returned if sensor had overflow */
++#define BMM050_OVERFLOW_OUTPUT       -32768
++#define BMM050_OVERFLOW_OUTPUT_S32   ((BMM050_S32)(-2147483647-1))
++#define BMM050_OVERFLOW_OUTPUT_FLOAT 0.0f
++#define BMM050_FLIP_OVERFLOW_ADCVAL  -4096
++#define BMM050_HALL_OVERFLOW_ADCVAL  -16384
++
++
++#define BMM050_PRESETMODE_LOWPOWER                  1
++#define BMM050_PRESETMODE_REGULAR                   2
++#define BMM050_PRESETMODE_HIGHACCURACY              3
++#define BMM050_PRESETMODE_ENHANCED                  4
++
++/* PRESET MODES - DATA RATES */
++#define BMM050_LOWPOWER_DR                       BMM050_DR_10HZ
++#define BMM050_REGULAR_DR                        BMM050_DR_10HZ
++#define BMM050_HIGHACCURACY_DR                   BMM050_DR_20HZ
++#define BMM050_ENHANCED_DR                       BMM050_DR_10HZ
++
++/* PRESET MODES - REPETITIONS-XY RATES */
++#define BMM050_LOWPOWER_REPXY                     1
++#define BMM050_REGULAR_REPXY                      4
++#define BMM050_HIGHACCURACY_REPXY                23
++#define BMM050_ENHANCED_REPXY                     7
++
++/* PRESET MODES - REPETITIONS-Z RATES */
++#define BMM050_LOWPOWER_REPZ                      2
++#define BMM050_REGULAR_REPZ                      15
++#define BMM050_HIGHACCURACY_REPZ                 82
++#define BMM050_ENHANCED_REPZ                     26
++
++/* Data Rates */
++
++#define BMM050_DR_10HZ                     0
++#define BMM050_DR_02HZ                     1
++#define BMM050_DR_06HZ                     2
++#define BMM050_DR_08HZ                     3
++#define BMM050_DR_15HZ                     4
++#define BMM050_DR_20HZ                     5
++#define BMM050_DR_25HZ                     6
++#define BMM050_DR_30HZ                     7
++
++/*user defined Structures*/
++struct bmm050_mdata {
++	BMM050_S16 datax;
++	BMM050_S16 datay;
++	BMM050_S16 dataz;
++	BMM050_U16 resistance;
++};
++struct bmm050_mdata_s32 {
++	BMM050_S32 datax;
++	BMM050_S32 datay;
++	BMM050_S32 dataz;
++	BMM050_U16 resistance;
++	BMM050_U16 drdy;
++};
++struct bmm050_iio_mdata_s32 {
++		BMM050_S32 data;
++		BMM050_U16 drdy;
++		BMM050_U16 value_x_valid;
++		BMM050_U16 value_y_valid;
++		BMM050_U16 value_z_valid;
++};
++
++struct bmm050_mdata_float {
++	float datax;
++	float datay;
++	float  dataz;
++	BMM050_U16 resistance;
++};
++
++struct bmm050 {
++	unsigned char company_id;
++	unsigned char dev_addr;
++
++	BMM050_WR_FUNC_PTR;
++	BMM050_RD_FUNC_PTR;
++	void (*delay_msec)(BMM050_MDELAY_DATA_TYPE);
++
++	signed char dig_x1;
++	signed char dig_y1;
++
++	signed char dig_x2;
++	signed char dig_y2;
++
++	BMM050_U16 dig_z1;
++	BMM050_S16 dig_z2;
++	BMM050_S16 dig_z3;
++	BMM050_S16 dig_z4;
++
++	unsigned char dig_xy1;
++	signed char dig_xy2;
++
++	BMM050_U16 dig_xyz1;
++};
++
++/************************Start**********************************************/
++struct bmm_client_data {
++	struct bmm050 device;
++	struct i2c_client *client;
++	struct input_dev *input;
++	struct iio_trigger	*trig;
++	struct delayed_work work;
++	unsigned char *buffer_data;
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	struct early_suspend early_suspend_handler;
++#endif
++
++	atomic_t delay;
++	/* whether the system in suspend state */
++	atomic_t in_suspend;
++
++	struct bmm050_mdata_s32 value;
++	struct bmm050_iio_mdata_s32 iio_mdata;
++	u8 enable:1;
++	s8 op_mode:4;
++	u8 odr;
++	u8 rept_xy;
++	u8 rept_z;
++
++	s16 result_test;
++
++	struct mutex mutex_power_mode;
++
++	/* controls not only reg, but also workqueue */
++	struct mutex mutex_op_mode;
++	struct mutex mutex_enable;
++	struct mutex mutex_odr;
++	struct mutex mutex_rept_xy;
++	struct mutex mutex_rept_z;
++
++	struct mutex mutex_value;
++#ifdef CONFIG_BMM_USE_PLATFORM_DATA
++	struct bosch_sensor_specific *bst_pd;
++#endif
++};
++
++/*Related with output data type*/
++enum BMM_SCAN_INDEX {
++		BMM_SCAN_MAG_X,
++		BMM_SCAN_MAG_Y,
++		BMM_SCAN_MAG_Z,
++		BMM_SCAN_TIMESTAMP,
++};
++
++
++#define BMM_NUMBER_DATA_CHANNELS           3
++#define BMM_BYTE_PRE_CHANNEL                       2
++
++irqreturn_t bmm_buffer_handler(int irq, void *p);
++int bmm_probe_trigger(struct iio_dev *indio_dev);
++void bmm_deallocate_ring(struct iio_dev *indio_dev);
++
++
++
++
++
++/************************End**********************************************/
++BMM050_RETURN_FUNCTION_TYPE bmm050_init(struct bmm050 *p_bmm050);
++BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ(
++		struct bmm050_mdata *mdata);
++BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ_s32(
++		struct bmm050_mdata_s32 *mdata);
++#ifdef ENABLE_FLOAT
++BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ_float(
++		struct bmm050_mdata_float *mdata);
++#endif
++BMM050_RETURN_FUNCTION_TYPE bmm050_read_register(
++		unsigned char addr, unsigned char *data, unsigned char len);
++BMM050_RETURN_FUNCTION_TYPE bmm050_write_register(
++		unsigned char addr, unsigned char *data, unsigned char len);
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_self_test_XYZ(
++		unsigned char *self_testxyz);
++BMM050_S16 bmm050_compensate_X(
++		BMM050_S16 mdata_x, BMM050_U16 data_R);
++BMM050_S32 bmm050_compensate_X_s32(
++		BMM050_S16 mdata_x,  BMM050_U16 data_R);
++#ifdef ENABLE_FLOAT
++float bmm050_compensate_X_float(
++		BMM050_S16 mdata_x,  BMM050_U16 data_R);
++#endif
++BMM050_S16 bmm050_compensate_Y(
++		BMM050_S16 mdata_y, BMM050_U16 data_R);
++BMM050_S32 bmm050_compensate_Y_s32(
++		BMM050_S16 mdata_y,  BMM050_U16 data_R);
++#ifdef ENABLE_FLOAT
++float bmm050_compensate_Y_float(
++		BMM050_S16 mdata_y,  BMM050_U16 data_R);
++#endif
++BMM050_S16 bmm050_compensate_Z(
++		BMM050_S16 mdata_z,  BMM050_U16 data_R);
++BMM050_S32 bmm050_compensate_Z_s32(
++		BMM050_S16 mdata_z,  BMM050_U16 data_R);
++#ifdef ENABLE_FLOAT
++float bmm050_compensate_Z_float(
++		BMM050_S16 mdata_z,  BMM050_U16 data_R);
++#endif
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_raw_xyz(
++		struct bmm050_mdata *mdata);
++BMM050_RETURN_FUNCTION_TYPE bmm050_init_trim_registers(void);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_spi3(
++		unsigned char value);
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_powermode(
++		unsigned char *mode);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_powermode(
++		unsigned char mode);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_adv_selftest(
++		unsigned char adv_selftest);
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_adv_selftest(
++		unsigned char *adv_selftest);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_datarate(
++		unsigned char data_rate);
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_datarate(
++		unsigned char *data_rate);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_functional_state(
++		unsigned char functional_state);
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_functional_state(
++		unsigned char *functional_state);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_selftest(
++		unsigned char selftest);
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_selftest(
++		unsigned char *selftest);
++BMM050_RETURN_FUNCTION_TYPE bmm050_perform_advanced_selftest(
++		BMM050_S16 *diff_z);
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_repetitions_XY(
++		unsigned char *no_repetitions_xy);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_repetitions_XY(
++		unsigned char no_repetitions_xy);
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_repetitions_Z(
++		unsigned char *no_repetitions_z);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_repetitions_Z(
++		unsigned char no_repetitions_z);
++BMM050_RETURN_FUNCTION_TYPE bmm050_get_presetmode(unsigned char *mode);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_presetmode(unsigned char mode);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_control_measurement_x(
++		unsigned char enable_disable);
++BMM050_RETURN_FUNCTION_TYPE bmm050_set_control_measurement_y(
++		unsigned char enable_disable);
++BMM050_RETURN_FUNCTION_TYPE bmm050_soft_reset(void);
++
++#endif
+diff --git a/drivers/iio/magnetometer/bmm050_trigger.c b/drivers/iio/magnetometer/bmm050_trigger.c
+new file mode 100644
+index 0000000..aae6400
+--- /dev/null
++++ b/drivers/iio/magnetometer/bmm050_trigger.c
+@@ -0,0 +1,68 @@
++/*!
++ * @section LICENSE
++ * (C) Copyright 2011~2014 Bosch Sensortec GmbH All Rights Reserved
++ *
++ * This software program is licensed subject to the GNU General
++ * Public License (GPL).Version 2,June 1991,
++ * available at http://www.fsf.org/copyleft/gpl.html
++ *
++ * @filename    bmm050_trigger.c
++ * @date        "Mon Sep 30 15:07:11 2013 +0800"
++ * @id          "60d8c14"
++ * @version     v1.0
++ *
++ * @brief       BMM050 Linux Driver
++ */
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/iio/iio.h>
++#include <linux/iio/trigger.h>
++#include <linux/interrupt.h>
++
++#include "bmm050_iio.h"
++
++
++static const struct iio_trigger_ops bmm_trigger_ops = {
++	  .owner = THIS_MODULE,
++};
++
++int bmm_probe_trigger(struct iio_dev *indio_dev)
++{
++	int ret;
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++	struct i2c_client *client = client_data->client;
++
++	client_data->trig = devm_iio_trigger_alloc(&client->dev,
++					"%s-trigger%d",
++					indio_dev->name,
++					indio_dev->id);
++
++	if (client_data->trig == NULL) {
++		dev_err(&indio_dev->dev,
++			"bmm failed to allocate iio trigger.\n");
++		return -ENOMEM;
++	}
++
++	iio_trigger_set_drvdata(client_data->trig, indio_dev);
++	client_data->trig->dev.parent = &client_data->client->dev;
++	client_data->trig->ops = &bmm_trigger_ops;
++
++	ret = iio_trigger_register(client_data->trig);
++	if (ret < 0) {
++		dev_err(&indio_dev->dev,
++			"bmm iio trigger failed to register.\n");
++		return -ENODEV;
++	}
++
++	indio_dev->trig = client_data->trig;
++
++	return 0;
++}
++
++void bmm_remove_trigger(struct iio_dev *indio_dev)
++{
++	struct bmm_client_data *client_data = iio_priv(indio_dev);
++	iio_trigger_unregister(client_data->trig);
++}
++
+-- 
+1.7.9.5
+

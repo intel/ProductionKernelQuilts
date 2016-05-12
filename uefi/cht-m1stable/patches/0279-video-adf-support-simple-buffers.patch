@@ -1,0 +1,343 @@
+From ab0c3e8fccdf8f54e1836dd1825744cc7a1aee0a Mon Sep 17 00:00:00 2001
+From: Greg Hackmann <ghackmann@google.com>
+Date: Thu, 10 Oct 2013 13:03:26 -0700
+Subject: [PATCH 279/634] video: adf: support "simple" buffers
+
+Simple buffers are linear RGB buffers analogous to KMS's dumb buffers.
+Simple buffers can be allocated and posted to a display interface
+without any driver-private data.
+
+Internally, ADF drivers provide the driver-private data needed (if any)
+to post a simple buffer to the display.
+
+Change-Id: Ib0b737622eaf343111310f6623f99d69cf3807d2
+Signed-off-by: Greg Hackmann <ghackmann@google.com>
+---
+ drivers/video/adf/adf_client.c | 78 ++++++++++++++++++++++++++++++++++++++
+ drivers/video/adf/adf_fops.c   | 85 ++++++++++++++++++++++++++++++++++++++++++
+ include/uapi/video/adf.h       | 46 +++++++++++++++++++++++
+ include/video/adf.h            | 18 +++++++++
+ include/video/adf_client.h     |  4 ++
+ 5 files changed, 231 insertions(+)
+
+diff --git a/drivers/video/adf/adf_client.c b/drivers/video/adf/adf_client.c
+index f52b29d..48e97ef 100644
+--- a/drivers/video/adf/adf_client.c
++++ b/drivers/video/adf/adf_client.c
+@@ -762,3 +762,81 @@ done:
+ 	return ret;
+ }
+ EXPORT_SYMBOL(adf_device_detach);
++
++/**
++ * adf_interface_simple_buffer_alloc - allocate a simple buffer
++ *
++ * @intf: target interface
++ * @w: width in pixels
++ * @h: height in pixels
++ * @format: format fourcc
++ * @dma_buf: returns the allocated buffer
++ * @offset: returns the byte offset of the allocated buffer's first pixel
++ * @pitch: returns the allocated buffer's pitch
++ *
++ * See &struct adf_simple_buffer_alloc for a description of simple buffers and
++ * their limitations.
++ *
++ * Returns 0 on success or -errno on failure.
++ */
++int adf_interface_simple_buffer_alloc(struct adf_interface *intf, u16 w, u16 h,
++		u32 format, struct dma_buf **dma_buf, u32 *offset, u32 *pitch)
++{
++	if (!intf->ops || !intf->ops->alloc_simple_buffer)
++		return -EOPNOTSUPP;
++
++	if (!adf_format_is_rgb(format))
++		return -EINVAL;
++
++	return intf->ops->alloc_simple_buffer(intf, w, h, format, dma_buf,
++			offset, pitch);
++}
++EXPORT_SYMBOL(adf_interface_simple_buffer_alloc);
++
++/**
++ * adf_interface_simple_post - flip to a single buffer
++ *
++ * @intf: interface targeted by the flip
++ * @buf: buffer to display
++ *
++ * adf_interface_simple_post() can be used generically for simple display
++ * configurations, since the client does not need to provide any driver-private
++ * configuration data.
++ *
++ * adf_interface_simple_post() has the same copying semantics as
++ * adf_device_post().
++ *
++ * On success, returns a sync fence which signals when the buffer is removed
++ * from the screen.  On failure, returns ERR_PTR(-errno).
++ */
++struct sync_fence *adf_interface_simple_post(struct adf_interface *intf,
++		struct adf_buffer *buf)
++{
++	size_t custom_data_size = 0;
++	void *custom_data = NULL;
++	struct sync_fence *ret;
++
++	if (intf->ops && intf->ops->describe_simple_post) {
++		int err;
++
++		custom_data = kzalloc(ADF_MAX_CUSTOM_DATA_SIZE, GFP_KERNEL);
++		if (!custom_data) {
++			ret = ERR_PTR(-ENOMEM);
++			goto done;
++		}
++
++		err = intf->ops->describe_simple_post(intf, buf, custom_data,
++				&custom_data_size);
++		if (err < 0) {
++			ret = ERR_PTR(err);
++			goto done;
++		}
++	}
++
++	ret = adf_device_post(adf_interface_parent(intf), &intf, 1, buf, 1,
++			custom_data, custom_data_size);
++done:
++	kfree(custom_data);
++	return ret;
++}
++EXPORT_SYMBOL(adf_interface_simple_post);
+diff --git a/drivers/video/adf/adf_fops.c b/drivers/video/adf/adf_fops.c
+index 90b234a..d2e30c9 100644
+--- a/drivers/video/adf/adf_fops.c
++++ b/drivers/video/adf/adf_fops.c
+@@ -310,6 +310,79 @@ err_get_user:
+ 	return ret;
+ }
+ 
++static int adf_intf_simple_post_config(struct adf_interface *intf,
++		struct adf_simple_post_config __user *arg)
++{
++	struct adf_device *dev = intf->base.parent;
++	struct sync_fence *complete_fence;
++	int complete_fence_fd;
++	struct adf_buffer buf;
++	int ret = 0;
++
++	complete_fence_fd = get_unused_fd();
++	if (complete_fence_fd < 0)
++		return complete_fence_fd;
++
++	ret = adf_buffer_import(dev, &arg->buf, &buf);
++	if (ret < 0)
++		goto err_import;
++
++	if (put_user(complete_fence_fd, &arg->complete_fence)) {
++		ret = -EFAULT;
++		goto err_put_user;
++	}
++
++	complete_fence = adf_interface_simple_post(intf, &buf);
++	if (IS_ERR(complete_fence)) {
++		ret = PTR_ERR(complete_fence);
++		goto err_put_user;
++	}
++
++	sync_fence_install(complete_fence, complete_fence_fd);
++	return 0;
++
++err_put_user:
++	adf_buffer_cleanup(&buf);
++err_import:
++	put_unused_fd(complete_fence_fd);
++	return ret;
++}
++
++static int adf_intf_simple_buffer_alloc(struct adf_interface *intf,
++		struct adf_simple_buffer_alloc __user *arg)
++{
++	struct adf_simple_buffer_alloc data;
++	struct dma_buf *dma_buf;
++	int ret = 0;
++
++	if (copy_from_user(&data, arg, sizeof(data)))
++		return -EFAULT;
++
++	data.fd = get_unused_fd_flags(O_CLOEXEC);
++	if (data.fd < 0)
++		return data.fd;
++
++	ret = adf_interface_simple_buffer_alloc(intf, data.w, data.h,
++			data.format, &dma_buf, &data.offset, &data.pitch);
++	if (ret < 0)
++		goto err_alloc;
++
++	if (copy_to_user(arg, &data, sizeof(*arg))) {
++		ret = -EFAULT;
++		goto err_copy;
++	}
++
++	fd_install(data.fd, dma_buf->file);
++	return 0;
++
++err_copy:
++	dma_buf_put(dma_buf);
++
++err_alloc:
++	put_unused_fd(data.fd);
++	return ret;
++}
++
+ static int adf_copy_attachment_list_to_user(
+ 		struct adf_attachment_config __user *to, size_t n_to,
+ 		struct adf_attachment *from, size_t n_from)
+@@ -539,6 +612,8 @@ static long adf_overlay_engine_ioctl(struct adf_overlay_engine *eng,
+ 	case ADF_SET_MODE:
+ 	case ADF_GET_DEVICE_DATA:
+ 	case ADF_GET_INTERFACE_DATA:
++	case ADF_SIMPLE_POST_CONFIG:
++	case ADF_SIMPLE_BUFFER_ALLOC:
+ 	case ADF_ATTACH:
+ 	case ADF_DETACH:
+ 		return -EINVAL;
+@@ -567,6 +642,14 @@ static long adf_interface_ioctl(struct adf_interface *intf,
+ 		return adf_intf_get_data(intf,
+ 				(struct adf_interface_data __user *)arg);
+ 
++	case ADF_SIMPLE_POST_CONFIG:
++		return adf_intf_simple_post_config(intf,
++				(struct adf_simple_post_config __user *)arg);
++
++	case ADF_SIMPLE_BUFFER_ALLOC:
++		return adf_intf_simple_buffer_alloc(intf,
++				(struct adf_simple_buffer_alloc __user *)arg);
++
+ 	case ADF_POST_CONFIG:
+ 	case ADF_GET_DEVICE_DATA:
+ 	case ADF_GET_OVERLAY_ENGINE_DATA:
+@@ -609,6 +692,8 @@ static long adf_device_ioctl(struct adf_device *dev, struct adf_file *file,
+ 	case ADF_SET_MODE:
+ 	case ADF_GET_INTERFACE_DATA:
+ 	case ADF_GET_OVERLAY_ENGINE_DATA:
++	case ADF_SIMPLE_POST_CONFIG:
++	case ADF_SIMPLE_BUFFER_ALLOC:
+ 		return -EINVAL;
+ 
+ 	default:
+diff --git a/include/uapi/video/adf.h b/include/uapi/video/adf.h
+index 757465b..4b9e60c 100644
+--- a/include/uapi/video/adf.h
++++ b/include/uapi/video/adf.h
+@@ -152,6 +152,50 @@ struct adf_post_config {
+ #define ADF_MAX_INTERFACES (PAGE_SIZE / sizeof(__u32))
+ 
+ /**
++ * struct adf_simple_buffer_allocate - request to allocate a "simple" buffer
++ *
++ * @w: width of buffer in pixels (input)
++ * @h: height of buffer in pixels (input)
++ * @format: DRM-style fourcc (input)
++ *
++ * @fd: dma_buf fd (output)
++ * @offset: location of first pixel, in bytes (output)
++ * @pitch: length of a scanline including padding, in bytes (output)
++ *
++ * Simple buffers are analogous to DRM's "dumb" buffers.  They have a single
++ * plane of linear RGB data which can be allocated and scanned out without
++ * any driver-private ioctls or data.
++ *
++ * @format must be a standard RGB format defined in drm_fourcc.h.
++ *
++ * ADF clients must NOT assume that an interface can scan out a simple buffer
++ * allocated by a different ADF interface, even if the two interfaces belong to
++ * the same ADF device.
++ */
++struct adf_simple_buffer_alloc {
++	__u16 w;
++	__u16 h;
++	__u32 format;
++
++	__s64 fd;
++	__u32 offset;
++	__u32 pitch;
++};
++
++/**
++ * struct adf_simple_post_config - request to flip to a single buffer without
++ * driver-private data
++ *
++ * @buf: description of buffer displayed (input)
++ * @complete_fence: sync_fence fd which will clear when this buffer has left the
++ * screen (output)
++ */
++struct adf_simple_post_config {
++	struct adf_buffer_config buf;
++	__s64 complete_fence;
++};
++
++/**
+  * struct adf_attachment_config - description of attachment between an overlay
+  * engine and an interface
+  *
+@@ -248,6 +292,8 @@ struct adf_overlay_engine_data {
+ #define ADF_GET_INTERFACE_DATA	_IOR('D', 5, struct adf_interface_data)
+ #define ADF_GET_OVERLAY_ENGINE_DATA \
+ 				_IOR('D', 6, struct adf_overlay_engine_data)
++#define ADF_SIMPLE_POST_CONFIG	_IOW('D', 7, struct adf_simple_post_config)
++#define ADF_SIMPLE_BUFFER_ALLOC	_IOW('D', 8, struct adf_simple_buffer_alloc)
+ #define ADF_ATTACH		_IOW('D', 9, struct adf_attachment_config)
+ #define ADF_DETACH		_IOW('D', 10, struct adf_attachment_config)
+ 
+diff --git a/include/video/adf.h b/include/video/adf.h
+index c09d8df..6c2191a 100644
+--- a/include/video/adf.h
++++ b/include/video/adf.h
+@@ -299,6 +299,16 @@ struct adf_device {
+  * @blank: change the display's DPMS state.  Return 0 on success or error
+  *	code (<0) on failure.
+  *
++ * @alloc_simple_buffer: allocate a buffer with the specified @w, @h, and
++ *	@format.  @format will be a standard RGB format (i.e.,
++ *	adf_format_is_rgb(@format) == true).  Return 0 on success or error code
++ *	(<0) on failure.  On success, return the buffer, offset, and pitch in
++ *	@dma_buf, @offset, and @pitch respectively.
++ * @describe_simple_post: provide driver-private data needed to post a single
++ *	buffer @buf.  Copy up to ADF_MAX_CUSTOM_DATA_SIZE bytes into @data
++ *	(allocated by ADF) and return the number of bytes in @size.  Return 0 on
++ *	success or error code (<0) on failure.
++ *
+  * @modeset: change the interface's mode.  @mode is not necessarily part of the
+  *	modelist passed to adf_hotplug_notify_connected(); the driver may
+  *	accept or reject custom modes at its discretion.  Return 0 on success or
+@@ -318,6 +328,14 @@ struct adf_interface_ops {
+ 	int (*blank)(struct adf_interface *intf, u8 state);
+ 
+ 	/* optional */
++	int (*alloc_simple_buffer)(struct adf_interface *intf,
++			u16 w, u16 h, u32 format,
++			struct dma_buf **dma_buf, u32 *offset, u32 *pitch);
++	/* optional */
++	int (*describe_simple_post)(struct adf_interface *intf,
++			struct adf_buffer *fb, void *data, size_t *size);
++
++	/* optional */
+ 	int (*modeset)(struct adf_interface *intf,
+ 			struct drm_mode_modeinfo *mode);
+ 
+diff --git a/include/video/adf_client.h b/include/video/adf_client.h
+index 1e471a4..983f2b6 100644
+--- a/include/video/adf_client.h
++++ b/include/video/adf_client.h
+@@ -28,6 +28,10 @@ int adf_interface_set_mode(struct adf_interface *intf,
+ 		struct drm_mode_modeinfo *mode);
+ int adf_interface_get_screen_size(struct adf_interface *intf, u16 *width,
+ 		u16 *height);
++int adf_interface_simple_buffer_alloc(struct adf_interface *intf, u16 w, u16 h,
++		u32 format, struct dma_buf **dma_buf, u32 *offset, u32 *pitch);
++struct sync_fence *adf_interface_simple_post(struct adf_interface *intf,
++		struct adf_buffer *buf);
+ 
+ bool adf_overlay_engine_supports_format(struct adf_overlay_engine *eng,
+ 		u32 format);
+-- 
+1.9.1
+

@@ -1,0 +1,269 @@
+From 3bbb47d29951061c7cfaf2f35bbfd03fab14e82a Mon Sep 17 00:00:00 2001
+From: "Thulasimani,Sivakumar" <sivakumar.thulasimani@intel.com>
+Date: Thu, 24 Sep 2015 18:53:36 +0530
+Subject: [PATCH 13/28] FOR_UPSTREAM [VPG]: drm/i915: Lane count change
+ detection
+
+DP panel can issue short pulse interrupts during which it can
+modify the number of lanes supported by it. This will result in
+change in capabilities of the display and limit the max
+resoultion possible on it. This should be informed to the
+user mode as well since HWC will issue the modeset assuming
+old capabilities.
+
+This patch detects lane count change and simulates a detatch
+and attach, so to the user mode or anyone else tracking the
+display it will appear as unplug and replug of different
+display.
+
+v2: moved queuing of delayed thread to intel_dp where we
+set simulate_disconnect_connect flag. There is a chance
+for short pulse to be hit even before long pulse detection
+is complete, in such a scenario the delayed thread won't
+be queued resulting in flag never getting cleared.
+Since we set the flag and queue it immediately we can be
+sure that the flag will be cleared.
+
+v3: Squashed hdmi detection fix during simulation to this patch
+If DP and HDMI are enumerated on the same port any attempt to read
+edid for HDMI might result in GMBUS retry loop consuming upto 200ms.
+The specific scenario for this is seen when
+1) both DP and HDMI are enabled on the same port
+2) DP is hotplugged to the board
+
+During Simulation, since DP is plugged-in, live status will be high
+for the port being checked, resulting in intel_hdmi_hot_plug
+attempting to read the edid, once this enters the gmbus layer it
+consumes 200ms due to some bug inside it before returning.
+So better to avoid this when it is expected to not pass.
+
+Change-Id: I2ca73a2d23343e9b257f0d64650317e1da2837d5
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9749
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Reviewed-on: https://android.intel.com:443/439686
+---
+ drivers/gpu/drm/i915/i915_drv.h   |  2 ++
+ drivers/gpu/drm/i915/i915_irq.c   | 48 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_dp.c   | 51 ++++++++++++++++++++++++++++++++++++---
+ drivers/gpu/drm/i915/intel_drv.h  |  2 ++
+ drivers/gpu/drm/i915/intel_hdmi.c |  6 +++++
+ 5 files changed, 106 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 081e98c..5c6085e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2001,7 +2001,9 @@ struct drm_i915_private {
+ 	struct intel_digital_port *hpd_irq_port[I915_MAX_PORTS];
+ 	u32 long_hpd_port_mask;
+ 	u32 short_hpd_port_mask;
++	u32 simulate_dp_in_progress;
+ 	struct work_struct dig_port_work;
++	struct delayed_work simulate_work;
+ 
+ 	/* Old dri1 support infrastructure, beware the dragons ya fools entering
+ 	 * here! */
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 961c88b..d905b36 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1153,6 +1153,51 @@ static void intel_hdmi_disable_port(struct drm_device *dev,
+ 	intel_hdmi->skip_port_check = true;
+ }
+ 
++/*
++ * This function is the second half of logic to perform fake
++ * disconnect-connect. The first half was the connector setting
++ * a flag, returning status as disconnected and queing this function.
++ *
++ * This function uses simulate_disconnect_connect flag to identify the
++ * connector that should be detected again. Since this is executed after
++ * a delay if the panel is still plugged in it will be reported as
++ * connected to user mode
++ */
++static void intel_hpd_simulate_reconnect_work(struct work_struct *work)
++{
++	struct drm_i915_private *dev_priv =
++		container_of(work, struct drm_i915_private, simulate_work.work);
++	struct drm_device *dev = dev_priv->dev;
++	struct intel_encoder *intel_encoder;
++	struct intel_connector *intel_connector;
++	struct drm_connector *connector;
++	struct drm_mode_config *mode_config = &dev->mode_config;
++
++	DRM_DEBUG_KMS("\n");
++	mutex_lock(&mode_config->mutex);
++
++	list_for_each_entry(connector, &mode_config->connector_list, head) {
++		intel_connector = to_intel_connector(connector);
++		if (!intel_connector->simulate_disconnect_connect)
++			continue;
++
++		intel_connector->simulate_disconnect_connect = false;
++
++		if (!intel_connector->encoder)
++			continue;
++
++		intel_encoder = intel_connector->encoder;
++
++		spin_lock_irq(&dev_priv->irq_lock);
++		dev_priv->hpd_event_bits |= (1 << intel_encoder->hpd_pin);
++		spin_unlock_irq(&dev_priv->irq_lock);
++	}
++
++	mutex_unlock(&mode_config->mutex);
++
++	queue_work(dev_priv->hpdwq, &dev_priv->hotplug_work);
++}
++
+ static void i915_digport_work_func(struct work_struct *work)
+ {
+ 	struct drm_i915_private *dev_priv =
+@@ -1299,6 +1344,7 @@ static void i915_hotplug_work_func(struct work_struct *work)
+ static void intel_hpd_irq_uninstall(struct drm_i915_private *dev_priv)
+ {
+ 	del_timer_sync(&dev_priv->hotplug_reenable_timer);
++	cancel_delayed_work_sync(&dev_priv->simulate_work);
+ }
+ 
+ static void ironlake_rps_change_irq_handler(struct drm_device *dev)
+@@ -5349,6 +5395,8 @@ void intel_irq_init(struct drm_device *dev)
+ 	INIT_WORK(&dev_priv->gpu_error.work, i915_error_work_func);
+ 	INIT_WORK(&dev_priv->rps.work, gen6_pm_rps_work);
+ 	INIT_WORK(&dev_priv->l3_parity.error_work, ivybridge_parity_work);
++	INIT_DELAYED_WORK(&dev_priv->simulate_work,
++			intel_hpd_simulate_reconnect_work);
+ 
+ 	/* Let's track the enabled rps events */
+ 	dev_priv->pm_rps_events = GEN6_PM_RPS_EVENTS;
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index cdf3e62..126ee92 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -4435,6 +4435,31 @@ update_status:
+ 
+  }
+ 
++static void intel_dp_update_simulate_detach_info(struct intel_dp *intel_dp)
++{
++	struct intel_connector *intel_connector = intel_dp->attached_connector;
++	struct drm_device *dev = intel_dp_to_dev(intel_dp);
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_encoder *intel_encoder = &dp_to_dig_port(intel_dp)->base;
++
++	/*
++	 * Queue thread only if it is not already done.
++	 * the flag is cleared inside the callback function
++	 * hence we can be sure that there is no race condition
++	 * under which it may remain set.
++	 */
++	if (!intel_connector->simulate_disconnect_connect) {
++		intel_connector->simulate_disconnect_connect = true;
++
++		/* update current pin to indicate simulation in progress */
++		dev_priv->simulate_dp_in_progress = intel_encoder->hpd_pin;
++
++		DRM_DEBUG_KMS("Queue simulate work func\n");
++		mod_delayed_work(system_wq, &dev_priv->simulate_work,
++				msecs_to_jiffies(100));
++	}
++}
++
+ /*
+  * According to DP spec
+  * 5.1.2:
+@@ -4451,6 +4476,7 @@ intel_dp_check_link_status(struct intel_dp *intel_dp, bool *perform_full_detect)
+ 	u8 sink_irq_vector;
+ 	u8 link_status[DP_LINK_STATUS_SIZE];
+ 	u8 old_sink_count = intel_dp->sink_count;
++	u8 old_lane_count = intel_dp->dpcd[DP_MAX_LANE_COUNT];
+ 	bool ret;
+ 
+ 	*perform_full_detect = false;
+@@ -4494,6 +4520,21 @@ intel_dp_check_link_status(struct intel_dp *intel_dp, bool *perform_full_detect)
+ 			sink_irq_vector &= ~DP_AUTOMATED_TEST_REQUEST;
+ 		}
+ 
++		/*
++		 * if lane count has changed, we need to inform
++		 * user mode of new capablities, this is done by setting
++		 * our flag to do a fake disconnect and connect so it
++		 * will appear to the user mode that a new panel is
++		 * connected and will use the new capabilties of the
++		 * panel
++		 */
++		if (old_lane_count != intel_dp->dpcd[DP_MAX_LANE_COUNT]) {
++			DRM_DEBUG_KMS("Lane count changed\n");
++			intel_dp_update_simulate_detach_info(intel_dp);
++			*perform_full_detect = true;
++			return;
++		}
++
+ 		if (sink_irq_vector & (DP_CP_IRQ | DP_SINK_SPECIFIC_IRQ))
+ 			DRM_DEBUG_DRIVER("CP or sink specific irq unhandled\n");
+ 
+@@ -4715,9 +4756,7 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 	enum intel_display_power_domain power_domain;
+ 	struct edid *edid = NULL;
+ 	struct intel_crtc *intel_crtc = crtc ? to_intel_crtc(crtc) : NULL;
+-#ifdef CONFIG_EXTCON
+ 	struct intel_connector *intel_connector = to_intel_connector(connector);
+-#endif
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
+@@ -4727,7 +4766,10 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 	DRM_DEBUG_KMS("[CONNECTOR:%d:%s]\n",
+ 		      connector->base.id, connector->name);
+ 
+-	if (HAS_PCH_SPLIT(dev))
++	if (intel_connector->simulate_disconnect_connect) {
++		DRM_DEBUG_KMS("Simulating disconnect\n");
++		status = connector_status_disconnected;
++	} else if (HAS_PCH_SPLIT(dev))
+ 		status = ironlake_dp_detect(intel_dp);
+ 	else
+ 		status = g4x_dp_detect(intel_dp);
+@@ -4812,6 +4854,9 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 		chv_upfront_link_train(dev, intel_dp, intel_crtc);
+ 	}
+ 
++	/* if simulation was in progress clear the flag */
++	if (dev_priv->simulate_dp_in_progress & intel_encoder->hpd_pin)
++		dev_priv->simulate_dp_in_progress &= ~(intel_encoder->hpd_pin);
+ 
+ out:
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 2497808..004a3e1 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -244,6 +244,8 @@ struct intel_connector {
+ 
+ 	/* Whether DPMS off is pending on this ? */
+ 	bool dpms_off_pending;
++
++	bool simulate_disconnect_connect;
+ };
+ 
+ typedef struct dpll {
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index d4338d5..c0b125b 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1147,6 +1147,12 @@ void intel_hdmi_hot_plug(struct intel_encoder *intel_encoder)
+ 
+ 	connector = &intel_hdmi->attached_connector->base;
+ 
++	/* check if simulate is in progress for current port */
++	if (dev_priv->simulate_dp_in_progress & intel_encoder->hpd_pin) {
++		DRM_DEBUG_KMS("Simulate DP disconnect in progress\n");
++		return;
++	}
++
+ 	/*
+ 	 * We are here, means there is a HDMI hot-plug
+ 	 * Lets try to get EDID
+-- 
+1.9.1
+

@@ -1,0 +1,92 @@
+From f30e9e96a306cb5d7acc19a94f52b299574e74c0 Mon Sep 17 00:00:00 2001
+Message-Id: <f30e9e96a306cb5d7acc19a94f52b299574e74c0.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Thu, 24 Apr 2014 23:55:42 +0200
+Subject: [PATCH 127/312] FROM_UPSTREAM [VPG]: drm/i915: runtime PM support
+ for DPMS
+
+Keeping track of the power domains is a bit messy since crtc->active
+is currently updated by the platform hooks, but we need to be aware of
+which state transition exactly is going on. Maybe we simply need to
+shovel all the power domain handling down into platform code to
+simplify this. But doing that requires some more auditing since
+currently the ->mode_set callbacks still read some random registers
+(to e.g. figure out the reference clocks).
+
+Also note that intel_crtc_update_dpms is always call first/last even
+for encoders which have their own dpms functions. Hence we really only
+need to update this place here.
+
+Being a quick "does it blow up?" run not really tested yet.
+
+v2: Don't do runtime PM in the DPMS hooks for HAS_DDI platforms since
+that is stalled. Also add a comment to explain what's going on.
+
+v3: Fixed checkpatch errors in intel_display.c
+
+Issue: GMIN-1451
+Change-Id: Ibb0e19692ecaff070a2f82e907e8443f3f123584
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/intel_display.c |   37 ++++++++++++++++++++++++++++++----
+ 1 file changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 9ba13ff..d48d3f9 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5473,16 +5473,45 @@ void intel_crtc_update_dpms(struct drm_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct intel_encoder *intel_encoder;
++	enum intel_display_power_domain domain;
++	unsigned long domains;
+ 	bool enable = false;
+ 
+ 	for_each_encoder_on_crtc(dev, crtc, intel_encoder)
+ 		enable |= intel_encoder->connectors_active;
+ 
+-	if (enable)
+-		dev_priv->display.crtc_enable(crtc);
+-	else
+-		dev_priv->display.crtc_disable(crtc);
++	if (enable) {
++		if (!intel_crtc->active) {
++			/*
++			 * FIXME: DDI plls and relevant code isn't converted
++			 * yet, so do runtime PM for DPMS only for all other
++			 * platforms for now.
++			 */
++			if (!HAS_DDI(dev)) {
++				domains = get_crtc_power_domains(crtc);
++				for_each_power_domain(domain, domains)
++					intel_display_power_get(dev_priv,
++								domain);
++				intel_crtc->enabled_power_domains = domains;
++			}
++
++			dev_priv->display.crtc_enable(crtc);
++		}
++	} else {
++		if (intel_crtc->active) {
++			dev_priv->display.crtc_disable(crtc);
++
++			if (!HAS_DDI(dev)) {
++				domains = intel_crtc->enabled_power_domains;
++				for_each_power_domain(domain, domains)
++					intel_display_power_put(dev_priv,
++								domain);
++				intel_crtc->enabled_power_domains = 0;
++			}
++		}
++	}
+ 
+ 	intel_crtc_update_sarea(crtc, enable);
+ }
+-- 
+1.7.9.5
+

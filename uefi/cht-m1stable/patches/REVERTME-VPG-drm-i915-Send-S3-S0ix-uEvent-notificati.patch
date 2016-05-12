@@ -1,0 +1,118 @@
+From 3fcaafca40cb333229db1c7cd1fc95bc2c47219a Mon Sep 17 00:00:00 2001
+From: Deepak S <deepak.s@intel.com>
+Date: Wed, 6 Jan 2016 11:42:15 +0530
+Subject: [PATCH 2/7] REVERTME [VPG]: drm/i915: Send S3/S0ix uEvent
+ notification at start of suspend
+
+If the suspend of GFX device gets triggered immediately after resume,
+then hdcpd and i915 can fall into a dead loop of S0/S3 transitions.
+This happens due to activation of hdcpd hotplug thread on resume
+(for 15s), where it does hotplug related processing which involves
+register access (through libreg). This hotplug related work is repeated
+in a loop for 15 seconds but with a sleep of several ms after every
+iteration. This sleep is long enough to trigger the runtime suspend of
+the GFX device. Before a new iteration, loop exit condition is checked
+which becomes true either on the elapsing of 15 seconds or on the
+reception of S3 uevent. So if suspend of GFX gets triggered at the end
+of an iteration due to sleep but S3 uevent is received just after the
+check of exit condition, hotplug processing starts which again wakes
+up the GFX and keeps the hotplug thread activated for another 15
+seconds. This leads to a cycle where GFX goes to suspend at the end of
+an iteration, but gets resumed on the next iteration, as the uevent is
+received just after the start of next iteration.
+
+This situation seems to be avoidable by just moving the S3 uEvent
+notification earlier, right at the start of suspend callback.
+
+REVERTME: This is a short term fix proposed by hdcpd team. This should
+be reverted when they are ready with a better fix in hdcpd code.
+
+Change-Id: Ic6dd3de3a1586f972dc1dae2f3413dd0319161b5
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-13964
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Signed-off-by: Praveen Paneri <praveen.paneri@intel.com>
+Reviewed-on: https://android.intel.com:443/454916
+---
+ drivers/gpu/drm/i915/i915_drv.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index aaae75a..33205e9 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -559,7 +559,10 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 	struct drm_crtc *crtc;
+ 	int ret;
+ 	u32 i;
+-	char *envp[] = { "GSTATE=3", NULL };
++	char *envp_d3[] = { "GSTATE=3", NULL };
++	char *envp_d0[] = { "GSTATE=0", NULL };
++
++	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp_d3);
+ 
+ 	/* ignore lid events during suspend */
+ 	mutex_lock(&dev_priv->modeset_restore_lock);
+@@ -580,6 +583,8 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 
+ 		error = i915_gem_suspend(dev);
+ 		if (error) {
++			kobject_uevent_env(&dev->primary->kdev->kobj,
++						KOBJ_CHANGE, envp_d0);
+ 			dev_err(&dev->pdev->dev,
+ 				"GEM idle failed, resume might fail\n");
+ 			return error;
+@@ -635,8 +640,6 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 	if (ret)
+ 		WARN(1, "Suspend complete failed: %d\n", ret);
+ 
+-	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp);
+-
+ 	return 0;
+ }
+ 
+@@ -1973,7 +1976,8 @@ static int intel_runtime_suspend(struct device *device)
+ 	struct drm_device *dev = pci_get_drvdata(pdev);
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int ret, i;
+-	char *envp[] = { "GSTATE=3", NULL };
++	char *envp_d3[] = { "GSTATE=3", NULL };
++	char *envp_d0[] = { "GSTATE=0", NULL };
+ 
+ 	if (WARN_ON_ONCE(!(dev_priv->rps.enabled && intel_enable_rc6(dev))))
+ 		return -ENODEV;
+@@ -1981,6 +1985,7 @@ static int intel_runtime_suspend(struct device *device)
+ 	if (WARN_ON_ONCE(!HAS_RUNTIME_PM(dev)))
+ 		return -ENODEV;
+ 
++	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp_d3);
+ 	assert_force_wake_inactive(dev_priv);
+ 
+ 	DRM_DEBUG_KMS("Suspending device\n");
+@@ -1993,6 +1998,7 @@ static int intel_runtime_suspend(struct device *device)
+ 	 * for consistency return -EAGAIN, which will reschedule this suspend.
+ 	 */
+ 	if (!mutex_trylock(&dev->struct_mutex)) {
++		kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp_d0);
+ 		DRM_DEBUG_KMS("device lock contention, deffering suspend\n");
+ 		/*
+ 		 * Bump the expiration timestamp, otherwise the suspend won't
+@@ -2026,6 +2032,7 @@ static int intel_runtime_suspend(struct device *device)
+ 
+ 	ret = intel_suspend_complete(dev_priv);
+ 	if (ret) {
++		kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp_d0);
+ 		DRM_ERROR("Runtime suspend failed, disabling it (%d)\n", ret);
+ 		intel_runtime_pm_restore_interrupts(dev);
+ 
+@@ -2046,8 +2053,6 @@ static int intel_runtime_suspend(struct device *device)
+ 	 */
+ 	intel_opregion_notify_adapter(dev, PCI_D1);
+ 
+-	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp);
+-
+ 	DRM_DEBUG_KMS("Device suspended\n");
+ 	return 0;
+ }
+-- 
+1.9.1
+

@@ -1,0 +1,185 @@
+From ee513c6106809e234874cd98f797b843b75bde9c Mon Sep 17 00:00:00 2001
+From: Yuyang Du <yuyang.du@intel.com>
+Date: Mon, 17 Nov 2014 18:32:56 -0500
+Subject: [PATCH] sched: Introduce and calculate CPU ConCurrency (CC)
+
+CC is an average of the run queue length. It is calculated in two steps:
+
+(1) Divide continuous time into periods of time, and average the rq length
+    in each period:
+
+    a = sum(nr_running * t) / period
+
+(2) Exponentially decay the past periods, and sum up all past averages:
+    (let f be decaying factor, and a_x the xth period average since period 0):
+
+s = a_n + f^1 * a_n-1 + f^2 * a_n-2 +, ..., + f^(n-1) * a_1 + f^n * a_0
+
+CC is modified when enqueue and dequeue the CPU rq. But we also update it
+in scheduler tick, load balancing, and idle enter/exit in case we may not have
+enqueue and dequeue for a long time.
+
+So we update cpu concurrency at:
+- enqueue task
+- dequeue task
+- periodic scheduler tick in case no en/dequeue for long
+- enter and exit idle
+- update_blocked_averages
+
+Change-Id: Ic595dc227c8d2a50cfc289d617b87b2888da5244
+Orig-Change-Id: Id2761daa6fd3cee8f2db06d1f4922019cabac8fa
+Orig-Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-20603
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9774
+Signed-off-by: Srinidhi Kasagar <srinidhi.kasagar@intel.com>
+Signed-off-by: Yuyang Du <yuyang.du@intel.com>
+---
+ kernel/sched/core.c  |  3 +++
+ kernel/sched/fair.c  | 37 +++++++++++++++++++++++++++++++++++++
+ kernel/sched/sched.h | 10 ++++++++++
+ 3 files changed, 50 insertions(+)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index bf2bafd..27f3e9b 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -762,6 +762,7 @@ static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	update_rq_clock(rq);
+ 	sched_info_queued(rq, p);
++	update_cpu_concurrency(rq);
+ 	p->sched_class->enqueue_task(rq, p, flags);
+ }
+ 
+@@ -769,6 +770,7 @@ static void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	update_rq_clock(rq);
+ 	sched_info_dequeued(rq, p);
++	update_cpu_concurrency(rq);
+ 	p->sched_class->dequeue_task(rq, p, flags);
+ }
+ 
+@@ -2443,6 +2445,7 @@ void scheduler_tick(void)
+ 
+ 	raw_spin_lock(&rq->lock);
+ 	update_rq_clock(rq);
++	update_cpu_concurrency(rq);
+ 	curr->sched_class->task_tick(rq, curr, 0);
+ 	update_cpu_load_active(rq);
+ 	raw_spin_unlock(&rq->lock);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 9f6ca7f..e5e927c 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2396,6 +2396,8 @@ static inline void dequeue_entity_load_avg(struct cfs_rq *cfs_rq,
+ 	} /* migrations, e.g. sleep=0 leave decay_count == 0 */
+ }
+ 
++void update_cpu_concurrency(struct rq *rq);
++
+ /*
+  * Update the rq's load with the elapsed running time before entering
+  * idle. if the last scheduled task is not a CFS task, idle_enter will
+@@ -2403,6 +2405,7 @@ static inline void dequeue_entity_load_avg(struct cfs_rq *cfs_rq,
+  */
+ void idle_enter_fair(struct rq *this_rq)
+ {
++	update_cpu_concurrency(this_rq);
+ }
+ 
+ /*
+@@ -2412,6 +2415,7 @@ void idle_enter_fair(struct rq *this_rq)
+  */
+ void idle_exit_fair(struct rq *this_rq)
+ {
++	update_cpu_concurrency(this_rq);
+ }
+ 
+ #else
+@@ -5094,6 +5098,8 @@ static void update_blocked_averages(int cpu)
+ 		__update_blocked_averages_cpu(cfs_rq->tg, rq->cpu);
+ 	}
+ 
++	update_cpu_concurrency(rq);
++
+ 	raw_spin_unlock_irqrestore(&rq->lock, flags);
+ }
+ 
+@@ -7354,3 +7360,34 @@ __init void init_sched_fair_class(void)
+ #endif /* SMP */
+ 
+ }
++
++#ifdef CONFIG_SMP
++/*
++ * CPU ConCurrency (CC) measures the CPU load by averaging
++ * the number of runnable tasks. Using CC, the scheduler can
++ * consolidate the load of CPUs when balancing load to improve
++ * power efficiency without sacrificing performance.
++ *
++ * Copyright (C) 2014 Intel, Inc.,
++ *
++ * Author: Du, Yuyang <yuyang.du@intel.com>
++ */
++
++/*
++ * We update cpu concurrency at:
++ * - enqueue task
++ * - dequeue task
++ * - periodic scheduler tick in case no en/dequeue for long
++ * - enter and exit idle
++ * - update_blocked_averages
++ */
++void update_cpu_concurrency(struct rq *rq)
++{
++	struct sched_avg *sa = &rq->concurrency.avg;
++	if (__update_entity_runnable_avg(rq->clock, sa, rq->nr_running)) {
++		sa->load_avg_contrib = sa->runnable_avg_sum << NICE_0_SHIFT;
++		sa->load_avg_contrib /= (sa->runnable_avg_period + 1);
++	}
++}
++
++#endif /* SMP */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 0e30e35..2e88c8c 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -512,6 +512,10 @@ struct root_domain {
+ 
+ extern struct root_domain def_root_domain;
+ 
++struct cpu_concurrency_t {
++	struct sched_avg avg;
++};
++
+ #endif /* CONFIG_SMP */
+ 
+ /*
+@@ -599,6 +603,8 @@ struct rq {
+ 
+ 	struct list_head cfs_tasks;
+ 
++	struct cpu_concurrency_t concurrency;
++
+ 	u64 rt_avg;
+ 	u64 age_stamp;
+ 	u64 idle_stamp;
+@@ -1178,12 +1184,16 @@ extern void idle_balance(int this_cpu, struct rq *this_rq);
+ extern void idle_enter_fair(struct rq *this_rq);
+ extern void idle_exit_fair(struct rq *this_rq);
+ 
++extern void update_cpu_concurrency(struct rq *rq);
++
+ #else	/* CONFIG_SMP */
+ 
+ static inline void idle_balance(int cpu, struct rq *rq)
+ {
+ }
+ 
++static inline void update_cpu_concurrency(struct rq *rq) {}
++
+ #endif
+ 
+ extern void sysrq_sched_debug_show(void);
+-- 
+1.9.1
+

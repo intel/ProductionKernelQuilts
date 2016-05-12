@@ -1,0 +1,154 @@
+From c01aebd95db6df1b454ad192df1b009d5fd4e8a6 Mon Sep 17 00:00:00 2001
+Message-Id: <c01aebd95db6df1b454ad192df1b009d5fd4e8a6.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Fri, 21 Nov 2014 14:55:42 +0000
+Subject: [PATCH 20/63] REVERTME [VPG]: drm/i915: Update watchdog to support
+ request structures
+
+More seqno to request conversions.
+
+Note: The watchdog code in question was added in the following patch:
+  REVERTME [VPG]: drm/i915: Refactored native sync code for better file splits
+  commit id: 7f6f43d460784c9d86cb334c35b2ebdd15f7a850
+
+Therefore this patch could be squashed into that one and/or dropped
+when that patch is dropped.
+
+Change-Id: Idcf307335c1732f64ee3db4104c549be9776f989
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   10 +++++-----
+ drivers/gpu/drm/i915/intel_lrc.c           |   18 ++++++++++--------
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |    9 ++++++---
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    3 ++-
+ 4 files changed, 23 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 4c3c99b..e321ed3 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1237,11 +1237,11 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 			goto error;
+ 	}
+ 
+-	/* Flag this seqno as being active on the ring so the watchdog
++	/* Flag this request as being active on the ring so the watchdog
+ 	 * code knows where to look if things go wrong. */
+-	ret = i915_write_active_seqno(ring, seqno);
++	ret = i915_write_active_request(ring, intel_ring_get_request(ring));
+ 	if (ret) {
+-		DRM_DEBUG_DRIVER("Failed to store seqno for %d (%d)\n",
++		DRM_DEBUG_DRIVER("Failed to tag request on ring %d (%d)\n",
+ 				 ring->id, ret);
+ 		goto error;
+ 	}
+@@ -1272,8 +1272,8 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 			goto error;
+ 	}
+ 
+-	/* Clear the active seqno again */
+-	ret = i915_write_active_seqno(ring, 0);
++	/* Clear the active request again */
++	ret = i915_write_active_request(ring, NULL);
+ 	if (ret)
+ 		goto error;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index db000c5..c6af21c 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -814,8 +814,9 @@ gen8_ring_stop_watchdog(struct intel_ringbuffer *ringbuf)
+ 	return 0;
+ }
+ 
+-static int logical_ring_write_active_seqno(struct intel_ringbuffer *ringbuf,
+-					   u32 seqno)
++static int
++logical_ring_write_active_request(struct intel_ringbuffer *ringbuf,
++				  struct drm_i915_gem_request *req)
+ {
+ 	int ret;
+ 	struct intel_engine_cs *ring = ringbuf->ring;
+@@ -829,7 +830,7 @@ static int logical_ring_write_active_seqno(struct intel_ringbuffer *ringbuf,
+ 				(ring->status_page.gfx_addr +
+ 				 (I915_GEM_ACTIVE_SEQNO_INDEX <<
+ 				  MI_STORE_DWORD_INDEX_SHIFT)));
+-	intel_logical_ring_emit(ringbuf, seqno);
++	intel_logical_ring_emit(ringbuf, i915_gem_request_get_seqno(req));
+ 	intel_logical_ring_emit(ringbuf, MI_NOOP);
+ 	intel_logical_ring_advance(ringbuf);
+ 
+@@ -1056,11 +1057,12 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	if (IS_GEN8(dev) && ring == &dev_priv->ring[RCS])
+ 		i915_program_perfmon(dev, ringbuf, ctx);
+ 
+-	/* Flag this seqno as being active on the ring so the watchdog
++	/* Flag this request as being active on the ring so the watchdog
+ 	 * code knows where to look if things go wrong. */
+-	ret = logical_ring_write_active_seqno(ringbuf, seqno);
++	ret = logical_ring_write_active_request(ringbuf,
++						intel_ring_get_request(ring));
+ 	if (ret) {
+-		DRM_DEBUG_DRIVER("Failed to store seqno for %d (%d)\n",
++		DRM_DEBUG_DRIVER("Failed to tag request on ring %d (%d)\n",
+ 				 ring->id, ret);
+ 		goto error;
+ 	}
+@@ -1076,8 +1078,8 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 			goto error;
+ 	}
+ 
+-	/* Clear the active seqno again */
+-	ret = logical_ring_write_active_seqno(ringbuf, 0);
++	/* Clear the active request again */
++	ret = logical_ring_write_active_request(ringbuf, NULL);
+ 	if (ret)
+ 		goto error;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index f02fd27..e96b73d 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2215,8 +2215,11 @@ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring)
+ }
+ 
+ /* Write a specific seqno value to the HWS page so that
+- * we can identify the cause of any hangs. */
+-int i915_write_active_seqno(struct intel_engine_cs *ring, u32 seqno)
++ * we can identify the cause of any hangs. NB: req can be
++ * null in the case of clearing the active request, in this
++ * case, a seqno of zero is written. */
++int i915_write_active_request(struct intel_engine_cs *ring,
++			      struct drm_i915_gem_request *req)
+ {
+ 	int ret;
+ 
+@@ -2227,7 +2230,7 @@ int i915_write_active_seqno(struct intel_engine_cs *ring, u32 seqno)
+ 	intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
+ 	intel_ring_emit(ring, I915_GEM_ACTIVE_SEQNO_INDEX <<
+ 			MI_STORE_DWORD_INDEX_SHIFT);
+-	intel_ring_emit(ring, seqno);
++	intel_ring_emit(ring, i915_gem_request_get_seqno(req));
+ 	intel_ring_emit(ring, MI_NOOP);
+ 	intel_ring_advance(ring);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 05b82d0..38bd240 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -483,7 +483,8 @@ static inline u32 intel_ring_get_tail(struct intel_ringbuffer *ringbuf)
+ 	return ringbuf->tail;
+ }
+ 
+-int i915_write_active_seqno(struct intel_engine_cs *ring, u32 seqno);
++int i915_write_active_request(struct intel_engine_cs *ring,
++			      struct drm_i915_gem_request *req);
+ 
+ static inline u32 intel_ring_get_seqno(struct intel_engine_cs *ring)
+ {
+-- 
+1.7.9.5
+

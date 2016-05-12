@@ -1,0 +1,546 @@
+From aa0c58fe046f9d00f3d381a75f6169b3f6d58c94 Mon Sep 17 00:00:00 2001
+Message-Id: <aa0c58fe046f9d00f3d381a75f6169b3f6d58c94.1415496071.git.chang-joon.lee@intel.com>
+From: Brad Volkin <bradley.d.volkin@intel.com>
+Date: Wed, 21 May 2014 11:54:02 -0700
+Subject: [PATCH 1/8] MUST_REBASE [VPG]: drm/i915: Ioctl for adding to the cmd
+ parser tables
+
+The appended data goes in the driver private structure instead
+of the ring structure (where the kernel tables live) because the
+ring stucture does not persist across suspend/resume. We want the
+appened data to persist.
+
+For: APDEV-870
+Change-Id: Ie1438931b89f2cf13e5b85605b2b2006982999e9
+Signed-off-by: Brad Volkin <bradley.d.volkin@intel.com>
+---
+ drivers/gpu/drm/i915/i915_cmd_parser.c |  223 ++++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/i915_dma.c        |    4 +
+ drivers/gpu/drm/i915/i915_drv.h        |   89 ++-----------
+ include/uapi/drm/i915_drm.h            |  102 +++++++++++++++
+ 4 files changed, 331 insertions(+), 87 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_cmd_parser.c b/drivers/gpu/drm/i915/i915_cmd_parser.c
+index 9f8be4a..78085cb 100644
+--- a/drivers/gpu/drm/i915/i915_cmd_parser.c
++++ b/drivers/gpu/drm/i915/i915_cmd_parser.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include "i915_drv.h"
++#include "i915_drm.h"
+ 
+ /**
+  * DOC: batch buffer command parser
+@@ -765,6 +766,7 @@ find_cmd(struct intel_engine_cs *ring,
+ 	 u32 cmd_header,
+ 	 struct drm_i915_cmd_descriptor *default_desc)
+ {
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	const struct drm_i915_cmd_descriptor *desc;
+ 	u32 mask;
+ 
+@@ -772,6 +774,23 @@ find_cmd(struct intel_engine_cs *ring,
+ 	if (desc)
+ 		return desc;
+ 
++	if (dev_priv->append_cmd_table[ring->id]) {
++		const struct drm_i915_cmd_table *table =
++			dev_priv->append_cmd_table[ring->id];
++		int i;
++
++		for (i = 0; i < table->count; i++) {
++			const struct drm_i915_cmd_descriptor *desc =
++				&table->table[i];
++			unsigned int masked_cmd = desc->cmd.mask & cmd_header;
++			unsigned int masked_value =
++				desc->cmd.value & desc->cmd.mask;
++
++			if (masked_cmd == masked_value)
++				return desc;
++		}
++	}
++
+ 	mask = ring->get_cmd_length_mask(cmd_header);
+ 	if (!mask)
+ 		return NULL;
+@@ -892,15 +911,27 @@ static bool check_cmd(const struct intel_engine_cs *ring,
+ 
+ 		if (!valid_reg(ring->reg_table,
+ 			       ring->reg_count, reg_addr)) {
+-			if (!is_master ||
+-			    !valid_reg(ring->master_reg_table,
+-				       ring->master_reg_count,
++			struct drm_i915_private *dev_priv =
++				ring->dev->dev_private;
++			unsigned int *append_table =
++				dev_priv->append_reg[ring->id].table;
++			int append_count =
++				dev_priv->append_reg[ring->id].count;
++
++			if (!append_table ||
++			    !valid_reg(append_table,
++				       append_count,
+ 				       reg_addr)) {
+-				DRM_DEBUG_DRIVER("CMD: Rejected register 0x%08X in command: 0x%08X (ring=%d)\n",
+-						 reg_addr,
+-						 *cmd,
+-						 ring->id);
+-				return false;
++				if (!is_master ||
++				    !valid_reg(ring->master_reg_table,
++					       ring->master_reg_count,
++					       reg_addr)) {
++					DRM_DEBUG_DRIVER("CMD: Rejected register 0x%08X in command: 0x%08X (ring=%d)\n",
++							 reg_addr,
++							 *cmd,
++							 ring->id);
++					return false;
++				}
+ 			}
+ 		}
+ 	}
+@@ -1057,3 +1088,179 @@ int i915_cmd_parser_get_version(void)
+ 	 */
+ 	return 1;
+ }
++
++static void cleanup_append_cmd_table(struct drm_i915_private *dev_priv,
++				     int ring_id)
++{
++	if (dev_priv->append_cmd_table[ring_id]) {
++		const struct drm_i915_cmd_descriptor *table =
++			dev_priv->append_cmd_table[ring_id]->table;
++
++		drm_free_large((void *)table);
++		drm_free_large((void *)dev_priv->append_cmd_table[ring_id]);
++
++		dev_priv->append_cmd_table[ring_id] = NULL;
++	}
++}
++
++static void cleanup_append_reg_table(struct drm_i915_private *dev_priv,
++				     int ring_id)
++{
++	if (dev_priv->append_reg[ring_id].table) {
++		drm_free_large((void *)dev_priv->append_reg[ring_id].table);
++
++		dev_priv->append_reg[ring_id].table = NULL;
++		dev_priv->append_reg[ring_id].count = 0;
++	}
++}
++
++void i915_cmd_parser_cleanup(struct drm_i915_private *dev_priv)
++{
++	int i;
++
++	for (i = 0; i < I915_NUM_RINGS; i++) {
++		cleanup_append_cmd_table(dev_priv, i);
++		cleanup_append_reg_table(dev_priv, i);
++	}
++}
++
++static int append_cmds(struct drm_i915_private *dev_priv,
++		       int ring_id,
++		       struct drm_i915_cmd_parser_append *args)
++{
++	struct drm_i915_cmd_table *cmd_table;
++	int ret;
++
++	cmd_table = drm_malloc_ab(sizeof(*cmd_table), 1);
++	if (!cmd_table)
++		return -ENOMEM;
++
++	cmd_table->count = args->cmd_count;
++	cmd_table->table = drm_malloc_ab(sizeof(*cmd_table->table),
++					 args->cmd_count);
++	if (!cmd_table) {
++		drm_free_large(cmd_table);
++		return -ENOMEM;
++	}
++
++	ret = copy_from_user((void *)cmd_table->table,
++			     (struct drm_i915_cmd_descriptor __user *)
++			     (uintptr_t)args->cmds,
++			     sizeof(*cmd_table->table) * args->cmd_count);
++	if (ret) {
++		drm_free_large((void *)cmd_table->table);
++		drm_free_large(cmd_table);
++		return -EFAULT;
++	}
++
++	dev_priv->append_cmd_table[ring_id] = cmd_table;
++
++	return 0;
++}
++
++static int append_regs(struct drm_i915_private *dev_priv,
++		       int ring_id,
++		       struct drm_i915_cmd_parser_append *args)
++{
++	unsigned int *regs;
++	int ret;
++
++	regs = drm_malloc_ab(sizeof(*regs), args->reg_count);
++	if (!regs)
++		return -ENOMEM;
++
++	ret = copy_from_user(regs,
++			     (unsigned int __user *)(uintptr_t)args->regs,
++			     sizeof(*regs) * args->reg_count);
++	if (ret) {
++		drm_free_large(regs);
++		return -EFAULT;
++	}
++
++	dev_priv->append_reg[ring_id].table = regs;
++	dev_priv->append_reg[ring_id].count = args->reg_count;
++
++	return 0;
++}
++
++int i915_cmd_parser_append_ioctl(struct drm_device *dev, void *data,
++				 struct drm_file *file_priv)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_i915_cmd_parser_append *args = data;
++	struct intel_engine_cs *ring = NULL;
++	int ret = 0;
++
++	mutex_lock(&dev->struct_mutex);
++
++	/* This ioctl has DRM_ROOT_ONLY set but the code to check that flag in
++	 * drm_ioctl is/was removed from the VLV kernel. To be sure, check for
++	 * the appropriate permission here.
++	 */
++	if (!capable(CAP_SYS_ADMIN)) {
++		DRM_DEBUG("CMD: append from non-root user\n");
++		ret = -EACCES;
++		goto out;
++	}
++
++	if ((args->cmd_count < 1 && args->reg_count < 1) ||
++	    (!args->cmds && !args->regs)) {
++		DRM_DEBUG("CMD: append with invalid lists cmd=(0x%llx, %d) reg=(0x%llx, %d)\n",
++			  args->cmds, args->cmd_count,
++			  args->regs, args->reg_count);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	switch (args->ring & I915_EXEC_RING_MASK) {
++	case I915_EXEC_DEFAULT:
++	case I915_EXEC_RENDER:
++		ring = &dev_priv->ring[RCS];
++		break;
++	case I915_EXEC_BSD:
++		ring = &dev_priv->ring[VCS];
++		break;
++	case I915_EXEC_BLT:
++		ring = &dev_priv->ring[BCS];
++		break;
++	case I915_EXEC_VEBOX:
++		ring = &dev_priv->ring[VECS];
++		break;
++	default:
++		DRM_DEBUG("CMD: append with unknown ring: %d\n",
++			  (int)(args->ring & I915_EXEC_RING_MASK));
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (args->cmds) {
++		if (dev_priv->append_cmd_table[ring->id]) {
++			DRM_ERROR("CMD: append cmd was already sent\n");
++			ret = -EEXIST;
++		} else {
++			ret = append_cmds(dev_priv, ring->id, args);
++		}
++
++		if (ret)
++			goto out;
++	}
++
++	if (args->regs) {
++		if (dev_priv->append_reg[ring->id].table) {
++			DRM_ERROR("CMD: append reg was already sent\n");
++			ret = -EEXIST;
++		} else {
++			ret = append_regs(dev_priv, ring->id, args);
++			if (ret)
++				cleanup_append_cmd_table(dev_priv, ring->id);
++		}
++
++		if (ret)
++			goto out;
++	}
++
++out:
++	mutex_unlock(&dev->struct_mutex);
++
++	return ret;
++}
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 41da23b..734a455 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1966,6 +1966,8 @@ int i915_driver_unload(struct drm_device *dev)
+ 	if (dev_priv->slab)
+ 		kmem_cache_destroy(dev_priv->slab);
+ 
++	i915_cmd_parser_cleanup(dev_priv);
++
+ 	pci_dev_put(dev_priv->bridge_dev);
+ 	kfree(dev_priv);
+ 
+@@ -2098,6 +2100,8 @@ const struct drm_ioctl_desc i915_ioctls[] = {
+ 	DRM_IOCTL_DEF_DRV(I915_SET_CSC, intel_configure_csc, DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(I915_SET_PLANE_ALPHA, i915_set_plane_alpha, \
+ 							DRM_AUTH|DRM_UNLOCKED),
++	DRM_IOCTL_DEF_DRV(I915_CMD_PARSER_APPEND, i915_cmd_parser_append_ioctl,
++			  DRM_UNLOCKED|DRM_ROOT_ONLY),
+ };
+ 
+ int i915_max_ioctl = ARRAY_SIZE(i915_ioctls);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 3dca993..38e0135 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1668,6 +1668,13 @@ struct drm_i915_private {
+ 	DECLARE_HASHTABLE(mm_structs, 7);
+ 	struct mutex mm_lock;
+ 
++	/* Command parser */
++	struct drm_i915_cmd_table *append_cmd_table[I915_NUM_RINGS];
++	struct {
++		unsigned int *table;
++		int count;
++	} append_reg[I915_NUM_RINGS];
++
+ 	/* Kernel Modesetting */
+ 
+ 	struct sdvo_device_mapping sdvo_mappings[2];
+@@ -2066,85 +2073,6 @@ struct drm_i915_file_private {
+ };
+ 
+ /*
+- * A command that requires special handling by the command parser.
+- */
+-struct drm_i915_cmd_descriptor {
+-	/*
+-	 * Flags describing how the command parser processes the command.
+-	 *
+-	 * CMD_DESC_FIXED: The command has a fixed length if this is set,
+-	 *                 a length mask if not set
+-	 * CMD_DESC_SKIP: The command is allowed but does not follow the
+-	 *                standard length encoding for the opcode range in
+-	 *                which it falls
+-	 * CMD_DESC_REJECT: The command is never allowed
+-	 * CMD_DESC_REGISTER: The command should be checked against the
+-	 *                    register whitelist for the appropriate ring
+-	 * CMD_DESC_MASTER: The command is allowed if the submitting process
+-	 *                  is the DRM master
+-	 */
+-	u32 flags;
+-#define CMD_DESC_FIXED    (1<<0)
+-#define CMD_DESC_SKIP     (1<<1)
+-#define CMD_DESC_REJECT   (1<<2)
+-#define CMD_DESC_REGISTER (1<<3)
+-#define CMD_DESC_BITMASK  (1<<4)
+-#define CMD_DESC_MASTER   (1<<5)
+-
+-	/*
+-	 * The command's unique identification bits and the bitmask to get them.
+-	 * This isn't strictly the opcode field as defined in the spec and may
+-	 * also include type, subtype, and/or subop fields.
+-	 */
+-	struct {
+-		u32 value;
+-		u32 mask;
+-	} cmd;
+-
+-	/*
+-	 * The command's length. The command is either fixed length (i.e. does
+-	 * not include a length field) or has a length field mask. The flag
+-	 * CMD_DESC_FIXED indicates a fixed length. Otherwise, the command has
+-	 * a length mask. All command entries in a command table must include
+-	 * length information.
+-	 */
+-	union {
+-		u32 fixed;
+-		u32 mask;
+-	} length;
+-
+-	/*
+-	 * Describes where to find a register address in the command to check
+-	 * against the ring's register whitelist. Only valid if flags has the
+-	 * CMD_DESC_REGISTER bit set.
+-	 */
+-	struct {
+-		u32 offset;
+-		u32 mask;
+-	} reg;
+-
+-#define MAX_CMD_DESC_BITMASKS 3
+-	/*
+-	 * Describes command checks where a particular dword is masked and
+-	 * compared against an expected value. If the command does not match
+-	 * the expected value, the parser rejects it. Only valid if flags has
+-	 * the CMD_DESC_BITMASK bit set. Only entries where mask is non-zero
+-	 * are valid.
+-	 *
+-	 * If the check specifies a non-zero condition_mask then the parser
+-	 * only performs the check when the bits specified by condition_mask
+-	 * are non-zero.
+-	 */
+-	struct {
+-		u32 offset;
+-		u32 mask;
+-		u32 expected;
+-		u32 condition_offset;
+-		u32 condition_mask;
+-	} bits[MAX_CMD_DESC_BITMASKS];
+-};
+-
+-/*
+  * A table of commands requiring special handling by the command parser.
+  *
+  * Each ring has an array of tables. Each table consists of an array of command
+@@ -2869,6 +2797,9 @@ int i915_parse_cmds(struct intel_engine_cs *ring,
+ 		    struct drm_i915_gem_object *batch_obj,
+ 		    u32 batch_start_offset,
+ 		    bool is_master);
++int i915_cmd_parser_append_ioctl(struct drm_device *dev, void *data,
++				 struct drm_file *file_priv);
++void i915_cmd_parser_cleanup(struct drm_i915_private *dev_priv);
+ 
+ /* i915_suspend.c */
+ extern int i915_save_state(struct drm_device *dev);
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 61274fe..430c664 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -284,6 +284,7 @@ struct csc_coeff {
+ #define DRM_I915_GEM_ACCESS_USERDATA	0x3c
+ #define DRM_I915_SET_PLANE_ALPHA	0x3d
+ #define DRM_I915_PERFMON		0x3e
++#define DRM_I915_CMD_PARSER_APPEND	0x3f
+ 
+ #define DRM_IOCTL_I915_INIT		DRM_IOW( DRM_COMMAND_BASE + DRM_I915_INIT, drm_i915_init_t)
+ #define DRM_IOCTL_I915_FLUSH		DRM_IO ( DRM_COMMAND_BASE + DRM_I915_FLUSH)
+@@ -358,6 +359,9 @@ struct csc_coeff {
+ 					struct drm_i915_perfmon)
+ #define DRM_IOCTL_I915_SET_CSC DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_SET_CSC, \
+ 		struct csc_coeff)
++#define DRM_IOCTL_I915_CMD_PARSER_APPEND	\
++		DRM_IOW (DRM_COMMAND_BASE + DRM_I915_CMD_PARSER_APPEND, \
++		struct drm_i915_cmd_parser_append)
+ 
+ /* Allow drivers to submit batchbuffers directly to hardware, relying
+  * on the security mechanisms provided by hardware.
+@@ -1288,4 +1292,102 @@ struct dpst_initialize_context {
+ 		struct dpst_histogram_status_legacy	hist_status_legacy;
+ 	};
+ };
++
++/*
++ * A command that requires special handling by the command parser.
++ */
++struct drm_i915_cmd_descriptor {
++	/*
++	 * Flags describing how the command parser processes the command.
++	 *
++	 * CMD_DESC_FIXED: The command has a fixed length if this is set,
++	 *                 a length mask if not set
++	 * CMD_DESC_SKIP: The command is allowed but does not follow the
++	 *                standard length encoding for the opcode range in
++	 *                which it falls
++	 * CMD_DESC_REJECT: The command is never allowed
++	 * CMD_DESC_REGISTER: The command should be checked against the
++	 *                    register whitelist for the appropriate ring
++	 * CMD_DESC_MASTER: The command is allowed if the submitting process
++	 *                  is the DRM master
++	 */
++	__u32 flags;
++#define CMD_DESC_FIXED    (1<<0)
++#define CMD_DESC_SKIP     (1<<1)
++#define CMD_DESC_REJECT   (1<<2)
++#define CMD_DESC_REGISTER (1<<3)
++#define CMD_DESC_BITMASK  (1<<4)
++#define CMD_DESC_MASTER   (1<<5)
++
++	/*
++	 * The command's unique identification bits and the bitmask to get them.
++	 * This isn't strictly the opcode field as defined in the spec and may
++	 * also include type, subtype, and/or subop fields.
++	 */
++	struct {
++		__u32 value;
++		__u32 mask;
++	} cmd;
++
++	/*
++	 * The command's length. The command is either fixed length (i.e. does
++	 * not include a length field) or has a length field mask. The flag
++	 * CMD_DESC_FIXED indicates a fixed length. Otherwise, the command has
++	 * a length mask. All command entries in a command table must include
++	 * length information.
++	 */
++	union {
++		__u32 fixed;
++		__u32 mask;
++	} length;
++
++	/*
++	 * Describes where to find a register address in the command to check
++	 * against the ring's register whitelist. Only valid if flags has the
++	 * CMD_DESC_REGISTER bit set.
++	 */
++	struct {
++		__u32 offset;
++		__u32 mask;
++	} reg;
++
++#define MAX_CMD_DESC_BITMASKS 3
++	/*
++	 * Describes command checks where a particular dword is masked and
++	 * compared against an expected value. If the command does not match
++	 * the expected value, the parser rejects it. Only valid if flags has
++	 * the CMD_DESC_BITMASK bit set. Only entries where mask is non-zero
++	 * are valid.
++	 *
++	 * If the check specifies a non-zero condition_mask then the parser
++	 * only performs the check when the bits specified by condition_mask
++	 * are non-zero.
++	 */
++	struct {
++		__u32 offset;
++		__u32 mask;
++		__u32 expected;
++		__u32 condition_offset;
++		__u32 condition_mask;
++	} bits[MAX_CMD_DESC_BITMASKS];
++};
++
++/*
++ * Add command checks or whitelisted registers to the command parser. Root-only.
++ */
++struct drm_i915_cmd_parser_append {
++	/* The ring who's structures are to be updated; use I915_EXEC_* bits */
++	__u32 ring;
++
++	/* Array of drm_i915_cmd_descriptor structs and count of structs */
++	__u32 cmd_count;
++	__u64 cmds;
++
++	/* Array of register offsets and count of registers */
++	__u64 regs;
++	__u32 reg_count;
++
++	__u32 pad;
++};
++
+ #endif /* _UAPI_I915_DRM_H_ */
+-- 
+1.7.9.5
+

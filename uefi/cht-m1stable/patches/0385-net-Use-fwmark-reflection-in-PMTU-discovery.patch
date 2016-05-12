@@ -1,0 +1,100 @@
+From a6a04e8afc6d69358bdcc98e59a6b33f7a90457c Mon Sep 17 00:00:00 2001
+From: Lorenzo Colitti <lorenzo@google.com>
+Date: Sat, 10 May 2014 11:56:37 +0900
+Subject: [PATCH 385/634] net: Use fwmark reflection in PMTU discovery.
+
+Currently, routing lookups used for Path PMTU Discovery in
+absence of a socket or on unmarked sockets use a mark of 0.
+This causes PMTUD not to work when using routing based on
+netfilter fwmark mangling and fwmark ip rules, such as:
+
+  iptables -j MARK --set-mark 17
+  ip rule add fwmark 17 lookup 100
+
+This patch causes these route lookups to use the fwmark from the
+received ICMP error when the fwmark_reflect sysctl is enabled.
+This allows the administrator to make PMTUD work by configuring
+appropriate fwmark rules to mark the inbound ICMP packets.
+
+Black-box tested using user-mode linux by pointing different
+fwmarks at routing tables egressing on different interfaces, and
+using iptables mangling to mark packets inbound on each interface
+with the interface's fwmark. ICMPv4 and ICMPv6 PMTU discovery
+work as expected when mark reflection is enabled and fail when
+it is disabled.
+
+Change-Id: Id7fefb7ec1ff7f5142fba43db1960b050e0dfaec
+Signed-off-by: Lorenzo Colitti <lorenzo@google.com>
+---
+ Documentation/networking/ip-sysctl.txt | 8 ++++++--
+ net/ipv4/route.c                       | 7 +++++++
+ net/ipv6/route.c                       | 2 +-
+ 3 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index 83e51a5..03c4bde 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -60,7 +60,9 @@ fwmark_reflect - BOOLEAN
+ 	Controls the fwmark of kernel-generated IPv4 reply packets that are not
+ 	associated with a socket for example, TCP RSTs or ICMP echo replies).
+ 	If unset, these packets have a fwmark of zero. If set, they have the
+-	fwmark of the packet they are replying to.
++	fwmark of the packet they are replying to. Similarly affects the fwmark
++	used by internal routing lookups triggered by incoming packets, such as
++	the ones used for Path MTU Discovery.
+ 	Default: 0
+ 
+ route/max_size - INTEGER
+@@ -1192,7 +1194,9 @@ fwmark_reflect - BOOLEAN
+ 	Controls the fwmark of kernel-generated IPv6 reply packets that are not
+ 	associated with a socket for example, TCP RSTs or ICMPv6 echo replies).
+ 	If unset, these packets have a fwmark of zero. If set, they have the
+-	fwmark of the packet they are replying to.
++	fwmark of the packet they are replying to. Similarly affects the fwmark
++	used by internal routing lookups triggered by incoming packets, such as
++	the ones used for Path MTU Discovery.
+ 	Default: 0
+ 
+ conf/interface/*:
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 625615c..d1d373d 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1011,6 +1011,9 @@ void ipv4_update_pmtu(struct sk_buff *skb, struct net *net, u32 mtu,
+ 	struct flowi4 fl4;
+ 	struct rtable *rt;
+ 
++	if (!mark)
++		mark = IP4_REPLY_MARK(net, skb->mark);
++
+ 	__build_flow_key(&fl4, NULL, iph, oif,
+ 			 RT_TOS(iph->tos), protocol, mark, flow_flags);
+ 	rt = __ip_route_output_key(net, &fl4);
+@@ -1028,6 +1031,10 @@ static void __ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu)
+ 	struct rtable *rt;
+ 
+ 	__build_flow_key(&fl4, sk, iph, 0, 0, 0, 0, 0);
++
++	if (!fl4.flowi4_mark)
++		fl4.flowi4_mark = IP4_REPLY_MARK(sock_net(sk), skb->mark);
++
+ 	rt = __ip_route_output_key(sock_net(sk), &fl4);
+ 	if (!IS_ERR(rt)) {
+ 		__ip_rt_update_pmtu(rt, &fl4, mtu);
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 665c4b6..33e14ec 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1173,7 +1173,7 @@ void ip6_update_pmtu(struct sk_buff *skb, struct net *net, __be32 mtu,
+ 
+ 	memset(&fl6, 0, sizeof(fl6));
+ 	fl6.flowi6_oif = oif;
+-	fl6.flowi6_mark = mark;
++	fl6.flowi6_mark = mark ? mark : IP6_REPLY_MARK(net, skb->mark);
+ 	fl6.daddr = iph->daddr;
+ 	fl6.saddr = iph->saddr;
+ 	fl6.flowlabel = ip6_flowinfo(iph);
+-- 
+1.9.1
+

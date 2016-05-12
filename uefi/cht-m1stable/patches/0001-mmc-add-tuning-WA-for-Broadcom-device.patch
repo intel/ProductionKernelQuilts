@@ -1,0 +1,88 @@
+From 2c9445ef06311cf578b3bf72d4829effae94096d Mon Sep 17 00:00:00 2001
+From: Yuan Juntao <juntaox.yuan@intel.com>
+Date: Tue, 25 Nov 2014 18:12:04 +0800
+Subject: [PATCH 1/1] mmc: add tuning WA for Broadcom device.
+
+Some BCM SDIO device cannot response for tuning command before sending
+CMD52. For this case, by pass tuning. But sometime CMD52 will still fail.
+If failure happens, retry CMD52 and perform tuning
+
+Change-Id: I0cfc6a7fca3984198cbb181113cde183a565e97a
+Signed-off-by: Yuan Juntao <juntaox.yuan@intel.com>
+---
+ drivers/mmc/core/quirks.c   | 3 +++
+ drivers/mmc/core/sdio_ops.c | 6 +++++-
+ drivers/mmc/host/sdhci.c    | 6 ++++++
+ include/linux/mmc/card.h    | 1 +
+ 4 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mmc/core/quirks.c b/drivers/mmc/core/quirks.c
+index 6c36fcc..a96b8d6 100644
+--- a/drivers/mmc/core/quirks.c
++++ b/drivers/mmc/core/quirks.c
+@@ -66,6 +66,9 @@ static const struct mmc_fixup mmc_fixup_methods[] = {
+ 	SDIO_FIXUP(SDIO_VENDOR_ID_MARVELL, SDIO_DEVICE_ID_MARVELL_8797_F0,
+ 		   add_quirk, MMC_QUIRK_BROKEN_IRQ_POLLING),
+ 
++	SDIO_FIXUP(SDIO_VENDOR_ID_BROADCOM, SDIO_ANY_ID,
++		   add_quirk, MMC_QUIRK_NO_TUNING_IN_SLEEP),
++
+ 	END_FIXUP
+ };
+ 
+diff --git a/drivers/mmc/core/sdio_ops.c b/drivers/mmc/core/sdio_ops.c
+index 62508b4..7a1a3e7 100644
+--- a/drivers/mmc/core/sdio_ops.c
++++ b/drivers/mmc/core/sdio_ops.c
+@@ -86,7 +86,11 @@ static int mmc_io_rw_direct_host(struct mmc_host *host, int write, unsigned fn,
+ 	cmd.arg |= in;
+ 	cmd.flags = MMC_RSP_SPI_R5 | MMC_RSP_R5 | MMC_CMD_AC;
+ 
+-	err = mmc_wait_for_cmd(host, &cmd, 0);
++	if (host->card &&
++		(host->card->quirks & MMC_QUIRK_NO_TUNING_IN_SLEEP))
++		err = mmc_wait_for_cmd(host, &cmd, 1);
++	else
++		err = mmc_wait_for_cmd(host, &cmd, 0);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index 81b38b5..d59a70e 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -28,6 +28,7 @@
+ #include <linux/mmc/mmc.h>
+ #include <linux/mmc/host.h>
+ #include <linux/mmc/card.h>
++#include <linux/mmc/sdio.h>
+ #include <linux/mmc/slot-gpio.h>
+ 
+ #include "sdhci.h"
+@@ -1405,6 +1406,11 @@ static void sdhci_request(struct mmc_host *mmc, struct mmc_request *mrq)
+ 		    !(present_state & (SDHCI_DOING_WRITE | SDHCI_DOING_READ)) &&
+ 		    (present_state & SDHCI_DATA_0_LVL_MASK)) {
+ 			if (mmc->card) {
++				if (mmc_card_sdio(mmc->card) &&
++					(mmc->card->quirks & MMC_QUIRK_NO_TUNING_IN_SLEEP) &&
++					(mrq->cmd->opcode == SD_IO_RW_DIRECT) &&
++					(mrq->cmd->retries > 0))
++					goto end_tuning;
+ 				if ((mmc->card->ext_csd.part_config & 0x07) ==
+ 					EXT_CSD_PART_CONFIG_ACC_RPMB)
+ 					goto end_tuning;
+diff --git a/include/linux/mmc/card.h b/include/linux/mmc/card.h
+index df04fb4..2b8f5fe 100644
+--- a/include/linux/mmc/card.h
++++ b/include/linux/mmc/card.h
+@@ -274,6 +274,7 @@ struct mmc_card {
+ #define MMC_QUIRK_LONG_READ_TIME (1<<9)		/* Data read time > CSD says */
+ #define MMC_QUIRK_SEC_ERASE_TRIM_BROKEN (1<<10)	/* Skip secure for erase/trim */
+ #define MMC_QUIRK_BROKEN_IRQ_POLLING	(1<<11)	/* Polling SDIO_CCCR_INTx could create a fake interrupt */
++#define MMC_QUIRK_NO_TUNING_IN_SLEEP	(1<<12) /* no tuning before sdio card is wakeup */
+ 
+ 	unsigned int		erase_size;	/* erase size in sectors */
+  	unsigned int		erase_shift;	/* if erase unit is power 2 */
+-- 
+1.9.1
+

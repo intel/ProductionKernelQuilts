@@ -1,0 +1,109 @@
+From dfaf4de4fa90fa5e422b4e50d1a18f94e3b86b6b Mon Sep 17 00:00:00 2001
+From: Zhang Yanmin <yanmin.zhang@intel.com>
+Date: Thu, 21 Jan 2016 16:45:46 +0800
+Subject: [PATCH 6/6] sst: change the condition about if calling
+ sst_pm_runtime_put
+
+We hit power useup issue at s3 testing.
+Log shows sst suspend always fails as pm_usage_count > 0.
+
+Basically, sst_close_pcm_stream=>sst_free_stream=>sst_wait_timeout
+returns -1, then sst_close_pcm_stream wouldn't call sst_pm_runtime_put.
+
+Basded on the current comments in sst_close_pcm_stream,
+sst_open_pcm_stream might fail and return a minus str_id. At this case,
+sst_open_pcm_stream already calls sst_pm_runtime_put.
+sst_close_pcm_stream needn't call it again. However,
+sst_close_pcm_stream=>sst_free_stream return -EINVAL to mean this case.
+Following checking need use -EINVAL instead of -EBUSY.
+
+The patch fixes it by:
+1) reset retval if sst_wait_timeout fails in sst_free_stream;
+2) Check -EINVAL instead if -EBUSY.
+
+Change-Id: Icce97fad5c2b347f32dc2d9493566931495447e1
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-20643
+Signed-off-by: Zhang Yanmin <yanmin.zhang@intel.com>
+Reviewed-on: https://android.intel.com:443/469727
+---
+ sound/soc/intel/sst/sst_drv_interface.c | 38 +++++++++++++++++++--------------
+ sound/soc/intel/sst/sst_stream.c        |  5 +++++
+ 2 files changed, 27 insertions(+), 16 deletions(-)
+
+diff --git a/sound/soc/intel/sst/sst_drv_interface.c b/sound/soc/intel/sst/sst_drv_interface.c
+index 1e3c285..2684d95 100644
+--- a/sound/soc/intel/sst/sst_drv_interface.c
++++ b/sound/soc/intel/sst/sst_drv_interface.c
+@@ -535,15 +535,18 @@ put:
+ 	stream->compr_cb_param = NULL;
+ 	stream->compr_cb = NULL;
+ 
+-	/* The free_stream will return a error if there is no stream to free,
+-	(i.e. the alloc failure case). And in this case the open does a put in
+-	the error scenario, so skip in this case.
+-		In the close we need to handle put in the success scenario and
+-	the timeout error(EBUSY) scenario. */
+-	if (!retval || (retval == -EBUSY))
+-		sst_pm_runtime_put(sst_drv_ctx);
++	/*
++	 * The free_stream will return error -EINVAL if there is
++	 * no stream to free, (i.e. the alloc failure case). And
++	 * in this case the open does a put in the error scenario,
++	 * so skip in this case. In the close we need to handle
++	 * put in the success scenario and the timeout error(EBUSY)
++	 * scenario.
++	 */
++	if (retval == -EINVAL)
++		WARN(1, "%s: free stream returned err %d\n", __func__, retval);
+ 	else
+-		pr_err("%s: free stream returned err %d\n", __func__, retval);
++		sst_pm_runtime_put(sst_drv_ctx);
+ 
+ 	pr_debug("%s: End\n", __func__);
+ 	return retval;
+@@ -789,15 +792,18 @@ put:
+ 	stream->period_elapsed = NULL;
+ 	sst_drv_ctx->stream_cnt--;
+ 
+-	/* The free_stream will return a error if there is no stream to free,
+-	(i.e. the alloc failure case). And in this case the open does a put in
+-	the error scenario, so skip in this case.
+-		In the close we need to handle put in the success scenario and
+-	the timeout error(EBUSY) scenario. */
+-	if (!retval || (retval == -EBUSY))
+-		sst_pm_runtime_put(sst_drv_ctx);
++	/*
++	 * The free_stream will return error -EINVAL if there is
++	 * no stream to free, (i.e. the alloc failure case). And
++	 * in this case the open does a put in the error scenario,
++	 * so skip in this case. In the close we need to handle
++	 * put in the success scenario and the timeout error(EBUSY)
++	 * scenario.
++	 */
++	if (retval == -EINVAL)
++		WARN(1, "%s: free stream returned err %d\n", __func__, retval);
+ 	else
+-		pr_err("%s: free stream returned err %d\n", __func__, retval);
++		sst_pm_runtime_put(sst_drv_ctx);
+ 
+ 	pr_debug("%s: Exit\n", __func__);
+ 	return 0;
+diff --git a/sound/soc/intel/sst/sst_stream.c b/sound/soc/intel/sst/sst_stream.c
+index d194ddb..0836703 100644
+--- a/sound/soc/intel/sst/sst_stream.c
++++ b/sound/soc/intel/sst/sst_stream.c
+@@ -705,6 +705,11 @@ int sst_free_stream(int str_id)
+ 		ops->post_message(&sst_drv_ctx->ipc_post_msg_wq);
+ 		retval = sst_wait_timeout(sst_drv_ctx, block);
+ 		pr_debug("sst: wait for free returned %d\n", retval);
++		/*
++		 * Reset to 0 as sst_free_stream might block
++		 * the calling of _put when closing the stream
++		 */
++		retval = 0;
+ 		mutex_lock(&sst_drv_ctx->stream_lock);
+ 		sst_clean_stream(str_info);
+ 		mutex_unlock(&sst_drv_ctx->stream_lock);
+-- 
+1.9.1
+

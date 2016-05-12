@@ -1,0 +1,104 @@
+From d30d577143ea804e2436d33c0f64bbec6e8524c0 Mon Sep 17 00:00:00 2001
+From: San Mehat <san@google.com>
+Date: Thu, 30 Jul 2009 08:21:19 -0700
+Subject: [PATCH 044/634] mmc: mmcblk: Add support for deferred SD bus resume
+
+Signed-off-by: San Mehat <san@google.com>
+
+mmc: card: Add MMC_BLOCK_DEFERRED_RESUME option to Kconfig
+
+Signed-off-by: San Mehat <san@google.com>
+---
+ drivers/mmc/card/Kconfig |  9 +++++++++
+ drivers/mmc/card/block.c | 16 ++++++++++++++++
+ drivers/mmc/core/core.c  |  6 ++++++
+ 3 files changed, 31 insertions(+)
+
+diff --git a/drivers/mmc/card/Kconfig b/drivers/mmc/card/Kconfig
+index 5562308..79d8212 100644
+--- a/drivers/mmc/card/Kconfig
++++ b/drivers/mmc/card/Kconfig
+@@ -50,6 +50,15 @@ config MMC_BLOCK_BOUNCE
+ 
+ 	  If unsure, say Y here.
+ 
++config MMC_BLOCK_DEFERRED_RESUME
++	bool "Deferr MMC layer resume until I/O is requested"
++	depends on MMC_BLOCK
++	default n
++	help
++	  Say Y here to enable deferred MMC resume until I/O
++	  is requested. This will reduce overall resume latency and
++	  save power when theres an SD card inserted but not being used.
++
+ config SDIO_UART
+ 	tristate "SDIO UART/GPS class support"
+ 	depends on TTY
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index 1842ff0..d6f2534 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -1964,6 +1964,9 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+ 	return 0;
+ }
+ 
++static int
++mmc_blk_set_blksize(struct mmc_blk_data *md, struct mmc_card *card);
++
+ static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+ {
+ 	int ret;
+@@ -1973,6 +1976,13 @@ static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+ 	unsigned long flags;
+ 	unsigned int cmd_flags = req ? req->cmd_flags : 0;
+ 
++#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
++	if (mmc_bus_needs_resume(card->host)) {
++		mmc_resume_bus(card->host);
++		mmc_blk_set_blksize(md, card);
++	}
++#endif
++
+ 	if (req && !mq->mqrq_prev->req)
+ 		/* claim host only for the first request */
+ 		mmc_get_card(card);
+@@ -2412,6 +2422,9 @@ static int mmc_blk_probe(struct mmc_card *card)
+ 	mmc_set_drvdata(card, md);
+ 	mmc_fixup_device(card, blk_fixups);
+ 
++#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
++	mmc_set_bus_resume_policy(card->host, 1);
++#endif
+ 	if (mmc_add_disk(md))
+ 		goto out;
+ 
+@@ -2454,6 +2467,9 @@ static void mmc_blk_remove(struct mmc_card *card)
+ 	pm_runtime_put_noidle(&card->dev);
+ 	mmc_blk_remove_req(md);
+ 	mmc_set_drvdata(card, NULL);
++#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
++	mmc_set_bus_resume_policy(card->host, 0);
++#endif
+ }
+ 
+ static int _mmc_blk_suspend(struct mmc_card *card)
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 4ba43e0..1664d78 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -2447,6 +2447,12 @@ void mmc_rescan(struct work_struct *work)
+ 
+ 	host->detect_change = 0;
+ 
++	/* If the card was removed the bus will be marked
++	 * as dead - extend the wakelock so userspace
++	 * can respond */
++	if (host->bus_dead)
++		extend_wakelock = 1;
++
+ 	/*
+ 	 * Let mmc_bus_put() free the bus/bus_ops if we've found that
+ 	 * the card is no longer present.
+-- 
+1.9.1
+

@@ -1,0 +1,158 @@
+From fba5e3ddd0e40a8d486d80c467b02f35320baf24 Mon Sep 17 00:00:00 2001
+From: Srinidhi Kasagar <srinidhi.kasagar@intel.com>
+Date: Fri, 14 Nov 2014 20:30:33 +0530
+Subject: [PATCH 1/1] PM QoS: Add CPU frequency min as PM QoS params
+
+This adds minimum CPU frequency as PM QoS parameter.
+
+Inspired from the patch
+http://lists.linux-foundation.org/pipermail/linux-pm/2012-January/033502.html
+
+Change-Id: If4ce0528eefb8aef7c13072a066078cf98bd6fc2
+Signed-off-by: Srinidhi Kasagar <srinidhi.kasagar@intel.com>
+---
+ drivers/cpufreq/cpufreq.c | 36 ++++++++++++++++++++++++++++++++++++
+ include/linux/pm_qos.h    |  2 ++
+ kernel/power/qos.c        | 15 ++++++++++++++-
+ 3 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 8a8f09e..f500c00 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -25,6 +25,7 @@
+ #include <linux/kernel_stat.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/pm_qos.h>
+ #include <linux/slab.h>
+ #include <linux/syscore_ops.h>
+ #include <linux/tick.h>
+@@ -2030,10 +2031,15 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
+ 				struct cpufreq_policy *new_policy)
+ {
+ 	int ret = 0, failed = 1;
++	unsigned int pmin = new_policy->min;
++	unsigned int qmin = pm_qos_request(PM_QOS_CPU_FREQ_MIN);
+ 
+ 	pr_debug("setting new policy for CPU %u: %u - %u kHz\n", new_policy->cpu,
+ 		new_policy->min, new_policy->max);
+ 
++	/* clamp the new policy to PM QoS limits */
++	new_policy->min = max(pmin, qmin);
++
+ 	memcpy(&new_policy->cpuinfo, &policy->cpuinfo, sizeof(policy->cpuinfo));
+ 
+ 	if (new_policy->min > policy->max || new_policy->max < policy->min) {
+@@ -2126,6 +2132,9 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
+ 	}
+ 
+ error_out:
++	/* restore the limits that the policy requested */
++	new_policy->min = pmin;
++
+ 	return ret;
+ }
+ 
+@@ -2221,6 +2230,27 @@ static struct notifier_block __refdata cpufreq_cpu_notifier = {
+ 	.notifier_call = cpufreq_cpu_callback,
+ };
+ 
++static int cpu_freq_notify(struct notifier_block *b, unsigned long l, void *v)
++{
++	int cpu;
++
++	for_each_online_cpu(cpu) {
++		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
++		if (policy) {
++			cpufreq_update_policy(policy->cpu);
++			cpufreq_cpu_put(policy);
++		}
++	}
++
++	pr_debug("%s: Min cpufreq updated with the value %lu\n", __func__, l);
++
++	return NOTIFY_OK;
++}
++
++static struct notifier_block __refdata min_freq_notifier = {
++	.notifier_call = cpu_freq_notify,
++};
++
+ /*********************************************************************
+  *               BOOST						     *
+  *********************************************************************/
+@@ -2421,6 +2451,8 @@ EXPORT_SYMBOL_GPL(cpufreq_unregister_driver);
+ 
+ static int __init cpufreq_core_init(void)
+ {
++	int rc;
++
+ 	if (cpufreq_disabled())
+ 		return -ENODEV;
+ 
+@@ -2428,6 +2460,10 @@ static int __init cpufreq_core_init(void)
+ 	BUG_ON(!cpufreq_global_kobject);
+ 	register_syscore_ops(&cpufreq_syscore_ops);
+ 
++	rc = pm_qos_add_notifier(PM_QOS_CPU_FREQ_MIN,
++			&min_freq_notifier);
++	BUG_ON(rc);
++
+ 	return 0;
+ }
+ core_initcall(cpufreq_core_init);
+diff --git a/include/linux/pm_qos.h b/include/linux/pm_qos.h
+index 5a95013..8770ae4 100644
+--- a/include/linux/pm_qos.h
++++ b/include/linux/pm_qos.h
+@@ -15,6 +15,7 @@ enum {
+ 	PM_QOS_CPU_DMA_LATENCY,
+ 	PM_QOS_NETWORK_LATENCY,
+ 	PM_QOS_NETWORK_THROUGHPUT,
++	PM_QOS_CPU_FREQ_MIN,
+ 
+ 	/* insert new class ID */
+ 	PM_QOS_NUM_CLASSES,
+@@ -32,6 +33,7 @@ enum pm_qos_flags_status {
+ #define PM_QOS_CPU_DMA_LAT_DEFAULT_VALUE	(2000 * USEC_PER_SEC)
+ #define PM_QOS_NETWORK_LAT_DEFAULT_VALUE	(2000 * USEC_PER_SEC)
+ #define PM_QOS_NETWORK_THROUGHPUT_DEFAULT_VALUE	0
++#define PM_QOS_CPU_FREQ_MIN_DEFAULT_VALUE	0
+ #define PM_QOS_DEV_LAT_DEFAULT_VALUE		0
+ 
+ #define PM_QOS_FLAG_NO_POWER_OFF	(1 << 0)
+diff --git a/kernel/power/qos.c b/kernel/power/qos.c
+index 8dff9b4..1c6fa72 100644
+--- a/kernel/power/qos.c
++++ b/kernel/power/qos.c
+@@ -101,12 +101,25 @@ static struct pm_qos_object network_throughput_pm_qos = {
+ 	.name = "network_throughput",
+ };
+ 
++static BLOCKING_NOTIFIER_HEAD(cpu_freq_min_notifier);
++static struct pm_qos_constraints cpu_freq_min_constraints = {
++	.list = PLIST_HEAD_INIT(cpu_freq_min_constraints.list),
++	.target_value = PM_QOS_CPU_FREQ_MIN_DEFAULT_VALUE,
++	.default_value = PM_QOS_CPU_FREQ_MIN_DEFAULT_VALUE,
++	.type = PM_QOS_MAX,
++	.notifiers = &cpu_freq_min_notifier,
++};
++static struct pm_qos_object cpu_freq_min_pm_qos = {
++	.constraints = &cpu_freq_min_constraints,
++	.name = "cpu_freq_min",
++};
+ 
+ static struct pm_qos_object *pm_qos_array[] = {
+ 	&null_pm_qos,
+ 	&cpu_dma_pm_qos,
+ 	&network_lat_pm_qos,
+-	&network_throughput_pm_qos
++	&network_throughput_pm_qos,
++	&cpu_freq_min_pm_qos
+ };
+ 
+ static ssize_t pm_qos_power_write(struct file *filp, const char __user *buf,
+-- 
+1.9.1
+

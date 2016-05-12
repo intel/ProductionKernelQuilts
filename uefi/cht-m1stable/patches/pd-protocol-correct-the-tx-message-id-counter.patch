@@ -1,0 +1,111 @@
+From d234da8ce79f4088b2b2a33f4674763faff9f81c Mon Sep 17 00:00:00 2001
+From: "R, Kannappan" <r.kannappan@intel.com>
+Date: Tue, 24 Nov 2015 11:43:20 +0530
+Subject: [PATCH 06/12] pd/protocol: correct the tx message id counter
+
+transmit message id increments randomly and fails
+certification. increment tx message id only on
+goodcrc.
+
+Change-Id: If2cab5f0f1c494255a1a4b7f7b6818aa327734d1
+Signed-off-by: R, Kannappan <r.kannappan@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-10789
+Reviewed-on: https://android.intel.com:443/439718
+(cherry picked from commit 42cd6116065d4eb205fb1ab2374b92656320929b)
+Reviewed-on: https://android.intel.com:443/443323
+---
+ drivers/usb/typec/pd/policy_engine.c |  4 ++++
+ drivers/usb/typec/pd/protocol.c      | 20 +++++++-------------
+ drivers/usb/typec/pd/protocol.h      |  2 +-
+ 3 files changed, 12 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 82f6545..861273d 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -772,6 +772,10 @@ static void pe_handle_dpm_event(struct policy_engine *pe,
+ 					__func__);
+ 			 break;
+ 		}
++		/* reset the protocol layer */
++		pe_send_packet(pe, NULL, 0,
++				PD_CMD_PROTOCOL_RESET, PE_EVT_SEND_PROTOCOL_RESET);
++
+ 		pe_set_power_role(pe, POWER_ROLE_NONE);
+ 		pe_set_data_role(pe, DATA_ROLE_NONE);
+ 		/* Stop all active policies */
+diff --git a/drivers/usb/typec/pd/protocol.c b/drivers/usb/typec/pd/protocol.c
+index 585f410..d567663 100644
+--- a/drivers/usb/typec/pd/protocol.c
++++ b/drivers/usb/typec/pd/protocol.c
+@@ -204,6 +204,7 @@ static int pd_prot_rcv_pkt_from_policy(struct pd_prot *prot, u8 msg_type,
+ 		return prot_rx_reset(prot);
+ 	} else if (msg_type == PD_CMD_PROTOCOL_RESET) {
+ 		pd_prot_flush_fifo(prot, FIFO_TYPE_RX);
++		pd_reset_counters(prot);
+ 		prot_clear_rx_msg_list(prot);
+ 		return pd_tx_fsm_state(prot, PROT_TX_PHY_LAYER_RESET);
+ 	}
+@@ -239,17 +240,6 @@ int prot_rx_send_goodcrc(struct pd_prot *pd, u8 msg_id)
+ 	return 0;
+ }
+ 
+-static void pd_tx_discard_msg(struct pd_prot *pd)
+-{
+-	mutex_lock(&pd->tx_lock);
+-	pd->event = PROT_EVENT_DISCARD;
+-	pd->tx_msg_id = pd->tx_msg_id + 1;
+-	if (pd->tx_msg_id >= PD_MAX_MSG_ID)
+-		pd->tx_msg_id = 0;
+-	mutex_unlock(&pd->tx_lock);
+-	pd_tx_fsm_state(pd, PROT_TX_PHY_LAYER_RESET);
+-}
+-
+ static int prot_fwd_ctrlmsg_to_pe(struct pd_prot *pd, struct prot_msg *msg)
+ {
+ 	enum pe_event event = PE_EVT_RCVD_NONE;
+@@ -431,7 +421,7 @@ static void pd_prot_phy_rcv(struct pd_prot *pd)
+ 		else if (msg_type == PD_CTRL_MSG_GOODCRC) {
+ 			send_good_crc = 0;
+ 			if (msg_id == pd->tx_msg_id) {
+-				pd->tx_msg_id = (msg_id + 1) % PD_MAX_MSG_ID;
++				pd->tx_msg_id = (msg_id + 1) & PD_MAX_MSG_ID;
+ 				pd_prot_add_msg_rx_list(pd, &rcv_buf, len);
+ 			} else
+ 				dev_warn(pd->phy->dev, "GCRC msg id not matching\n");
+@@ -449,7 +439,6 @@ static void pd_prot_phy_rcv(struct pd_prot *pd)
+ 		 * reveived messages.
+ 		 */
+ 		if (pd->rx_msg_id != msg_id) {
+-			pd_tx_discard_msg(pd);
+ 			pd->rx_msg_id = msg_id;
+ 			pd_prot_add_msg_rx_list(pd, &rcv_buf, len);
+ 		} else {
+@@ -470,6 +459,11 @@ static void pd_notify_protocol(struct typec_phy *phy, unsigned long event)
+ 	case PROT_PHY_EVENT_TX_SENT:
+ 		mutex_lock(&pd->tx_lock);
+ 		pd->event = PROT_EVENT_TX_COMPLETED;
++		/*
++		 * msg sent and received good crc.
++		 * flush the tx fifo
++		 */
++		pd_prot_flush_fifo(pd, FIFO_TYPE_TX);
+ 		mutex_unlock(&pd->tx_lock);
+ 		complete(&pd->tx_complete);
+ 		break;
+diff --git a/drivers/usb/typec/pd/protocol.h b/drivers/usb/typec/pd/protocol.h
+index dca52dc..e09a5b2 100644
+--- a/drivers/usb/typec/pd/protocol.h
++++ b/drivers/usb/typec/pd/protocol.h
+@@ -9,7 +9,7 @@
+ #include "message.h"
+ #include "policy_engine.h"
+ 
+-#define PD_MAX_MSG_ID	8
++#define PD_MAX_MSG_ID	7
+ 
+ enum {
+ 	PROT_EVENT_NONE,
+-- 
+1.9.1
+

@@ -1,0 +1,120 @@
+From 5393c71b4b77caa285e60652239b784e74c30e36 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 17 Jan 2014 14:15:44 -0800
+Subject: [PATCH 08/12] usb/xhci: Change how we indicate a host supports Link
+ PM.
+
+The xHCI driver currently uses a USB core internal field,
+udev->lpm_capable, to indicate the xHCI driver knows how to calculate
+the LPM timeout values.  If this value is set for the host controller
+udev, it means Link PM can be enabled for child devices under that host.
+
+Change the code so the xHCI driver isn't mucking with USB core internal
+fields.  Instead, indicate the xHCI driver doesn't support Link PM on
+this host by clearing the U1 and U2 exit latencies in the roothub
+SuperSpeed Extended Capabilities BOS descriptor.
+
+The code to check for the roothub setting U1 and U2 exit latencies to
+zero will also disable LPM for external devices that do that same.  This
+was already effectively done with commit
+ae8963adb4ad8c5f2a89ca1d99fb7bb721e7599f "usb: Don't enable LPM if the
+exit latency is zero."  Leave that code in place, so that if a device
+sets one exit latency value to zero, but the other is set to a valid
+value, LPM is only enabled for the U1 or U2 state that had the valid
+value.  This is the same behavior the code had before.
+
+Also, change messages about missing Link PM information from warning
+level to info level.  Only print a warning about the first device that
+doesn't support LPM, to avoid log spam.  Further, cleanup some
+unnecessary line breaks to help people to grep for the error messages.
+
+Change-Id: I7fa61637f8295ffb696062cec4bb5ecbf8b80e57
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-8512
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Konrad Leszczynski <konrad.leszczynski@intel.com>
+Reviewed-on: https://android.intel.com:443/441298
+---
+ drivers/usb/core/hub.c      | 24 ++++++++++++++++--------
+ drivers/usb/host/xhci-hub.c |  8 +++++---
+ drivers/usb/host/xhci-pci.c |  6 ------
+ 3 files changed, 21 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index b5bb14a..5d018e4 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -137,19 +137,27 @@ static int usb_device_supports_lpm(struct usb_device *udev)
+ 		return 0;
+ 	}
+ 
+-	/* All USB 3.0 must support LPM, but we need their max exit latency
+-	 * information from the SuperSpeed Extended Capabilities BOS descriptor.
++	/*
++	 * According to the USB 3.0 spec, all USB 3.0 devices must support LPM.
++	 * However, there are some that don't, and they set the U1/U2 exit
++	 * latencies to zero.
+ 	 */
+ 	if (!udev->bos->ss_cap) {
+-		dev_warn(&udev->dev, "No LPM exit latency info found.  "
+-				"Power management will be impacted.\n");
++		dev_info(&udev->dev, "No LPM exit latency info found, disabling LPM.\n");
+ 		return 0;
+ 	}
+-	if (udev->parent->lpm_capable)
+-		return 1;
+ 
+-	dev_warn(&udev->dev, "Parent hub missing LPM exit latency info.  "
+-			"Power management will be impacted.\n");
++	if (udev->bos->ss_cap->bU1devExitLat == 0 &&
++			udev->bos->ss_cap->bU2DevExitLat == 0) {
++		if (udev->parent)
++			dev_info(&udev->dev, "LPM exit latency is zeroed, disabling LPM.\n");
++		else
++			dev_info(&udev->dev, "We don't know the algorithms for LPM for this host, disabling LPM.\n");
++		return 0;
++	}
++
++	if (!udev->parent || udev->parent->lpm_capable)
++		return 1;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index 4514644..bcbcf83 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -752,9 +752,11 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 		/* Set the U1 and U2 exit latencies. */
+ 		memcpy(buf, &usb_bos_descriptor,
+ 				USB_DT_BOS_SIZE + USB_DT_USB_SS_CAP_SIZE);
+-		temp = readl(&xhci->cap_regs->hcs_params3);
+-		buf[12] = HCS_U1_LATENCY(temp);
+-		put_unaligned_le16(HCS_U2_LATENCY(temp), &buf[13]);
++		if ((xhci->quirks & XHCI_LPM_SUPPORT)) {
++			temp = readl(&xhci->cap_regs->hcs_params3);
++			buf[12] = HCS_U1_LATENCY(temp);
++			put_unaligned_le16(HCS_U2_LATENCY(temp), &buf[13]);
++		}
+ 
+ 		/* Indicate whether the host has LTM support. */
+ 		temp = readl(&xhci->cap_regs->hcc_params);
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index 28958e1..dcd2a8c 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -347,12 +347,6 @@ static int xhci_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ 		goto put_usb3_hcd;
+ 	/* Roothub already marked as USB 3.0 speed */
+ 
+-	/* We know the LPM timeout algorithms for this host, let the USB core
+-	 * enable and disable LPM for devices under the USB 3.0 roothub.
+-	 */
+-	if (xhci->quirks & XHCI_LPM_SUPPORT)
+-		hcd_to_bus(xhci->shared_hcd)->root_hub->lpm_capable = 1;
+-
+ 	if (device_create_file(&dev->dev, &dev_attr_ssic_port_enable))
+ 		dev_err(&dev->dev, "can't create ssic_port_enable attribute\n");
+ 
+-- 
+1.9.1
+

@@ -1,0 +1,416 @@
+From 0d4e240e13bc3f2c6d670b0011ec631774073689 Mon Sep 17 00:00:00 2001
+Message-Id: <0d4e240e13bc3f2c6d670b0011ec631774073689.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Tue, 19 Nov 2013 19:02:41 +0530
+Subject: [PATCH 110/312] FOR_UPSTREAM [VPG]: drm/i915/vlv: WA for Turbo and
+ RC6 to work together
+
+With RC6 enabled, BYT has an HW issue in determining the right
+Gfx busyness.
+WA for Turbo + RC6: Use SW based Gfx busy-ness detection to decide
+on increasing/decreasing the freq. This logic will monitor C0
+counters of render/media power-wells over EI period and takes
+necessary action based on these values
+
+Issue: VIZ-3390
+Change-Id: Iee680cdb210db0198e288443259f048716fcea8d
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Reviewed-on: https://android.intel.com/164316
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h |   18 +++++
+ drivers/gpu/drm/i915/i915_irq.c |  144 +++++++++++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/i915_reg.h |   15 ++++
+ drivers/gpu/drm/i915/intel_pm.c |   37 +++++++---
+ 4 files changed, 200 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 6e499f8..9f3b835 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -692,6 +692,12 @@ struct intel_gmbus {
+ 	struct drm_i915_private *dev_priv;
+ };
+ 
++struct intel_rps_ei_calc {
++	u32 cz_ts_ei;
++	u32 render_ei_c0;
++	u32 media_ei_c0;
++};
++
+ struct i915_suspend_saved_registers {
+ 	u8 saveLBB;
+ 	u32 saveDSPACNTR;
+@@ -935,6 +941,11 @@ struct intel_gen6_power_mgmt {
+ 	u8 rp1_freq;		/* "less than" RP0 power/freqency */
+ 	u8 rp0_freq;		/* Non-overclocked max frequency. */
+ 
++	u32 cz_freq;
++	u32 ei_interrupt_count;
++
++	bool use_RC0_residency_for_turbo;
++
+ 	int last_adj;
+ 	enum { LOW_POWER, BETWEEN, HIGH_POWER } power;
+ 
+@@ -1588,6 +1599,13 @@ struct drm_i915_private {
+ 	/* gen6+ rps state */
+ 	struct intel_gen6_power_mgmt rps;
+ 
++	/* rps wa up ei calculation */
++	struct intel_rps_ei_calc rps_up_ei;
++
++	/* rps wa down ei calculation */
++	struct intel_rps_ei_calc rps_down_ei;
++
++
+ 	/* ilk-only ips/rps state. Everything in here is protected by the global
+ 	 * mchdev_lock in intel_pm.c */
+ 	struct intel_ilk_power_mgmt ips;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index c285afe..af70916 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1227,6 +1227,118 @@ static void notify_ring(struct drm_device *dev,
+ 	i915_queue_hangcheck(dev);
+ }
+ 
++static u32 vlv_c0_residency(struct drm_i915_private *dev_priv,
++				struct  intel_rps_ei_calc *rps_ei)
++{
++	u32 cz_ts, cz_freq_khz;
++	u32 render_count, media_count;
++	u32 elapsed_render, elapsed_media, elapsed_time;
++	u32 residency = 0;
++
++	cz_ts = vlv_punit_read(dev_priv, PUNIT_REG_CZ_TIMESTAMP);
++	cz_freq_khz = DIV_ROUND_CLOSEST(dev_priv->mem_freq * 1000, 4);
++
++	render_count = I915_READ(VLV_RENDER_C0_COUNT_REG);
++	media_count = I915_READ(VLV_MEDIA_C0_COUNT_REG);
++
++	if (rps_ei->cz_ts_ei == 0) {
++		rps_ei->cz_ts_ei = cz_ts;
++		rps_ei->render_ei_c0 = render_count;
++		rps_ei->media_ei_c0 = media_count;
++
++		return dev_priv->rps.cur_freq;
++	}
++
++	elapsed_time = cz_ts - rps_ei->cz_ts_ei;
++	rps_ei->cz_ts_ei = cz_ts;
++
++	elapsed_render = render_count - rps_ei->render_ei_c0;
++	rps_ei->render_ei_c0 = render_count;
++
++	elapsed_media = media_count - rps_ei->media_ei_c0;
++	rps_ei->media_ei_c0 = media_count;
++
++	/* Convert all the counters into common unit of milli sec */
++	elapsed_time /= VLV_CZ_CLOCK_TO_MILLI_SEC;
++	elapsed_render /=  cz_freq_khz;
++	elapsed_media /= cz_freq_khz;
++
++	/* Calculate overall C0 residency percentage only
++	* if elapsed time is non zero
++	*/
++	if (elapsed_time) {
++		residency =
++			((max(elapsed_render, elapsed_media) * 100)
++				/ elapsed_time);
++	}
++
++	return residency;
++}
++
++/**
++ * vlv_calc_delay_from_C0_counters - Increase/Decrease freq based on GPU
++ * busy-ness calculated from C0 counters of render & media power wells
++ * @dev_priv: DRM device private
++ *
++ */
++static u32 vlv_calc_delay_from_C0_counters(struct drm_i915_private *dev_priv)
++{
++	u32 residency_C0_up = 0, residency_C0_down = 0;
++	u8 new_delay;
++
++	dev_priv->rps.ei_interrupt_count++;
++
++	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
++
++	if (dev_priv->rps_up_ei.cz_ts_ei == 0) {
++		vlv_c0_residency(dev_priv, &dev_priv->rps_up_ei);
++		vlv_c0_residency(dev_priv, &dev_priv->rps_down_ei);
++		return dev_priv->rps.cur_freq;
++	}
++
++
++	/* To down throttle, C0 residency should be less than down threshold
++	* for continous EI intervals. So calculate down EI counters
++	* once in VLV_INT_COUNT_FOR_DOWN_EI
++	*/
++	if (dev_priv->rps.ei_interrupt_count == VLV_INT_COUNT_FOR_DOWN_EI) {
++
++		dev_priv->rps.ei_interrupt_count = 0;
++
++		residency_C0_down =  vlv_c0_residency(dev_priv,
++						&dev_priv->rps_down_ei);
++	} else {
++		residency_C0_up =  vlv_c0_residency(dev_priv,
++						&dev_priv->rps_up_ei);
++	}
++
++	new_delay = dev_priv->rps.cur_freq;
++
++	/* C0 residency is greater than UP threshold. Increase Frequency */
++	if (residency_C0_up >= VLV_RP_UP_EI_THRESHOLD) {
++
++		if (dev_priv->rps.cur_freq < dev_priv->rps.max_freq_softlimit)
++			new_delay = dev_priv->rps.cur_freq + 1;
++
++		/*
++		 * For better performance, jump directly
++		 * to RPe if we're below it.
++		 */
++		if (new_delay < dev_priv->rps.efficient_freq)
++			new_delay = dev_priv->rps.efficient_freq;
++
++	} else if (!dev_priv->rps.ei_interrupt_count &&
++			(residency_C0_down < VLV_RP_DOWN_EI_THRESHOLD)) {
++		/* This means, C0 residency is less than down threshold over
++		* a period of VLV_INT_COUNT_FOR_DOWN_EI. So, reduce the freq
++		*/
++		if (dev_priv->rps.cur_freq > dev_priv->rps.min_freq_softlimit)
++			new_delay = dev_priv->rps.cur_freq - 1;
++	}
++
++	return new_delay;
++}
++
+ static void gen6_pm_rps_work(struct work_struct *work)
+ {
+ 	struct drm_i915_private *dev_priv =
+@@ -1241,14 +1353,17 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 		bdw_enable_pm_irq(dev_priv, dev_priv->pm_rps_events);
+ 	else {
+ 		/* Make sure not to corrupt PMIMR state used by ringbuffer */
+-		snb_enable_pm_irq(dev_priv, dev_priv->pm_rps_events);
++		if (dev_priv->rps.use_RC0_residency_for_turbo)
++			snb_enable_pm_irq(dev_priv, GEN6_PM_RP_UP_EI_EXPIRED);
++		else
++			snb_enable_pm_irq(dev_priv, dev_priv->pm_rps_events);
+ 	}
+ 	spin_unlock_irq(&dev_priv->irq_lock);
+ 
+ 	/* Make sure we didn't queue anything we're not going to process. */
+-	WARN_ON(pm_iir & ~dev_priv->pm_rps_events);
++	WARN_ON(pm_iir & ~(dev_priv->pm_rps_events | GEN6_PM_RP_UP_EI_EXPIRED));
+ 
+-	if ((pm_iir & dev_priv->pm_rps_events) == 0)
++	if ((pm_iir & (dev_priv->pm_rps_events | GEN6_PM_RP_UP_EI_EXPIRED)) == 0)
+ 		return;
+ 
+ 	mutex_lock(&dev_priv->rps.hw_lock);
+@@ -1279,6 +1394,8 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 		else
+ 			new_delay = dev_priv->rps.min_freq_softlimit;
+ 		adj = 0;
++	} else if (pm_iir & GEN6_PM_RP_UP_EI_EXPIRED) {
++		new_delay = vlv_calc_delay_from_C0_counters(dev_priv);
+ 	} else if (pm_iir & GEN6_PM_RP_DOWN_THRESHOLD) {
+ 		if (adj < 0)
+ 			adj *= 2;
+@@ -1722,6 +1839,16 @@ static void gen6_rps_irq_handler(struct drm_i915_private *dev_priv, u32 pm_iir)
+ 		queue_work(dev_priv->wq, &dev_priv->rps.work);
+ 	}
+ 
++	if (pm_iir & GEN6_PM_RP_UP_EI_EXPIRED) {
++		spin_lock(&dev_priv->irq_lock);
++		dev_priv->rps.pm_iir |= pm_iir & GEN6_PM_RP_UP_EI_EXPIRED;
++		snb_disable_pm_irq(dev_priv, pm_iir & GEN6_PM_RP_UP_EI_EXPIRED);
++		spin_unlock(&dev_priv->irq_lock);
++		DRM_DEBUG_DRIVER("\nQueueing RPS Work - RC6 WA Turbo");
++
++		queue_work(dev_priv->wq, &dev_priv->rps.work);
++	}
++
+ 	if (HAS_VEBOX(dev_priv->dev)) {
+ 		if (pm_iir & PM_VEBOX_USER_INTERRUPT)
+ 			notify_ring(dev_priv->dev, &dev_priv->ring[VECS]);
+@@ -1885,7 +2012,7 @@ static irqreturn_t valleyview_irq_handler(int irq, void *arg)
+ 		if (iir & I915_DISPLAY_PORT_INTERRUPT)
+ 			i9xx_hpd_irq_handler(dev);
+ 
+-		if (pm_iir)
++		if (pm_iir & (GEN6_PM_RPS_EVENTS | GEN6_PM_RP_UP_EI_EXPIRED))
+ 			gen6_rps_irq_handler(dev_priv, pm_iir);
+ 
+ 		I915_WRITE(GTIIR, gt_iir);
+@@ -3320,6 +3447,15 @@ static void gen5_gt_irq_postinstall(struct drm_device *dev)
+ 			pm_irqs |= PM_VEBOX_USER_INTERRUPT;
+ 
+ 		dev_priv->pm_irq_mask = 0xffffffff;
++
++		if (dev_priv->rps.use_RC0_residency_for_turbo) {
++			dev_priv->pm_irq_mask &= ~GEN6_PM_RP_UP_EI_EXPIRED;
++			pm_irqs |= GEN6_PM_RP_UP_EI_EXPIRED;
++		} else {
++			dev_priv->pm_irq_mask &= ~GEN6_PM_RPS_EVENTS;
++			pm_irqs |= GEN6_PM_RPS_EVENTS;
++		}
++
+ 		GEN5_IRQ_INIT(GEN6_PM, dev_priv->pm_irq_mask, pm_irqs);
+ 	}
+ }
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 203b72f..053bd44 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -534,6 +534,7 @@ enum punit_power_well {
+ #define PUNIT_REG_GPU_FREQ_STS			0xd8
+ #define   GENFREQSTATUS				(1<<0)
+ #define PUNIT_REG_MEDIA_TURBO_FREQ_REQ		0xdc
++#define PUNIT_REG_CZ_TIMESTAMP			0xce
+ 
+ #define PUNIT_FUSE_BUS2				0xf6 /* bits 47:40 */
+ #define PUNIT_FUSE_BUS1				0xf5 /* bits 55:48 */
+@@ -549,6 +550,11 @@ enum punit_power_well {
+ #define   FB_FMAX_VMIN_FREQ_LO_SHIFT		27
+ #define   FB_FMAX_VMIN_FREQ_LO_MASK		0xf8000000
+ 
++#define VLV_CZ_CLOCK_TO_MILLI_SEC		100000
++#define VLV_RP_UP_EI_THRESHOLD			90
++#define VLV_RP_DOWN_EI_THRESHOLD		70
++#define VLV_INT_COUNT_FOR_DOWN_EI		5
++
+ /* vlv2 north clock has */
+ #define CCK_FUSE_REG				0x8
+ #define  CCK_FUSE_HPLL_FREQ_MASK		0x3
+@@ -5414,6 +5420,7 @@ enum punit_power_well {
+ #define   VLV_GTLC_ALLOWWAKEERR			(1 << 1)
+ #define   VLV_GTLC_PW_MEDIA_STATUS_MASK		(1 << 5)
+ #define   VLV_GTLC_PW_RENDER_STATUS_MASK	(1 << 7)
++#define VLV_GTLC_SURVIVABILITY_REG              0x130098
+ #define  FORCEWAKE_MT				0xa188 /* multi-threaded */
+ #define   FORCEWAKE_KERNEL			0x1
+ #define   FORCEWAKE_USER			0x2
+@@ -5422,6 +5429,11 @@ enum punit_power_well {
+ #define    FORCEWAKE_MT_ENABLE			(1<<5)
+ #define  VLV_SPAREG2H				0xA194
+ 
++#define VLV_GFX_CLK_FORCE_ON_BIT                (1<<2)
++#define VLV_GFX_CLK_STATUS_BIT                  (1<<3)
++
++#define VLV_RC_COUNTER_CONTROL                  0xFFFF00FF
++
+ #define  GTFIFODBG				0x120000
+ #define    GT_FIFO_SBDROPERR			(1<<6)
+ #define    GT_FIFO_BLOBDROPERR			(1<<5)
+@@ -5558,6 +5570,9 @@ enum punit_power_well {
+ #define VLV_GFX_CLK_STATUS_BIT			(1<<3)
+ #define VLV_GFX_CLK_FORCE_ON_BIT		(1<<2)
+ 
++#define VLV_RENDER_C0_COUNT_REG		0x138118
++#define VLV_MEDIA_C0_COUNT_REG			0x13811C
++
+ #define GEN6_GT_GFX_RC6_LOCKED			0x138104
+ #define VLV_COUNTER_CONTROL			0x138104
+ #define   VLV_COUNT_RANGE_HIGH			(1<<15)
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index cffd75f..2229b93 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3427,7 +3427,9 @@ static u32 gen6_rps_pm_mask(struct drm_i915_private *dev_priv, u8 val)
+ 	/* IVB and SNB hard hangs on looping batchbuffer
+ 	 * if GEN6_PM_UP_EI_EXPIRED is masked.
+ 	 */
+-	if (INTEL_INFO(dev_priv->dev)->gen <= 7 && !IS_HASWELL(dev_priv->dev))
++	if (INTEL_INFO(dev_priv->dev)->gen <= 7 &&
++		!IS_HASWELL(dev_priv->dev) &&
++		!dev_priv->rps.use_RC0_residency_for_turbo)
+ 		mask |= GEN6_PM_RP_UP_EI_EXPIRED;
+ 
+ 	if (IS_GEN8(dev_priv->dev))
+@@ -3698,8 +3700,13 @@ static void gen6_disable_rps_interrupts(struct drm_device *dev)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	I915_WRITE(GEN6_PMINTRMSK, 0xffffffff);
+-	I915_WRITE(GEN6_PMIER, I915_READ(GEN6_PMIER) &
+-				~dev_priv->pm_rps_events);
++	if (dev_priv->rps.use_RC0_residency_for_turbo)
++		I915_WRITE(GEN6_PMIER, I915_READ(GEN6_PMIER) &
++						~GEN6_PM_RP_UP_EI_EXPIRED);
++	else
++		I915_WRITE(GEN6_PMIER, I915_READ(GEN6_PMIER) &
++						~dev_priv->pm_rps_events);
++
+ 	/* Complete PM interrupt masking here doesn't race with the rps work
+ 	 * item again unmasking PM interrupts because that is using a different
+ 	 * register (PMIMR) to mask PM interrupts. The only risk is in leaving
+@@ -3709,7 +3716,10 @@ static void gen6_disable_rps_interrupts(struct drm_device *dev)
+ 	dev_priv->rps.pm_iir = 0;
+ 	spin_unlock_irq(&dev_priv->irq_lock);
+ 
+-	I915_WRITE(GEN6_PMIIR, dev_priv->pm_rps_events);
++	if (dev_priv->rps.use_RC0_residency_for_turbo)
++		I915_WRITE(GEN6_PMIIR, GEN6_PM_RP_UP_EI_EXPIRED);
++	else
++		I915_WRITE(GEN6_PMIIR, dev_priv->pm_rps_events);
+ }
+ 
+ static void gen6_disable_rps(struct drm_device *dev)
+@@ -3808,10 +3818,16 @@ static void gen6_enable_rps_interrupts(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
++	/* Clear out any stale interrupts first */
+ 	spin_lock_irq(&dev_priv->irq_lock);
+ 	WARN_ON(dev_priv->rps.pm_iir);
+-	snb_enable_pm_irq(dev_priv, dev_priv->pm_rps_events);
+-	I915_WRITE(GEN6_PMIIR, dev_priv->pm_rps_events);
++	if (dev_priv->rps.use_RC0_residency_for_turbo) {
++		snb_enable_pm_irq(dev_priv, GEN6_PM_RP_UP_EI_EXPIRED);
++		I915_WRITE(GEN6_PMIIR, GEN6_PM_RP_UP_EI_EXPIRED);
++	} else {
++		snb_enable_pm_irq(dev_priv, dev_priv->pm_rps_events);
++		I915_WRITE(GEN6_PMIIR, dev_priv->pm_rps_events);
++	}
+ 	spin_unlock_irq(&dev_priv->irq_lock);
+ }
+ 
+@@ -4272,6 +4288,7 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 	I915_WRITE(GEN6_RP_DOWN_EI, 350000);
+ 
+ 	I915_WRITE(GEN6_RP_IDLE_HYSTERSIS, 10);
++	I915_WRITE(GEN6_RP_DOWN_TIMEOUT, 0xf4240);
+ 
+ 	dev_priv->rps.rps_mask = GEN6_RP_MEDIA_TURBO |
+ 				   GEN6_RP_MEDIA_HW_NORMAL_MODE |
+@@ -4290,10 +4307,7 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 	I915_WRITE(GEN6_RC6_THRESHOLD, 0x557);
+ 
+ 	/* allows RC6 residency counter to work */
+-	I915_WRITE(VLV_COUNTER_CONTROL,
+-		   _MASKED_BIT_ENABLE(VLV_COUNT_RANGE_HIGH |
+-				      VLV_MEDIA_RC6_COUNT_EN |
+-				      VLV_RENDER_RC6_COUNT_EN));
++	I915_WRITE(VLV_COUNTER_CONTROL, VLV_RC_COUNTER_CONTROL);
+ 
+ 	rc6_mode = GEN7_RC_CTL_TO_MODE | VLV_RC_CTL_CTX_RST_PARALLEL;
+ 	dev_priv->rps.rc6_mask = rc6_mode;
+@@ -4319,6 +4333,9 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 
+ 	valleyview_set_rps(dev_priv->dev, dev_priv->rps.efficient_freq);
+ 
++	/* enable WA for RC6+turbo to work together */
++	dev_priv->rps.use_RC0_residency_for_turbo = true;
++
+ 	vlv_set_rps_mode(dev, false);
+ 
+ 	gen6_gt_force_wake_put(dev_priv, FORCEWAKE_ALL);
+-- 
+1.7.9.5
+

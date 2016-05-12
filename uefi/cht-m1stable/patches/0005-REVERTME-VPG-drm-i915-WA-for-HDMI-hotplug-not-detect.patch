@@ -1,0 +1,124 @@
+From caf4314efe546bf676af46aa2a779c3a98740265 Mon Sep 17 00:00:00 2001
+Message-Id: <caf4314efe546bf676af46aa2a779c3a98740265.1440053504.git.chang-joon.lee@intel.com>
+In-Reply-To: <6008ee84d5599bc5fa55865b2ba0bb03e982c7b7.1440053504.git.chang-joon.lee@intel.com>
+References: <6008ee84d5599bc5fa55865b2ba0bb03e982c7b7.1440053504.git.chang-joon.lee@intel.com>
+From: Praveen Paneri <praveen.paneri@intel.com>
+Date: Tue, 4 Aug 2015 20:22:10 +0530
+Subject: [PATCH 5/5] REVERTME [VPG]: drm/i915: WA for HDMI hotplug not
+ detected
+
+HDMI hotplug is not detected during sleep. DPST PipeB pipeC
+workaround depends on HDMI connection status. We read HDMI
+hotplug state to confirm HDMI status before taking action
+on disabling DPST.
+
+REVERTME: This patch is a temporary fix to make DPST pipeB
+pipeC WA work smoothly. Once there is a proper fix, this
+patch should be reverted.
+
+v2: Using intel_hdmi_live_status() instead of reading hdmi
+status directly from the register.
+
+Change-Id: Idee208869e8d5265376f16e1bc2cabfdebd38237
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-15487
+Signed-off-by: Praveen Paneri <praveen.paneri@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dpst.c  | 39 +++++++++++++++++++++++++++++++++------
+ drivers/gpu/drm/i915/intel_drv.h  |  1 +
+ drivers/gpu/drm/i915/intel_hdmi.c |  4 +++-
+ 3 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dpst.c b/drivers/gpu/drm/i915/i915_dpst.c
+index a8c5d25..8e42d09 100644
+--- a/drivers/gpu/drm/i915/i915_dpst.c
++++ b/drivers/gpu/drm/i915/i915_dpst.c
+@@ -85,6 +85,23 @@ i915_dpst_save_conn_on_edp(struct drm_device *dev)
+ 	return ret;
+ }
+ 
++static bool i915_dpst_get_hdmi_status(struct drm_device *dev)
++{
++	struct intel_connector *i_connector = NULL;
++	struct drm_connector *d_connector;
++
++	list_for_each_entry(d_connector, &dev->mode_config.connector_list, head)
++	{
++		i_connector = to_intel_connector(d_connector);
++		if (i_connector->encoder
++			&& (i_connector->encoder->type == INTEL_OUTPUT_HDMI)) {
++			return intel_hdmi_live_status(d_connector);
++		}
++	}
++
++	return false;
++}
++
+ int i915_dpst_sanitize_wa(struct drm_device *dev, int enable_dpst_wa)
+ {
+ 	/* This W/A should be enabled only on CHV */
+@@ -103,12 +120,22 @@ void i915_dpst_wa_action(struct drm_device *dev, bool hdmi_enabled)
+ 		/* HDMI display unplugged, so we can re-enable DPST again */
+ 		dev_priv->dpst.disabled_by_hdmi = false;
+ 		i915_dpst_display_on(dev);
+-	} else if (hdmi_enabled && dpst_pipe_known &&
+-				dev_priv->dpst.pipe == PIPE_B) {
+-		/* Do not use DPST on PIPE_B if a HDMI display is connected */
+-		if (dev_priv->dpst.user_enable)
+-			i915_dpst_enable_disable(dev, 0);
+-		dev_priv->dpst.disabled_by_hdmi = true;
++	} else if (hdmi_enabled && !dev_priv->dpst.disabled_by_hdmi &&
++			dpst_pipe_known && dev_priv->dpst.pipe == PIPE_B) {
++		/*
++		 * If HDMI is disconnected during sleep, it might not be
++		 * detected. We need to check the hdmi live status to avoid
++		 * this fake DPST disabling.
++		 */
++		if (i915_dpst_get_hdmi_status(dev)) {
++			/*
++			 * Do not use DPST on PIPE_B if a HDMI display
++			 * is connected.
++			 */
++			if (dev_priv->dpst.user_enable)
++				i915_dpst_enable_disable(dev, 0);
++			dev_priv->dpst.disabled_by_hdmi = true;
++		}
+ 	} else if (hdmi_enabled && !dpst_pipe_known) {
+ 		/*
+ 		 * We will make sure to sanitize disabled_by_hdmi when we have
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 3a4cfdf..a2ec4ca 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1072,6 +1072,7 @@ void intel_hdmi_init_connector(struct intel_digital_port *intel_dig_port,
+ struct intel_hdmi *enc_to_intel_hdmi(struct drm_encoder *encoder);
+ bool intel_hdmi_compute_config(struct intel_encoder *encoder,
+ 			       struct intel_crtc_config *pipe_config);
++bool intel_hdmi_live_status(struct drm_connector *connector);
+ 
+ 
+ /* intel_lvds.c */
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index 22b949e..78510f5 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1030,7 +1030,7 @@ static bool vlv_hdmi_live_status(struct drm_device *dev,
+  * if device is Gen 7 and above, read the live status reg
+  * else, do not block the detection, return true
+  */
+-static bool intel_hdmi_live_status(struct drm_connector *connector)
++bool intel_hdmi_live_status(struct drm_connector *connector)
+ {
+ 	struct drm_device *dev = connector->dev;
+ 	struct intel_hdmi *intel_hdmi = intel_attached_hdmi(connector);
+@@ -1249,6 +1249,8 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 			intel_hdmi->rgb_quant_range_selectable =
+ 				drm_rgb_quant_range_selectable(edid);
+ 
++			if (I915_HAS_DPST(dev) && i915.enable_dpst_wa)
++				i915_dpst_wa_action(dev, true);
+ 			DRM_DEBUG_DRIVER("Got edid, HDMI connected\n");
+ 		} else {
+ 			DRM_ERROR("No digital form EDID? Using stored one\n");
+-- 
+1.9.1
+

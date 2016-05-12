@@ -1,0 +1,208 @@
+From 49ff5e24acce11af1a92b6f9ffac6c82eac04965 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Date: Thu, 5 Jun 2014 16:24:17 +0100
+Subject: [PATCH 222/351] ASoC: wm5102: Add controls to allow shaping of
+ ultrasonic response
+
+Add controls to allow custom shaping of the ultrasonic response. This
+patch also allows this to be turned on/off at runtime rather than
+through pdata as was previously the case. Although, it should be noted
+that settings will not affect a currently open audio stream, they will
+be applied when the next audio stream is started.
+
+Change-Id: If423cbe6d16a7683d113e24a5ae37196feed4b40
+Signed-off-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Signed-off-by: Nikesh Oswal <Nikesh.Oswal@wolfsonmicro.com>
+---
+ include/linux/mfd/arizona/core.h  |    3 ++
+ include/linux/mfd/arizona/pdata.h |    3 --
+ sound/soc/codecs/arizona.c        |   49 ++++++++++++++++++-----------
+ sound/soc/codecs/wm5102.c         |   62 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 96 insertions(+), 21 deletions(-)
+
+diff --git a/include/linux/mfd/arizona/core.h b/include/linux/mfd/arizona/core.h
+index 144f7b1..bf4411c 100644
+--- a/include/linux/mfd/arizona/core.h
++++ b/include/linux/mfd/arizona/core.h
+@@ -120,6 +120,9 @@ struct arizona {
+ 
+ 	int tdm_width[ARIZONA_MAX_AIF];
+ 	int tdm_slots[ARIZONA_MAX_AIF];
++
++	uint16_t out_comp_coeff;
++	uint8_t out_comp_enabled;
+ };
+ 
+ int arizona_clk32k_enable(struct arizona *arizona);
+diff --git a/include/linux/mfd/arizona/pdata.h b/include/linux/mfd/arizona/pdata.h
+index 1d99f74..68890f3 100644
+--- a/include/linux/mfd/arizona/pdata.h
++++ b/include/linux/mfd/arizona/pdata.h
+@@ -217,9 +217,6 @@ struct arizona_pdata {
+ 	/** Mode for outputs */
+ 	bool out_mono[ARIZONA_MAX_OUTPUT];
+ 
+-	/** Provide improved ultrasonic frequency response */
+-	bool ultrasonic_response;
+-
+ 	/** PDM speaker mute setting */
+ 	unsigned int spk_mute[ARIZONA_MAX_PDM_SPK];
+ 
+diff --git a/sound/soc/codecs/arizona.c b/sound/soc/codecs/arizona.c
+index d5409f7..93d9c2d 100644
+--- a/sound/soc/codecs/arizona.c
++++ b/sound/soc/codecs/arizona.c
+@@ -1416,13 +1416,34 @@ static int arizona_startup(struct snd_pcm_substream *substream,
+ 					  constraint);
+ }
+ 
++static void arizona_wm5102_set_dac_comp(struct snd_soc_codec *codec,
++					unsigned int rate)
++{
++	struct arizona_priv *priv = snd_soc_codec_get_drvdata(codec);
++	struct arizona *arizona = priv->arizona;
++
++	mutex_lock(&arizona->reg_setting_lock);
++	snd_soc_write(codec, 0x80, 0x3);
++	if (rate >= 176400) {
++		mutex_lock(&codec->mutex);
++		snd_soc_write(codec, ARIZONA_DAC_COMP_1,
++			      arizona->out_comp_coeff);
++		snd_soc_write(codec, ARIZONA_DAC_COMP_2,
++			      arizona->out_comp_enabled);
++		mutex_unlock(&codec->mutex);
++	} else {
++		snd_soc_write(codec, ARIZONA_DAC_COMP_2, 0x0);
++	}
++	snd_soc_write(codec, 0x80, 0x0);
++	mutex_unlock(&arizona->reg_setting_lock);
++}
++
+ static int arizona_hw_params_rate(struct snd_pcm_substream *substream,
+ 				  struct snd_pcm_hw_params *params,
+ 				  struct snd_soc_dai *dai)
+ {
+ 	struct snd_soc_codec *codec = dai->codec;
+ 	struct arizona_priv *priv = snd_soc_codec_get_drvdata(codec);
+-	struct arizona *arizona = priv->arizona;
+ 	struct arizona_dai_priv *dai_priv = &priv->dai[dai->id - 1];
+ 	int base = dai->driver->base;
+ 	int i, sr_val;
+@@ -1441,25 +1462,17 @@ static int arizona_hw_params_rate(struct snd_pcm_substream *substream,
+ 	}
+ 	sr_val = i;
+ 
+-	switch (priv->arizona->type) {
+-	case WM5102:
+-		if (priv->arizona->pdata.ultrasonic_response) {
+-			mutex_lock(&arizona->reg_setting_lock);
+-			snd_soc_write(codec, 0x80, 0x3);
+-			if (params_rate(params) >= 176400)
+-				snd_soc_write(codec, 0x4dd, 0x1);
+-			else
+-				snd_soc_write(codec, 0x4dd, 0x0);
+-			snd_soc_write(codec, 0x80, 0x0);
+-			mutex_unlock(&arizona->reg_setting_lock);
+-		}
+-		break;
+-	default:
+-		break;
+-	}
+-
+ 	switch (dai_priv->clk) {
+ 	case ARIZONA_CLK_SYSCLK:
++		switch (priv->arizona->type) {
++		case WM5102:
++			arizona_wm5102_set_dac_comp(codec,
++						    params_rate(params));
++			break;
++		default:
++			break;
++		}
++
+ 		snd_soc_update_bits(codec, ARIZONA_SAMPLE_RATE_1,
+ 				    ARIZONA_SAMPLE_RATE_1_MASK, sr_val);
+ 		if (base)
+diff --git a/sound/soc/codecs/wm5102.c b/sound/soc/codecs/wm5102.c
+index a23c337..36bc774 100644
+--- a/sound/soc/codecs/wm5102.c
++++ b/sound/soc/codecs/wm5102.c
+@@ -624,6 +624,62 @@ static int wm5102_sysclk_ev(struct snd_soc_dapm_widget *w,
+ 	return 0;
+ }
+ 
++static int wm5102_out_comp_coeff_get(struct snd_kcontrol *kcontrol,
++				     struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
++	struct arizona *arizona = dev_get_drvdata(codec->dev->parent);
++	uint16_t data;
++
++	mutex_lock(&codec->mutex);
++	data = cpu_to_be16(arizona->out_comp_coeff);
++	memcpy(ucontrol->value.bytes.data, &data, sizeof(data));
++	mutex_unlock(&codec->mutex);
++
++	return 0;
++}
++
++static int wm5102_out_comp_coeff_put(struct snd_kcontrol *kcontrol,
++				     struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
++	struct arizona *arizona = dev_get_drvdata(codec->dev->parent);
++
++	mutex_lock(&codec->mutex);
++	memcpy(&arizona->out_comp_coeff, ucontrol->value.bytes.data,
++	       sizeof(arizona->out_comp_coeff));
++	arizona->out_comp_coeff = be16_to_cpu(arizona->out_comp_coeff);
++	mutex_unlock(&codec->mutex);
++
++	return 0;
++}
++
++static int wm5102_out_comp_switch_get(struct snd_kcontrol *kcontrol,
++				      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
++	struct arizona *arizona = dev_get_drvdata(codec->dev->parent);
++
++	mutex_lock(&codec->mutex);
++	ucontrol->value.integer.value[0] = arizona->out_comp_enabled;
++	mutex_unlock(&codec->mutex);
++
++	return 0;
++}
++
++static int wm5102_out_comp_switch_put(struct snd_kcontrol *kcontrol,
++				      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
++	struct arizona *arizona = dev_get_drvdata(codec->dev->parent);
++
++	mutex_lock(&codec->mutex);
++	arizona->out_comp_enabled = ucontrol->value.integer.value[0];
++	mutex_unlock(&codec->mutex);
++
++	return 0;
++}
++
+ static const char *wm5102_osr_text[] = {
+ 	"Low power", "Normal", "High performance",
+ };
+@@ -855,6 +911,12 @@ SOC_SINGLE_TLV("Noise Gate Threshold Volume", ARIZONA_NOISE_GATE_CONTROL,
+ 	       ARIZONA_NGATE_THR_SHIFT, 7, 1, ng_tlv),
+ SOC_ENUM("Noise Gate Hold", arizona_ng_hold),
+ 
++SND_SOC_BYTES_EXT("Output Compensation Coefficient", 2,
++		  wm5102_out_comp_coeff_get, wm5102_out_comp_coeff_put),
++
++SOC_SINGLE_EXT("Output Compensation Switch", 0, 0, 1, 0,
++	       wm5102_out_comp_switch_get, wm5102_out_comp_switch_put),
++
+ WM5102_NG_SRC("HPOUT1L", ARIZONA_NOISE_GATE_SELECT_1L),
+ WM5102_NG_SRC("HPOUT1R", ARIZONA_NOISE_GATE_SELECT_1R),
+ WM5102_NG_SRC("HPOUT2L", ARIZONA_NOISE_GATE_SELECT_2L),
+-- 
+1.7.9.5
+

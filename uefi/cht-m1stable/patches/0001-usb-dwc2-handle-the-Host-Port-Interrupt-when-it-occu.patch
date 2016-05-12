@@ -1,0 +1,77 @@
+From 8816ffdce5851f7143ac43c1e82bac4bc882882f Mon Sep 17 00:00:00 2001
+From: Dinh Nguyen <dinguyen@altera.com>
+Date: Tue, 4 Feb 2014 15:19:40 -0800
+Subject: [PATCH 01/65] usb: dwc2: handle the Host Port Interrupt when it
+ occurs in device mode
+
+According to the spec for the DWC2 controller, when the PRTINT interrupt fires,
+the application must clear the appropriate status bit in the Host Port Control
+and Status register to clear this bit.
+
+When disconnecting an A-cable when the dwc2 host driver, the PRTINT fires, but
+only the GINTSTS_PRTINT status is cleared, no action is done with the HPRT0
+register. The HPRT0_ENACHG bit in the HPRT0 must also be poked to correctly
+clear the GINTSTS_PRTINT interrupt.
+
+I am seeing this behavoir on v2.93 of the DWC2 IP. When I disconnect an OTG
+A-cable adapter, the PRTINT interrupt fires when the DWC2 is in device mode
+and is never cleared.
+
+This patch adds the function to read the HPRT0 register when the PRTINT fires
+and the dwc2 IP has already transitioned to device mode. This function is only
+clearing the HPRT0_ENACHG bit for now, but can be modified to handle more.
+
+Signed-off-by: Dinh Nguyen <dinguyen@altera.com>
+[ paulz: modified patch to preserve HPRT0_ENA bit ]
+Signed-off-by: Paul Zimmerman <paulz@synopsys.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/dwc2/core_intr.c | 25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/dwc2/core_intr.c b/drivers/usb/dwc2/core_intr.c
+index 8205799..c93918b 100644
+--- a/drivers/usb/dwc2/core_intr.c
++++ b/drivers/usb/dwc2/core_intr.c
+@@ -72,6 +72,26 @@ static const char *dwc2_op_state_str(struct dwc2_hsotg *hsotg)
+ }
+ 
+ /**
++ * dwc2_handle_usb_port_intr - handles OTG PRTINT interrupts.
++ * When the PRTINT interrupt fires, there are certain status bits in the Host
++ * Port that needs to get cleared.
++ *
++ * @hsotg: Programming view of DWC_otg controller
++ */
++static void dwc2_handle_usb_port_intr(struct dwc2_hsotg *hsotg)
++{
++	u32 hprt0 = readl(hsotg->regs + HPRT0);
++
++	if (hprt0 & HPRT0_ENACHG) {
++		hprt0 &= ~HPRT0_ENA;
++		writel(hprt0, hsotg->regs + HPRT0);
++	}
++
++	/* Clear interrupt */
++	writel(GINTSTS_PRTINT, hsotg->regs + GINTSTS);
++}
++
++/**
+  * dwc2_handle_mode_mismatch_intr() - Logs a mode mismatch warning message
+  *
+  * @hsotg: Programming view of DWC_otg controller
+@@ -479,9 +499,8 @@ irqreturn_t dwc2_handle_common_intr(int irq, void *dev)
+ 		if (dwc2_is_device_mode(hsotg)) {
+ 			dev_dbg(hsotg->dev,
+ 				" --Port interrupt received in Device mode--\n");
+-			gintsts = GINTSTS_PRTINT;
+-			writel(gintsts, hsotg->regs + GINTSTS);
+-			retval = 1;
++			dwc2_handle_usb_port_intr(hsotg);
++			retval = IRQ_HANDLED;
+ 		}
+ 	}
+ 
+-- 
+1.9.1
+

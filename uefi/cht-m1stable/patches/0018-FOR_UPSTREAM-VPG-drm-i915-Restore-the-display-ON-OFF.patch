@@ -1,0 +1,143 @@
+From 1eb1c092c1452eb64d7f55a5b8e5016f2d6a9f6c Mon Sep 17 00:00:00 2001
+Message-Id: <1eb1c092c1452eb64d7f55a5b8e5016f2d6a9f6c.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: vanditak <vandita.kulkarni@intel.com>
+Date: Tue, 8 Oct 2013 01:07:03 +0530
+Subject: [PATCH 018/312] FOR_UPSTREAM [VPG]: drm/i915: Restore the display
+ ON/OFF state during suspend resume.
+
+Do not turn ON the display during resume if the DPMS state is set to OFF
+by the user before suspend.
+In particular, for Android if the hardware composer sets the DPMS state
+to OFF before suspend, then during resume do not turn ON the display.
+Turn ON the display when the hardware composer sets the DPMS state to ON,
+using a drm set property ioctl.
+
+Problem description: The display turns ON on every resume, without any
+user space initiated action to turn on the display like power key press.
+Root cause: During resume, as soon as the software pipe prepare is done,
+the driver sets the DPMS state to DPMS ON, and hence there is no check
+for the DPMS state before crtc_enable. As a result the display pipe gets
+enabled during resume ignoring the DPMS state during suspend.
+Fix: With this patch the DPMS state is restored and a check is added to
+call crtc_enable only if the DPMS state is not set to OFF during suspend.
+Hence in case of android the hardware composer would set the DPMS state
+to OFF just before supend and the resume will not turn on the display.
+The display would turn on only after the hardware composer sets the DPMS
+property to ON.
+
+The default DPMS state remains as ON unless set to OFF by the user.
+This will ensure that a suspend called from display ON state will resume to
+display ON state.
+If the user sets the DPMS state to OFF before supend, then the user
+has to set it to ON after resume.
+
+(cherry picked from commit b36bc8ecb1a7fe93863b223e650eba57040e89ea)
+
+Issue: AXIA-4201
+OTC-Tracker: AXIA-4537
+Change-Id: Ie6eaf5e76b38060bf1e1f10b0143b0964f558213
+Signed-off-by: vanditak <vandita.kulkarni@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |   44 +++++++++++++---------------------
+ 1 file changed, 16 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 92f8112..d82effc 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -4989,7 +4989,6 @@ static void intel_crtc_disable(struct drm_crtc *crtc)
+ 		if (connector->encoder->crtc != crtc)
+ 			continue;
+ 
+-		connector->dpms = DRM_MODE_DPMS_OFF;
+ 		to_intel_encoder(connector->encoder)->connectors_active = false;
+ 	}
+ }
+@@ -9913,7 +9912,6 @@ intel_modeset_update_state(struct drm_device *dev, unsigned prepare_pipes)
+ {
+ 	struct intel_encoder *intel_encoder;
+ 	struct intel_crtc *intel_crtc;
+-	struct drm_connector *connector;
+ 
+ 	list_for_each_entry(intel_encoder, &dev->mode_config.encoder_list,
+ 			    base.head) {
+@@ -9936,26 +9934,6 @@ intel_modeset_update_state(struct drm_device *dev, unsigned prepare_pipes)
+ 		WARN_ON(intel_crtc->base.enabled != !!intel_crtc->new_config);
+ 	}
+ 
+-	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
+-		if (!connector->encoder || !connector->encoder->crtc)
+-			continue;
+-
+-		intel_crtc = to_intel_crtc(connector->encoder->crtc);
+-
+-		if (prepare_pipes & (1 << intel_crtc->pipe)) {
+-			struct drm_property *dpms_property =
+-				dev->mode_config.dpms_property;
+-
+-			connector->dpms = DRM_MODE_DPMS_ON;
+-			drm_object_property_set_value(&connector->base,
+-							 dpms_property,
+-							 DRM_MODE_DPMS_ON);
+-
+-			intel_encoder = to_intel_encoder(connector->encoder);
+-			intel_encoder->connectors_active = true;
+-		}
+-	}
+-
+ }
+ 
+ static bool intel_fuzzy_clock_check(int clock1, int clock2)
+@@ -10389,6 +10367,7 @@ static int __intel_set_mode(struct drm_crtc *crtc,
+ 	struct drm_display_mode *saved_mode;
+ 	struct intel_crtc_config *pipe_config = NULL;
+ 	struct intel_crtc *intel_crtc;
++	struct drm_connector *connector;
+ 	unsigned disable_pipes, prepare_pipes, modeset_pipes;
+ 	int ret = 0;
+ 
+@@ -10497,11 +10476,22 @@ static int __intel_set_mode(struct drm_crtc *crtc,
+ 			goto done;
+ 	}
+ 
+-	/* Now enable the clocks, plane, pipe, and connectors that we set up. */
+-	for_each_intel_crtc_masked(dev, prepare_pipes, intel_crtc) {
+-		update_scanline_offset(intel_crtc);
++	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
++		if (!connector->encoder || !connector->encoder->crtc)
++			continue;
+ 
+-		dev_priv->display.crtc_enable(&intel_crtc->base);
++		intel_crtc = to_intel_crtc(connector->encoder->crtc);
++
++		if ((connector->dpms != DRM_MODE_DPMS_OFF)
++			&& (prepare_pipes & (1 << (intel_crtc)->pipe))) {
++			/*
++			 * Now enable the clocks, plane, pipe, and connectors that we 
++			 * set up.
++			*/
++			update_scanline_offset(intel_crtc);
++			to_intel_encoder(connector->encoder)->connectors_active = true;
++			dev_priv->display.crtc_enable(&intel_crtc->base);
++		}
+ 	}
+ 
+ 	/* FIXME: add subpixel order */
+@@ -12229,11 +12219,9 @@ static void intel_modeset_readout_hw_state(struct drm_device *dev)
+ 	list_for_each_entry(connector, &dev->mode_config.connector_list,
+ 			    base.head) {
+ 		if (connector->get_hw_state(connector)) {
+-			connector->base.dpms = DRM_MODE_DPMS_ON;
+ 			connector->encoder->connectors_active = true;
+ 			connector->base.encoder = &connector->encoder->base;
+ 		} else {
+-			connector->base.dpms = DRM_MODE_DPMS_OFF;
+ 			connector->base.encoder = NULL;
+ 		}
+ 		DRM_DEBUG_KMS("[CONNECTOR:%d:%s] hw state readout: %s\n",
+-- 
+1.7.9.5
+

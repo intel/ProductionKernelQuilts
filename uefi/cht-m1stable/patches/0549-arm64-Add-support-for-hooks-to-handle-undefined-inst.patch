@@ -1,0 +1,159 @@
+From 56cfa63a99e6a9b4fd951017f6490431a597dc70 Mon Sep 17 00:00:00 2001
+From: Punit Agrawal <punit.agrawal@arm.com>
+Date: Tue, 18 Nov 2014 11:41:22 +0000
+Subject: [PATCH 549/634] arm64: Add support for hooks to handle undefined
+ instructions
+
+Add support to register hooks for undefined instructions. The handlers
+will be called when the undefined instruction and the processor state
+(as contained in pstate) match criteria used at registration.
+
+Signed-off-by: Punit Agrawal <punit.agrawal@arm.com>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Change-Id: Id63a0ddec8b6af448d9512b259e6e7edaee7abff
+---
+ arch/arm64/include/asm/insn.h  |  2 ++
+ arch/arm64/include/asm/traps.h | 16 ++++++++++
+ arch/arm64/kernel/insn.c       |  5 ++++
+ arch/arm64/kernel/traps.c      | 66 ++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 89 insertions(+)
+
+diff --git a/arch/arm64/include/asm/insn.h b/arch/arm64/include/asm/insn.h
+index c44ad39..b2d28c0 100644
+--- a/arch/arm64/include/asm/insn.h
++++ b/arch/arm64/include/asm/insn.h
+@@ -105,4 +105,6 @@ int aarch64_insn_patch_text_nosync(void *addr, u32 insn);
+ int aarch64_insn_patch_text_sync(void *addrs[], u32 insns[], int cnt);
+ int aarch64_insn_patch_text(void *addrs[], u32 insns[], int cnt);
+ 
++bool aarch32_insn_is_wide(u32 insn);
++
+ #endif	/* __ASM_INSN_H */
+diff --git a/arch/arm64/include/asm/traps.h b/arch/arm64/include/asm/traps.h
+index 10ca8ff..232e4ba 100644
+--- a/arch/arm64/include/asm/traps.h
++++ b/arch/arm64/include/asm/traps.h
+@@ -18,6 +18,22 @@
+ #ifndef __ASM_TRAP_H
+ #define __ASM_TRAP_H
+ 
++#include <linux/list.h>
++
++struct pt_regs;
++
++struct undef_hook {
++	struct list_head node;
++	u32 instr_mask;
++	u32 instr_val;
++	u64 pstate_mask;
++	u64 pstate_val;
++	int (*fn)(struct pt_regs *regs, u32 instr);
++};
++
++void register_undef_hook(struct undef_hook *hook);
++void unregister_undef_hook(struct undef_hook *hook);
++
+ static inline int in_exception_text(unsigned long ptr)
+ {
+ 	extern char __exception_text_start[];
+diff --git a/arch/arm64/kernel/insn.c b/arch/arm64/kernel/insn.c
+index 565e26f..437b437 100644
+--- a/arch/arm64/kernel/insn.c
++++ b/arch/arm64/kernel/insn.c
+@@ -303,3 +303,8 @@ u32 __kprobes aarch64_insn_gen_nop(void)
+ {
+ 	return aarch64_insn_gen_hint(AARCH64_INSN_HINT_NOP);
+ }
++
++bool aarch32_insn_is_wide(u32 insn)
++{
++	return insn >= 0xe800;
++}
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index 49c667b..943a30e 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -258,6 +258,69 @@ void arm64_notify_die(const char *str, struct pt_regs *regs,
+ 		die(str, regs, err);
+ }
+ 
++static LIST_HEAD(undef_hook);
++static DEFINE_RAW_SPINLOCK(undef_lock);
++
++void register_undef_hook(struct undef_hook *hook)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&undef_lock, flags);
++	list_add(&hook->node, &undef_hook);
++	raw_spin_unlock_irqrestore(&undef_lock, flags);
++}
++
++void unregister_undef_hook(struct undef_hook *hook)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&undef_lock, flags);
++	list_del(&hook->node);
++	raw_spin_unlock_irqrestore(&undef_lock, flags);
++}
++
++static int call_undef_hook(struct pt_regs *regs)
++{
++	struct undef_hook *hook;
++	unsigned long flags;
++	u32 instr;
++	int (*fn)(struct pt_regs *regs, u32 instr) = NULL;
++	void __user *pc = (void __user *)instruction_pointer(regs);
++
++	if (!user_mode(regs))
++		return 1;
++
++	if (compat_thumb_mode(regs)) {
++		/* 16-bit Thumb instruction */
++		if (get_user(instr, (u16 __user *)pc))
++			goto exit;
++		instr = le16_to_cpu(instr);
++		if (aarch32_insn_is_wide(instr)) {
++			u32 instr2;
++
++			if (get_user(instr2, (u16 __user *)(pc + 2)))
++				goto exit;
++			instr2 = le16_to_cpu(instr2);
++			instr = (instr << 16) | instr2;
++		}
++	} else {
++		/* 32-bit ARM instruction */
++		if (get_user(instr, (u32 __user *)pc))
++			goto exit;
++		instr = le32_to_cpu(instr);
++	}
++
++	raw_spin_lock_irqsave(&undef_lock, flags);
++	list_for_each_entry(hook, &undef_hook, node)
++		if ((instr & hook->instr_mask) == hook->instr_val &&
++			(regs->pstate & hook->pstate_mask) == hook->pstate_val)
++			fn = hook->fn;
++
++	raw_spin_unlock_irqrestore(&undef_lock, flags);
++exit:
++	return fn ? fn(regs, instr) : 1;
++}
++
+ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
+ {
+ 	siginfo_t info;
+@@ -267,6 +330,9 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
+ 	if (!aarch32_break_handler(regs))
+ 		return;
+ 
++	if (call_undef_hook(regs) == 0)
++		return;
++
+ 	if (show_unhandled_signals && unhandled_signal(current, SIGILL) &&
+ 	    printk_ratelimit()) {
+ 		pr_info("%s[%d]: undefined instruction: pc=%p\n",
+-- 
+1.9.1
+

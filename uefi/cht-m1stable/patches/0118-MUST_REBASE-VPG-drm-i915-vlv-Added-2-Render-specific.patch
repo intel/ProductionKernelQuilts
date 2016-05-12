@@ -1,0 +1,100 @@
+From 4390ebb7e3415d3b04c89fc690a342b33d514e7d Mon Sep 17 00:00:00 2001
+Message-Id: <4390ebb7e3415d3b04c89fc690a342b33d514e7d.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: akashgoe <akash.goel@intel.com>
+Date: Mon, 16 Sep 2013 12:22:25 +0530
+Subject: [PATCH 118/312] MUST_REBASE [VPG]: drm/i915/vlv: Added 2 Render
+ specific Hw Workarounds
+
+Added 2 new rendering specific Workarounds
+1. WaTlbInvalidateStoreDataBefore :-
+     Before pipecontrol with TLB invalidate set,
+     need 2 store data commands
+2. WaReadAfterWriteHazard :-
+     Send 8 store dword commands after flush
+     for read after write hazard
+     (HSD Gen6 bug_de 3047871)
+
+v2: Make Wa logic specific to VALLEYVIEW (Jon)
+
+v3: Remove Blank line from commit msg (Jon)
+
+Issue: VIZ-3445
+Change-Id: Ib60f8dc7d2213552e498d588e1bba7eaa1a921ed
+Signed-off-by: akashgoe <akash.goel@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+(cherry picked from commit 8522d86d7d5fcb58f7ba5f743aa6b7b8a4438a61)
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   47 +++++++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 6bd6f29..69ca84f 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2371,6 +2371,31 @@ intel_ring_flush_all_caches(struct intel_engine_cs *ring)
+ 
+ 	trace_i915_gem_ring_flush(ring, 0, I915_GEM_GPU_DOMAINS);
+ 
++	if (IS_VALLEYVIEW(ring->dev) && IS_GEN7(ring->dev)) {
++		/*
++		 * WaReadAfterWriteHazard
++		 * Send a number of Store Data commands here to finish
++		 * flushing hardware pipeline.This is needed in the case
++		 * where the next workload tries reading from the same
++		 * surface that this batch writes to. Without these StoreDWs,
++		 * not all of the data will actually be flushd to the surface
++		 * by the time the next batch starts reading it, possibly
++		 * causing a small amount of corruption.
++		 */
++		int i;
++		ret = intel_ring_begin(ring, 4 * 12);
++		if (ret)
++			return ret;
++		for (i = 0; i < 12; i++) {
++			intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
++			intel_ring_emit(ring, I915_GEM_HWS_SCRATCH_INDEX <<
++						MI_STORE_DWORD_INDEX_SHIFT);
++			intel_ring_emit(ring, 0);
++			intel_ring_emit(ring, MI_NOOP);
++		}
++		intel_ring_advance(ring);
++	}
++
+ 	ring->gpu_caches_dirty = false;
+ 	return 0;
+ }
+@@ -2381,6 +2406,28 @@ intel_ring_invalidate_all_caches(struct intel_engine_cs *ring)
+ 	uint32_t flush_domains;
+ 	int ret;
+ 
++	if (IS_VALLEYVIEW(ring->dev) && IS_GEN7(ring->dev)) {
++		/*
++		 * WaTlbInvalidateStoreDataBefore:vlv
++		 * Before pipecontrol with TLB invalidate set, need 2 store
++		 * data cmds (such as MI_STORE_DATA_IMM or MI_STORE_DATA_INDEX)
++		 * Without this, hardware cannot guarantee the cmd after the
++		 * PIPE_CONTROL with TLB inv will not use the old TLB values.
++		 */
++		int i;
++		ret = intel_ring_begin(ring, 4 * 2);
++		if (ret)
++			return ret;
++		for (i = 0; i < 2; i++) {
++			intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
++			intel_ring_emit(ring, I915_GEM_HWS_SCRATCH_INDEX <<
++						MI_STORE_DWORD_INDEX_SHIFT);
++			intel_ring_emit(ring, 0);
++			intel_ring_emit(ring, MI_NOOP);
++		}
++		intel_ring_advance(ring);
++	}
++
+ 	flush_domains = 0;
+ 	if (ring->gpu_caches_dirty)
+ 		flush_domains = I915_GEM_GPU_DOMAINS;
+-- 
+1.7.9.5
+

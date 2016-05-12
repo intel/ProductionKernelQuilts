@@ -1,0 +1,1693 @@
+From fff68c567d5cac08decd65f77bef4155f706b0a0 Mon Sep 17 00:00:00 2001
+Message-Id: <fff68c567d5cac08decd65f77bef4155f706b0a0.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Mon, 8 Sep 2014 12:33:33 +0530
+Subject: [PATCH 24/75] MUST_REBASE [VPG]: adf/intel/vlv: Add Basic VLV ADF
+ driver
+
+Register an instance with intel adf core for vlv driver.
+Basic code for primary and sprite plane capability initilizations
+
+v2: Remove vlv_pipe, we have per encoder pipe, dsi_pipe for DSI
+v3: Do primary plane pixel format initialization and offset computations
+v3: Complete primary plane validate and flip
+v4: Unify the plane ids sequentially
+    Order -> PRIMARY_A(0), SPRITE_A(1), SPRITE_A(2)
+	     PRIMARY_B(3), SPRITE_B(4), SPRITE_B(5)
+v5: Complete Sprite enabling and flip code
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I498979e511bc8690ef71a1b04b9311603c137f39
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Signed-off-by: Pallavi <pallavi.g@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Signed-off-by: Gajanan Bhat <gajanan.bhat@intel.com>
+Signed-off-by: Uma Shankar <uma.shankar@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ drivers/video/adf/Kconfig                          |   13 +
+ drivers/video/adf/intel/core/Makefile              |    6 +-
+ drivers/video/adf/intel/core/intel_adf_drv.c       |   50 ++
+ drivers/video/adf/intel/core/intel_dc_config.c     |   24 +-
+ drivers/video/adf/intel/core/vlv/Makefile          |    7 +
+ drivers/video/adf/intel/core/vlv/vlv_dc_config.c   |  176 +++++++
+ drivers/video/adf/intel/core/vlv/vlv_pri_plane.c   |  346 +++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_sp_plane.c    |  532 ++++++++++++++++++++
+ .../adf/intel/include/core/common/dsi/dsi_panel.h  |    1 -
+ .../adf/intel/include/core/common/dsi/dsi_pipe.h   |    3 -
+ .../video/adf/intel/include/core/intel_adf_drv.h   |   24 +
+ .../video/adf/intel/include/core/intel_dc_config.h |   15 +-
+ .../adf/intel/include/core/vlv/vlv_dc_config.h     |   50 ++
+ .../video/adf/intel/include/core/vlv/vlv_dc_hw.h   |   29 ++
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |    1 +
+ .../adf/intel/include/core/vlv/vlv_pri_plane.h     |   55 ++
+ .../adf/intel/include/core/vlv/vlv_sp_plane.h      |   62 +++
+ drivers/video/adf/intel/include/intel_adf.h        |    3 +-
+ drivers/video/adf/intel/intel_adf.c                |    5 +-
+ 19 files changed, 1380 insertions(+), 22 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/intel_adf_drv.c
+ create mode 100644 drivers/video/adf/intel/core/vlv/Makefile
+ create mode 100644 drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+ create mode 100644 drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+ create mode 100644 drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+ create mode 100644 drivers/video/adf/intel/include/core/intel_adf_drv.h
+ create mode 100644 drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+ create mode 100644 drivers/video/adf/intel/include/core/vlv/vlv_dc_hw.h
+ create mode 100644 drivers/video/adf/intel/include/core/vlv/vlv_pri_plane.h
+ create mode 100644 drivers/video/adf/intel/include/core/vlv/vlv_sp_plane.h
+
+diff --git a/drivers/video/adf/Kconfig b/drivers/video/adf/Kconfig
+index 3563f6a..8e6b7ae 100644
+--- a/drivers/video/adf/Kconfig
++++ b/drivers/video/adf/Kconfig
+@@ -25,6 +25,19 @@ config ADF_INTEL
+ 	help
+ 	  Enable ADF compatible Intel display driver.
+ 
++choice
++	prompt "Intel Gen Platform"
++	depends on ADF_INTEL
++	default ADF_INTEL_VLV
++	help
++	  The ADF driver supports multiple Intel GEN platforms. Select the targeted one.
++
++	config ADF_INTEL_VLV
++		bool "Valleyview"
++		help
++		  Intel VLV SoC Platform.
++endchoice
++
+ config ADF_INTEL_FBDEV
+ 	depends on ADF_INTEL && ADF_FBDEV
+ 	tristate "Intel FBDEV Driver "
+diff --git a/drivers/video/adf/intel/core/Makefile b/drivers/video/adf/intel/core/Makefile
+index c463d10..ecd468f 100644
+--- a/drivers/video/adf/intel/core/Makefile
++++ b/drivers/video/adf/intel/core/Makefile
+@@ -1,13 +1,15 @@
+ # Makefile for Intel display driver based on ADF framework
+ 
+-ccflags-y := -Idrivers/staging/android -Iinclude/adf -Iinclude/uapi/adf -Idrivers/video/adf/intel/include
++ccflags-y := -Idrivers/staging/ -Iinclude/adf -Iinclude/uapi/adf -Idrivers/video/adf/intel/include
+ 
+ CFLAGS_adf.o := -I$(src)
+ 
+-obj-$(CONFIG_ADF_INTEL) += intel_plane.o \
++obj-$(CONFIG_ADF_INTEL) += intel_adf_drv.o \
++	intel_plane.o \
+ 	intel_pipe.o \
+ 	intel_dc_power.o \
+ 	intel_dc_memory.o \
+ 	intel_dc_config.o
+ 
+ obj-$(CONFIG_ADF_INTEL) += common/
++obj-$(CONFIG_ADF_INTEL_VLV)	+= vlv/
+diff --git a/drivers/video/adf/intel/core/intel_adf_drv.c b/drivers/video/adf/intel/core/intel_adf_drv.c
+new file mode 100644
+index 0000000..44ee4fe
+--- /dev/null
++++ b/drivers/video/adf/intel/core/intel_adf_drv.c
+@@ -0,0 +1,50 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/device.h>
++#include <linux/console.h>
++#include <linux/module.h>
++#include <linux/mod_devicetable.h>
++
++#include <drm/drmP.h>
++#include <drm/drm.h>
++#include <drm/i915_adf.h>
++#include "intel_adf.h"
++#include "core/intel_adf_drv.h"
++
++#define DRIVER_NAME "intel_adf_drv"
++
++struct intel_adf_context *adf_ctx;
++
++static int intel_adf_init(void)
++{
++	struct pci_dev *i915_pci_dev;
++
++	i915_pci_dev = i915_adf_get_pci_dev();
++	adf_ctx = intel_adf_context_create(i915_pci_dev);
++	if (IS_ERR(adf_ctx)) {
++		pr_err("%s:failed to create ADF context\n", __func__);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static void intel_adf_exit(void)
++{
++	intel_adf_context_destroy(adf_ctx);
++}
++
++late_initcall(intel_adf_init);
++module_exit(intel_adf_exit);
++MODULE_LICENSE("GPL and additional rights");
+diff --git a/drivers/video/adf/intel/core/intel_dc_config.c b/drivers/video/adf/intel/core/intel_dc_config.c
+index 61c8839..99000f2 100644
+--- a/drivers/video/adf/intel/core/intel_dc_config.c
++++ b/drivers/video/adf/intel/core/intel_dc_config.c
+@@ -15,14 +15,12 @@
+ 
+ #include "core/intel_dc_config.h"
+ 
+-struct intel_dc_config_entry {
+-	const u32 id;
+-	struct intel_dc_config * (*get_dc_config)(const struct pci_dev *pdev,
+-		u32 id);
+-	void (*destroy_dc_config)(struct intel_dc_config *config);
+-};
+-
+ static const struct intel_dc_config_entry g_dc_configs[] = {
++	{
++		.id = 0,
++		.get_dc_config = vlv_get_dc_config,
++		.destroy_dc_config = vlv_dc_config_destroy,
++	},
+ };
+ 
+ int intel_dc_component_init(struct intel_dc_component *component,
+@@ -176,11 +174,15 @@ void intel_dc_config_add_plane(struct intel_dc_config *config,
+ void intel_dc_config_add_pipe(struct intel_dc_config *config,
+ 	struct intel_pipe *pipe, u8 idx)
+ {
+-	if (!config || !pipe)
++	if (!config || !pipe) {
++		dev_err(config->dev, "%s: config or pipe is NULL\n", __func__);
+ 		return;
++	}
+ 
+-	if (config->pipes[idx])
++	if (config->pipes[idx]) {
++		dev_err(config->dev, "%s: pipe already added\n", __func__);
+ 		return;
++	}
+ 
+ 	config->pipes[idx] = pipe;
+ 	config->n_pipes++;
+@@ -256,8 +258,10 @@ struct intel_dc_config *intel_adf_get_dc_config(struct pci_dev *pdev, u32 id)
+ 		}
+ 	}
+ 
+-	if (!config)
++	if (!config) {
++		dev_err(&pdev->dev, "%s: failed to get dc config\n", __func__);
+ 		return ERR_PTR(-EINVAL);
++	}
+ 
+ 	/*validate this config*/
+ 	err = intel_dc_config_validate(config);
+diff --git a/drivers/video/adf/intel/core/vlv/Makefile b/drivers/video/adf/intel/core/vlv/Makefile
+new file mode 100644
+index 0000000..48ac00f
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/Makefile
+@@ -0,0 +1,7 @@
++# Makefile for intel vlv display driver
++
++ccflags-y := -Idrivers/staging/ -Iinclude/adf -Iinclude/uapi/adf -Idrivers/video/adf/intel/include -Werror
++
++obj-y := vlv_dc_config.o \
++	vlv_pri_plane.o \
++	vlv_sp_plane.o
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+new file mode 100644
+index 0000000..29a7af0
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+@@ -0,0 +1,176 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/pci.h>
++#include "core/intel_dc_config.h"
++#include "core/vlv/vlv_dc_config.h"
++#include "core/vlv/vlv_pri_plane.h"
++#include "core/vlv/vlv_sp_plane.h"
++
++#define VLV_ID(pipe, plane) ((pipe * VLV_MAX_PLANES) + plane)
++
++struct vlv_dc_config {
++	struct intel_dc_config base;
++	struct vlv_disp {
++		struct vlv_pri_plane pplane;
++		struct vlv_sp_plane splane[2];
++
++		/*
++		 * TBD:
++		 * Add pipe datastructure
++		 */
++	} vdisp[2];
++};
++
++static inline struct vlv_dc_config *to_vlv_dc_config(
++	struct intel_dc_config *config)
++{
++	return container_of(config, struct vlv_dc_config, base);
++}
++
++static const struct intel_dc_attachment vlv_allowed_attachments[] = {
++	{
++		.pipe_id = PIPE_A,
++		.plane_id = PRIMARY_PLANE,
++	},
++	{
++		.pipe_id = PIPE_A,
++		.plane_id = SPRITE_A,
++	},
++	{
++		.pipe_id = PIPE_A,
++		.plane_id = SPRITE_B,
++	}
++};
++
++void vlv_dc_config_destroy(struct intel_dc_config *config)
++{
++	struct vlv_dc_config *vlv_config = to_vlv_dc_config(config);
++	struct vlv_pri_plane *pplane;
++	struct vlv_sp_plane *splane;
++	int pipe;
++
++	if (!config)
++		return;
++
++	for (pipe = 0; pipe < MAX_PIPES; pipe++) {
++		/* Do pipe deinit here one pipe init code is there from DSI */
++
++		pplane = &vlv_config->vdisp[pipe].pplane;
++		vlv_pri_plane_destroy(pplane);
++		splane = &vlv_config->vdisp[pipe].splane[0];
++		vlv_sp_plane_destroy(splane);
++		splane = &vlv_config->vdisp[pipe].splane[1];
++		vlv_sp_plane_destroy(splane);
++	}
++
++	intel_dc_config_destroy(config);
++	kfree(config);
++
++	return;
++}
++
++static int vlv_initialize_disp(struct vlv_dc_config *vlv_config, int pipe,
++		enum intel_pipe_type type)
++{
++	struct vlv_pri_plane *pplane;
++	struct vlv_sp_plane *splane;
++	int err;
++
++	if (pipe > MAX_PIPES) {
++		dev_err(vlv_config->base.dev, "%s:invalid pipe", __func__);
++		return -EINVAL;
++	}
++	/* Initialize the plane */
++	pplane = &vlv_config->vdisp[pipe].pplane;
++	err = vlv_pri_plane_init(pplane, vlv_config->base.dev, PRIMARY_PLANE);
++	if (err) {
++		dev_err(vlv_config->base.dev,
++			"%s: failed to init pri plane, %d\n", __func__, err);
++		return err;
++	}
++	intel_dc_config_add_plane(&vlv_config->base, &pplane->base,
++				  VLV_ID(pipe, VLV_PLANE));
++	/* Initialize first sprite */
++	splane = &vlv_config->vdisp[pipe].splane[0];
++	err = vlv_sp_plane_init(splane, vlv_config->base.dev, pipe ?
++				SPRITE_C : SPRITE_A);
++	if (err) {
++		dev_err(vlv_config->base.dev,
++			"%s: failed to init sprite plane, %d\n", __func__, err);
++		return err;
++	}
++	intel_dc_config_add_plane(&vlv_config->base, &splane->base,
++				  VLV_ID(pipe, VLV_SPRITE1));
++	/* Initialize second sprite */
++	splane = &vlv_config->vdisp[pipe].splane[1];
++	err = vlv_sp_plane_init(splane, vlv_config->base.dev, pipe ?
++				SPRITE_D : SPRITE_B);
++	if (err) {
++		dev_err(vlv_config->base.dev,
++				"%s: failed to init sprite plane, %d\n",
++			__func__, err);
++		return err;
++	}
++	intel_dc_config_add_plane(&vlv_config->base, &splane->base,
++				  VLV_ID(pipe, VLV_SPRITE2));
++
++	/* TBD: Initialize interface PIPE */
++	return err;
++}
++
++struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id)
++{
++	struct vlv_dc_config *config;
++	struct intel_dc_memory *memory;
++	int err;
++
++	if (!pdev)
++		return ERR_PTR(-EINVAL);
++
++	config = kzalloc(sizeof(struct vlv_dc_config), GFP_KERNEL);
++	if (!config) {
++		dev_err(&pdev->dev, "failed to alloc memory\n");
++		return ERR_PTR(-ENOMEM);
++	}
++	/* Init config */
++	err = intel_dc_config_init(&config->base, &pdev->dev, 0,
++				   NUM_PLANES, VLV_N_PIPES,
++				   &vlv_allowed_attachments[0],
++				   ARRAY_SIZE(vlv_allowed_attachments));
++	if (err) {
++		dev_err(&pdev->dev, "failed to inintialize dc config\n");
++		goto err;
++	}
++	/* create and add memory */
++	/*
++	 * TODO: add gem config or get the gem struct here and register as a
++	 * interface with adf y using intel_dc_config_add_memory();
++	 */
++	memory = kzalloc(sizeof(struct intel_dc_memory), GFP_KERNEL);
++	config->base.memory = memory;
++
++	/* create and add power */
++	/*
++	 * TODO: add dpms config over here and register with adf using
++	 * intel_dc_config_add_power();
++	 */
++
++	vlv_initialize_disp(config, PIPE_A, INTEL_PIPE_DSI);
++
++	return &config->base;
++err:
++	vlv_dc_config_destroy(&config->base);
++	return ERR_PTR(err);
++}
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+new file mode 100644
+index 0000000..8383530
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+@@ -0,0 +1,346 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <intel_adf_device.h>
++#include <core/intel_dc_config.h>
++#include <core/common/intel_dc_regs.h>
++#include <core/vlv/vlv_pri_plane.h>
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_dc_regs.h>
++#include <drm/i915_drm.h>
++
++#define SEC_PLANE_OFFSET 0x1000
++
++struct format_info {
++	u32 drm_format;
++	u32 hw_config;
++	u8 bpp;
++};
++
++static const struct format_info format_mapping[] = {
++	{
++		.drm_format = DRM_FORMAT_C8,
++		.hw_config = DISPPLANE_8BPP,
++		.bpp = 1,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_RGB565,
++		.hw_config = DISPPLANE_BGRX565,
++		.bpp = 2,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_XRGB8888,
++		.hw_config = DISPPLANE_BGRX888,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_ARGB8888,
++		.hw_config = DISPPLANE_BGRA888,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_XBGR2101010,
++		.hw_config = DISPPLANE_RGBX101010,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_ABGR2101010,
++		.hw_config = DISPPLANE_RGBA101010,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_XRGB2101010,
++		.hw_config = DISPPLANE_BGRX101010,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_ARGB2101010,
++		.hw_config = DISPPLANE_BGRA101010,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_XBGR8888,
++		.hw_config = DISPPLANE_RGBX888,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_ABGR8888,
++		.hw_config = DISPPLANE_RGBA888,
++		.bpp = 4,
++	},
++};
++
++static const u32 pri_supported_formats[] = {
++	DRM_FORMAT_C8,
++	DRM_FORMAT_RGB565,
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_ABGR8888,
++	DRM_FORMAT_XRGB2101010,
++	DRM_FORMAT_ARGB2101010,
++	DRM_FORMAT_XBGR2101010,
++	DRM_FORMAT_ABGR2101010,
++};
++
++static const u32 pri_supported_transforms[] = {
++	INTEL_PLANE_TRANSFORM_ROT180,
++};
++
++static const u32 pri_supported_blendings[] = {
++	INTEL_PLANE_BLENDING_NONE,
++	INTEL_PLANE_BLENDING_PREMULT,
++};
++
++static const u32 pri_supported_tiling[] = {
++	INTEL_PLANE_TILE_NONE,
++	INTEL_PLANE_TILE_X,
++};
++
++static int get_format_config(u32 drm_format, u32 *config, u8 *bpp)
++{
++	int i;
++	for (i = 0; i < ARRAY_SIZE(format_mapping); i++) {
++		if (format_mapping[i].drm_format == drm_format) {
++			*config = format_mapping[i].hw_config;
++			*bpp = format_mapping[i].bpp;
++			return 0;
++		}
++	}
++
++	return -EINVAL;
++}
++
++static int init_context(struct vlv_pri_plane_context *ctx, u8 idx)
++{
++	switch (idx) {
++	case PRIMARY_PLANE:
++		ctx->plane = 0;
++		break;
++	case SECONDARY_PLANE:
++		ctx->plane = 1;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void vlv_pri_suspend(struct intel_dc_component *comp)
++{
++	return;
++}
++
++static void vlv_pri_resume(struct intel_dc_component *comp)
++{
++	return;
++}
++
++static int vlv_pri_validate(struct intel_plane *plane,
++		struct intel_buffer *buf,
++		struct intel_plane_config *config)
++{
++	u32 format_config;
++	u8 bpp;
++	return get_format_config(buf->format, &format_config, &bpp);
++}
++
++/* Computes the linear offset to the base tile and adjusts x, y. bytes per pixel
++* is assumed to be a power-of-two. */
++unsigned long vlv_compute_page_offset(int *x, int *y,
++					unsigned int tiling_mode,
++					unsigned int cpp,
++					unsigned int pitch)
++{
++	if (tiling_mode != I915_TILING_NONE) {
++		unsigned int tile_rows, tiles;
++
++		tile_rows = *y / 8;
++		*y %= 8;
++		tiles = *x / (512/cpp);
++		*x %= 512/cpp;
++
++		return tile_rows * pitch * 8 + tiles * 4096;
++	} else {
++		unsigned int offset;
++
++		offset = *y * pitch + *x * cpp;
++		*y = 0;
++		*x = (offset & 4095) / cpp;
++		return offset & -4096;
++	}
++}
++
++static void vlv_pri_flip(struct intel_plane *plane,
++		struct intel_buffer *buf,
++		struct intel_plane_config *config)
++{
++	struct vlv_pri_plane *pri_plane = to_vlv_pri_plane(plane);
++	struct pri_plane_regs_value *regs = &pri_plane->ctx.regs;
++	int src_x, src_y;
++	u32 format_config = 0;
++	u8 bpp = 0;
++	u32 pidx = pri_plane->ctx.plane;
++	unsigned long dspaddr_offset;
++
++	get_format_config(buf->format, &format_config, &bpp);
++
++	src_x = config->src_x;
++	src_y = config->src_y;
++
++	regs->dspcntr = REG_READ(DSPCNTR(pidx));
++	regs->dspcntr |= DISPLAY_PLANE_ENABLE;
++	regs->dspcntr &= ~DISPPLANE_PIXFORMAT_MASK;
++	regs->dspcntr |= format_config;
++
++	/* TODO tile support should be add as apart of the buf param*/
++	regs->dspcntr &= ~DISPPLANE_TILED;
++
++	regs->stride = buf->stride;
++
++	regs->linearoff = src_y * regs->stride + src_x * bpp;
++
++	dspaddr_offset = vlv_compute_page_offset(&src_x, &src_y,
++				I915_TILING_NONE, bpp, regs->stride);
++
++	regs->linearoff -= dspaddr_offset;
++
++	regs->tileoff = (src_y << 16) | src_x;
++
++	regs->surfaddr = (buf->gtt_offset_in_pages + dspaddr_offset);
++
++	REG_WRITE(DSPCNTR(pidx), regs->dspcntr);
++	REG_WRITE(DSPSTRIDE(pidx), regs->stride);
++	REG_WRITE(DSPTILEOFF(pidx), regs->tileoff);
++	REG_WRITE(DSPLINOFF(pidx), regs->linearoff);
++	I915_MODIFY_DISPBASE(DSPSURF(pidx), regs->surfaddr);
++	REG_POSTING_READ(DSPSURF(pidx));
++
++	return;
++}
++
++static inline void vlv_adf_flush_disp_plane(u8 plane)
++{
++	REG_WRITE(DSPSURF(plane), REG_READ(DSPSURF(plane)));
++}
++
++static int vlv_pri_enable(struct intel_plane *plane)
++{
++	u32 reg, value;
++
++	reg = DSPCNTR(plane->base.idx);
++	value = REG_READ(reg);
++	if (value & DISPLAY_PLANE_ENABLE) {
++		dev_dbg(plane->base.dev, "%splane already enabled\n",
++				__func__);
++		return 0;
++	}
++
++	REG_WRITE(reg, value | DISPLAY_PLANE_ENABLE);
++	vlv_adf_flush_disp_plane(plane->base.idx);
++
++	/*
++	 * TODO:No need to wait in case of mipi.
++	 * Since data will flow only when port is enabled.
++	 * wait for vblank will time out for mipi
++	 *
++	 * update for HDMI later
++	 */
++	return 0;
++}
++
++static int vlv_pri_disable(struct intel_plane *plane)
++{
++	u32 reg, value;
++
++	reg = DSPCNTR(plane->base.idx);
++	value = REG_READ(reg);
++	if ((value & DISPLAY_PLANE_ENABLE) == 0) {
++		dev_dbg(plane->base.dev, "%splane already disabled\n",
++				__func__);
++		return 0;
++	}
++
++	REG_WRITE(reg, value & ~DISPLAY_PLANE_ENABLE);
++	vlv_adf_flush_disp_plane(plane->base.idx);
++	return 0;
++}
++
++static const struct intel_plane_capabilities vlv_pri_caps = {
++	.supported_formats = pri_supported_formats,
++	.n_supported_formats = ARRAY_SIZE(pri_supported_formats),
++	.supported_blendings = pri_supported_blendings,
++	.n_supported_blendings = ARRAY_SIZE(pri_supported_blendings),
++	.supported_transforms = pri_supported_transforms,
++	.n_supported_transforms = ARRAY_SIZE(pri_supported_transforms),
++	.supported_scalings = NULL,
++	.n_supported_scalings = 0,
++	.supported_decompressions = NULL,
++	.n_supported_decompressions = 0,
++	.supported_tiling = pri_supported_tiling,
++	.n_supported_tiling = ARRAY_SIZE(pri_supported_tiling),
++	.supported_zorder = NULL,
++	.n_supported_zorder = 0,
++	.supported_reservedbit = NULL,
++	.n_supported_reservedbit = 0,
++};
++
++static const struct intel_plane_ops vlv_pri_ops = {
++	.base = {
++		.suspend = vlv_pri_suspend,
++		.resume = vlv_pri_resume,
++	},
++	.adf_ops = {
++		.supported_formats = pri_supported_formats,
++		.n_supported_formats = ARRAY_SIZE(pri_supported_formats),
++	},
++	.validate = vlv_pri_validate,
++	.flip = vlv_pri_flip,
++	.enable = vlv_pri_enable,
++	.disable = vlv_pri_disable,
++};
++
++int vlv_pri_plane_init(struct vlv_pri_plane *pplane, struct device *dev, u8 idx)
++{
++	int err;
++
++	if (!pplane) {
++		dev_err(dev, "%s: struct NULL\n", __func__);
++		return -EINVAL;
++	}
++	err = init_context(&pplane->ctx, idx);
++	if (err) {
++		pr_err("%s: plane context initialization failed\n", __func__);
++		return err;
++	}
++	return intel_adf_plane_init(&pplane->base, dev, idx, &vlv_pri_caps,
++			&vlv_pri_ops, "primary_plane");
++}
++
++void vlv_pri_plane_destroy(struct vlv_pri_plane *plane)
++{
++	if (plane)
++		intel_plane_destroy(&plane->base);
++	memset(&plane->ctx, 0, sizeof(plane->ctx));
++}
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+new file mode 100644
+index 0000000..22b9c37
+--- /dev/null
++++ b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+@@ -0,0 +1,532 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <drm/i915_drm.h>
++
++#include "intel_adf_device.h"
++#include "core/common/intel_dc_regs.h"
++#include "core/common/dsi/dsi_pipe.h"
++#include "core/vlv/vlv_dc_regs.h"
++#include "core/vlv/vlv_dc_config.h"
++#include "core/intel_dc_config.h"
++#include "core/vlv/vlv_sp_plane.h"
++#include "core/vlv/vlv_pri_plane.h"
++
++struct format_info {
++	u32 drm_format;
++	u32 hw_config;
++	u8 bpp;
++};
++
++static const struct format_info format_mappings[] = {
++	{
++		.drm_format = DRM_FORMAT_YUYV,
++		.hw_config = SP_FORMAT_YUV422 | SP_YUV_ORDER_YUYV,
++		.bpp = 2,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_YVYU,
++		.hw_config = SP_FORMAT_YUV422 | SP_YUV_ORDER_YVYU,
++		.bpp = 2,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_UYVY,
++		.hw_config = SP_FORMAT_YUV422 | SP_YUV_ORDER_UYVY,
++		.bpp = 2,
++	},
++
++	{
++
++		.drm_format = DRM_FORMAT_VYUY,
++		.hw_config = SP_FORMAT_YUV422 | SP_YUV_ORDER_VYUY,
++		.bpp = 2,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_C8,
++		.hw_config = DISPPLANE_8BPP,
++		.bpp = 1,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_RGB565,
++		.hw_config = DISPPLANE_BGRX565,
++		.bpp = 2,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_XRGB8888,
++		.hw_config = DISPPLANE_BGRX888,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_ARGB8888,
++		.hw_config = DISPPLANE_BGRA888,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_XBGR2101010,
++		.hw_config = DISPPLANE_RGBX101010,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_ABGR2101010,
++		.hw_config = DISPPLANE_RGBA101010,
++		.bpp = 4,
++	},
++
++	{
++		.drm_format = DRM_FORMAT_XBGR8888,
++		.hw_config = DISPPLANE_RGBX888,
++		.bpp = 4,
++	},
++	{
++		.drm_format = DRM_FORMAT_ABGR8888,
++		.hw_config = DISPPLANE_RGBA888,
++		.bpp = 4,
++	},
++};
++
++static void vlv_adf_flush_sp_plane(u32 pipe, u32 plane)
++{
++	REG_WRITE(SPSURF(pipe, plane), REG_READ(SPSURF(pipe, plane)));
++}
++
++static int context_init(struct vlv_sp_plane_context *ctx, u8 idx)
++{
++	switch (idx) {
++	case SPRITE_A:
++		ctx->plane = 0;
++		ctx->pipe = 0;
++		break;
++	case SPRITE_B:
++		ctx->plane = 1;
++		ctx->pipe = 0;
++		break;
++	case SPRITE_C:
++		ctx->plane = 0;
++		ctx->pipe = 1;
++		break;
++	case SPRITE_D:
++		ctx->plane = 1;
++		ctx->pipe = 1;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static void context_destroy(struct vlv_sp_plane_context *ctx)
++{
++	return;
++}
++
++static int get_format_config(u32 drm_format, u32 *format, u32 *bpp)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(format_mappings); i++) {
++		if (format_mappings[i].drm_format == drm_format) {
++			*format = format_mappings[i].hw_config;
++			*bpp = format_mappings[i].bpp;
++			return 0;
++		}
++	}
++
++	return -EINVAL;
++}
++
++static void vlv_sp_suspend(struct intel_dc_component *component)
++{
++	return;
++}
++
++static void vlv_sp_resume(struct intel_dc_component *component)
++{
++	return;
++}
++
++/**
++ * rect_clip_scaled - perform a scaled clip operation
++ * @src: source window rectangle
++ * @dst: destination window rectangle
++ * @clip: clip rectangle
++ * @hscale: horizontal scaling factor
++ * @vscale: vertical scaling factor
++ *
++ * Clip rectangle @dst by rectangle @clip. Clip rectangle @src by the
++ * same amounts multiplied by @hscale and @vscale.
++ *
++ * RETURNS:
++ * %true if rectangle @dst is still visible after being clipped,
++ * %false otherwise
++*/
++
++static bool rect_clip_scaled(struct rectangle *src, struct rectangle *dst,
++			const struct rectangle *clip)
++{
++	int diff;
++	int width, height;
++
++	diff = clip->x1 - dst->x1;
++	if (diff > 0) {
++		int64_t tmp = src->x1 + (int64_t) diff;
++		src->x1 = clamp_t(int64_t, tmp, INT_MIN, INT_MAX);
++	}
++	diff = clip->y1 - dst->y1;
++	if (diff > 0) {
++		int64_t tmp = src->y1 + (int64_t) diff;
++		src->y1 = clamp_t(int64_t, tmp, INT_MIN, INT_MAX);
++	}
++	diff = dst->x2 - clip->x2;
++	if (diff > 0) {
++		int64_t tmp = src->x2 - (int64_t) diff;
++		src->x2 = clamp_t(int64_t, tmp, INT_MIN, INT_MAX);
++	}
++	diff = dst->y2 - clip->y2;
++	if (diff > 0) {
++		int64_t tmp = src->y2 - (int64_t) diff;
++		src->y2 = clamp_t(int64_t, tmp, INT_MIN, INT_MAX);
++	}
++
++	dst->x1 = max(dst->x1, clip->x1);
++	dst->y1 = max(dst->y1, clip->y1);
++	dst->x2 = min(dst->x2, clip->x2);
++	dst->y2 = min(dst->y2, clip->y2);
++
++	width = dst->x2 - dst->x1;
++	height = dst->y2 - dst->y1;
++
++	return width > 0 && height > 0;
++}
++
++static bool format_is_yuv(uint32_t format)
++{
++	switch (format) {
++	case DRM_FORMAT_YUYV:
++	case DRM_FORMAT_UYVY:
++	case DRM_FORMAT_VYUY:
++	case DRM_FORMAT_YVYU:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static int vlv_sp_validate(struct intel_plane *plane, struct intel_buffer *buf,
++		struct intel_plane_config *config)
++{
++	struct dsi_pipe *dsi_pipe;
++	struct drm_mode_modeinfo *mode;
++	u32 format_config, bpp;
++	bool visible = false;
++	struct rectangle clip;
++
++	/* TODO need to add tiling support */
++	u32 tiling_mode = I915_TILING_NONE;
++
++	struct rectangle src = {
++		/* sample coordinates in 16.16 fixed point */
++		.x1 = config->src_x,
++		.x2 = config->src_x + config->src_w,
++		.y1 = config->src_y,
++		.y2 = config->src_y + config->src_h,
++	};
++
++	struct rectangle dst = {
++		/* integer pixels */
++		.x1 = config->dst_x,
++		.x2 = config->dst_x + config->dst_w,
++		.y1 = config->dst_y,
++		.y2 = config->dst_y + config->dst_h,
++	};
++
++	if (config->pipe->type == INTEL_PIPE_DSI) {
++		dsi_pipe = to_dsi_pipe(config->pipe);
++		mode = &dsi_pipe->config.perferred_mode;
++	} else {
++		/* handle HDMI pipe later */
++		return -EINVAL;
++	}
++
++	clip.x1 = 0;
++	clip.y1 = 0;
++	clip.x2 = mode->hdisplay;
++	clip.y2 = mode->vdisplay;
++
++	if (get_format_config(buf->format, &format_config, &bpp)) {
++		pr_err("ADF: pixel format not supported %s\n", __func__);
++		return -EINVAL;
++	}
++
++	/* check buf limits */
++	if (buf->w < 3 || buf->h < 3 || buf->stride > 16384) {
++		pr_err("ADF: Unsutable fb for the plane %s\n", __func__);
++		return -EINVAL;
++	}
++
++	/* sprite planes can be linear or x-tiled surfaces */
++	if (tiling_mode != I915_TILING_NONE && tiling_mode != I915_TILING_X) {
++		pr_err("ADF: unsupported tiling mode %s\n", __func__);
++		return -EINVAL;
++	}
++
++	visible = rect_clip_scaled(&src, &dst, &clip);
++
++	config->dst_x = dst.x1;
++	config->dst_y = dst.y1;
++	config->dst_w = (dst.x2 - dst.x1);
++	config->dst_h = (dst.y2 - dst.y1);
++
++	if (visible) {
++		/* sanity check to make sure the src viewport wasn't enlarged */
++		WARN_ON(src.x1 < (int) config->src_x ||
++			src.y1 < (int) config->src_y ||
++			src.x2 > (int) (config->src_x + config->src_w) ||
++			src.y2 > (int) (config->src_y + config->src_h));
++
++		/*
++		 * Hardware doesn't handle subpixel coordinates.
++		 * Adjust to (macro)pixel boundary
++		 */
++		config->src_x = src.x1;
++		config->src_w = (src.x2 - src.x1);
++		config->src_y = src.y1;
++		config->src_h = (src.y2 - src.y1);
++
++		if (format_is_yuv(buf->format)) {
++			config->src_x &= ~1;
++			config->src_w &= ~1;
++			config->dst_w &= ~1;
++		}
++	} else {
++		pr_err("ADF: plane is not visible %s\n", __func__);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void vlv_sp_flip(struct intel_plane *planeptr, struct intel_buffer *buf,
++			struct intel_plane_config *config)
++{
++	struct vlv_sp_plane *splane = to_vlv_sp_plane(planeptr);
++	int plane = splane->ctx.plane;
++	int pipe = splane->ctx.pipe;
++	struct sp_plane_regs_value *regs = &splane->ctx.regs;
++	u32 hw_format = 0;
++	u32 bpp = 0;
++	u32 sprctl;
++	u32 dst_w = (config->dst_w & VLV_SP_12BIT_MASK) - 1;
++	u32 dst_h = (config->dst_h & VLV_SP_12BIT_MASK) - 1;
++	u32 src_x = config->src_x & VLV_SP_12BIT_MASK;
++	u32 src_y = config->src_y & VLV_SP_12BIT_MASK;
++	u32 dst_x = config->dst_x & VLV_SP_12BIT_MASK;
++	u32 dst_y = config->dst_y & VLV_SP_12BIT_MASK;
++	unsigned long sprsurf_offset, linear_offset;
++
++	get_format_config(buf->format, &hw_format, &bpp);
++	sprctl = REG_READ(SPCNTR(pipe, plane));
++
++	/* Mask out pixel format bits in case we change it */
++	sprctl &= ~SP_PIXFORMAT_MASK;
++	sprctl &= ~SP_YUV_BYTE_ORDER_MASK;
++	sprctl &= ~SP_TILED;
++
++	sprctl |= hw_format;
++	sprctl |= SP_GAMMA_ENABLE;
++
++	/* tile mode need to be supported */
++
++	sprctl |= SP_ENABLE;
++	regs->dspcntr = sprctl;
++
++	linear_offset = src_y * buf->stride + src_x * bpp;
++	sprsurf_offset = vlv_compute_page_offset(&src_x, &src_y,
++			I915_TILING_NONE, bpp, buf->stride);
++	regs->linearoff = linear_offset - sprsurf_offset;
++
++	regs->stride = buf->stride;
++	regs->pos = ((dst_y << 16) | dst_x);
++	regs->tileoff = (src_y << 16) | src_x;
++	regs->size = (dst_h << 16) | dst_w;
++	regs->surfaddr = (buf->gtt_offset_in_pages + sprsurf_offset);
++
++	REG_WRITE(SPSTRIDE(pipe, plane), regs->stride);
++	REG_WRITE(SPPOS(pipe, plane), regs->pos);
++	REG_WRITE(SPTILEOFF(pipe, plane), regs->tileoff);
++	REG_WRITE(SPLINOFF(pipe, plane), regs->linearoff);
++	REG_WRITE(SPSIZE(pipe, plane), regs->size);
++	REG_WRITE(SPCNTR(pipe, plane), regs->dspcntr);
++	I915_MODIFY_DISPBASE(SPSURF(pipe, plane), regs->surfaddr);
++	REG_POSTING_READ(SPSURF(pipe, plane));
++
++	return;
++}
++
++static int vlv_sp_enable(struct intel_plane *planeptr)
++{
++	u32 reg, value;
++	struct vlv_sp_plane *splane = to_vlv_sp_plane(planeptr);
++	int plane = splane->ctx.plane;
++	int pipe = splane->ctx.pipe;
++
++	reg = SPCNTR(pipe, plane);
++	value = REG_READ(reg);
++	if (value & DISPLAY_PLANE_ENABLE) {
++		return 0;
++		dev_dbg(planeptr->base.dev, "%splane already enabled\n",
++				__func__);
++	}
++
++	REG_WRITE(reg, value | DISPLAY_PLANE_ENABLE);
++	vlv_adf_flush_sp_plane(pipe, plane);
++	/*
++	 * TODO:No need to wait in case of mipi.
++	 * Since data will flow only when port is enabled.
++	 * wait for vblank will time out for mipi
++	 */
++	return 0;
++}
++
++static int vlv_sp_disable(struct intel_plane *planeptr)
++{
++	u32 reg, value;
++	struct vlv_sp_plane *splane = to_vlv_sp_plane(planeptr);
++	int plane = splane->ctx.plane;
++	int pipe = splane->ctx.pipe;
++
++	reg = SPCNTR(pipe, plane);
++	reg = SPCNTR(pipe, plane);
++	value = REG_READ(reg);
++	if ((value & DISPLAY_PLANE_ENABLE) == 0) {
++		dev_dbg(planeptr->base.dev, "%splane already disabled\n",
++				__func__);
++		return 0;
++	}
++
++	REG_WRITE(reg, value & ~DISPLAY_PLANE_ENABLE);
++	vlv_adf_flush_sp_plane(pipe, plane);
++
++	return 0;
++}
++
++static const u32 sprite_supported_formats[] = {
++	DRM_FORMAT_C8,
++	DRM_FORMAT_YUYV,
++	DRM_FORMAT_YVYU,
++	DRM_FORMAT_UYVY,
++	DRM_FORMAT_VYUY,
++	DRM_FORMAT_RGB565,
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_ABGR8888,
++	DRM_FORMAT_XBGR2101010,
++	DRM_FORMAT_ABGR2101010,
++};
++
++static const u32 sprite_supported_transforms[] = {
++	INTEL_PLANE_TRANSFORM_ROT180,
++};
++
++static const u32 sprite_supported_blendings[] = {
++	INTEL_PLANE_BLENDING_NONE,
++	INTEL_PLANE_BLENDING_PREMULT,
++};
++
++static const u32 sprite_supported_tiling[] = {
++	INTEL_PLANE_TILE_NONE,
++	INTEL_PLANE_TILE_X,
++	INTEL_PLANE_TILE_Y,
++};
++
++static const u32 sprite_supported_zorder[] = {
++	INTEL_PLANE_P1S1S2C1,
++	INTEL_PLANE_P1S2S1C1,
++	INTEL_PLANE_S2P1S1C1,
++	INTEL_PLANE_S2S1P1C1,
++	INTEL_PLANE_S1P1S2C1,
++	INTEL_PLANE_S1S2P1C1,
++};
++
++static const u32 sprite_supported_reservedbit[] = {
++	INTEL_PLANE_RESERVED_BIT_ZERO,
++	INTEL_PLANE_RESERVED_BIT_SET,
++};
++
++static const struct intel_plane_ops vlv_sp_ops = {
++	.base = {
++		.suspend = vlv_sp_suspend,
++		.resume = vlv_sp_resume,
++	},
++	.adf_ops = {
++		.supported_formats = sprite_supported_formats,
++		.n_supported_formats = ARRAY_SIZE(sprite_supported_formats),
++	},
++	.validate = vlv_sp_validate,
++	.flip = vlv_sp_flip,
++	.enable = vlv_sp_enable,
++	.disable = vlv_sp_disable,
++};
++
++static const struct intel_plane_capabilities vlv_sp_caps = {
++	.supported_formats = sprite_supported_formats,
++	.n_supported_formats = ARRAY_SIZE(sprite_supported_formats),
++	.supported_blendings = sprite_supported_blendings,
++	.n_supported_blendings = ARRAY_SIZE(sprite_supported_blendings),
++	.supported_transforms = sprite_supported_transforms,
++	.n_supported_transforms = ARRAY_SIZE(sprite_supported_transforms),
++	.supported_scalings = NULL,
++	.n_supported_scalings = 0,
++	.supported_decompressions = NULL,
++	.n_supported_decompressions = 0,
++	.supported_tiling = sprite_supported_tiling,
++	.n_supported_tiling = ARRAY_SIZE(sprite_supported_tiling),
++	.supported_zorder = sprite_supported_zorder,
++	.n_supported_zorder = ARRAY_SIZE(sprite_supported_zorder),
++	.supported_reservedbit = sprite_supported_reservedbit,
++	.n_supported_reservedbit = ARRAY_SIZE(sprite_supported_reservedbit),
++};
++
++int vlv_sp_plane_init(struct vlv_sp_plane *splane, struct device *dev, u8 idx)
++{
++	int err;
++
++	if (!splane) {
++		dev_err(dev, "data provided is NULL\n");
++		return -EINVAL;
++	}
++	err = context_init(&splane->ctx, idx);
++	if (err) {
++		dev_err(dev, "failed to init sprite context\n");
++		return err;
++	}
++	return intel_adf_plane_init(&splane->base, dev, idx, &vlv_sp_caps,
++			&vlv_sp_ops, "sp_plane");
++}
++
++void vlv_sp_plane_destroy(struct vlv_sp_plane *splane)
++{
++	if (splane) {
++		intel_plane_destroy(&splane->base);
++		context_destroy(&splane->ctx);
++	}
++}
+diff --git a/drivers/video/adf/intel/include/core/common/dsi/dsi_panel.h b/drivers/video/adf/intel/include/core/common/dsi/dsi_panel.h
+index d4c9708..532635e 100644
+--- a/drivers/video/adf/intel/include/core/common/dsi/dsi_panel.h
++++ b/drivers/video/adf/intel/include/core/common/dsi/dsi_panel.h
+@@ -20,7 +20,6 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <drm/drm_mode.h>
+-#include <linux/panel_psb_drv.h>
+ 
+ struct dsi_pipe;
+ 
+diff --git a/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h b/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
+index 0174194..aa5b8c1 100644
+--- a/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
++++ b/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
+@@ -20,9 +20,7 @@
+ 
+ #include "core/intel_dc_config.h"
+ #include "core/common/dsi/dsi_config.h"
+-#include "core/common/dsi/dsi_pkg_sender.h"
+ #include "core/common/dsi/dsi_panel.h"
+-#include "pwr_mgmt.h"
+ #ifdef CONFIG_BACKLIGHT_CLASS_DEVICE
+ #include "core/common/backlight_dev.h"
+ #endif
+@@ -58,7 +56,6 @@ struct dsi_pipe {
+ 	struct intel_pipe base;
+ 	struct dsi_pipe_ops ops;
+ 	struct dsi_config config;
+-	struct dsi_pkg_sender sender;
+ 	struct dsi_panel *panel;
+ };
+ 
+diff --git a/drivers/video/adf/intel/include/core/intel_adf_drv.h b/drivers/video/adf/intel/include/core/intel_adf_drv.h
+new file mode 100644
+index 0000000..05fc69c
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/intel_adf_drv.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef VLV_DRV_H
++#define VLV_DRV_H
++#include <linux/err.h>
++
++unsigned long vlv_compute_page_offset(int *x, int *y,
++					unsigned int tiling_mode,
++					unsigned int cpp,
++					unsigned int pitch);
++
++#endif
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index d857f25..f8c3123 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -29,6 +29,7 @@ struct intel_dc_component;
+ struct intel_plane;
+ struct intel_pipe;
+ struct intel_dc_memory;
++struct intel_dc_power_ops;
+ 
+ enum intel_plane_blending {
+ 	INTEL_PLANE_BLENDING_NONE,
+@@ -105,6 +106,7 @@ struct intel_buffer {
+ 	u32 h;
+ 	u32 format;
+ 	u32 gtt_offset_in_pages;
++	u32 stride;
+ };
+ 
+ struct intel_dc_buffer {
+@@ -298,6 +300,13 @@ struct intel_dc_config {
+ 	struct intel_dc_power *power;
+ };
+ 
++struct intel_dc_config_entry {
++	const u32 id;
++	struct intel_dc_config * (*get_dc_config)(struct pci_dev *pdev,
++		u32 id);
++	void (*destroy_dc_config)(struct intel_dc_config *config);
++};
++
+ static inline struct intel_plane *to_intel_plane(
+ 	struct intel_dc_component *component)
+ {
+@@ -310,7 +319,7 @@ static inline struct intel_pipe *to_intel_pipe(
+ 	return container_of(component, struct intel_pipe, base);
+ }
+ 
+-extern int intel_plane_init(struct intel_plane *plane, struct device *dev,
++extern int intel_adf_plane_init(struct intel_plane *plane, struct device *dev,
+ 	u8 idx, const struct intel_plane_capabilities *caps,
+ 	const struct intel_plane_ops *ops, const char *name);
+ extern void intel_plane_destroy(struct intel_plane *plane);
+@@ -371,4 +380,8 @@ extern struct intel_dc_config *intel_adf_get_dc_config(
+ 	struct pci_dev *pdev, const u32 id);
+ extern void intel_adf_destroy_config(struct intel_dc_config *config);
+ 
++/* Supported configs */
++extern struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id);
++extern void vlv_dc_config_destroy(struct intel_dc_config *config);
++
+ #endif /* INTEL_DC_CONFIG_H_ */
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+new file mode 100644
+index 0000000..77b8dd5
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+@@ -0,0 +1,50 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef VLV_DC_CONFIG_H
++#define VLV_DC_CONFIG_H
++
++#include "core/intel_dc_config.h"
++
++#define VLV_N_PLANES	6
++#define VLV_N_PIPES	2
++#define VLV_NUM_SPRITES 2
++#define VLV_SP_12BIT_MASK 0xFFF
++
++enum pipe {
++	PIPE_A = 0,
++	PIPE_B,
++	MAX_PIPES,
++};
++
++enum planes {
++	PRIMARY_PLANE = 0,
++	SPRITE_A = 1,
++	SPRITE_B = 2,
++	SECONDARY_PLANE = 3,
++	SPRITE_C = 4,
++	SPRITE_D = 5,
++	NUM_PLANES,
++};
++
++enum vlv_disp_plane {
++	VLV_PLANE = 0,
++	VLV_SPRITE1,
++	VLV_SPRITE2,
++	VLV_MAX_PLANES,
++};
++
++bool vlv_intf_screen_connected(struct intel_pipe *pipe);
++u32 vlv_intf_vsync_counter(struct intel_pipe *pipe, u32 interval);
++#endif
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_hw.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_hw.h
+new file mode 100644
+index 0000000..58c3543
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_hw.h
+@@ -0,0 +1,29 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef VLV_DC_HW_H
++#define VLV_DC_HW_H
++
++struct hw_context_entry {
++	u32 reg;
++	u32 value;
++};
++
++enum {
++	PLANE_A = 0,
++	PLANE_B,
++	N_PRI_PLANE,
++};
++
++#endif
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index 40cee9f..966d08a 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -3531,6 +3531,7 @@
+ #define   DISPPLANE_RGBX101010			(0x8<<26)
+ #define   DISPPLANE_RGBA101010			(0x9<<26)
+ #define   DISPPLANE_BGRX101010			(0xa<<26)
++#define   DISPPLANE_BGRA101010                  (0xb<<26)
+ #define   DISPPLANE_RGBX161616			(0xc<<26)
+ #define   DISPPLANE_RGBX888			(0xe<<26)
+ #define   DISPPLANE_RGBA888			(0xf<<26)
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pri_plane.h b/drivers/video/adf/intel/include/core/vlv/vlv_pri_plane.h
+new file mode 100644
+index 0000000..43aa380
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pri_plane.h
+@@ -0,0 +1,55 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef VLV_PRI_PLANE_H
++#define VLV_PRI_PLANE_H
++
++#include "core/intel_dc_config.h"
++#include "vlv_dc_hw.h"
++
++enum {
++	PLANE_PIXEL_FORMAT_C8 = 0,
++};
++
++struct pri_plane_regs_value {
++	u32 dspcntr;
++	u32 stride;
++	unsigned long linearoff;
++	unsigned long tileoff;
++	unsigned long surfaddr;
++};
++
++struct vlv_pri_plane_context {
++	struct pri_plane_regs_value regs;
++	u32 plane;
++};
++
++struct vlv_pri_plane {
++	struct intel_plane base;
++	struct vlv_pri_plane_context ctx;
++};
++
++static inline struct vlv_pri_plane *to_vlv_pri_plane(struct intel_plane *plane)
++{
++	return container_of(plane, struct vlv_pri_plane, base);
++}
++
++int vlv_pri_plane_init(struct vlv_pri_plane *pplane,
++		struct device *dev, u8 idx);
++void vlv_pri_plane_destroy(struct vlv_pri_plane *plane);
++extern unsigned long vlv_compute_page_offset(int *x, int *y,
++					unsigned int tiling_mode,
++					unsigned int cpp,
++					unsigned int pitch);
++#endif
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_sp_plane.h b/drivers/video/adf/intel/include/core/vlv/vlv_sp_plane.h
+new file mode 100644
+index 0000000..31a6a49
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_sp_plane.h
+@@ -0,0 +1,62 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef VLV_SP_PLANE_H
++#define VLV_SP_PLANE_H
++
++#include "core/intel_dc_config.h"
++#include "core/common/overlay.h"
++#include "vlv_dc_hw.h"
++
++struct sp_plane_regs_value {
++	u32 dspcntr;
++	u32 stride;
++	u32 pos;
++	u32 size;
++	unsigned long linearoff;
++	unsigned long tileoff;
++	unsigned long surfaddr;
++};
++
++struct vlv_sp_plane_context {
++	struct sp_plane_regs_value regs;
++	u32 plane;
++	u32 pipe;
++};
++
++struct vlv_sp_plane {
++	struct intel_plane base;
++	struct vlv_sp_plane_context ctx;
++};
++
++/**
++ * struct rectangle - two dimensional rectangle
++ * @x1: horizontal starting coordinate (inclusive)
++ * @x2: horizontal ending coordinate (exclusive)
++ * @y1: vertical starting coordinate (inclusive)
++ * @y2: vertical ending coordinate (exclusive)
++*/
++struct rectangle {
++	int x1, y1, x2, y2;
++};
++
++static inline struct vlv_sp_plane *to_vlv_sp_plane(struct intel_plane *plane)
++{
++	return container_of(plane, struct vlv_sp_plane, base);
++}
++
++int vlv_sp_plane_init(struct vlv_sp_plane *splane, struct device *dev, u8 idx);
++void vlv_sp_plane_destroy(struct vlv_sp_plane *splane);
++
++#endif
+diff --git a/drivers/video/adf/intel/include/intel_adf.h b/drivers/video/adf/intel/include/intel_adf.h
+index 088d8e9..88910f1 100644
+--- a/drivers/video/adf/intel/include/intel_adf.h
++++ b/drivers/video/adf/intel/include/intel_adf.h
+@@ -43,8 +43,7 @@ struct intel_adf_context {
+ #endif
+ };
+ 
+-extern struct intel_adf_context *intel_adf_context_create(
+-	struct pci_dev *pdev, void *pg);
++extern struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev);
+ extern void intel_adf_context_destroy(struct intel_adf_context *ctx);
+ extern int intel_adf_context_on_event(void);
+ 
+diff --git a/drivers/video/adf/intel/intel_adf.c b/drivers/video/adf/intel/intel_adf.c
+index f0e7126..d5a2d60 100644
+--- a/drivers/video/adf/intel/intel_adf.c
++++ b/drivers/video/adf/intel/intel_adf.c
+@@ -204,8 +204,7 @@ void intel_adf_context_destroy(struct intel_adf_context *ctx)
+ 	g_adf_context = NULL;
+ }
+ 
+-struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev,
+-	void *pg)
++struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev)
+ {
+ 	struct intel_adf_context *ctx;
+ 	struct intel_adf_device *dev;
+@@ -220,7 +219,7 @@ struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev,
+ 	u32 platform_id = 0;
+ 	int err;
+ 
+-	if (!pdev || !pg)
++	if (!pdev)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	/*create ADF context*/
+-- 
+1.7.9.5
+

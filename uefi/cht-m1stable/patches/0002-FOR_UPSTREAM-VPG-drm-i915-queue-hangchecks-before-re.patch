@@ -1,0 +1,120 @@
+From bc4c1c37d657ecb40dbcf86dde8511816f420849 Mon Sep 17 00:00:00 2001
+Message-Id: <bc4c1c37d657ecb40dbcf86dde8511816f420849.1442426313.git.yunwei.zhang@intel.com>
+In-Reply-To: <e1a881aacd5b5e6c23178e07b30439f59d003bae.1442426313.git.yunwei.zhang@intel.com>
+References: <e1a881aacd5b5e6c23178e07b30439f59d003bae.1442426313.git.yunwei.zhang@intel.com>
+From: Tim Gore <tim.gore@intel.com>
+Date: Fri, 14 Aug 2015 16:37:27 +0100
+Subject: [PATCH 2/2] FOR_UPSTREAM [VPG]: drm/i915: queue hangchecks before
+ retiring work
+
+The igt test gem_ctx_exec hangs during subtest
+reset-pin-leak, but only when all the subtests are run,
+not if the subtest is run alone. This is caused by a
+rather unfortunate combination. The test creates a simple
+batch buffer which it re-uses across several tests, and
+more importantly across several contexts. The basic test
+creates a context, submits the batch buffer, waits for the
+work to complete and then tries to destroy the context.
+At this point there are still some outstanding references
+to the context, so it does not actually get destroyed.
+The submission of this work causes a delayed work item
+to be queued to call the retire_work_handler, with a delay
+of 1s.
+The reset-pin-leak test creates a new context, sets the
+stop_rings bits to cause a gpu hang and then submits the
+same batch buffer. It then waits for this work to complete.
+The work of course hangs. At this point no hangcheck work
+has been queued as it is piggy-backed onto retire_work.
+When the retire_work_handler is called, it first tries
+to retire any finished work. During this process the first
+context (used by the basic test) gets its reference count
+reduced to zero and gem_context_free is called on it.
+gem_context_free tries to destroy the ppgtt for this
+context, BUT this ppgtt contains a vma that is backed by
+the batch buffer. Vma's are not reference counted, so the
+code checks the batch buffer object and finds that its
+last_read_req is pointing to the most recently submitted
+request from the reset-pin-leak test, and this request is
+of course still active. In fact this request is in a
+different context and hence using a different ppgtt, but
+the code that is trying to unbind the vma doesn't realise
+this and calls __wait_request on the hung request. The
+retire_work_handler is now stuck. It has not queued the
+hangcheck work at this point, so the hang is never found,
+and we're toast.
+
+From within the vma unbind code there is no simple way to
+tell that there a no pending gem_requests using it unless
+it searches through all current requests, including those
+in the scheduler. So the simple solution is to queue the
+hangcheck work at the start of the retire_work_handler.
+This way, if the retire work gets stuck in this way the
+hangcheck mechanism will fire and hopefully clear the hang.
+
+After the retire_work_handler has finished, if the gpu is
+idle i just cancel the hangcheck work. To give us a chance
+of cancelling this hangcheck i have slightly modified the
+i915_queue_hangcheck function to give a minimum delay of
+one jiffy, rather than 0.
+
+v2. Following comment from Tomas Elf, removed the code that
+cancels the hangcheck if the gpu appears to be idle after
+retiring work. This is to avoid possible race conditions.
+The hangcheck is fairly lightweight so not a big deal if
+it runs once more than needed.
+
+Change-Id: Ib272f6da862845fbc224d33c13855133cab721cc
+Tracked-On: https://jira01.devtools.intel.com/browse/VIZ-6259
+Signed-off-by: Tim Gore <tim.gore@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c | 23 +++++++++++++----------
+ 1 file changed, 13 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 3af94c1..1224e84 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3244,9 +3244,21 @@ i915_gem_retire_work_handler(struct work_struct *work)
+ 	struct drm_i915_private *dev_priv =
+ 		container_of(work, typeof(*dev_priv), mm.retire_work.work);
+ 	struct drm_device *dev = dev_priv->dev;
++	struct intel_engine_cs *ring;
++	unsigned i;
+ 	bool idle;
+ 	unsigned long ts = dev_priv->mm.retire_work_timestamp;
+ 
++	/*
++	 * It is possible for i915_gem_retire_requests to get stuck
++	 * in the case of a gpu hang, so need to queue the hangcheck
++	 * work first.
++	 */
++	for_each_ring(ring, dev_priv, i) {
++		if (!list_empty(&ring->request_list))
++			i915_queue_hangcheck(dev, i, ts);
++	}
++
+ 	/* Come back later if the device is busy... */
+ 	idle = false;
+ 	if (mutex_trylock(&dev->struct_mutex)) {
+@@ -3254,17 +3266,8 @@ i915_gem_retire_work_handler(struct work_struct *work)
+ 		mutex_unlock(&dev->struct_mutex);
+ 	}
+ 
+-	if (!idle) {
+-		struct intel_engine_cs *ring;
+-		unsigned i;
+-
++	if (!idle)
+ 		queue_retire_work(dev_priv, round_jiffies_up_relative(HZ));
+-
+-		for_each_ring(ring, dev_priv, i) {
+-			if (!list_empty(&ring->request_list))
+-				i915_queue_hangcheck(dev, i, ts);
+-		}
+-	}
+ }
+ 
+ static void
+-- 
+1.9.1
+

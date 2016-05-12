@@ -1,0 +1,283 @@
+From a90cee25fe93450aac11a108ec0948bc57b0f3aa Mon Sep 17 00:00:00 2001
+From: Jayachandran B <jayachandran.b@intel.com>
+Date: Fri, 2 May 2014 18:48:50 +0530
+Subject: [PATCH 08/39] ASoC: firmware: Add support for dynamic CPU dais
+
+Issue: GMINL-3679
+
+This patch enhances the ASoC Firmware parser to parse and load
+platform (CPU) dais based on firmware configuration binary which
+contains the dai information for a given platform.
+
+The binary data is parsed and dais with corresponding attributes are
+created. Appropriate dai operation is associated with each dai based
+on information passed via the dai load interface. The dais are then
+registered via call back provided by the calling context.
+
+Change-Id: I8a034fe0753bcf8e2c6ce8ed0d9e95d3c8374d8e
+Signed-off-by: Jayachandran B <jayachandran.b@intel.com>
+---
+ include/sound/soc-fw.h    |  15 ++++++
+ include/uapi/sound/asoc.h |  29 +++++++++++
+ sound/soc/soc-fw.c        | 123 +++++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 166 insertions(+), 1 deletion(-)
+
+diff --git a/include/sound/soc-fw.h b/include/sound/soc-fw.h
+index c3580b9..8d5d4e1 100644
+--- a/include/sound/soc-fw.h
++++ b/include/sound/soc-fw.h
+@@ -32,6 +32,14 @@ struct snd_soc_fw_kcontrol_ops {
+ };
+ 
+ /*
++ * Dai operations - used to map dai ops structure to firmware based dais.
++ */
++struct snd_soc_fw_dai_ops {
++	u32 id;
++	struct snd_soc_dai_ops *ops;
++};
++
++/*
+  * Public API - Used by component drivers to load new mixers, DAPM, vendor
+  * specific data.
+  */
+@@ -63,6 +71,9 @@ struct snd_soc_fw_platform_ops {
+ 	/* external widget init - can be used to set ext funcs + pdata */
+ 	int (*widget_load)(struct snd_soc_platform *, struct snd_soc_dapm_widget *);
+ 
++	/* external dai init - can be used to set ext funcs + pdata */
++	int (*dai_load)(struct snd_soc_platform *, struct snd_soc_dai_driver *dai_drv, int n);
++
+ 	/* callback to handle vendor data */
+ 	int (*vendor_load)(struct snd_soc_platform *, struct snd_soc_fw_hdr *);
+ 	int (*vendor_unload)(struct snd_soc_platform *, struct snd_soc_fw_hdr *);
+@@ -73,6 +84,10 @@ struct snd_soc_fw_platform_ops {
+ 	/* kcontrols operations */
+ 	const struct snd_soc_fw_kcontrol_ops *io_ops;
+ 	int io_ops_count;
++
++	/* dai operations */
++	const struct snd_soc_fw_dai_ops *dai_ops;
++	int dai_ops_count;
+ };
+ 
+ struct snd_soc_fw_card_ops {
+diff --git a/include/uapi/sound/asoc.h b/include/uapi/sound/asoc.h
+index 3912e65..cfd0dbb 100644
+--- a/include/uapi/sound/asoc.h
++++ b/include/uapi/sound/asoc.h
+@@ -775,6 +775,7 @@ enum snd_soc_dapm_type {
+ #define SND_SOC_FW_DAPM_WIDGET		3
+ #define SND_SOC_FW_DAI_LINK		4
+ #define SND_SOC_FW_COEFF		5
++#define SND_SOC_FW_DAI			6
+ 
+ #define SND_SOC_FW_VENDOR_FW		1000
+ #define SND_SOC_FW_VENDOR_CONFIG	1001
+@@ -893,4 +894,32 @@ struct snd_soc_file_coeff_data {
+ 	/* data here */
+ } __attribute__((packed));
+ 
++
++
++struct snd_soc_fw_dai_caps {
++	const char stream_name[SND_SOC_FW_TEXT_SIZE];
++	__le64 formats;		/* SNDRV_PCM_FMTBIT_* */
++	__le32 rates;		/* SNDRV_PCM_RATE_* */
++	__le32 rate_min;	/* min rate */
++	__le32 rate_max;	/* max rate */
++	__le32 channels_min;	/* min channels */
++	__le32 channels_max;	/* max channels */
++	__le32 reserved[12];	/* Reserved for future use*/
++} __attribute__((packed));
++
++struct snd_soc_fw_dai_elem {
++	const char name[SND_SOC_FW_TEXT_SIZE];
++	__le32 dai_type;    /* Type used to match dais and set ops */
++	__u8 compress_dai;  /* 1 = compressed; 0 = PCM*/
++	__le32 reserved[12];/* reserved for future use */
++	__le32 pb_stream:1; /* If playback stream supported this dai */
++	__le32 cp_stream:1; /* If capture stream supported this dai */
++	struct snd_soc_fw_dai_caps playback_caps;
++	struct snd_soc_fw_dai_caps capture_caps;
++} __attribute__((packed));
++
++struct snd_soc_fw_dai_data {
++	__le32 count; /* in elems */
++/* data here */
++} __attribute__((packed));
+ #endif
+diff --git a/sound/soc/soc-fw.c b/sound/soc/soc-fw.c
+index dbf54ca..8185d41 100644
+--- a/sound/soc/soc-fw.c
++++ b/sound/soc/soc-fw.c
+@@ -40,9 +40,10 @@
+ #define SOC_FW_PASS_WIDGET	2
+ #define SOC_FW_PASS_GRAPH	3
+ #define SOC_FW_PASS_PINS	4
++#define SOC_FW_PASS_DAI		5
+ 
+ #define SOC_FW_PASS_START	SOC_FW_PASS_VENDOR
+-#define SOC_FW_PASS_END	SOC_FW_PASS_PINS
++#define SOC_FW_PASS_END	SOC_FW_PASS_DAI
+ 
+ struct soc_fw {
+ 	const char *file;
+@@ -64,6 +65,10 @@ struct soc_fw {
+ 	const struct snd_soc_fw_kcontrol_ops *io_ops;
+ 	int io_ops_count;
+ 
++	/* dai operations */
++	const struct snd_soc_fw_dai_ops *dai_ops;
++	int dai_ops_count;
++
+ 	/* optional fw loading callbacks to component drivers */
+ 	union {
+ 		struct snd_soc_fw_codec_ops *codec_ops;
+@@ -243,6 +248,16 @@ static int soc_fw_widget_load(struct soc_fw *sfw, struct snd_soc_dapm_widget *w)
+ 	return 0;
+ }
+ 
++/* pass new dynamic dais to component driver for dai registration */
++static int soc_fw_dai_load(struct soc_fw *sfw, struct snd_soc_dai_driver *dai_drv, int n)
++{
++	if (sfw->platform && sfw->platform_ops && sfw->platform_ops->dai_load)
++		return sfw->platform_ops->dai_load(sfw->platform, dai_drv, n);
++
++	dev_dbg(sfw->dev, "ASoC: no handler specified for dai registration\n");
++
++	return 0;
++}
+ /* tell the component driver that all firmware has been loaded in this request */
+ static void soc_fw_complete(struct soc_fw *sfw)
+ {
+@@ -1101,6 +1116,108 @@ static int soc_fw_dai_link_load(struct soc_fw *sfw, struct snd_soc_fw_hdr *hdr)
+ 	return 0;
+ }
+ 
++/* bind a dai to its ops */
++static int soc_fw_dai_bind_ops(unsigned int dai_type, struct snd_soc_dai_driver *dai_drv,
++		const struct snd_soc_fw_dai_ops *ops, int num_ops)
++{
++	int i;
++
++	dai_drv->ops = NULL;
++	for (i = 0; i < num_ops; i++) {
++		if (dai_type == ops[i].id) {
++			dai_drv->ops = ops[i].ops;
++			break;
++		}
++	}
++
++	return 0;
++}
++
++static inline int soc_fw_set_dai_caps(struct snd_soc_pcm_stream *stream,
++		struct	snd_soc_fw_dai_caps *caps)
++{
++	/* validate stream names */
++	if (strnlen(caps->stream_name, SND_SOC_FW_TEXT_SIZE) ==
++			SND_SOC_FW_TEXT_SIZE)
++		return -EINVAL;
++
++	stream->stream_name = caps->stream_name;
++	stream->formats = caps->formats;
++	stream->rates = caps->rates;
++	stream->rate_min = caps->rate_min;
++	stream->rate_max = caps->rate_max;
++	stream->channels_min = caps->channels_min;
++	stream->channels_max = caps->channels_max;
++	return 0;
++}
++
++static int soc_fw_ddai_load(struct soc_fw *sfw, struct snd_soc_fw_hdr *hdr)
++{
++	struct snd_soc_fw_dai_data *dai_data =
++		(struct snd_soc_fw_dai_data *)sfw->pos;
++	struct snd_soc_fw_dai_elem *elem;
++	int count = dai_data->count, i;
++	struct snd_soc_dai_driver *dai_drv;
++
++	if (sfw->pass != SOC_FW_PASS_DAI)
++		return 0;
++
++	sfw->pos += sizeof(struct snd_soc_fw_dai_data);
++	/* The following function for control count has been reused to
++	 * validate the dai count as well
++	 */
++	if (soc_fw_check_control_count(sfw,
++				sizeof(struct snd_soc_fw_dai_elem),
++				count, hdr->size)) {
++		dev_err(sfw->dev, "ASoC: invalid count %d for DAI elems\n",
++				count);
++		return -EINVAL;
++	}
++
++	dev_dbg(sfw->dev, "ASoC: adding %d DAIs\n", count);
++	dai_drv = devm_kzalloc(sfw->dev,
++			sizeof(struct snd_soc_dai_driver) * count, GFP_KERNEL);
++	if (!dai_drv) {
++		dev_err(sfw->dev, "ASoC: Mem alloc failue\n");
++		return -ENOMEM;
++	}
++	for (i = 0; i < count; i++) {
++		elem = (struct snd_soc_fw_dai_elem *)sfw->pos;
++		sfw->pos += sizeof(struct snd_soc_fw_dai_elem);
++
++		/* validate dai name */
++		if (strnlen(elem->name, SND_SOC_FW_TEXT_SIZE) ==
++				SND_SOC_FW_TEXT_SIZE) {
++			dev_err(sfw->dev, "ASoC: invalid dai name\n");
++			return -EINVAL;
++		}
++		dai_drv[i].name = elem->name;
++		dai_drv[i].compress_dai = elem->compress_dai;
++
++		if (elem->pb_stream) {
++			if (soc_fw_set_dai_caps(&dai_drv[i].playback,
++					&elem->playback_caps)) {
++				dev_err(sfw->dev, "ASoC: invalid playback stream name\n");
++				return -EINVAL;
++			}
++
++		}
++		if (elem->cp_stream) {
++			if (soc_fw_set_dai_caps(&dai_drv[i].capture,
++					&elem->capture_caps)) {
++				dev_err(sfw->dev, "ASoC: invalid capture stream name\n");
++				return -EINVAL;
++			}
++		}
++
++		soc_fw_dai_bind_ops(elem->dai_type, &dai_drv[i],
++				sfw->dai_ops, sfw->dai_ops_count);
++	}
++
++	/* Call the platform driver call back to register the dais */
++	return soc_fw_dai_load(sfw, dai_drv,  count);
++}
++
+ static int soc_valid_header(struct soc_fw *sfw, struct snd_soc_fw_hdr *hdr)
+ {
+ 	if (soc_fw_get_hdr_offset(sfw) >= sfw->fw->size)
+@@ -1161,6 +1278,8 @@ static int soc_fw_load_header(struct soc_fw *sfw, struct snd_soc_fw_hdr *hdr)
+ 		return soc_fw_dai_link_load(sfw, hdr);
+ 	case SND_SOC_FW_COEFF:
+ 		return soc_fw_coeff_load(sfw, hdr);
++	case SND_SOC_FW_DAI:
++		return soc_fw_ddai_load(sfw, hdr);
+ 	default:
+ 		return soc_fw_vendor_load(sfw, hdr);
+ 	}
+@@ -1247,6 +1366,8 @@ int snd_soc_fw_load_platform(struct snd_soc_platform *platform,
+ 	sfw.index = index;
+ 	sfw.io_ops = ops->io_ops;
+ 	sfw.io_ops_count = ops->io_ops_count;
++	sfw.dai_ops = ops->dai_ops;
++	sfw.dai_ops_count = ops->dai_ops_count;
+ 
+ 	return soc_fw_load(&sfw);
+ }
+-- 
+1.9.1
+

@@ -1,0 +1,201 @@
+From 66eecbc10f29f2b619a606039c9ed78c7e7c258b Mon Sep 17 00:00:00 2001
+From: Greg Hackmann <ghackmann@google.com>
+Date: Tue, 15 Oct 2013 12:51:20 -0700
+Subject: [PATCH 287/634] video: adf: add helpers for validating custom formats
+
+Many custom formats look a lot like the standard ones, but with
+different subsampling, bpp, etc.  Expose and document
+adf_buffer_validate()'s main body, so drivers can reuse its logic when
+validating these formats.
+
+Change-Id: I1d06981c9e5aab26f3ab2956c08c679f2c823bcc
+Signed-off-by: Greg Hackmann <ghackmann@google.com>
+---
+ drivers/video/adf/adf.c        | 64 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/video/adf/adf_client.c | 49 +++++---------------------------
+ include/video/adf.h            | 21 ++++++++++++++
+ 3 files changed, 92 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/video/adf/adf.c b/drivers/video/adf/adf.c
+index 7951175..64f763d 100644
+--- a/drivers/video/adf/adf.c
++++ b/drivers/video/adf/adf.c
+@@ -1027,6 +1027,70 @@ void adf_format_str(u32 format, char buf[ADF_FORMAT_STR_SIZE])
+ }
+ EXPORT_SYMBOL(adf_format_str);
+ 
++/**
++ * adf_format_validate_yuv - validate the number and size of planes in buffers
++ * with a custom YUV format.
++ *
++ * @dev: ADF device performing the validation
++ * @buf: buffer to validate
++ * @num_planes: expected number of planes
++ * @hsub: expected horizontal chroma subsampling factor, in pixels
++ * @vsub: expected vertical chroma subsampling factor, in pixels
++ * @cpp: expected bytes per pixel for each plane (length @num_planes)
++ *
++ * adf_format_validate_yuv() is intended to be called as a helper from @dev's
++ * validate_custom_format() op.
++ *
++ * Returns 0 if @buf has the expected number of planes and each plane
++ * has sufficient size, or -EINVAL otherwise.
++ */
++int adf_format_validate_yuv(struct adf_device *dev, struct adf_buffer *buf,
++		u8 num_planes, u8 hsub, u8 vsub, u8 cpp[])
++{
++	u8 i;
++
++	if (num_planes != buf->n_planes) {
++		char format_str[ADF_FORMAT_STR_SIZE];
++		adf_format_str(buf->format, format_str);
++		dev_err(&dev->base.dev, "%u planes expected for format %s but %u planes provided\n",
++				num_planes, format_str, buf->n_planes);
++		return -EINVAL;
++	}
++
++	if (buf->w == 0 || buf->w % hsub) {
++		dev_err(&dev->base.dev, "bad buffer width %u\n", buf->w);
++		return -EINVAL;
++	}
++
++	if (buf->h == 0 || buf->h % vsub) {
++		dev_err(&dev->base.dev, "bad buffer height %u\n", buf->h);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < num_planes; i++) {
++		u32 width = buf->w / (i != 0 ? hsub : 1);
++		u32 height = buf->h / (i != 0 ? vsub : 1);
++		u8 cpp = adf_format_plane_cpp(buf->format, i);
++
++		if (buf->pitch[i] < (u64) width * cpp) {
++			dev_err(&dev->base.dev, "plane %u pitch is shorter than buffer width (pitch = %u, width = %u, bpp = %u)\n",
++					i, buf->pitch[i], width, cpp * 8);
++			return -EINVAL;
++		}
++
++		if ((u64) height * buf->pitch[i] + buf->offset[i] >
++				buf->dma_bufs[i]->size) {
++			dev_err(&dev->base.dev, "plane %u buffer too small (height = %u, pitch = %u, offset = %u, size = %zu)\n",
++					i, height, buf->pitch[i],
++					buf->offset[i], buf->dma_bufs[i]->size);
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(adf_format_validate_yuv);
++
+ void adf_modeinfo_set_name(struct drm_mode_modeinfo *mode)
+ {
+ 	bool interlaced = mode->flags & DRM_MODE_FLAG_INTERLACE;
+diff --git a/drivers/video/adf/adf_client.c b/drivers/video/adf/adf_client.c
+index 48e97ef..e4a7921 100644
+--- a/drivers/video/adf/adf_client.c
++++ b/drivers/video/adf/adf_client.c
+@@ -244,7 +244,8 @@ static int adf_buffer_validate(struct adf_buffer *buf)
+ {
+ 	struct adf_overlay_engine *eng = buf->overlay_engine;
+ 	struct device *dev = &eng->base.dev;
+-	u8 hsub, vsub, num_planes, i;
++	struct adf_device *parent = adf_overlay_engine_parent(eng);
++	u8 hsub, vsub, num_planes, cpp[ADF_MAX_PLANES], i;
+ 
+ 	if (!adf_overlay_engine_supports_format(eng, buf->format)) {
+ 		char format_str[ADF_FORMAT_STR_SIZE];
+@@ -253,53 +254,17 @@ static int adf_buffer_validate(struct adf_buffer *buf)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (!adf_format_is_standard(buf->format)) {
+-		struct adf_device *parent = adf_overlay_engine_parent(eng);
++	if (!adf_format_is_standard(buf->format))
+ 		return parent->ops->validate_custom_format(parent, buf);
+-	}
+ 
+ 	hsub = adf_format_horz_chroma_subsampling(buf->format);
+ 	vsub = adf_format_vert_chroma_subsampling(buf->format);
+ 	num_planes = adf_format_num_planes(buf->format);
++	for (i = 0; i < num_planes; i++)
++		cpp[i] = adf_format_plane_cpp(buf->format, i);
+ 
+-	if (num_planes != buf->n_planes) {
+-		char format_str[ADF_FORMAT_STR_SIZE];
+-		adf_format_str(buf->format, format_str);
+-		dev_err(dev, "%u planes expected for format %s but %u planes provided\n",
+-				num_planes, format_str, buf->n_planes);
+-		return -EINVAL;
+-	}
+-
+-	if (buf->w == 0 || buf->w % hsub) {
+-		dev_err(dev, "bad buffer width %u\n", buf->w);
+-		return -EINVAL;
+-	}
+-
+-	if (buf->h == 0 || buf->h % vsub) {
+-		dev_err(dev, "bad buffer height %u\n", buf->h);
+-		return -EINVAL;
+-	}
+-
+-	for (i = 0; i < num_planes; i++) {
+-		u32 width = buf->w / (i != 0 ? hsub : 1);
+-		u32 height = buf->h / (i != 0 ? vsub : 1);
+-		u8 cpp = adf_format_plane_cpp(buf->format, i);
+-
+-		if (buf->pitch[i] < (u64) width * cpp) {
+-			dev_err(dev, "plane %u pitch is shorter than buffer width (pitch = %u, width = %u, bpp = %u)\n",
+-					i, buf->pitch[i], width, cpp * 8);
+-			return -EINVAL;
+-		}
+-
+-		if ((u64) height * buf->pitch[i] + buf->offset[i] >
+-				buf->dma_bufs[i]->size) {
+-			dev_err(dev, "plane %u buffer too small (height = %u, pitch = %u, offset = %u, size = %zu)\n",
+-					i, height, buf->pitch[i],
+-					buf->offset[i], buf->dma_bufs[i]->size);
+-		}
+-	}
+-
+-	return 0;
++	return adf_format_validate_yuv(parent, buf, num_planes, hsub, vsub,
++			cpp);
+ }
+ 
+ static int adf_buffer_map(struct adf_device *dev, struct adf_buffer *buf,
+diff --git a/include/video/adf.h b/include/video/adf.h
+index 82d49fc..1681354 100644
+--- a/include/video/adf.h
++++ b/include/video/adf.h
+@@ -435,6 +435,27 @@ const char *adf_event_type_str(struct adf_obj *obj, enum adf_event_type type);
+ 
+ #define ADF_FORMAT_STR_SIZE 5
+ void adf_format_str(u32 format, char buf[ADF_FORMAT_STR_SIZE]);
++int adf_format_validate_yuv(struct adf_device *dev, struct adf_buffer *buf,
++		u8 num_planes, u8 hsub, u8 vsub, u8 cpp[]);
++/**
++ * adf_format_validate_rgb - validate the number and size of planes in buffers
++ * with a custom RGB format.
++ *
++ * @dev: ADF device performing the validation
++ * @buf: buffer to validate
++ * @cpp: expected bytes per pixel
++ *
++ * adf_format_validate_rgb() is intended to be called as a helper from @dev's
++ * validate_custom_format() op.  @buf must have a single RGB plane.
++ *
++ * Returns 0 if @buf has a single plane with sufficient size, or -EINVAL
++ * otherwise.
++ */
++static inline int adf_format_validate_rgb(struct adf_device *dev,
++		struct adf_buffer *buf, u8 cpp)
++{
++	return adf_format_validate_yuv(dev, buf, 1, 1, 1, &cpp);
++}
+ 
+ int adf_event_get(struct adf_obj *obj, enum adf_event_type type);
+ int adf_event_put(struct adf_obj *obj, enum adf_event_type type);
+-- 
+1.9.1
+

@@ -1,0 +1,127 @@
+From 9a379a3f1f1726dc37014ac7d2722ae5b9e6a4e9 Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Mon, 27 Oct 2014 16:55:44 +0800
+Subject: [PATCH 108/117] ov5693, mt9m114: Clamp exposure to preserve FPS in
+ video mode
+
+In capturemode == CI_MODE_VIDEO, the camera sensors are expected to be
+constant rate to preserve video frame rate at the expense of
+sampling precision.
+
+In theory, this can be tuned at the AIQ level (to prevent userspace
+from asking for the too-slow frame rates) but in practice that is
+fragile and the consequence is failed acceptance tests due to frame
+rate glitches that depend on the lighting environment of the test
+(i.e. "it doesn't work when the device is flat on the table").
+
+Implement clamping at the sensor level to augment userspace control.
+Correct tuning will still be required, but tests won't fail.
+
+Change-Id: I9efe8d6413bb32e935060cc49352387350b5fd36
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ .../camera/drivers/media/i2c/mt9m114.c              | 21 +++++++++++++++------
+ .../camera/drivers/media/i2c/mt9m114.h              |  1 +
+ .../camera/drivers/media/i2c/ov5693.c               | 17 ++++++++++++-----
+ 3 files changed, 28 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+index 9fc75e5..4e6826a 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+@@ -1157,6 +1157,7 @@ static long mt9m114_s_exposure(struct v4l2_subdev *sd,
+     struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct mt9m114_device *dev = to_mt9m114_sensor(sd);
+     int ret = 0;
++    int max_itg;
+     unsigned int coarse_integration = 0;
+     unsigned int fine_integration = 0;
+     unsigned int FLines = 0;
+@@ -1175,12 +1176,18 @@ static long mt9m114_s_exposure(struct v4l2_subdev *sd,
+     FLines = mt9m114_res[dev->res].lines_per_frame;
+     AnalogGain = exposure->gain[0];
+     DigitalGain = exposure->gain[1];
+-	if (!dev->streamon) {
+-		/*Save the first exposure values while stream is off*/
+-		dev->first_exp = coarse_integration;
+-		dev->first_gain = AnalogGain;
+-		dev->first_diggain = DigitalGain;
+-	}
++
++    /* Clamp integration time in video mode so as not to reduce FPS */
++    max_itg = FLines - 6;
++    if (coarse_integration > max_itg && dev->run_mode == CI_MODE_VIDEO)
++	    coarse_integration = max_itg;
++
++    if (!dev->streamon) {
++	    /*Save the first exposure values while stream is off*/
++	    dev->first_exp = coarse_integration;
++	    dev->first_gain = AnalogGain;
++	    dev->first_diggain = DigitalGain;
++    }
+     //DigitalGain = 0x400 * (((u16) DigitalGain) >> 8) + ((unsigned int)(0x400 * (((u16) DigitalGain) & 0xFF)) >>8);
+ 
+     //set frame length
+@@ -1752,6 +1759,8 @@ static int mt9m114_t_vflip(struct v4l2_subdev *sd, int value)
+ static int mt9m114_s_parm(struct v4l2_subdev *sd,
+ 			struct v4l2_streamparm *param)
+ {
++	struct mt9m114_device *dev = to_mt9m114_sensor(sd);
++	dev->run_mode = param->parm.capture.capturemode;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h
+index 58322d4..45d296d 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h
+@@ -273,6 +273,7 @@ struct mt9m114_device {
+ 	int real_model_id;
+ 	int nctx;
+ 	int power;
++	int run_mode;
+ 
+ 	unsigned int bus_width;
+ 	unsigned int mode;
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c b/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c
+index 094fda8..a1ec401 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c
+@@ -434,11 +434,22 @@ static long __ov5693_set_exposure(struct v4l2_subdev *sd, int coarse_itg,
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+ 	struct ov5693_device *dev = to_ov5693_sensor(sd);
+ 	u16 vts,hts;
+-	int ret,exp_val;
++	int ret,exp_val,max_itg;
+ 
+ 	hts = ov5693_res[dev->fmt_idx].pixels_per_line;
+ 	vts = ov5693_res[dev->fmt_idx].lines_per_frame;
+ 
++	max_itg = vts - OV5693_INTEGRATION_TIME_MARGIN;
++	if (coarse_itg > max_itg) {
++		if(dev->run_mode == CI_MODE_VIDEO) {
++			/* Don't reduce FPS in video mode */
++			coarse_itg = max_itg;
++		} else {
++			/* Increase the VTS to match exposure + MARGIN */
++			vts = (u16) coarse_itg + OV5693_INTEGRATION_TIME_MARGIN;
++		}
++	}
++
+ 	/* group hold */
+ 	ret = ov5693_write_reg(client, OV5693_8BIT,
+                                        OV5693_GROUP_ACCESS, 0x00);
+@@ -448,10 +459,6 @@ static long __ov5693_set_exposure(struct v4l2_subdev *sd, int coarse_itg,
+ 		return ret;
+ 	}
+ 
+-	/* Increase the VTS to match exposure + MARGIN */
+-	if (coarse_itg > vts - OV5693_INTEGRATION_TIME_MARGIN)
+-		vts = (u16) coarse_itg + OV5693_INTEGRATION_TIME_MARGIN;
+-
+ 	ret = ov5693_write_reg(client, OV5693_8BIT, OV5693_TIMING_VTS_H, (vts >> 8) & 0xFF);
+ 	if (ret) {
+ 		dev_err(&client->dev, "%s: write %x error, aborted\n",
+-- 
+1.9.3
+

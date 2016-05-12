@@ -1,0 +1,192 @@
+From 30297faadc2ad30e6f6576313d613c59d99cde9f Mon Sep 17 00:00:00 2001
+From: Vijayavardhan Vennapusa <vvreddy@codeaurora.org>
+Date: Wed, 30 Jan 2013 17:35:45 +0530
+Subject: [PATCH 5/6] USB: dwc3: Fix issues in isochronous endpoint handling
+
+If there are no requests queued by function driver when
+XFRNRDY interrupt is recieved, pending flag will be set.
+Then if function driver queues request, don't queue ENDTXFR
+command and wait for XFRNRDY interrupt.
+
+START TRANSFER command will fail if the interval for which
+requests are being queued is already expired. Handle this
+case by queueing ENDXFER command and waiting till recieves
+XFRNRDY interrupt.
+
+Change-Id: I9498be3967e0f80b05cf0830affe5463f07e2976
+Signed-off-by: Vijayavardhan Vennapusa <vvreddy@codeaurora.org>
+---
+ drivers/usb/dwc3/core.h   |    2 +
+ drivers/usb/dwc3/gadget.c |   81 ++++++++++++++++++++++++++++++++++++----------
+ drivers/usb/dwc3/gadget.h |    8 ++++
+ 3 files changed, 74 insertions(+), 17 deletions(-)
+
+--- linux.orig/drivers/usb/dwc3/core.h
++++ linux/drivers/usb/dwc3/core.h
+@@ -398,6 +398,7 @@ struct dwc3_event_buffer {
+  * @number: endpoint number (1 - 15)
+  * @type: set to bmAttributes & USB_ENDPOINT_XFERTYPE_MASK
+  * @resource_index: Resource transfer index
++ * @current_uf: Current uf received through last event parameter
+  * @interval: the interval on which the ISOC transfer is started
+  * @name: a human readable name e.g. ep1out-bulk
+  * @direction: true for TX, false for RX
+@@ -431,6 +432,7 @@ struct dwc3_ep {
+ 	u8			number;
+ 	u8			type;
+ 	u8			resource_index;
++	u16			current_uf;
+ 	u32			interval;
+ 
+ 	char			name[20];
+--- linux.orig/drivers/usb/dwc3/gadget.c
++++ linux/drivers/usb/dwc3/gadget.c
+@@ -339,6 +339,16 @@ int dwc3_send_gadget_ep_cmd(struct dwc3
+ 					DWC3_DEPCMD_STATUS(reg));
+ 			if (DWC3_DEPCMD_STATUS(reg))
+ 				return -EINVAL;
++
++			/* SW issues START TRANSFER command to isochronous ep
++			* with future frame interval. If future interval time
++			* has already passed when core recieves command, core
++			* will respond with an error(bit13 in Command complete
++			* event. Hence return error in this case.
++			*/
++			if ((reg & 0x2000) && ((cmd & 0xF) == DWC3_DEPCMD_STARTTRANSFER))
++				return -EAGAIN;
++			
+ 			return 0;
+ 		}
+ 
+@@ -937,7 +947,7 @@ static int __dwc3_gadget_kick_transfer(s
+ 		int start_new)
+ {
+ 	struct dwc3_gadget_ep_cmd_params params;
+-	struct dwc3_request		*req;
++	struct dwc3_request		*req, *req1, *n;
+ 	struct dwc3			*dwc = dep->dwc;
+ 	int				ret;
+ 	u32				cmd;
+@@ -986,15 +996,44 @@ static int __dwc3_gadget_kick_transfer(s
+ 	if (ret < 0) {
+ 		dev_dbg(dwc->dev, "failed to send STARTTRANSFER command\n");
+ 
+-		/*
+-		 * FIXME we need to iterate over the list of requests
+-		 * here and stop, unmap, free and del each of the linked
+-		 * requests instead of what we do now.
+-		 */
+-		usb_gadget_unmap_request(&dwc->gadget, &req->request,
++		if ((ret == -EAGAIN) && start_new &&
++				usb_endpoint_xfer_isoc(dep->endpoint.desc)) {
++			/* If bit13 in Command complete event is set, software
++			 * must issue ENDTRANDFER command and wait for
++			 * Xfernotready event to queue the requests again.
++			 */
++			if (!dep->resource_index) {
++				dep->resource_index =
++					 dwc3_gadget_ep_get_transfer_index(dwc,
++								dep->number);
++				WARN_ON_ONCE(!dep->resource_index);
++			}
++			dwc3_stop_active_transfer(dwc, dep->number);
++			list_for_each_entry_safe_reverse(req1, n,
++						 &dep->req_queued, list) {
++				req1->trb = NULL;
++				dwc3_gadget_move_request_list_front(req1);
++				if (req->request.num_mapped_sgs)
++					dep->busy_slot +=
++						 req->request.num_mapped_sgs;
++				else
++					dep->busy_slot++;
++				if ((dep->busy_slot & DWC3_TRB_MASK) ==
++							DWC3_TRB_NUM - 1)
++					dep->busy_slot++;
++			}
++			return ret;
++		} else {
++			/*
++			 * FIXME we need to iterate over the list of requests
++			 * here and stop, unmap, free and del each of the linked
++			 * requests instead of what we do now.
++			 */
++			usb_gadget_unmap_request(&dwc->gadget, &req->request,
+ 				req->direction);
+-		list_del(&req->list);
+-		return ret;
++			list_del(&req->list);
++			return ret;
++		}
+ 	}
+ 
+ 	dep->flags |= DWC3_EP_BUSY;
+@@ -1013,6 +1052,8 @@ static void __dwc3_gadget_start_isoc(str
+ {
+ 	u32 uf;
+ 
++	dep->current_uf = cur_uf;
++
+ 	if (list_empty(&dep->request_list)) {
+ 		dev_vdbg(dwc->dev, "ISOC ep %s run out for requests.\n",
+ 			dep->name);
+@@ -1085,10 +1126,17 @@ static int __dwc3_gadget_ep_queue(struct
+ 		 * notion of current microframe.
+ 		 */
+ 		if (usb_endpoint_xfer_isoc(dep->endpoint.desc)) {
+-			if (list_empty(&dep->req_queued)) {
++			/* If xfernotready event is recieved before issuing
++			 * START TRANSFER command, don't issue END TRANSFER.
++			 * Rather start queueing the requests by issuing START
++			 * TRANSFER command.
++			 */
++			if (list_empty(&dep->req_queued) && dep->resource_index)
+ 				dwc3_stop_active_transfer(dwc, dep->number);
+-				dep->flags = DWC3_EP_ENABLED;
+-			}
++			else
++				__dwc3_gadget_start_isoc(dwc, dep,
++							dep->current_uf);
++			dep->flags &= ~DWC3_EP_PENDING_REQUEST;
+ 			return 0;
+ 		}
+ 
+@@ -1857,18 +1905,17 @@ static int dwc3_cleanup_done_reqs(struct
+ 
+ 	if (usb_endpoint_xfer_isoc(dep->endpoint.desc) &&
+ 			list_empty(&dep->req_queued)) {
+-		if (list_empty(&dep->request_list)) {
++		if (list_empty(&dep->request_list))
+ 			/*
+ 			 * If there is no entry in request list then do
+ 			 * not issue END TRANSFER now. Just set PENDING
+ 			 * flag, so that END TRANSFER is issued when an
+ 			 * entry is added into request list.
+ 			 */
+-			dep->flags = DWC3_EP_PENDING_REQUEST;
+-		} else {
++			dep->flags |= DWC3_EP_PENDING_REQUEST;
++		else
+ 			dwc3_stop_active_transfer(dwc, dep->number);
+-			dep->flags = DWC3_EP_ENABLED;
+-		}
++		dep->flags &= ~DWC3_EP_MISSED_ISOC;
+ 		return 1;
+ 	}
+ 
+--- linux.orig/drivers/usb/dwc3/gadget.h
++++ linux/drivers/usb/dwc3/gadget.h
+@@ -68,6 +68,14 @@ static inline struct dwc3_request *next_
+ 	return list_first_entry(list, struct dwc3_request, list);
+ }
+ 
++static inline void dwc3_gadget_move_request_list_front(struct dwc3_request *req)
++{
++	struct dwc3_ep		*dep = req->dep;
++
++	req->queued = false;
++	list_move(&req->list, &dep->request_list);
++}
++
+ static inline void dwc3_gadget_move_request_queued(struct dwc3_request *req)
+ {
+ 	struct dwc3_ep		*dep = req->dep;

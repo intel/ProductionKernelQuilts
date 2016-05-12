@@ -1,0 +1,152 @@
+From ca6a6f32128e832b20edb76c75c38af2c5c679ea Mon Sep 17 00:00:00 2001
+Message-Id: <ca6a6f32128e832b20edb76c75c38af2c5c679ea.1424979244.git.feitong.yi@intel.com>
+In-Reply-To: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+References: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+From: Arun Siluvery <arun.siluvery@linux.intel.com>
+Date: Tue, 17 Feb 2015 16:04:15 +0000
+Subject: [PATCH 24/28] SQUASHME! [VPG]: drm/i915: Keep Ring HWS page address
+ persistent across GPU reset
+
+After an Engine is reset it is found that HW is losing Hardware Status Page address
+loaded in the register. We store various values in HWS, one of it is the
+active seqno. Before a batch is executed it's seqno is written at an index
+in this page and it is cleared after it is done.
+
+In the case of a hang, the batch that caused the hang would not be able
+to clear this field. Native sync logic uses this active seqno and signals
+the batch as timed out as it couldn't complete its execution properly.
+Since HW was losing its address it was not able to signal its status correctly.
+The fix is to save its value along with head, tail and control register
+and restore it after reset.
+
+Noticed a duplicate variable in Ring hangcheck structure to track
+last known head position. The changes to remove it are added to this
+patch as both of them are getting squashed into the same patch.
+
+This patch should be squashed into the following patch:
+
+     Author: Tomas Elf <tomas.elf@intel.com>
+     Date:   Fri Oct 24 13:57:09 2014 +0100
+     Change-Id: I45de965b4a81d93c135a74248eb22a8a5c816e9f
+     FOR_UPSTREAM [VPG]: drm/i915: Added gen8 support for Timeout Detection Recovery for engine hangs
+
+For: GMIN-3564
+Tracked-On: https://jira01.devtools.intel.com/browse/GMIN-3564
+Signed-off-by: Arun Siluvery <arun.siluvery@linux.intel.com>
+Change-Id: I38288f54badfe9a7acf76d738537fae84e4c7170
+---
+ drivers/gpu/drm/i915/i915_drv.c         |    6 +++---
+ drivers/gpu/drm/i915/intel_lrc.c        |   10 +++++++++-
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    8 ++------
+ 3 files changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 12ce00e..c7a6d07 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -1020,8 +1020,8 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 	}
+ 
+ 	DRM_DEBUG_TDR("head 0x%08X, last_head 0x%08X\n",
+-		head, dev_priv->ring[ringid].hangcheck.last_head);
+-	if (head == dev_priv->ring[ringid].hangcheck.last_head) {
++		head, dev_priv->ring[ringid].hangcheck.last_hd);
++	if (head == dev_priv->ring[ringid].hangcheck.last_hd) {
+ 		/*
+ 		 * The ring has not advanced since the last
+ 		 * time it hung so force it to advance to the
+@@ -1039,7 +1039,7 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 		ring_flags = FORCE_ADVANCE;
+ 		DRM_DEBUG_TDR("Force ring head to advance\n");
+ 	}
+-	dev_priv->ring[ringid].hangcheck.last_head = head;
++	dev_priv->ring[ringid].hangcheck.last_hd = head;
+ 
+ 	ret = intel_ring_save(ring, current_context, ring_flags);
+ 	if (ret == -EAGAIN) {
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index d825857..e045b51 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -2543,6 +2543,7 @@ gen8_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 	uint32_t tail;
+ 	uint32_t head_addr;
+ 	uint32_t tail_addr;
++	uint32_t hws_pga;
+ 	uint32_t hw_context_id1 = ~0u;
+ 	uint32_t hw_context_id2 = ~0u;
+ 
+@@ -2649,6 +2650,9 @@ gen8_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 	if (flags & RESET_HEAD_TAIL)
+ 		head = tail = 0;
+ 
++	/* HW is losing HWS Page address after reset, save it */
++	hws_pga = I915_READ(RING_HWS_PGA(ring->mmio_base));
++
+ 	data[0] = ctl;
+ 	data[1] = tail;
+ 
+@@ -2658,6 +2662,7 @@ gen8_ring_save(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 	 * save the current value as the value to restart at
+ 	 */
+ 	data[2] = head;
++	data[3] = hws_pga;
+ 
+ 	return 0;
+ }
+@@ -2670,6 +2675,7 @@ gen8_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 	uint32_t head;
+ 	uint32_t tail;
+ 	uint32_t ctl;
++	uint32_t hws_pga;
+ 
+ 	/*
+ 	 * Expect no less space than for three registers:
+@@ -2717,12 +2723,14 @@ gen8_ring_restore(struct intel_engine_cs *ring, struct intel_context *ctx,
+ 	ctl = data[0];
+ 	tail = data[1];
+ 	head = data[2];
++	hws_pga = data[3];
+ 
+-	/* Restore head, tail and ring buffer control */
++	/* Restore head, tail ring buffer control and hws page address */
+ 
+ 	I915_WRITE_HEAD_CTX_MMIO(ring, ctx, head);
+ 	I915_WRITE_TAIL(ring, tail);
+ 	I915_WRITE_CTL_CTX_MMIO(ring, ctx, ctl);
++	I915_WRITE(RING_HWS_PGA(ring->mmio_base), hws_pga);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 7f46ac2..368bdea 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -55,10 +55,11 @@ struct  intel_hw_status_page {
+  *     Head
+  *     Tail
+  *     Ring buffer control
++ *     Hardware Status page address
+  *
+  * The remaining registers are reinitialized, not restored.
+  */
+-#define GEN8_RING_CONTEXT_SIZE 3
++#define GEN8_RING_CONTEXT_SIZE 4
+ 
+ #define I915_RING_CONTEXT_SIZE \
+ 		MAX_CTX(GEN7_RING_CONTEXT_SIZE, \
+@@ -215,11 +216,6 @@ struct intel_ring_hangcheck {
+ 	u32 last_acthd;
+ 	u32 last_hd;
+ 
+-	/* Last recorded ring head index.
+-	* This is only ever a ring index where as active
+-	* head may be a graphics address in a ring buffer */
+-	u32 last_head;
+-
+ 	/* Last recorded instdone */
+ 	u32 prev_instdone[I915_NUM_INSTDONE_REG];
+ 
+-- 
+1.7.9.5
+

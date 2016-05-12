@@ -1,0 +1,190 @@
+From 57859f4d53af13dab5ed7d8de37e70fe1a259be0 Mon Sep 17 00:00:00 2001
+Message-Id: <57859f4d53af13dab5ed7d8de37e70fe1a259be0.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Wed, 12 Mar 2014 19:12:15 -0700
+Subject: [PATCH 15/68] FROM_UPSTREAM [VPG]: drm/i915: Track page table reload
+ need
+
+This patch was formerly known as, "Force pd restore when PDEs change,
+gen6-7." I had to change the name because it is needed for GEN8 too.
+
+The real issue this is trying to solve is when a new object is mapped
+into the current address space. The GPU does not snoop the new mapping
+so we must do the gen specific action to reload the page tables.
+
+GEN8 and GEN7 do differ in the way they load page tables for the RCS.
+GEN8 does so with the context restore, while GEN7 requires the proper
+load commands in the command streamer. Non-render is similar for both.
+
+Caveat for GEN7
+The docs say you cannot change the PDEs of a currently running context.
+We never map new PDEs of a running context, and expect them to be
+present - so I think this is okay. (We can unmap, but this should also
+be okay since we only unmap unreferenced objects that the GPU shouldn't
+be tryingto va->pa xlate.) The MI_SET_CONTEXT command does have a flag
+to signal that even if the context is the same, force a reload. It's
+unclear exactly what this does, but I have a hunch it's the right thing
+to do.
+
+The logic assumes that we always emit a context switch after mapping new
+PDEs, and before we submit a batch. This is the case today, and has been
+the case since the inception of hardware contexts. A note in the comment
+let's the user know.
+
+It's not just for gen8. If the current context has mappings change, we
+need a context reload to switch
+
+v2: Rebased after ppgtt clean up patches. Split the warning for aliasing
+and true ppgtt options. And do not break aliasing ppgtt, where to->ppgtt
+is always null.
+
+v3: Invalidate PPGTT TLBs inside alloc_va_range.
+
+v4: Rename ppgtt_invalidate_tlbs to mark_tlbs_dirty and move
+pd_dirty_rings from i915_address_space to i915_hw_ppgtt. Fixes when
+neither ctx->ppgtt and aliasing_ppgtt exist.
+
+v5: Removed references to teardown_va_range.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com> (v2+)
+
+This is a backport of v4 of "PPGTT dynamic page allocations" posted in
+intel-gfx.
+
+Change-Id: I460b7e3972a26f70c310aa2ca400a5d0a118fe54
+Upstream-repo: https://www.mail-archive.com/intel-gfx@lists.freedesktop.org/msg51915.html
+Upstream-commit: none
+Upstream-as-of-tag: none
+For: GMINL-5449
+For: VIZ-4619
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_context.c    |   29 +++++++++++++++++++++++-----
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    4 ++++
+ drivers/gpu/drm/i915/i915_gem_gtt.c        |   11 +++++++++++
+ drivers/gpu/drm/i915/i915_gem_gtt.h        |    1 +
+ 4 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 0806c16..4314a68 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -651,8 +651,20 @@ static inline bool should_skip_switch(struct intel_engine_cs *ring,
+ 				      struct intel_context *from,
+ 				      struct intel_context *to)
+ {
+-	if (from == to && !to->remap_slice)
+-		return true;
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++
++	if (to->remap_slice)
++		return false;
++
++	if (to->ppgtt) {
++		if (from == to && !test_bit(ring->id,
++				&to->ppgtt->pd_dirty_rings))
++			return true;
++	} else if (dev_priv->mm.aliasing_ppgtt) {
++		if (from == to && !test_bit(ring->id,
++				&dev_priv->mm.aliasing_ppgtt->pd_dirty_rings))
++			return true;
++	}
+ 
+ 	return false;
+ }
+@@ -669,9 +681,8 @@ needs_pd_load_pre(struct intel_engine_cs *ring, struct intel_context *to)
+ static bool
+ needs_pd_load_post(struct intel_engine_cs *ring, struct intel_context *to)
+ {
+-	return (!to->legacy_hw_ctx.initialized ||
+-			i915_gem_context_is_default(to)) &&
+-			to->ppgtt && IS_GEN8(ring->dev);
++	return IS_GEN8(ring->dev) &&
++			(to->ppgtt || &to->ppgtt->pd_dirty_rings);
+ }
+ 
+ static int do_switch(struct intel_engine_cs *ring,
+@@ -714,6 +725,12 @@ static int do_switch(struct intel_engine_cs *ring,
+ 		ret = to->ppgtt->switch_mm(to->ppgtt, ring, false);
+ 		if (ret)
+ 			goto unpin_out;
++
++		/* Doing a PD load always reloads the page dirs */
++		if (to->ppgtt)
++			clear_bit(ring->id, &to->ppgtt->pd_dirty_rings);
++		else
++			clear_bit(ring->id, &dev_priv->mm.aliasing_ppgtt->pd_dirty_rings);
+ 	}
+ 
+ 	if (ring != &dev_priv->ring[RCS]) {
+@@ -748,6 +765,8 @@ static int do_switch(struct intel_engine_cs *ring,
+ 	 */
+ 	if (!to->legacy_hw_ctx.initialized || i915_gem_context_is_default(to))
+ 		hw_flags |= MI_RESTORE_INHIBIT;
++	else if (to->ppgtt && test_and_clear_bit(ring->id, &to->ppgtt->pd_dirty_rings))
++		hw_flags |= MI_FORCE_RESTORE;
+ 
+ 	ret = mi_set_context(ring, to, hw_flags);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 22227a6..3fb7981 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1571,6 +1571,10 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto err;
+ 
++	/* XXX: Reserve has possibly change PDEs which means we must do a
++	 * context switch before we can coherently read some of the reserved
++	 * VMAs. */
++
+ 	/* The objects are in their final locations, apply the relocations. */
+ 	if (need_relocs)
+ 		ret = i915_gem_execbuffer_relocate(eb);
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 2bfdca0..6808b5d 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -1123,6 +1123,16 @@ static void gen6_ppgtt_unmap_pages(struct i915_hw_ppgtt *ppgtt)
+ 			       4096, PCI_DMA_BIDIRECTIONAL);
+ }
+ 
++/* PDE TLBs are a pain invalidate pre GEN8. It requires a context reload. If we
++ * are switching between contexts with the same LRCA, we also must do a force
++ * restore.
++ */
++static inline void mark_tlbs_dirty(struct i915_hw_ppgtt *ppgtt)
++{
++	/* If current vm != vm, */
++	ppgtt->pd_dirty_rings = INTEL_INFO(ppgtt->base.dev)->ring_mask;
++}
++
+ static int gen6_alloc_va_range(struct i915_address_space *vm,
+ 			       uint64_t start, uint64_t length)
+ {
+@@ -1142,6 +1152,7 @@ static int gen6_alloc_va_range(struct i915_address_space *vm,
+ 				I915_PPGTT_PT_ENTRIES);
+ 	}
+ 
++	mark_tlbs_dirty(ppgtt);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index a5252b3..596e533 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -275,6 +275,7 @@ struct i915_hw_ppgtt {
+ 	struct i915_address_space base;
+ 	struct kref ref;
+ 	struct drm_mm_node node;
++	unsigned long pd_dirty_rings;
+ 	unsigned num_pd_entries;
+ 	unsigned num_pd_pages; /* gen8+ */
+ 	union {
+-- 
+1.7.9.5
+

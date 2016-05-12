@@ -1,0 +1,157 @@
+From b38f4b1a44e02eb0a72932e8da080c5044f181da Mon Sep 17 00:00:00 2001
+From: Colin Cross <ccross@android.com>
+Date: Tue, 12 Jul 2011 19:53:24 -0700
+Subject: [PATCH 015/634] cgroup: Add generic cgroup subsystem permission
+ checks
+
+Rather than using explicit euid == 0 checks when trying to move
+tasks into a cgroup via CFS, move permission checks into each
+specific cgroup subsystem. If a subsystem does not specify a
+'allow_attach' handler, then we fall back to doing our checks
+the old way.
+
+Use the 'allow_attach' handler for the 'cpu' cgroup to allow
+non-root processes to add arbitrary processes to a 'cpu' cgroup
+if it has the CAP_SYS_NICE capability set.
+
+This version of the patch adds a 'allow_attach' handler instead
+of reusing the 'can_attach' handler.  If the 'can_attach' handler
+is reused, a new cgroup that implements 'can_attach' but not
+the permission checks could end up with no permission checks
+at all.
+
+Change-Id: Icfa950aa9321d1ceba362061d32dc7dfa2c64f0c
+Original-Author: San Mehat <san@google.com>
+Signed-off-by: Colin Cross <ccross@android.com>
+---
+ Documentation/cgroups/cgroups.txt |  9 +++++++++
+ include/linux/cgroup.h            |  2 ++
+ kernel/cgroup.c                   | 34 +++++++++++++++++++++++++++++++---
+ kernel/sched/core.c               | 19 +++++++++++++++++++
+ 4 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/cgroups/cgroups.txt b/Documentation/cgroups/cgroups.txt
+index 821de56..91bd5e0 100644
+--- a/Documentation/cgroups/cgroups.txt
++++ b/Documentation/cgroups/cgroups.txt
+@@ -578,6 +578,15 @@ is completely unused; @cgrp->parent is still valid. (Note - can also
+ be called for a newly-created cgroup if an error occurs after this
+ subsystem's create() method has been called for the new cgroup).
+ 
++int allow_attach(struct cgroup *cgrp, struct cgroup_taskset *tset)
++(cgroup_mutex held by caller)
++
++Called prior to moving a task into a cgroup; if the subsystem
++returns an error, this will abort the attach operation.  Used
++to extend the permission checks - if all subsystems in a cgroup
++return 0, the attach will be allowed to proceed, even if the
++default permission check (root or same user) fails.
++
+ int can_attach(struct cgroup *cgrp, struct cgroup_taskset *tset)
+ (cgroup_mutex held by caller)
+ 
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 9450f02..bbda8c0 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -579,6 +579,8 @@ struct cgroup_subsys {
+ 	void (*css_offline)(struct cgroup_subsys_state *css);
+ 	void (*css_free)(struct cgroup_subsys_state *css);
+ 
++	int (*allow_attach)(struct cgroup_subsys_state *css,
++			    struct cgroup_taskset *tset);
+ 	int (*can_attach)(struct cgroup_subsys_state *css,
+ 			  struct cgroup_taskset *tset);
+ 	void (*cancel_attach)(struct cgroup_subsys_state *css,
+diff --git a/kernel/cgroup.c b/kernel/cgroup.c
+index 18711f3..5a79f4b 100644
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@ -2110,6 +2110,25 @@ out_free_group_list:
+ 	return retval;
+ }
+ 
++static int cgroup_allow_attach(struct cgroup *cgrp, struct cgroup_taskset *tset)
++{
++	struct cgroup_subsys_state *css;
++	int i;
++	int ret;
++
++	for_each_css(css, i, cgrp) {
++		if (css->ss->allow_attach) {
++			ret = css->ss->allow_attach(css, tset);
++			if (ret)
++				return ret;
++		} else {
++			return -EACCES;
++		}
++	}
++
++	return 0;
++}
++
+ /*
+  * Find the task_struct of the task to attach by vpid and pass it along to the
+  * function to attach either it or all tasks in its threadgroup. Will lock
+@@ -2141,9 +2160,18 @@ retry_find_task:
+ 		if (!uid_eq(cred->euid, GLOBAL_ROOT_UID) &&
+ 		    !uid_eq(cred->euid, tcred->uid) &&
+ 		    !uid_eq(cred->euid, tcred->suid)) {
+-			rcu_read_unlock();
+-			ret = -EACCES;
+-			goto out_unlock_cgroup;
++			/*
++			 * if the default permission check fails, give each
++			 * cgroup a chance to extend the permission check
++			 */
++			struct cgroup_taskset tset = { };
++			tset.single.task = tsk;
++			tset.single.cgrp = cgrp;
++			ret = cgroup_allow_attach(cgrp, &tset);
++			if (ret) {
++				rcu_read_unlock();
++				goto out_unlock_cgroup;
++			}
+ 		}
+ 	} else
+ 		tsk = current;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index d499998..0a7e273 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7656,6 +7656,24 @@ static void cpu_cgroup_css_offline(struct cgroup_subsys_state *css)
+ 	sched_offline_group(tg);
+ }
+ 
++static int cpu_cgroup_allow_attach(struct cgroup_subsys_state *css,
++				   struct cgroup_taskset *tset)
++{
++	const struct cred *cred = current_cred(), *tcred;
++	struct task_struct *task;
++
++	cgroup_taskset_for_each(task, css, tset) {
++		tcred = __task_cred(task);
++
++		if ((current != task) && !capable(CAP_SYS_NICE) &&
++		    !uid_eq(cred->euid, tcred->uid) &&
++		    !uid_eq(cred->euid, tcred->suid))
++			return -EACCES;
++	}
++
++	return 0;
++}
++
+ static int cpu_cgroup_can_attach(struct cgroup_subsys_state *css,
+ 				 struct cgroup_taskset *tset)
+ {
+@@ -8026,6 +8044,7 @@ struct cgroup_subsys cpu_cgroup_subsys = {
+ 	.css_offline	= cpu_cgroup_css_offline,
+ 	.can_attach	= cpu_cgroup_can_attach,
+ 	.attach		= cpu_cgroup_attach,
++	.allow_attach	= cpu_cgroup_allow_attach,
+ 	.exit		= cpu_cgroup_exit,
+ 	.subsys_id	= cpu_cgroup_subsys_id,
+ 	.base_cftypes	= cpu_files,
+-- 
+1.9.1
+

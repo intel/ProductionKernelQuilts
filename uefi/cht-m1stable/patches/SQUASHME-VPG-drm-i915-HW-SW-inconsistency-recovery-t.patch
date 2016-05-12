@@ -1,0 +1,1194 @@
+From 81ec6f671e1c70daae412a1f9fb7d2d3a5497eb3 Mon Sep 17 00:00:00 2001
+From: Tomas Elf <tomas.elf@intel.com>
+Date: Mon, 5 Oct 2015 18:49:23 +0100
+Subject: [PATCH] SQUASHME! [VPG]: drm/i915: HW/SW inconsistency recovery
+ through forced CSB check
+
+1. This replaces forced context resubmission in the TDR/execlists API as a
+method for overcoming inconsistent HW/driver states, specifically when it comes
+to the observed state of what context is currently being executed
+(EXECLIST_STATUS_CONTEXT_ID==X, head context of the respective execlist
+queue==Y). The way it works is that if the periodic hang checker detects a
+sustained, irrecoverable inconsistent HW/driver state it tries faking a context
+event interrupt (since it's assumed that the state came about due to a lost
+interrupt). This does not always guarantee that the inconsistency is rectified
+but it typically solves the kind of HW/driver inconsistencies that happen due
+to lost context completion interrupts that happen sometimes during
+long-duration operations, which makes the driver think that a context is
+executing on hardware when the hardware is in fact idle because it completed
+the context execution without notifying the driver via the normal context
+completion event interrupt.
+
+If the faked interrupt is ineffective and the inconsistency remains this commit
+introduces a promotion path from the consistency checker to full GPU reset that
+allows the hang checker to skip per-engine recovery (which is ineffective
+during context submission status inconsistencies) and go straight for a full
+GPU reset, which is guaranteed to restore consistency by discarding all
+submitted work in the driver and forcing GPU to idle and thereby returning to a
+well-defined, consistent state.
+
+    NOTICE: Promotion to full GPU reset has been disabled by default for now
+    due to false positive inconsistency detections leading to unexpected full
+    GPU resets.  The path is still part of the patch but the promotion decision
+    is controlled through a module parameter called enable_inconsistency_reset.
+    When enough testing has been done and we are 100% confident that we can
+    trust the inconsistency detection we may opt to enable this feature by
+    default.
+
+In order to make full GPU reset work with not an engine hang but an
+inconsistent HW/SW state which might be blocking the driver from progressing
+this requires native sync to be extended with a function for resetting the
+fence of a specific request that can be used for for resetting all fences for
+all currently pending requests during full GPU reset in order to avoid Android
+userland from timing out pending fences. This function is then integrated into
+the scheduler from the point where all outstanding work is purged during a full
+GPU reset. In order to make this work from the scheduler we've had to remove
+the scheduler spinlock acquisition from i915_scheduler_wait_fence_signaled()
+since fences, upon being signalled, sometimes call back into this function,
+which results in spinlock recursion since the spinlock is already held when
+signalling the fence. Not grabbing the spinlock and updating the node flag from
+this function should be ok since the state of the flag is only important up
+until the point where the fence is signalled and not afterwards.
+
+2. Added a seqno hang check for the consistency checker to avoid the case where
+the hang checker detects a hang because the sampled HEAD register value has
+gone to zero because the hardware is idle. This is possible if two subsequent
+hang check periods detect HEAD==zero because one workload goes from busy->idle
+and samples HEAD==zero and then the subsequent workload goes from
+idle->busy->idle and samples another HEAD==zero upon which the hang checker
+decides that a hang is in progress because of these two subsequent HEAD==zero
+hang sample result (no HEAD progression even though HEAD==zero is a special
+case indicating hardware idle, which unfortunately the hang checker does not
+understand) and calls i915_hangcheck_hung(), which then does the consistency
+check and potentially finds a transient inconsistency and goes for
+inconsistency rectification, which in the worst case means a full GPU reset. By
+letting the consistency checker check for seqno progression two different
+workloads that both result in HEAD==zero can be distinguished and even though
+the hang checker sees an early hang indication the consistency checker can see
+that the two HEAD==zero indications are from two different workloads and can
+hold off the consistency check and thereby reduce the risk of false positive
+inconsistency rectifications.
+
+We could add the seqno check to the main hang detection algorithm in
+i915_hangcheck_sample() but that sometimes makes the hang checker less
+responsive, which could potentially lead to Android userland timeouts and
+broken display flips etc.
+
+3. Disabled INSTDONE checking in the hang detection algorithm since it's
+unpredictable and delays hang recovery sometimes, which potentially leads to
+Android userland breaking - resulting in fence timeouts and frozen display.
+
+4. This commit also introduces a new debugfs entry point for simulating lost
+context event interrupts (currently only for events that will lead to stuck
+contexts in the execlist queues, since that is what the consistency checker
+tries to deal with). There is a need for extended validation to test the
+consistency checker since it has been shown to cause problems in the past. This
+debugfs entrypoint can be used for this purpose.
+
+	SQUASHME! - This patch should be squashed into the following patch:
+		Author: Tomas Elf <tomas.elf@intel.com>
+   		Change-Id: I75b1b0419a03acbd71134cfe22bf1d63ffdb0154
+		REVERTME [VPG]: drm/i915: Lock-up workaround: Forced context resubmission
+
+Change-Id: I54ce0b2da55f7229b00733ce0bd8070cc0f475dd
+Signed-off-by: Tomas Elf <tomas.elf@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-5527
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |   78 ++++++++++
+ drivers/gpu/drm/i915/i915_dma.c         |    4 
+ drivers/gpu/drm/i915/i915_drv.c         |   33 ++++
+ drivers/gpu/drm/i915/i915_drv.h         |   13 +
+ drivers/gpu/drm/i915/i915_irq.c         |  166 ++++++++++++++++------
+ drivers/gpu/drm/i915/i915_params.c      |   14 +
+ drivers/gpu/drm/i915/i915_scheduler.c   |   19 +-
+ drivers/gpu/drm/i915/intel_lrc.c        |  236 ++++++++++++++++++++++++--------
+ drivers/gpu/drm/i915/intel_lrc.h        |    2 
+ drivers/gpu/drm/i915/intel_lrc_tdr.h    |    3 
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   19 --
+ drivers/gpu/drm/i915/intel_sync.c       |   32 ++--
+ drivers/gpu/drm/i915/intel_sync.h       |    7 
+ 13 files changed, 488 insertions(+), 138 deletions(-)
+
+Index: b/drivers/gpu/drm/i915/i915_debugfs.c
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_debugfs.c	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/i915_debugfs.c	2016-03-09 22:29:45.417111208 +0800
+@@ -4192,6 +4192,83 @@
+ 			i915_wedged_get, i915_wedged_set,
+ 			"%llu\n");
+ 
++static int
++i915_fake_ctx_submission_inconsistency_get(void *data, u64 *val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_engine_cs *ring;
++	unsigned i;
++
++	DRM_INFO("Faked inconsistent context submission state: %x\n",
++		dev_priv->gpu_error.faked_lost_ctx_event_irq);
++
++	for_each_ring(ring, dev_priv, i) {
++		u32 fake_cnt =
++			(dev_priv->gpu_error.faked_lost_ctx_event_irq >> (i<<2)) & 0xf;
++
++		DRM_INFO("%s: Faking %s [%u IRQs left to drop]\n",
++			ring->name,
++			fake_cnt?"enabled":"disabled",
++			fake_cnt);
++	}
++
++	*val = (u64) dev_priv->gpu_error.faked_lost_ctx_event_irq;
++
++	return 0;
++}
++
++static int
++i915_fake_ctx_submission_inconsistency_set(void *data, u64 val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u32 fake_status;
++
++	/*
++	 * val contains the new faked_lost_ctx_event_irq word that is to be
++	 * merged with the already set faked_lost_ctx_event_irq word.
++	 *
++	 * val == 0 means clear all previously set fake bits.
++	 *
++	 * Each nibble contains a number between 0-15 denoting the number of
++	 * interrupts left to lose on the engine that nibble corresponds to.
++	 *
++	 * RCS: faked_lost_ctx_event_irq[3:0]
++	 * VCS: faked_lost_ctx_event_irq[7:4]
++	 * BCS: faked_lost_ctx_event_irq[11:8]
++	 * VECS: faked_lost_ctx_event_irq[15:12]
++	 * VCS2: faked_lost_ctx_event_irq[19:16]
++	 *
++	 * The number in each nibble is decremented by the interrupt handler in
++	 * intel_lrc.c once the faked interrupt loss is executed. If a
++	 * targetted interrupt is received when bit corresponding to that
++	 * engine is set that interrupt will be dropped without side-effects.
++	 */
++
++	fake_status =
++		dev_priv->gpu_error.faked_lost_ctx_event_irq;
++
++	DRM_INFO("Faking lost context event IRQ (new status: %x, old status: %x)\n",
++		(u32) val, fake_status);
++
++	if (val) {
++		dev_priv->gpu_error.faked_lost_ctx_event_irq |= ((u32) val);
++	} else {
++		DRM_INFO("Clearing lost context event IRQ mask\n");
++
++		dev_priv->gpu_error.faked_lost_ctx_event_irq = 0;
++	}
++
++
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(i915_fake_ctx_submission_inconsistency_fops,
++			i915_fake_ctx_submission_inconsistency_get,
++			i915_fake_ctx_submission_inconsistency_set,
++			"%llu\n");
++
+ static const char *ringid_to_str(enum intel_ring_id ring_id)
+ {
+ 	switch (ring_id) {
+@@ -5127,6 +5204,7 @@
+ 	const struct file_operations *fops;
+ } i915_debugfs_files[] = {
+ 	{"i915_wedged", &i915_wedged_fops},
++	{"i915_fake_ctx_inconsistency", &i915_fake_ctx_submission_inconsistency_fops},
+ 	{"i915_max_freq", &i915_max_freq_fops},
+ 	{"i915_min_freq", &i915_min_freq_fops},
+ 	{"i915_cur_freq", &i915_cur_freq_fops},
+Index: b/drivers/gpu/drm/i915/i915_dma.c
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_dma.c	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/i915_dma.c	2016-03-09 22:29:45.417111208 +0800
+@@ -1629,15 +1629,17 @@
+ 	int ret = 0;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
++	dev_priv->gpu_error.faked_lost_ctx_event_irq = 0;
++
+ 	for (i = 0; i < I915_NUM_RINGS; i++) {
+ 		dev_priv->ring[i].hangcheck.count = 0;
+ 		dev_priv->ring[i].hangcheck.tdr_count = 0;
+ 		dev_priv->ring[i].hangcheck.watchdog_count = 0;
+ 		dev_priv->ring[i].hangcheck.total = 0;
+ 		dev_priv->ring[i].hangcheck.last_acthd = 0;
++		dev_priv->ring[i].hangcheck.last_seqno = 0;
+ 		dev_priv->ring[i].hangcheck.ringid = i;
+ 		dev_priv->ring[i].hangcheck.dev = dev;
+-		dev_priv->ring[i].hangcheck.forced_resubmission_cnt = 0;
+ 
+ 		INIT_DELAYED_WORK(&dev_priv->ring[i].hangcheck.work,
+ 			i915_hangcheck_sample);
+Index: b/drivers/gpu/drm/i915/i915_drv.c
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_drv.c	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/i915_drv.c	2016-03-09 22:29:45.417111208 +0800
+@@ -35,6 +35,7 @@
+ #include "intel_drv.h"
+ #include "intel_lrc_tdr.h"
+ #include "i915_scheduler.h"
++#include "intel_sync.h"
+ 
+ #include <linux/console.h>
+ #include <linux/module.h>
+@@ -912,6 +913,30 @@
+ 	acthd = intel_ring_get_active_head(ring);
+ 	completed_seqno = ring->get_seqno(ring, false);
+ 
++	/*
++	 * Flag that engine recovery is in progress.
++	 *
++	 * The DRM_I915_HANGCHECK_RESETTING state is used to prevent the forced
++	 * CSB checker from faking any context event interrupts during this
++	 * critical path. Between engine reset and context resubmission the CSB
++	 * will be in a dedicated init state (e.g. CSB write pointer = 7),
++	 * which must not be disturbed. A faked context event interrupt at this
++	 * time would disturb the init state since the interrupt handler would
++	 * cause side-effects on the CSB read/write pointers and move the write
++	 * pointer value (7) out of its dedicated init state value, which we
++	 * don't want to do before context resubmission.
++	 *
++	 * The reason why there might be a forced CSB check between engine
++	 * reset and context resubmission is that the engine reset will force
++	 * the hardware into idle state post-reset but the driver will still
++	 * seemingly have submitted work in the execlist queue, which the
++	 * consistency checker potentially will interpret as an inconsistent
++	 * context submission state and try to rectify by forcing a CSB check.
++	 */
++	atomic_set_mask(
++		DRM_I915_HANGCHECK_RESETTING,
++		&ring->hangcheck.flags);
++
+ 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
+ 
+ 	/* Take wake lock to prevent power saving mode */
+@@ -1117,6 +1142,10 @@
+ 	/* Release power lock */
+ 	gen6_gt_force_wake_put(dev_priv, FORCEWAKE_ALL);
+ 
++	atomic_clear_mask(
++		DRM_I915_HANGCHECK_RESETTING,
++		&ring->hangcheck.flags);
++
+ 	return ret;
+ }
+ 
+@@ -1212,6 +1241,7 @@
+ 
+ 		}
+ 	}
++
+ 	i915_gem_reset(dev);
+ 
+ 	simulated = dev_priv->gpu_error.stop_rings != 0;
+@@ -1236,6 +1266,9 @@
+ 			dev_priv->gpu_error.last_reset = get_seconds();
+ 	}
+ 
++	/* Clear simulated lost context event interrupts */
++	dev_priv->gpu_error.faked_lost_ctx_event_irq = 0;
++
+ 	if (ret) {
+ 		DRM_ERROR("Failed to reset chip: %i\n", ret);
+ 		goto exit_locked;
+Index: b/drivers/gpu/drm/i915/i915_drv.h
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_drv.h	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/i915_drv.h	2016-03-09 22:29:45.417111208 +0800
+@@ -1363,6 +1363,18 @@
+ #define I915_STOP_RING_ALLOW_BAN       (1 << 31)
+ #define I915_STOP_RING_ALLOW_WARN      (1 << 30)
+ 
++	/*
++	 * Bit mask for simulation of lost context event IRQs on each
++	 * respective engine.
++	 *
++	 *   Bits 0:3:		Number of lost IRQs to be faked on RCS
++	 *   Bits 4:7:		Number of lost IRQs to be faked on VCS
++	 *   Bits 8:11:		Number of lost IRQs to be faked on BCS
++	 *   Bits 12:15:	Number of lost IRQs to be faked on VECS
++	 *   Bits 16:19:	Number of lost IRQs to be faked on VCS2
++	 */
++	u32 faked_lost_ctx_event_irq;
++
+ 	unsigned long total_resets;
+ 
+ 	/* For missed irq/seqno simulation. */
+@@ -2511,6 +2523,7 @@
+ 	unsigned int gpu_reset_min_alive_period;
+ 	/* leave bools at the end to not create holes */
+ 	bool enable_hangcheck;
++	bool enable_inconsistency_reset;
+ 	bool fastboot;
+ 	bool prefault_disable;
+ 	bool reset;
+Index: b/drivers/gpu/drm/i915/i915_irq.c
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_irq.c	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/i915_irq.c	2016-03-09 22:29:45.417111208 +0800
+@@ -1807,7 +1807,7 @@
+ 			if (rcs & GT_RENDER_USER_INTERRUPT)
+ 				notify_ring(dev, ring);
+ 			if (rcs & GT_CONTEXT_SWITCH_INTERRUPT)
+-				intel_execlists_handle_ctx_events(ring);
++				intel_execlists_handle_ctx_events(ring, true);
+ 			if (rcs & GT_GEN8_RCS_WATCHDOG_INTERRUPT) {
+ 				struct intel_engine_cs *ring;
+ 
+@@ -1824,7 +1824,7 @@
+ 			if (bcs & GT_RENDER_USER_INTERRUPT)
+ 				notify_ring(dev, ring);
+ 			if (bcs & GT_CONTEXT_SWITCH_INTERRUPT)
+-				intel_execlists_handle_ctx_events(ring);
++				intel_execlists_handle_ctx_events(ring, true);
+ 		} else
+ 			DRM_ERROR("The master control interrupt lied (GT0)!\n");
+ 	}
+@@ -1840,7 +1840,7 @@
+ 			if (vcs & GT_RENDER_USER_INTERRUPT)
+ 				notify_ring(dev, ring);
+ 			if (vcs & GT_CONTEXT_SWITCH_INTERRUPT)
+-				intel_execlists_handle_ctx_events(ring);
++				intel_execlists_handle_ctx_events(ring, true);
+ 			if (vcs & GT_GEN8_VCS_WATCHDOG_INTERRUPT) {
+ 				struct intel_engine_cs *ring;
+ 
+@@ -1857,7 +1857,7 @@
+ 			if (vcs & GT_RENDER_USER_INTERRUPT)
+ 				notify_ring(dev, ring);
+ 			if (vcs & GT_CONTEXT_SWITCH_INTERRUPT)
+-				intel_execlists_handle_ctx_events(ring);
++				intel_execlists_handle_ctx_events(ring, true);
+ 			if (vcs & GT_GEN8_VCS_WATCHDOG_INTERRUPT) {
+ 				struct intel_engine_cs *ring;
+ 
+@@ -1894,7 +1894,7 @@
+ 			if (vcs & GT_RENDER_USER_INTERRUPT)
+ 				notify_ring(dev, ring);
+ 			if (vcs & GT_CONTEXT_SWITCH_INTERRUPT)
+-				intel_execlists_handle_ctx_events(ring);
++				intel_execlists_handle_ctx_events(ring, true);
+ 		} else
+ 			DRM_ERROR("The master control interrupt lied (GT3)!\n");
+ 	}
+@@ -3617,13 +3617,14 @@
+  * This function is called when the TDR algorithm detects that the
+  * hardware has not advanced during the last sampling period
+  */
+-static bool i915_hangcheck_hung(struct intel_ring_hangcheck *hc)
++static bool i915_hangcheck_hung(struct intel_ring_hangcheck *hc, u32 seqno)
+ {
+ 	struct drm_device *dev = hc->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	uint32_t mbox_wait;
+ 	uint32_t threshold;
+ 	struct intel_engine_cs *ring;
++	bool force_full_GPU_reset = false;
+ 
+ 	DRM_DEBUG_TDR("Ring [%d] hc->count = %d\n", hc->ringid, hc->count);
+ 	ring = &dev_priv->ring[hc->ringid];
+@@ -3642,7 +3643,86 @@
+ 
+ 	DRM_DEBUG_TDR("mbox_wait = %u threshold = %u", mbox_wait, threshold);
+ 
+-	if (hc->count++ > threshold) {
++	if (i915.enable_execlists) {
++		/*
++		 * TODO:
++		 * We could trace the context submission status history
++		 * from the previous hang checks but the question is
++		 * how we would interpret the information. If we're not
++		 * stuck in an inconsistent state in every sample
++		 * period and it's fluctuating then how do we react? We
++		 * might as well try an inconsistency check just before
++		 * making a decision on hang recovery and if that gives
++		 * an inconsistent result we can't go for engine reset
++		 * anyway so there's not much in terms of options at
++		 * this point.
++		 *
++		 * WARNING:
++		 * When checking consistency in the hang checker as a
++		 * pre-stage to scheduling hang recovery then watchdog
++		 * timeout will break if there is an inconsistent state
++		 * and the hang checker has been disabled. The way
++		 * around this is by moving consistency checking to the
++		 * start of the engine hang recovery path which is
++		 * shared for all forms of hang recovery.
++		 */
++
++		/*
++		 * Consistency checking needs to happen before the 3-second
++		 * userland timeout happens, which means that we cannot wait
++		 * for 3 full hang check sample periods. Instead, do the
++		 * consistency check within 2 sample periods, that is if seqno
++		 * has not progressed in between two sample periods. Once
++		 * i915_hangcheck_hung() is called lack of execution progress
++		 * between 2 sample periods has already been detected. In some
++		 * cases (e.g. when HEAD is zero due to hardware being idle and
++		 * the last recorded HEAD value was zero too we might end up in
++		 * i915_hangcheck_hung() as soon as the first hang check sample
++		 * period. In order to avoid consistency checking happening
++		 * before a preliminary hang detection has been done make sure
++		 * to check seqno progress at this point. HEAD might go to zero
++		 * and cause false positive hang detections that way but seqnos
++		 * will always progress.
++		 */
++		if (seqno == hc->last_seqno) {
++
++			enum context_submission_status status =
++				i915_gem_context_get_current_context(ring, NULL);
++
++			if (status == CONTEXT_SUBMISSION_STATUS_SUBMITTED) {
++				DRM_DEBUG_TDR("Inconsistent context state. Faking interrupt on %s!\n", ring->name);
++				if (!intel_execlists_TDR_force_CSB_check(dev_priv, hc->ringid)) {
++					if (i915.enable_inconsistency_reset) {
++						WARN(1, "Inconsistency rectification failed! Falling back to full GPU reset!\n");
++						force_full_GPU_reset = true;
++					} else {
++						WARN(1, "Inconsistency rectification failed! Will not fall back to full GPU reset!\n");
++						/*
++						 * WARNING:
++						 * Without a way to fall back
++						 * to full GPU reset in the
++						 * case of a theoretical
++						 * irrecoverably inconsistent
++						 * state it is conceivable that
++						 * the device might hang until
++						 * reboot.
++						 */
++						force_full_GPU_reset = false;
++					}
++
++				} else {
++					/*
++					 * Hang was apparently due to inconsistent HW/driver state.
++					 * No need for hang recovery right now.
++					 */
++					hc->count = 0;
++					return false;
++				}
++			}
++		}
++	}
++
++	if ((hc->count++ > threshold) || force_full_GPU_reset) {
+ 		bool hung = true;
+ 
+ 		DRM_DEBUG_TDR("Hang check period expired... %s hung\n",
+@@ -3651,9 +3731,10 @@
+ 		/* Reset the counter */
+ 		hc->count = 0;
+ 
+-		i915_sync_hung_ring(ring);
++		if (!force_full_GPU_reset)
++			i915_sync_hung_ring(ring);
+ 
+-		if (!IS_GEN2(dev)) {
++		if (!force_full_GPU_reset && !IS_GEN2(dev)) {
+ 			/* If the ring is hanging on a WAIT_FOR_EVENT
+ 			* then simply poke the RB_WAIT bit
+ 			* and break the hang. This should work on
+@@ -3667,7 +3748,10 @@
+ 		if (hung) {
+ 			hc->tdr_count++;
+ 			ring->hangcheck.action = HANGCHECK_HUNG;
+-			i915_handle_error(dev, hc, 0, "%s hung", ring->name);
++			if (force_full_GPU_reset)
++				i915_handle_error(dev, NULL, 0, "Full GPU reset fall-back from %s", ring->name);
++			else
++				i915_handle_error(dev, hc, 0, "%s hung", ring->name);
+ 		}
+ 		return hung;
+ 	}
+@@ -3688,7 +3772,7 @@
+ 	int pending_work = 1;
+ 	int resched_timer = 1;
+ 	struct drm_i915_gem_request *last_req = NULL;
+-	uint32_t head, tail, acthd, instdone[I915_NUM_INSTDONE_REG];
++	uint32_t head, tail, acthd, instdone[I915_NUM_INSTDONE_REG], seqno;
+ 	struct drm_device *dev;
+ 	struct drm_i915_private *dev_priv;
+ 	struct intel_engine_cs *ring;
+@@ -3712,6 +3796,7 @@
+ 	tail = I915_READ_TAIL(ring) & TAIL_ADDR;
+ 	acthd = intel_ring_get_active_head(ring);
+ 	empty = list_empty(&ring->request_list);
++	seqno = ring->get_seqno(ring, false);
+ 
+ 	i915_get_extra_instdone(dev, instdone, ring);
+ 	instdone_cmp = (memcmp(hc->prev_instdone,
+@@ -3737,12 +3822,14 @@
+ 		      "status: %u\n", ring->id, (unsigned int) head,
+ 		      (unsigned int) hc->last_hd, (unsigned int) acthd,
+ 		      (unsigned int) hc->last_acthd, instdone_cmp, status);
+-	DRM_DEBUG_TDR("[%u] E:%d PW:%d TL:0x%08x Csq:0x%08x (%ld) Lsq:0x%08x (%ld) Idle: %s\n",
++	DRM_DEBUG_TDR("[%u] E:%d PW:%d TL:0x%08x Csq:0x%08x (%ld) Lsq:0x%08x (%ld) Psq:0x%08x (%ld) Idle: %s\n",
+ 		      ring->id, empty, pending_work, (unsigned int) tail,
+-		      (unsigned int) ring->get_seqno(ring, false),
+-		      (long int) ring->get_seqno(ring, false),
++		      (unsigned int) seqno,
++		      (long int) seqno,
+ 		      (unsigned int) i915_gem_request_get_seqno(last_req),
+ 		      (long int) i915_gem_request_get_seqno(last_req),
++		      (unsigned int) hc->last_seqno,
++		      (long int) hc->last_seqno,
+ 		      (idle ? "true" : "false"));
+ 
+ 	/*
+@@ -3758,6 +3845,22 @@
+ 	 */
+ 	acthd = 0;
+ 
++	/*
++	 * INSTDONE has been shown to be very random in its behaviour and does
++	 * not give us much information about the state of the command
++	 * streamer. It has been observed that the INSTDONE register keeps
++	 * changing state even when all command streamers are hung and are in a
++	 * stable state. For now disable the INSTDONE register check to make
++	 * the hang check algorithm more predictable in its behaviour and hang
++	 * check decision time.
++	 *
++	 * One destructive side-effect of having a somewhat unpredictable hang
++	 * detection time is that the Android userland sometimes tends to time
++	 * out during hangs, resulting in the display in a frozen state. That
++	 * is something we'd like to avoid if possible.
++	 */
++	instdone_cmp = 1;
++
+ 	/* Check both head and active head.
+ 	* Neither is enough on its own - acthd can be pointing within the
+ 	* batch buffer so is more likely to be moving, but the same
+@@ -3774,7 +3877,7 @@
+ 	    && (hc->last_hd == head)
+ 	    && instdone_cmp) {
+ 		/* Ring hasn't advanced in this sampling period */
+-		if (idle && (status == CONTEXT_SUBMISSION_STATUS_OK)) {
++		if (idle && (status != CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED)) {
+ 			ring->hangcheck.action = HANGCHECK_IDLE;
+ 
+ 			/* The hardware is idle */
+@@ -3788,18 +3891,18 @@
+ 				DRM_DEBUG_TDR("Possible stuck wait (0x%08x)\n",
+ 					ring->last_irq_seqno);
+ 				wake_up_all(&ring->irq_queue);
+-				i915_hangcheck_hung(hc);
++				i915_hangcheck_hung(hc, seqno);
+ 			} else {
+ 				/* Hardware and driver both idle */
+ 				hc->count = 0;
+ 				resched_timer = 0;
+ 			}
+-		} else if (status == CONTEXT_SUBMISSION_STATUS_OK) {
++		} else if (status != CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED) {
+ 			/*
+ 			 * The hardware is busy but has not advanced
+ 			 * since the last sample - possible hang
+ 			 */
+-			i915_hangcheck_hung(hc);
++			i915_hangcheck_hung(hc, seqno);
+ 		}
+ 	} else {
+ 		/* The state has changed so the hardware is active */
+@@ -3810,34 +3913,9 @@
+ 	/* Always update last sampled state */
+ 	hc->last_hd = head;
+ 	hc->last_acthd = acthd;
++	hc->last_seqno = seqno;
+ 	memcpy(hc->prev_instdone, instdone, sizeof(instdone));
+ 
+-	if (i915.enable_execlists) {
+-		if (resched_timer & (status == CONTEXT_SUBMISSION_STATUS_SUBMITTED)) {
+-			u32 remaining_detections =
+-				(DRM_I915_FORCED_RESUBMISSION_THRESHOLD -
+-					++hc->forced_resubmission_cnt);
+-
+-			DRM_DEBUG_TDR("HACK: EXECLIST_STATUS context ID=0 on" \
+-				      " %s with requests pending! " \
+-				      "Forced submission in %u\n",
+-				      ring->name,
+-				      (unsigned int) remaining_detections);
+-
+-		} else {
+-			/* Wait some more before forcing resubmission again */
+-			hc->forced_resubmission_cnt = 0;
+-		}
+-
+-		if (hc->forced_resubmission_cnt ==
+-				DRM_I915_FORCED_RESUBMISSION_THRESHOLD) {
+-			DRM_DEBUG_TDR("HACK: Forcing resubmission to move " \
+-				      "%s forward.\n", ring->name);
+-			intel_execlists_TDR_force_resubmit(dev_priv, hc->ringid);
+-			hc->forced_resubmission_cnt = 0;
+-		}
+-	}
+-
+ 	resched_timer &= (status != CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED);
+ 
+ 	if (resched_timer) {
+Index: b/drivers/gpu/drm/i915/i915_params.c
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_params.c	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/i915_params.c	2016-03-09 22:29:45.421111201 +0800
+@@ -38,6 +38,7 @@
+ 	.enable_fbc = -1,
+ 	.enable_execlists = -1,
+ 	.enable_hangcheck = true,
++	.enable_inconsistency_reset = false,
+ 	.enable_ppgtt = -1,
+ 	.enable_psr = 1,
+ 	.preliminary_hw_support = IS_ENABLED(CONFIG_DRM_I915_PRELIMINARY_HW_SUPPORT),
+@@ -126,6 +127,19 @@
+ 	"WARNING: Disabling this can cause system wide hangs. "
+ 	"(default: true)");
+ 
++module_param_named(enable_inconsistency_reset, i915.enable_inconsistency_reset, bool, 0644);
++MODULE_PARM_DESC(enable_inconsistency_reset,
++	"Allow promotion to full GPU reset in the event of a context submission "
++	"state inconsistency detection followed by a failed attempt to fake the "
++	"presumed lost context event interrupt. "
++	"If disabled the driver will not have any further options than to "
++	"simply fake more context event interrupts. If those also turn out to be "
++	"ineffective the driver might be caught in an irrecoverably hung state. "
++	"However, this scenario is hypothetical and has never been observed in "
++	"practice where faking interrupts have always turned out to be effective "
++	"in the case of lost context event interrupts. "
++	"(default: false)");
++
+ module_param_named(enable_ppgtt, i915.enable_ppgtt, int, 0400);
+ MODULE_PARM_DESC(enable_ppgtt,
+ 	"Override PPGTT usage. "
+Index: b/drivers/gpu/drm/i915/i915_scheduler.c
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_scheduler.c	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/i915_scheduler.c	2016-03-09 22:29:45.421111201 +0800
+@@ -544,6 +544,13 @@
+ 				/* Wot no state?! */
+ 				BUG();
+ 			}
++
++			/*
++			 * Signal the fences of all pending work (it is
++			 * harmless to signal work that has already been
++			 * signalled)
++			 */
++			i915_sync_hung_request(node->params.request);
+ 		}
+ 	}
+ 
+@@ -1242,18 +1249,8 @@
+ 	 * NB: The callback is executed at interrupt time, thus it can not
+ 	 * call _submit() directly. It must go via the delayed work handler.
+ 	 */
+-	if (dev_priv) {
+-		struct i915_scheduler   *scheduler;
+-		unsigned long           flags;
+-
+-		scheduler = dev_priv->scheduler;
+-
+-		spin_lock_irqsave(&scheduler->lock, flags);
+-		i915_waiter->node->flags &= ~i915_qef_fence_waiting;
+-		spin_unlock_irqrestore(&scheduler->lock, flags);
+-
++	if (dev_priv)
+ 		queue_work(dev_priv->wq, &dev_priv->mm.scheduler_work);
+-	}
+ 
+ 	kfree(waiter);
+ }
+Index: b/drivers/gpu/drm/i915/intel_lrc.c
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_lrc.c	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/intel_lrc.c	2016-03-09 22:33:05.136749561 +0800
+@@ -903,8 +903,9 @@
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	unsigned long flags;
+-	struct intel_ctx_submit_request *req;
++	struct intel_ctx_submit_request *tmpreq;
+ 	unsigned hw_context = 0;
++	unsigned sw_context = 0;
+ 	enum context_submission_status status =
+ 			CONTEXT_SUBMISSION_STATUS_UNDEFINED;
+ 	struct intel_context *tmpctx = NULL;
+@@ -913,20 +914,44 @@
+ 	spin_lock_irqsave(&ring->execlist_lock, flags);
+ 	hw_context = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
+ 
+-	req = list_first_entry_or_null(&ring->execlist_queue,
++	tmpreq = list_first_entry_or_null(&ring->execlist_queue,
+ 		struct intel_ctx_submit_request, execlist_link);
+ 
+-	if (req && req->ctx) {
+-		tmpctx = req->ctx;
++	if (tmpreq) {
++		sw_context =
++			intel_execlists_ctx_id((tmpreq->ctx)->engine[ring->id].state);
++
++		if (tmpreq->elsp_submitted > 0) {
++			/*
++			 * If the caller has not passed a non-NULL req parameter then
++			 * it is not interested in getting a request reference back.
++			 * Don't temporarily grab a reference since holding the execlist
++			 * lock is enough to ensure that the execlist code will hold its
++			 * reference all throughout this function. As long as that reference
++			 * is kept there is no need for us to take yet another reference.
++			 * The reason why this is of interest is because certain callers, such
++			 * as the TDR hang checker, cannot grab struct_mutex before calling
++			 * and because of that we cannot dereference any requests (DRM might
++			 * assert if we do). Just rely on the execlist code to provide
++			 * indirect protection.
++			 */
++			if (tmpreq->ctx)
++				tmpctx = tmpreq->ctx;
+ 
+-		if (ctx)
+-			i915_gem_context_reference(tmpctx);
++			if (ctx)
++				i915_gem_context_reference(tmpctx);
++
++		} else {
++			DRM_DEBUG_TDR("Head request in %s is inactive " \
++				      "(elsp_submitted=%d, hw_context=%x, sw_context=%x)\n",
++				ring->name,
++				tmpreq->elsp_submitted,
++				hw_context,
++				sw_context);
++		}
+ 	}
+ 
+ 	if (tmpctx) {
+-		unsigned sw_context =
+-			intel_execlists_ctx_id((tmpctx)->engine[ring->id].state);
+-
+ 		status = ((hw_context == sw_context) && (0 != hw_context)) ?
+ 			CONTEXT_SUBMISSION_STATUS_OK :
+ 			CONTEXT_SUBMISSION_STATUS_SUBMITTED;
+@@ -941,6 +966,12 @@
+ 			CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED;
+ 	}
+ 
++	if (status == CONTEXT_SUBMISSION_STATUS_SUBMITTED)
++		DRM_DEBUG_TDR("hw_ctx=%x, sw_ctx=%x, elsp_submitted=%d\n",
++			hw_context,
++			sw_context,
++			tmpreq ? tmpreq->elsp_submitted : 0);
++
+ 	if (ctx)
+ 		*ctx = tmpctx;
+ 
+@@ -981,13 +1012,63 @@
+ }
+ 
+ /**
++ * fake_lost_ctx_event_irq() - Checks for pending faked lost context event IRQs.
++ * @dev_priv: ...
++ * @ring: Engine to check pending faked lost IRQs for.
++ *
++ * Checks the bits in dev_priv->gpu_error.faked_lost_ctx_event_irq corresponding
++ * to the specified engine and updates the bits and returns a value accordingly.
++ *
++ * Return:
++ * 	true: If the current IRQ is to be lost.
++ * 	false: If the current IRQ is to be processed as normal.
++ */
++static inline bool fake_lost_ctx_event_irq(struct drm_i915_private *dev_priv,
++				           struct intel_engine_cs *ring)
++{
++	u32 *faked_lost_irq_mask =
++		&dev_priv->gpu_error.faked_lost_ctx_event_irq;
++
++	/*
++	 * Point out the least significant bit in the nibble of the faked lost
++	 * context event IRQ mask that corresponds to the engine at hand.
++	 */
++	u32 engine_nibble = (ring->id << 2);
++
++	/* Check engine nibble for any pending IRQs to be simulated as lost */
++	if (*faked_lost_irq_mask & (0xf << engine_nibble)) {
++		DRM_INFO("Faked lost interrupt on %s! (%x)\n",
++			ring->name,
++			*faked_lost_irq_mask);
++
++		/*
++		 * Subtract the IRQ that is to be simulated as lost from the
++		 * engine nibble.
++		 */
++		*faked_lost_irq_mask -= (0x1 << engine_nibble);
++
++		DRM_INFO("New fake lost irq mask: %x\n",
++			*faked_lost_irq_mask);
++
++		/* Tell the IRQ handler to simulate lost context event IRQ */
++		return true;
++	}
++
++	return false;
++}
++
++/**
+  * intel_execlists_handle_ctx_events() - handle Context Switch interrupts
+  * @ring: Engine Command Streamer to handle.
++ * @do_lock: Lock execlist spinlock (if false the caller is responsible for this)
+  *
+  * Check the unread Context Status Buffers and manage the submission of new
+  * contexts to the ELSP accordingly.
++ *
++ * Return:
++ * 	The number of unqueued contexts.
+  */
+-void intel_execlists_handle_ctx_events(struct intel_engine_cs *ring)
++int intel_execlists_handle_ctx_events(struct intel_engine_cs *ring, bool do_lock)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	u32 status_pointer;
+@@ -997,6 +1078,9 @@
+ 	u32 status_id;
+ 	u32 submit_contexts = 0;
+ 
++	if (do_lock)
++		spin_lock(&ring->execlist_lock);
++
+ 	status_pointer = I915_READ(RING_CONTEXT_STATUS_PTR(ring));
+ 
+ 	read_pointer = ring->next_context_status_buffer;
+@@ -1004,8 +1088,6 @@
+ 	if (read_pointer > write_pointer)
+ 		write_pointer += 6;
+ 
+-	spin_lock(&ring->execlist_lock);
+-
+ 	while (read_pointer < write_pointer) {
+ 		read_pointer++;
+ 
+@@ -1016,6 +1098,23 @@
+ 
+ 		if (status & GEN8_CTX_STATUS_PREEMPTED) {
+ 			if (status & GEN8_CTX_STATUS_LITE_RESTORE) {
++				if (fake_lost_ctx_event_irq(dev_priv, ring)) {
++				    /*
++				     * If we want to simulate the loss of a
++				     * context event IRQ (only for such events
++				     * that could affect the execlist queue,
++				     * since this is something that could
++				     * affect the HW/driver consistency
++				     * checker) then just exit the IRQ handler
++				     * early with no side-effects!  We want to
++				     * pretend like this IRQ never happened.
++				     * The next time the IRQ handler is entered
++				     * for this engine the CSB events should
++				     * remain in the CSB, waiting to be
++				     * processed.
++				     */
++				    goto exit;
++				}
+ 				if (execlists_check_remove_request(ring, status_id))
+ 					WARN(1, "Lite Restored request removed from queue\n");
+ 			} else
+@@ -1024,6 +1124,10 @@
+ 
+ 		 if ((status & GEN8_CTX_STATUS_ACTIVE_IDLE) ||
+ 		     (status & GEN8_CTX_STATUS_ELEMENT_SWITCH)) {
++
++			if (fake_lost_ctx_event_irq(dev_priv, ring))
++			    goto exit;
++
+ 			if (execlists_check_remove_request(ring, status_id))
+ 				submit_contexts++;
+ 		}
+@@ -1032,13 +1136,17 @@
+ 	if (submit_contexts != 0)
+ 		execlists_context_unqueue(ring);
+ 
+-	spin_unlock(&ring->execlist_lock);
+-
+ 	WARN(submit_contexts > 2, "More than two context complete events?\n");
+ 	ring->next_context_status_buffer = write_pointer % 6;
+ 
+ 	I915_WRITE(RING_CONTEXT_STATUS_PTR(ring),
+ 		   ((u32)ring->next_context_status_buffer & 0x07) << 8);
++
++exit:
++	if (do_lock)
++		spin_unlock(&ring->execlist_lock);
++
++	return submit_contexts;
+ }
+ 
+ static int execlists_context_queue(struct intel_engine_cs *ring,
+@@ -3528,62 +3636,80 @@
+ }
+ 
+ /**
+- * execlists_TDR_force_resubmit() - resubmit pending context if EXECLIST_STATUS
+- * context ID is stuck to 0.
++ * execlists_TDR_force_CSB_check() - check CSB manually to act on pending
++ * context status events.
+  *
+  * @dev_priv: ...
+- * @ringid: engine to resubmit context to.
++ * @ringid: engine whose CSB is to be checked.
+  *
+- * This function is simply a hack to work around a hardware oddity that
+- * manifests itself through stuck context ID zero in EXECLIST_STATUS register
+- * even though context is pending post-submission. There is no reason for this
+- * hardware behaviour but until we have resolved this issue we need this
+- * workaround.
++ * In case we missed a context event interrupt we can fake this interrupt by
++ * acting on pending CSB events manually by calling this function. This is
++ * normally what would happen in interrupt context but that does not prevent us
++ * from calling it from a user thread.
++ *
++ * Returns:
++ *	True if faked context event IRQ was effective.
++ *	False otherwise.
+  */
+-void intel_execlists_TDR_force_resubmit(struct drm_i915_private *dev_priv,
++bool intel_execlists_TDR_force_CSB_check(struct drm_i915_private *dev_priv,
+ 		unsigned ringid)
+ {
+ 	unsigned long flags;
+ 	struct intel_engine_cs *ring = &dev_priv->ring[ringid];
+-	struct intel_ctx_submit_request *req = NULL;
+-	struct intel_context *ctx = NULL;
+-	unsigned hw_context = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
++	int ret = 0;
++	enum context_submission_status status =
++			CONTEXT_SUBMISSION_STATUS_UNDEFINED;
+ 
+-	if (spin_is_locked(&ring->execlist_lock))
+-		return;
+-	else
+-		spin_lock_irqsave(&ring->execlist_lock, flags);
++	if (atomic_read(&ring->hangcheck.flags)
++		& DRM_I915_HANGCHECK_RESETTING) {
++		/*
++		 * Normally it's not a problem to fake context event interrupts
++		 * at any point even though the real interrupt might come in as
++		 * well. However, following a per-engine reset the read pointer
++		 * is set to 0 and the write pointer is set to 7.
++		 * Seeing as 7 % 6 = 1 (% 6 meaning there are 6 event slots),
++		 * which is 1 above the post-reset read pointer position, that
++		 * means that we've got a CSB window of non-zero size that
++		 * might be populated with context events by the hardware
++		 * following the TDR context resubmission. If we do a faked
++		 * interrupt too early (before finishing hang recovery) we
++		 * clear out this window by setting read pointer = write
++		 * pointer = 1 expecting that all contained events have been
++		 * processed (following a reset there will be nothing but
++		 * zeroes in there, though). This does not prevent the hardware
++		 * from filling in CSB slots 0 and 1 with events after this
++		 * point in time, though. By checking the CSB before allowing
++		 * the hardware fill in the events we hide these events from
++		 * being processed, potentially causing irrecoverable hangs.
++		 *
++		 * Solution: Do not fake interrupts while hang recovery is ongoing.
++		 */
++		DRM_DEBUG_TDR("Hang recovery on %s. No CSB check!\n", ring->name);
+ 
+-	if (hw_context) {
+-		WARN(1, "EXECLIST_STATUS context ID (%u) on %s is " \
+-			"not zero - no need for forced resubmission!\n",
+-			hw_context, ring->name);
+-		goto exit;
++		/*
++		 * Return true to allow another attempt for recovery since this
++		 * is a transitory state.
++		 */
++		return true;
+ 	}
+ 
+-	req = list_first_entry_or_null(&ring->execlist_queue,
+-			struct intel_ctx_submit_request, execlist_link);
+-
+-	if (req) {
+-		if (req->ctx) {
+-			ctx = req->ctx;
+-			i915_gem_context_reference(ctx);
++	status = i915_gem_context_get_current_context(ring, NULL);
+ 
+-		} else {
+-			WARN(1, "No context in request %p!", req);
+-			goto exit;
+-		}
+-	} else {
+-		WARN(1, "No context submitted to %s!\n", ring->name);
+-		goto exit;
+-	}
++	if (status == CONTEXT_SUBMISSION_STATUS_SUBMITTED) {
++		spin_lock_irqsave(&ring->execlist_lock, flags);
+ 
+-	execlists_TDR_context_unqueue(ring, true);
++		WARN(1, "Inconsistent context state. Faking interrupt on %s!",
++			ring->name);
+ 
+-exit:
+-	if (ctx)
+-		i915_gem_context_unreference(ctx);
++		ret = intel_execlists_handle_ctx_events(ring, false);
++		if (!ret)
++			DRM_ERROR("Forced CSB check of %s ineffective!\n",
++				ring->name);
+ 
+-	spin_unlock_irqrestore(&ring->execlist_lock, flags);
++		spin_unlock_irqrestore(&ring->execlist_lock, flags);
++		wake_up_all(&ring->irq_queue);
++	}
++
++	return !!ret;
+ }
+ 
+Index: b/drivers/gpu/drm/i915/intel_lrc.h
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_lrc.h	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/intel_lrc.h	2016-03-09 22:29:45.421111201 +0800
+@@ -114,7 +114,7 @@
+ 	int elsp_submitted;
+ };
+ 
+-void intel_execlists_handle_ctx_events(struct intel_engine_cs *ring);
++int intel_execlists_handle_ctx_events(struct intel_engine_cs *ring, bool do_lock);
+ void intel_execlists_retire_requests(struct intel_engine_cs *ring);
+ 
+ int intel_execlists_write_buffer_ctl(struct intel_engine_cs *ring,
+Index: b/drivers/gpu/drm/i915/intel_lrc_tdr.h
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_lrc_tdr.h	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/intel_lrc_tdr.h	2016-03-09 22:29:45.421111201 +0800
+@@ -34,8 +34,7 @@
+ intel_execlists_TDR_get_submitted_context(struct intel_engine_cs *ring,
+ 		struct intel_context **ctx);
+ 
+-void intel_execlists_TDR_force_resubmit(struct drm_i915_private *dev_priv,
+-		unsigned ringid);
++bool intel_execlists_TDR_force_CSB_check(struct drm_i915_private *dev_priv, unsigned ringid);
+ 
+ #endif /* _INTEL_LRC_TDR_H_ */
+ 
+Index: b/drivers/gpu/drm/i915/intel_ringbuffer.h
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h	2016-03-09 22:29:45.421111201 +0800
+@@ -220,12 +220,16 @@
+ 	 * head may be a graphics address in a ring buffer */
+ 	u32 last_head;
+ 
++	/* Last recorded engine seqno */
++	u32 last_seqno;
++
+ 	/* Last recorded instdone */
+ 	u32 prev_instdone[I915_NUM_INSTDONE_REG];
+ 
+ 	/* Flag to indicate if ring reset required */
+-#define DRM_I915_HANGCHECK_HUNG 0x01 /* Indicates this ring has hung */
+-#define DRM_I915_HANGCHECK_RESET 0x02 /* Indicates request to reset this ring */
++#define DRM_I915_HANGCHECK_HUNG 	0x01 /* This ring has hung */
++#define DRM_I915_HANGCHECK_RESET 	0x02 /* Request to reset this ring */
++#define DRM_I915_HANGCHECK_RESETTING 	0x04 /* Ring reset is imminent */
+ 	atomic_t flags;
+ 
+ 	/* Keep a record of the last time the ring was reset */
+@@ -240,17 +244,6 @@
+ 
+ 	/* Number of watchdog hang detections for this ring */
+ 	u32 watchdog_count;
+-
+-	/* Forced resubmission counter */
+-	u32 forced_resubmission_cnt;
+-
+-	/*
+-	 * Number of detections before forced resubmission is
+-	 * carried out. Yes, this number is arbitrary and is based
+-	 * on empirical evidence.
+-	 */
+-#define DRM_I915_FORCED_RESUBMISSION_THRESHOLD 2
+-
+ };
+ 
+ struct intel_ringbuffer {
+Index: b/drivers/gpu/drm/i915/intel_sync.c
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_sync.c	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/intel_sync.c	2016-03-09 22:29:45.421111201 +0800
+@@ -303,9 +303,28 @@
+ 		i915_sync_timeline_signal(timeline, value);
+ }
+ 
+-void i915_sync_hung_ring(struct intel_engine_cs *ring)
++void i915_sync_hung_request(struct drm_i915_gem_request *req)
+ {
+ 	struct i915_sync_timeline *timeline;
++
++	if (WARN_ON(!req))
++		return;
++
++	timeline = req->ctx->engine[req->ring->id].sync_timeline;
++
++	/* Signal the timeline. This will cause it to query the
++	 * signaled state of any waiting sync points.
++	 * If any match with ring->active_seqno then they
++	 * will be marked with an error state.
++	 */
++	timeline->pvt.killed_at = req->sync_value;
++	i915_sync_timeline_advance(req->ctx, req->ring, req->sync_value);
++	timeline->pvt.killed_at = 0;
++}
++
++void i915_sync_hung_ring(struct intel_engine_cs *ring)
++{
++
+ 	struct drm_i915_gem_request *req;
+ 	uint32_t active_seqno;
+ 
+@@ -328,16 +347,7 @@
+ 		return;
+ 	}
+ 
+-	timeline = req->ctx->engine[req->ring->id].sync_timeline;
+-
+-	/* Signal the timeline. This will cause it to query the
+-	 * signaled state of any waiting sync points.
+-	 * If any match with ring->active_seqno then they
+-	 * will be marked with an error state.
+-	 */
+-	timeline->pvt.killed_at = req->sync_value;
+-	i915_sync_timeline_advance(req->ctx, req->ring, req->sync_value);
+-	timeline->pvt.killed_at = 0;
++	i915_sync_hung_request(req);
+ }
+ 
+ bool i915_safe_to_ignore_fence(struct intel_engine_cs *ring, struct sync_fence *fence)
+Index: b/drivers/gpu/drm/i915/intel_sync.h
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_sync.h	2016-03-09 22:29:45.425111193 +0800
++++ b/drivers/gpu/drm/i915/intel_sync.h	2016-03-09 22:29:45.421111201 +0800
+@@ -79,6 +79,8 @@
+ 				uint32_t value);
+ void i915_sync_hung_ring(struct intel_engine_cs *ring);
+ 
++void i915_sync_hung_request(struct drm_i915_gem_request *req);
++
+ #else
+ 
+ static inline
+@@ -116,6 +118,11 @@
+ 
+ }
+ 
++static inline
++void i915_sync_hung_request(struct drm_i915_gem_request *req)
++{
++
++}
+ #endif /* CONFIG_DRM_I915_SYNC */
+ 
+ #endif /* _INTEL_SYNC_H_ */

@@ -1,0 +1,173 @@
+From 29946f3d46e762c5a979348dae0f0136aa2eecda Mon Sep 17 00:00:00 2001
+From: "Liu, Chuansheng" <chuansheng.liu@intel.com>
+Date: Mon, 13 Apr 2015 19:48:14 +0530
+Subject: [PATCH] PM / sleep: Asynchronous threads for resume_noirq
+
+In analogy with commits 5af84b82701a and 97df8c12995, using
+asynchronous threads can improve the overall resume_noirq time
+significantly.
+
+One typical case is:
+In resume_noirq phase and for the PCI devices, the function
+pci_pm_resume_noirq() will be called, and there is one d3_delay
+(10ms) at least.
+
+With the way of asynchronous threads, we just need wait d3_delay
+time once in parallel for each calling, which saves much time to
+resume quickly.
+Upsteam Commit-ID: 76569faa62c46382e080c3e190c66e19515aae1c
+
+Change-Id: Ie3430348bfbc57e31bd9b85b93b9077f49e33c96
+Signed-off-by: Chuansheng Liu <chuansheng.liu@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-7976
+[Upstream patch backported with merge conflicts resolved... ]
+Signed-off-by: Ananth Krishna R <ananth.krishna.r@intel.com>
+---
+ drivers/base/power/main.c | 80 ++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 58 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/base/power/main.c b/drivers/base/power/main.c
+index 36a8398..fe2c656 100644
+--- a/drivers/base/power/main.c
++++ b/drivers/base/power/main.c
+@@ -477,7 +477,8 @@ static void dpm_watchdog_clear(struct dpm_watchdog *wd)
+  * The driver of @dev will not receive interrupts while this function is being
+  * executed.
+  */
+-static int device_resume_noirq(struct device *dev, pm_message_t state)
++static int device_resume_noirq(struct device *dev,
++				 pm_message_t state, bool async)
+ {
+ 	pm_callback_t callback = NULL;
+ 	char *info = NULL;
+@@ -489,6 +490,8 @@ static int device_resume_noirq(struct device *dev, pm_message_t state)
+ 	if (dev->power.syscore)
+ 		goto Out;
+ 
++	dpm_wait(dev->parent, async);
++
+ 	if (dev->pm_domain) {
+ 		info = "noirq power domain ";
+ 		callback = pm_noirq_op(&dev->pm_domain->ops, state);
+@@ -511,10 +514,30 @@ static int device_resume_noirq(struct device *dev, pm_message_t state)
+ 	error = dpm_run_callback(callback, dev, state, info);
+ 
+  Out:
++	complete_all(&dev->power.completion);
+ 	TRACE_RESUME(error);
+ 	return error;
+ }
+ 
++static bool is_async(struct device *dev)
++{
++	return dev->power.async_suspend && pm_async_enabled
++		&& !pm_trace_is_enabled();
++
++}
++
++static void async_resume_noirq(void *data, async_cookie_t cookie)
++{
++	struct device *dev = (struct device *)data;
++	int error;
++
++	error = device_resume_noirq(dev, pm_transition, true);
++	if (error)
++		pm_dev_err(dev, pm_transition, " async", error);
++
++	put_device(dev);
++}
++
+ /**
+  * dpm_resume_noirq - Execute "noirq resume" callbacks for all devices.
+  * @state: PM transition of the system being carried out.
+@@ -524,39 +547,58 @@ static int device_resume_noirq(struct device *dev, pm_message_t state)
+  */
+ static void dpm_resume_noirq(pm_message_t state)
+ {
++	struct device *dev;
+ 	ktime_t starttime = ktime_get();
+ 
+ 	trace_suspend_resume(TPS("dpm_resume_noirq"), state.event, true);
+ 	mutex_lock(&dpm_list_mtx);
+-	while (!list_empty(&dpm_noirq_list)) {
+-		struct device *dev = to_device(dpm_noirq_list.next);
+-		int error;
++	pm_transition = state;
+ 
++	/*
++	 * Advanced the async threads upfront,
++	 * in case the starting of async thread is
++	 * delayed by non-async resuming devices.
++	 */
++	list_for_each_entry(dev, &dpm_noirq_list, power.entry) {
++		reinit_completion(&dev->power.completion);
++		if (is_async(dev)) {
++			get_device(dev);
++			async_schedule(async_resume_noirq, dev);
++		}
++	}
++
++	while (!list_empty(&dpm_noirq_list)) {
++		dev = to_device(dpm_noirq_list.next);
+ 		get_device(dev);
+ 		list_move_tail(&dev->power.entry, &dpm_late_early_list);
+ 		mutex_unlock(&dpm_list_mtx);
+ 
+-		pm_suspend_dbg(PM_SUSPEND_DBG_RESUME,
+-			"PM: device[%s] driver[%s] resume noirq enter\n",
+-			dev_name(dev), dev_driver_string(dev));
++		if (!is_async(dev)) {
++			int error;
+ 
+-		error = device_resume_noirq(dev, state);
++			pm_suspend_dbg(PM_SUSPEND_DBG_RESUME,
++				"PM: device[%s] driver[%s] resume noirq enter\n",
++				dev_name(dev), dev_driver_string(dev));
+ 
+-		pm_suspend_dbg(PM_SUSPEND_DBG_RESUME,
+-			"PM: device[%s] driver[%s] resume noirq exit\n",
+-			dev_name(dev), dev_driver_string(dev));
++			error = device_resume_noirq(dev, state, false);
+ 
+-		if (error) {
+-			suspend_stats.failed_resume_noirq++;
+-			dpm_save_failed_step(SUSPEND_RESUME_NOIRQ);
+-			dpm_save_failed_dev(dev_name(dev));
+-			pm_dev_err(dev, state, " noirq", error);
++			pm_suspend_dbg(PM_SUSPEND_DBG_RESUME,
++				"PM: device[%s] driver[%s] resume noirq exit\n",
++				dev_name(dev), dev_driver_string(dev));
++
++			if (error) {
++				suspend_stats.failed_resume_noirq++;
++				dpm_save_failed_step(SUSPEND_RESUME_NOIRQ);
++				dpm_save_failed_dev(dev_name(dev));
++				pm_dev_err(dev, state, " noirq", error);
++			}
+ 		}
+ 
+ 		mutex_lock(&dpm_list_mtx);
+ 		put_device(dev);
+ 	}
+ 	mutex_unlock(&dpm_list_mtx);
++	async_synchronize_full();
+ 	dpm_show_time(starttime, state, "noirq");
+ 	resume_device_irqs();
+ 	cpuidle_resume();
+@@ -614,12 +656,6 @@ static int device_resume_early(struct device *dev,
+ 	return error;
+ }
+ 
+-static bool is_async(struct device *dev)
+-{
+-	return dev->power.async_suspend && pm_async_enabled
+-		&& !pm_trace_is_enabled();
+-}
+-
+ static void async_resume_early(void *data, async_cookie_t cookie)
+ {
+ 	struct device *dev = (struct device *)data;
+-- 
+1.9.1
+

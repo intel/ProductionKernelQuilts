@@ -1,0 +1,158 @@
+From ff60f3b4022ee983285c91d339853fa129ff9214 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Date: Mon, 14 Jul 2014 16:15:23 +0100
+Subject: [PATCH 301/351] extcon: arizona: Deobfuscate arizona_extcon_do_magic
+
+arizona_extcon_do_magic does not lend a lot of clarity to the purpose
+of the function, and as all the registers used are described in the
+datasheet there is no need to obfuscate the code. This patch renames the
+function to arizona_extcon_hp_clamp, as it controls clamping on the
+headphone output.
+
+Change-Id: I9c88c8c7ae0b6447174a05baa1a4dae8c00527fe
+Signed-off-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+---
+ drivers/extcon/extcon-arizona.c  |   47 ++++++++++++++++++++------------------
+ include/linux/mfd/arizona/core.h |    2 +-
+ sound/soc/codecs/arizona.c       |    4 ++--
+ 3 files changed, 28 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/extcon/extcon-arizona.c b/drivers/extcon/extcon-arizona.c
+index 833ddfb..dc72ca2 100644
+--- a/drivers/extcon/extcon-arizona.c
++++ b/drivers/extcon/extcon-arizona.c
+@@ -153,8 +153,8 @@ DEVICE_ATTR(hp_impedance, S_IRUGO, arizona_extcon_show, NULL);
+ 
+ static void arizona_start_hpdet_acc_id(struct arizona_extcon_info *info);
+ 
+-static void arizona_extcon_do_magic(struct arizona_extcon_info *info,
+-				    unsigned int magic)
++static void arizona_extcon_hp_clamp(struct arizona_extcon_info *info,
++				    bool clamp)
+ {
+ 	struct arizona *arizona = info->arizona;
+ 	unsigned int mask, val = 0;
+@@ -167,25 +167,26 @@ static void arizona_extcon_do_magic(struct arizona_extcon_info *info,
+ 		break;
+ 	case WM8280:
+ 	case WM5110:
+-		mask = 0x0007;
+-		if (magic)
+-			val = 0x0001;
++		mask = ARIZONA_HP1L_SHRTO | ARIZONA_HP1L_FLWR |
++		       ARIZONA_HP1L_SHRTI;
++		if (clamp)
++			val = ARIZONA_HP1L_SHRTO;
+ 		else
+-			val = 0x0006;
++			val = ARIZONA_HP1L_FLWR | ARIZONA_HP1L_SHRTI;
+ 		break;
+ 	default:
+-		mask = 0x4000;
+-		if (magic)
+-			val = 0x4000;
++		mask = ARIZONA_RMV_SHRT_HP1L;
++		if (clamp)
++			val = ARIZONA_RMV_SHRT_HP1L;
+ 		break;
+ 	};
+ 
+ 	mutex_lock(&arizona->dapm->card->dapm_mutex);
+ 
+-	arizona->hpdet_magic = magic;
++	arizona->hpdet_clamp = clamp;
+ 
+-	/* Keep the HP output stages disabled while doing the magic */
+-	if (magic) {
++	/* Keep the HP output stages disabled while doing the clamp */
++	if (clamp) {
+ 		ret = regmap_update_bits(arizona->regmap,
+ 					 ARIZONA_OUTPUT_ENABLES_1,
+ 					 ARIZONA_OUT1L_ENA |
+@@ -197,19 +198,21 @@ static void arizona_extcon_do_magic(struct arizona_extcon_info *info,
+ 	}
+ 
+ 	if (mask) {
+-		ret = regmap_update_bits(arizona->regmap, 0x225, mask, val);
++		ret = regmap_update_bits(arizona->regmap, ARIZONA_HP_CTRL_1L,
++					 ARIZONA_RMV_SHRT_HP1L, val);
+ 		if (ret != 0)
+-			dev_warn(arizona->dev, "Failed to do magic: %d\n",
+-				 ret);
++			dev_warn(arizona->dev, "Failed to do clamp: %d\n",
++					 ret);
+ 
+-		ret = regmap_update_bits(arizona->regmap, 0x226, mask, val);
++		ret = regmap_update_bits(arizona->regmap, ARIZONA_HP_CTRL_1R,
++					 ARIZONA_RMV_SHRT_HP1R, val);
+ 		if (ret != 0)
+-			dev_warn(arizona->dev, "Failed to do magic: %d\n",
++			dev_warn(arizona->dev, "Failed to do clamp: %d\n",
+ 				 ret);
+ 	}
+ 
+-	/* Restore the desired state while not doing the magic */
+-	if (!magic) {
++	/* Restore the desired state while not doing the clamp */
++	if (!clamp) {
+ 		ret = regmap_update_bits(arizona->regmap,
+ 					 ARIZONA_OUTPUT_ENABLES_1,
+ 					 ARIZONA_OUT1L_ENA |
+@@ -648,7 +651,7 @@ done:
+ 			   ARIZONA_HP_IMPEDANCE_RANGE_MASK | ARIZONA_HP_POLL,
+ 			   0);
+ 
+-	arizona_extcon_do_magic(info, 0);
++	arizona_extcon_hp_clamp(info, false);
+ 
+ 	if (id_gpio)
+ 		gpio_set_value_cansleep(id_gpio, 0);
+@@ -693,7 +696,7 @@ static void arizona_identify_headphone(struct arizona_extcon_info *info)
+ 	if (info->mic)
+ 		arizona_stop_mic(info);
+ 
+-	arizona_extcon_do_magic(info, 0x4000);
++	arizona_extcon_hp_clamp(info, true);
+ 
+ 	ret = regmap_update_bits(arizona->regmap,
+ 				 ARIZONA_ACCESSORY_DETECT_MODE_1,
+@@ -744,7 +747,7 @@ static void arizona_start_hpdet_acc_id(struct arizona_extcon_info *info)
+ 
+ 	info->hpdet_active = true;
+ 
+-	arizona_extcon_do_magic(info, 0x4000);
++	arizona_extcon_hp_clamp(info, true);
+ 
+ 	ret = regmap_update_bits(arizona->regmap,
+ 				 ARIZONA_ACCESSORY_DETECT_MODE_1,
+diff --git a/include/linux/mfd/arizona/core.h b/include/linux/mfd/arizona/core.h
+index 086b997..8060aa4 100644
+--- a/include/linux/mfd/arizona/core.h
++++ b/include/linux/mfd/arizona/core.h
+@@ -131,7 +131,7 @@ struct arizona {
+ 	struct regmap_irq_chip_data *aod_irq_chip;
+ 	struct regmap_irq_chip_data *irq_chip;
+ 
+-	bool hpdet_magic;
++	bool hpdet_clamp;
+ 	unsigned int hp_ena;
+ 
+ 	unsigned int hp_impedance;
+diff --git a/sound/soc/codecs/arizona.c b/sound/soc/codecs/arizona.c
+index bfd5e8d..ce97956 100644
+--- a/sound/soc/codecs/arizona.c
++++ b/sound/soc/codecs/arizona.c
+@@ -1235,8 +1235,8 @@ int arizona_hp_ev(struct snd_soc_dapm_widget *w,
+ 	priv->arizona->hp_ena &= ~mask;
+ 	priv->arizona->hp_ena |= val;
+ 
+-	/* Force off if HPDET magic is active */
+-	if (priv->arizona->hpdet_magic ||
++	/* Force off if HPDET clamp is active */
++	if (priv->arizona->hpdet_clamp ||
+ 	    priv->arizona->hp_impedance <= priv->arizona->pdata.hpdet_short_circuit_imp)
+ 		val = 0;
+ 
+-- 
+1.7.9.5
+

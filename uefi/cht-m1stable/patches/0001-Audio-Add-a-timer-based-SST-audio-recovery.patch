@@ -1,0 +1,390 @@
+From 1fafed3b932aff413f410446f756ba23f02a1e38 Mon Sep 17 00:00:00 2001
+From: "Subhransu S. Prusty" <subhransu.s.prusty@intel.com>
+Date: Mon, 25 Aug 2014 12:59:16 +0530
+Subject: [PATCH 01/12] Audio: Add a timer based SST audio recovery
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+https://android.intel.com/#/c/213074/ ensures that recovery
+is implemented only if the timer is started during sst init.
+
+Change-Id: Id0d02a762981281f2372590876e04a81c26b4b12
+Signed-off-by: Subhransu S. Prusty <subhransu.s.prusty@intel.com>
+---
+ sound/soc/intel/platform-libs/controls_v2_dpcm.c | 17 ++++--
+ sound/soc/intel/sst/sst.c                        | 75 ++++++++++++++++++++++++
+ sound/soc/intel/sst/sst.h                        | 23 +++++++-
+ sound/soc/intel/sst/sst_acpi.c                   |  7 +++
+ sound/soc/intel/sst/sst_drv_interface.c          |  4 ++
+ sound/soc/intel/sst/sst_ipc.c                    |  2 +
+ sound/soc/intel/sst/sst_pvt.c                    | 62 ++++++++++++++++++++
+ sound/soc/intel/sst_platform.h                   |  1 +
+ 8 files changed, 185 insertions(+), 6 deletions(-)
+
+diff --git a/sound/soc/intel/platform-libs/controls_v2_dpcm.c b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+index 8c4c6bd..b6d8c4a 100644
+--- a/sound/soc/intel/platform-libs/controls_v2_dpcm.c
++++ b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+@@ -829,10 +829,19 @@ void sst_handle_vb_timer(struct snd_soc_platform *p, bool enable)
+ 	 * disable
+ 	 */
+ 	if ((enable && (timer_usage == 1)) ||
+-	    (!enable && (timer_usage == 0)))
+-		sst_fill_and_send_cmd_unlocked(sst, SST_IPC_IA_CMD, SST_FLAG_BLOCKED,
+-				      SST_TASK_SBA, 0, &cmd,
+-				      sizeof(cmd.header) + cmd.header.length);
++	    (!enable && (timer_usage == 0))) {
++
++		if (sst_fill_and_send_cmd_unlocked(sst, SST_IPC_IA_CMD, SST_FLAG_BLOCKED,
++				SST_TASK_SBA, 0, &cmd, sizeof(cmd.header) + cmd.header.length) == 0) {
++
++			if (sst_dsp->ops->set_generic_params(SST_SET_MONITOR_LPE,
++									(void *)&enable) != 0)
++				pr_err("%s: failed to set recovery timer\n", __func__);
++		} else
++			pr_err("%s: failed to send sst cmd %d\n",
++						 __func__, cmd.header.command_id);
++
++	}
+ 	mutex_unlock(&sst->lock);
+ 
+ 	if (!enable)
+diff --git a/sound/soc/intel/sst/sst.c b/sound/soc/intel/sst/sst.c
+index 5a7d992..0f489bf 100644
+--- a/sound/soc/intel/sst/sst.c
++++ b/sound/soc/intel/sst/sst.c
+@@ -73,6 +73,10 @@ static struct mutex drv_ctx_lock;
+ #else
+ #define intel_sst_ioctl_compat NULL
+ #endif
++#define DEFAULT_FW_MONITOR_INTERVAL 9000 /*timer callback interval in ms to check lpe state*/
++#define MIN_FW_MONITOR_INTERVAL     500
++#define MAX_FW_MONITOR_INTERVAL     20000
++
+ 
+ static const struct file_operations intel_sst_fops_cntrl = {
+ 	.owner = THIS_MODULE,
+@@ -504,6 +508,67 @@ static ssize_t sst_sysfs_set_recovery(struct device *dev,
+ static DEVICE_ATTR(audio_recovery, S_IRUGO | S_IWUSR,
+ 			sst_sysfs_get_recovery, sst_sysfs_set_recovery);
+ 
++static ssize_t sst_sysfs_get_recovery_interval(struct device *dev,
++	struct device_attribute *attr, char *buf)
++{
++	struct intel_sst_drv *ctx = dev_get_drvdata(dev);
++
++	return sprintf(buf, "%d\n", ctx->monitor_lpe.interval);
++}
++
++
++static ssize_t sst_sysfs_set_recovery_interval(struct device *dev,
++	 struct device_attribute *attr, const char *buf, size_t len)
++{
++	long val;
++	struct intel_sst_drv *ctx = dev_get_drvdata(dev);
++
++	if (kstrtol(buf, 0, &val)) {
++		pr_err("%s: not abe to set audio_recovery...\n", __func__);
++		return -EINVAL;
++	}
++
++	/*limiting the recovery interval between minimum and maximum value */
++	val = max(val, (long)MIN_FW_MONITOR_INTERVAL);
++	ctx->monitor_lpe.interval = min(val, (long)MAX_FW_MONITOR_INTERVAL);
++
++	pr_info("%s: setting recovery interval to %d\n", __func__,
++							 ctx->monitor_lpe.interval);
++
++	return len;
++}
++
++static DEVICE_ATTR(audio_recovery_interval, S_IRUGO | S_IWUSR,
++			sst_sysfs_get_recovery_interval, sst_sysfs_set_recovery_interval);
++
++int sst_recovery_init(struct intel_sst_drv *sst_drv_ctx)
++{
++	int ret_val = device_create_file(sst_drv_ctx->dev,
++						&dev_attr_audio_recovery_interval);
++	if (!ret_val) {
++		INIT_WORK(&sst_drv_ctx->monitor_lpe.mwork, sst_trigger_recovery);
++		sst_drv_ctx->recovery_wq =
++				create_singlethread_workqueue("sst_recovery_wq");
++		if (!sst_drv_ctx->recovery_wq) {
++			device_remove_file(sst_drv_ctx->dev,
++					&dev_attr_audio_recovery_interval);
++			ret_val = -ENOMEM;
++			goto free_wq;
++		}
++		sst_drv_ctx->monitor_lpe.interval = DEFAULT_FW_MONITOR_INTERVAL;
++		setup_timer(&sst_drv_ctx->monitor_lpe.sst_timer,
++					sst_timer_cb, (unsigned long)sst_drv_ctx);
++	}
++
++	return ret_val;
++free_wq:
++	if (sst_drv_ctx->recovery_wq)
++		destroy_workqueue(sst_drv_ctx->recovery_wq);
++	device_remove_file(sst_drv_ctx->dev, &dev_attr_audio_recovery_interval);
++	return ret_val;
++}
++
++
+ static const struct dmi_system_id dmi_machine_table[] = {
+ 	{
+ 		/*  INTEL MRD7 */
+@@ -899,6 +964,12 @@ static int intel_sst_probe(struct pci_dev *pci,
+ 		goto do_free_qos;
+ 	}
+ 
++	ret = sst_recovery_init(sst_drv_ctx);
++	if (ret) {
++		pr_err("%s:sst recovery intialization failed", __func__);
++		goto do_free_misc;
++	}
++
+ 	pr_info("%s successfully done!\n", __func__);
+ 	return ret;
+ 
+@@ -980,12 +1051,14 @@ static void intel_sst_remove(struct pci_dev *pci)
+ 	if (sst_drv_ctx->pci_id == SST_CLV_PCI_ID)
+ 		kfree(sst_drv_ctx->probe_bytes);
+ 
++	device_remove_file(sst_drv_ctx->dev, &dev_attr_audio_recovery_interval);
+ 	device_remove_file(sst_drv_ctx->dev, &dev_attr_audio_recovery);
+ 	kfree(sst_drv_ctx->fw_cntx);
+ 	kfree(sst_drv_ctx->runtime_param.param.addr);
+ 	flush_scheduled_work();
+ 	destroy_workqueue(sst_drv_ctx->post_msg_wq);
+ 	destroy_workqueue(sst_drv_ctx->mad_wq);
++	destroy_workqueue(sst_drv_ctx->recovery_wq);
+ 	pm_qos_remove_request(sst_drv_ctx->qos);
+ 	kfree(sst_drv_ctx->qos);
+ 	kfree(sst_drv_ctx->fw_sg_list.src);
+@@ -1170,6 +1243,8 @@ static void sst_do_shutdown(struct intel_sst_drv *ctx)
+ 	sst_add_to_dispatch_list_and_post(ctx, msg);
+ 	sst_wait_timeout(ctx, block);
+ 	sst_free_block(ctx, block);
++	if (&sst_drv_ctx->monitor_lpe.sst_timer)
++		del_timer(&sst_drv_ctx->monitor_lpe.sst_timer);
+ }
+ 
+ 
+diff --git a/sound/soc/intel/sst/sst.h b/sound/soc/intel/sst/sst.h
+index a52afe6..b80b36c 100644
+--- a/sound/soc/intel/sst/sst.h
++++ b/sound/soc/intel/sst/sst.h
+@@ -88,10 +88,12 @@ enum sst_algo_ops {
+ #define SST_IPCLPESC		0x70
+ #define SST_CLKCTL		0x78
+ #define SST_CSR2		0x80
++#define SST_TMRCTL              0xC0
++#define SST_TMRSTAT             0xC8
+ 
+ #define SST_SHIM_BEGIN		SST_CSR
+-#define SST_SHIM_END		SST_CSR2
+-#define SST_SHIM_SIZE		0x88
++#define SST_SHIM_END		SST_TMRSTAT
++#define SST_SHIM_SIZE		0xD0
+ 
+ #define FW_SIGNATURE_SIZE	4
+ 
+@@ -420,6 +422,7 @@ struct sst_shim_regs64 {
+ 	u64 ipclpesc;
+ 	u64 clkctl;
+ 	u64 csr2;
++	u64 tmrctl;
+ };
+ 
+ struct sst_vtsv_cache {
+@@ -429,6 +432,13 @@ struct sst_vtsv_cache {
+ 	u32 size2;
+ };
+ 
++struct sst_monitor_lpe {
++	u64 prev_match_val;
++	struct work_struct mwork;
++	struct timer_list sst_timer;
++	u32 interval;
++};
++
+ /***
+  *
+  * struct intel_sst_drv - driver ops
+@@ -500,6 +510,7 @@ struct intel_sst_drv {
+ 	struct work_struct      ipc_post_msg_wq;
+ 	wait_queue_head_t	wait_queue;
+ 	struct workqueue_struct *mad_wq;
++	struct workqueue_struct *recovery_wq; /*to queue work once recovery is triggered*/
+ 	struct workqueue_struct *post_msg_wq;
+ 	unsigned int		tstamp;
+ 	struct stream_info	streams[MAX_NUM_STREAMS+1]; /*str_id 0 is not used*/
+@@ -548,6 +559,8 @@ struct intel_sst_drv {
+ 	struct sst_mem_mgr      lib_mem_mgr;
+ 	/* Contains the cached vtsv files*/
+ 	struct sst_vtsv_cache	vcache;
++	/* To store external lpe timer info and recovery timer info*/
++	struct sst_monitor_lpe monitor_lpe;
+ 	/* Pointer to device ID, now for same PCI_ID, HID will be
+ 	 * will be different for FDK and EDK2. This will be used
+ 	 * for devices where PCI or ACPI id is same but HID is
+@@ -685,9 +698,15 @@ int sst_send_vtsv_data_to_fw(struct intel_sst_drv *ctx);
+ 
+ void sst_do_recovery_mrfld(struct intel_sst_drv *sst);
+ void sst_do_recovery(struct intel_sst_drv *sst);
++void sst_trigger_recovery(struct work_struct *work);
++void sst_update_timer(struct intel_sst_drv *sst_drv_ctx);
++void sst_do_recovery(struct intel_sst_drv *sst);
+ long intel_sst_ioctl_dsp(unsigned int cmd,
+ 		struct snd_ppp_params *algo_params, unsigned long arg);
+ 
++int sst_recovery_init(struct intel_sst_drv *sst_drv_ctx);
++int sst_set_timer(struct sst_monitor_lpe *monitor_lpe, bool enable);
++void sst_timer_cb(unsigned long data);
+ void sst_dump_to_buffer(const void *from, size_t from_len, char *buf);
+ 
+ extern int intel_scu_ipc_simple_command(int, int);
+diff --git a/sound/soc/intel/sst/sst_acpi.c b/sound/soc/intel/sst/sst_acpi.c
+index 6074b33..496eed4 100644
+--- a/sound/soc/intel/sst/sst_acpi.c
++++ b/sound/soc/intel/sst/sst_acpi.c
+@@ -275,6 +275,8 @@ int sst_destroy_workqueue(struct intel_sst_drv *ctx)
+ 		destroy_workqueue(ctx->mad_wq);
+ 	if (ctx->post_msg_wq)
+ 		destroy_workqueue(ctx->post_msg_wq);
++	if (ctx->recovery_wq)
++		destroy_workqueue(ctx->recovery_wq);
+ 	return 0;
+ }
+ 
+@@ -651,6 +653,11 @@ int sst_acpi_probe(struct platform_device *pdev)
+ 	pm_runtime_enable(dev);
+ 	register_sst(dev);
+ 	sst_debugfs_init(ctx);
++	ret = sst_recovery_init(ctx);
++	if (ret) {
++		pr_err("%s:sst recovery intialization failed", __func__);
++		goto do_free_misc;
++	}
+ 	sst_set_fw_state_locked(ctx, SST_RESET);
+ 	sst_save_shim64(ctx, ctx->shim, ctx->shim_regs64);
+ 	pr_info("%s successfully done!\n", __func__);
+diff --git a/sound/soc/intel/sst/sst_drv_interface.c b/sound/soc/intel/sst/sst_drv_interface.c
+index 2867ab8..8e108a1 100644
+--- a/sound/soc/intel/sst/sst_drv_interface.c
++++ b/sound/soc/intel/sst/sst_drv_interface.c
+@@ -1061,6 +1061,10 @@ static int sst_set_generic_params(enum sst_controls cmd, void *arg)
+ 		sst_pm_runtime_put(sst_drv_ctx);
+ 		break;
+ 	}
++	case SST_SET_MONITOR_LPE: {
++		ret_val = sst_set_timer(&sst_drv_ctx->monitor_lpe, *(bool *)arg);
++		break;
++	}
+ 	default:
+ 		pr_err("Invalid cmd request:%d\n", cmd);
+ 		ret_val = -EINVAL;
+diff --git a/sound/soc/intel/sst/sst_ipc.c b/sound/soc/intel/sst/sst_ipc.c
+index 517fd05..d5fd228 100644
+--- a/sound/soc/intel/sst/sst_ipc.c
++++ b/sound/soc/intel/sst/sst_ipc.c
+@@ -607,6 +607,8 @@ static void process_fw_async_msg(struct ipc_post *msg)
+ 				stream->period_elapsed(stream->pcm_substream);
+ 			if (stream->compr_cb)
+ 				stream->compr_cb(stream->compr_cb_param);
++			sst_update_timer(sst_drv_ctx);
++
+ 		}
+ 		break;
+ 
+diff --git a/sound/soc/intel/sst/sst_pvt.c b/sound/soc/intel/sst/sst_pvt.c
+index cc0b9d8..711386d 100644
+--- a/sound/soc/intel/sst/sst_pvt.c
++++ b/sound/soc/intel/sst/sst_pvt.c
+@@ -145,6 +145,7 @@ void dump_sst_shim(struct intel_sst_drv *sst)
+ 		read_shim_data(sst, SST_IPCLPESC),
+ 		read_shim_data(sst, SST_CLKCTL),
+ 		read_shim_data(sst, SST_CSR2));
++		read_shim_data(sst, SST_TMRCTL);
+ 	spin_unlock_irqrestore(&sst->ipc_spin_lock, irq_flags);
+ }
+ 
+@@ -570,3 +571,64 @@ void sst_clean_stream(struct stream_info *stream)
+ 	mutex_unlock(&stream->lock);
+ }
+ 
++void sst_update_timer(struct intel_sst_drv *sst_drv_ctx)
++{
++	struct intel_sst_drv *sst = sst_drv_ctx;
++	if (&sst->monitor_lpe.sst_timer != NULL) {
++		mod_timer(&sst->monitor_lpe.sst_timer, jiffies +
++				msecs_to_jiffies(sst->monitor_lpe.interval));
++		sst->monitor_lpe.prev_match_val = read_shim_data(sst, SST_TMRCTL);
++	}
++}
++
++void sst_trigger_recovery(struct work_struct *work)
++{
++	struct sst_monitor_lpe *monitor_lpe = container_of(work,
++							struct sst_monitor_lpe, mwork);
++	struct intel_sst_drv *sst  = container_of(monitor_lpe,
++						struct intel_sst_drv, monitor_lpe);
++	if (sst->ops->do_recovery)
++		sst->ops->do_recovery(sst);
++	return;
++}
++
++void sst_timer_cb(unsigned long data)
++{
++	struct intel_sst_drv *sst = (struct intel_sst_drv *)data;
++	u64 curr_match_val = read_shim_data(sst, SST_TMRCTL);
++
++	if (curr_match_val != sst->monitor_lpe.prev_match_val) {
++
++		mod_timer(&sst->monitor_lpe.sst_timer, jiffies +
++					msecs_to_jiffies(sst->monitor_lpe.interval));
++		sst->monitor_lpe.prev_match_val = curr_match_val;
++
++	} else {
++		pr_err(" triggering recovery !!!\n");
++		queue_work(sst->recovery_wq, &sst->monitor_lpe.mwork);
++		del_timer(&sst->monitor_lpe.sst_timer);
++	}
++
++	return;
++
++}
++
++int sst_set_timer(struct sst_monitor_lpe *monitor_lpe, bool enable)
++{
++	int ret = 0;
++	if (enable) {
++		ret = mod_timer(&monitor_lpe->sst_timer, jiffies +
++					msecs_to_jiffies(monitor_lpe->interval));
++		pr_debug("sst: recovery timer started, timer interval=%d sec\n",
++								monitor_lpe->interval/1000);
++	} else  {
++
++		if (&monitor_lpe->sst_timer != NULL)
++			ret = del_timer_sync(&monitor_lpe->sst_timer);
++		monitor_lpe->prev_match_val = 0;
++		pr_debug("sst: recovery timer stopped\n");
++
++	}
++
++	return ret;
++}
+diff --git a/sound/soc/intel/sst_platform.h b/sound/soc/intel/sst_platform.h
+index b61a00c..8db7289 100644
+--- a/sound/soc/intel/sst_platform.h
++++ b/sound/soc/intel/sst_platform.h
+@@ -75,6 +75,7 @@ enum sst_controls {
+ 	SST_SET_PROBE_BYTE_STREAM =     0x100D,
+ 	SST_GET_PROBE_BYTE_STREAM =	0x100E,
+ 	SST_SET_VTSV_INFO =		0x100F,
++	SST_SET_MONITOR_LPE =           0x1010,
+ };
+ 
+ struct pcm_stream_info {
+-- 
+1.8.3.2
+

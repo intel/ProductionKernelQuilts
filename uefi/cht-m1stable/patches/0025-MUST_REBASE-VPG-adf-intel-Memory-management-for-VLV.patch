@@ -1,0 +1,267 @@
+From ce0dd29362feda926c4cae23f2a552ff856ef723 Mon Sep 17 00:00:00 2001
+Message-Id: <ce0dd29362feda926c4cae23f2a552ff856ef723.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Shobhit Kumar <shobhit.kumar@intel.com>
+Date: Mon, 15 Sep 2014 20:12:16 +0530
+Subject: [PATCH 25/75] MUST_REBASE [VPG]: adf/intel: Memory management for
+ VLV
+
+VLV uses GEM memory manager. Complete implementation of memory will be
+done when we enable FB driver. For now Gralloc allocates memory using
+DRM prime interface which gives DMA Buf handle over GEM buffers.
+
+So just
+- do proper buffer mapping for use
+- Disable out default ADF memory initialization and validations if VLV is
+  enabled at compile time
+- Do not include intel_adf_mm.c for compilation
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I397af20279e0c86618f47538ef017019874cf598
+Signed-off-by: Pallavi <pallavi.g@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ drivers/video/adf/intel/Makefile                   |    2 ++
+ drivers/video/adf/intel/core/intel_dc_config.c     |    4 +++
+ .../video/adf/intel/include/core/intel_dc_config.h |    2 +-
+ drivers/video/adf/intel/intel_adf_device.c         |   34 ++++++++++++++++----
+ drivers/video/adf/intel/intel_adf_interface.c      |   12 +++++++
+ 5 files changed, 47 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/video/adf/intel/Makefile b/drivers/video/adf/intel/Makefile
+index 4c7cf75..d3f21a1 100644
+--- a/drivers/video/adf/intel/Makefile
++++ b/drivers/video/adf/intel/Makefile
+@@ -9,7 +9,9 @@ obj-$(CONFIG_ADF_INTEL) += intel_adf.o \
+ 
+ obj-$(CONFIG_ADF_INTEL_FBDEV) += intel_adf_fbdev.o
+ 
++ifndef CONFIG_ADF_INTEL_VLV
+ obj-$(CONFIG_ADF_MEMBLOCK) += intel_adf_mm.o
++endif
+ 
+ obj-$(CONFIG_ADF_INTEL_FBDEV) += intel_adf_fbdev.o
+ 
+diff --git a/drivers/video/adf/intel/core/intel_dc_config.c b/drivers/video/adf/intel/core/intel_dc_config.c
+index 99000f2..e8ffd5f 100644
+--- a/drivers/video/adf/intel/core/intel_dc_config.c
++++ b/drivers/video/adf/intel/core/intel_dc_config.c
+@@ -87,6 +87,7 @@ static int intel_pipe_validate(const struct intel_pipe *pipe)
+ 	return 0;
+ }
+ 
++#ifndef CONFIG_ADF_INTEL_VLV
+ static int intel_dc_memory_validate(const struct intel_dc_memory *memory)
+ {
+ 	if (!memory->total_pages) {
+@@ -105,6 +106,7 @@ static int intel_dc_memory_validate(const struct intel_dc_memory *memory)
+ 
+ 	return 0;
+ }
++#endif
+ 
+ static int intel_dc_config_validate(const struct intel_dc_config *config)
+ {
+@@ -147,6 +149,7 @@ static int intel_dc_config_validate(const struct intel_dc_config *config)
+ 		}
+ 	}
+ 
++#ifndef CONFIG_ADF_INTEL_VLV
+ 	/*check memory*/
+ 	INTEL_DC_CHECK(config->dev, config->memory);
+ 	err = intel_dc_memory_validate(config->memory);
+@@ -154,6 +157,7 @@ static int intel_dc_config_validate(const struct intel_dc_config *config)
+ 		dev_err(config->dev, "%s: invalid DC memory", __func__);
+ 		return -EINVAL;
+ 	}
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index f8c3123..1c1352a 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -105,7 +105,7 @@ struct intel_buffer {
+ 	u32 w;
+ 	u32 h;
+ 	u32 format;
+-	u32 gtt_offset_in_pages;
++	unsigned long gtt_offset_in_pages;
+ 	u32 stride;
+ };
+ 
+diff --git a/drivers/video/adf/intel/intel_adf_device.c b/drivers/video/adf/intel/intel_adf_device.c
+index 4884e64..0eef9e1 100644
+--- a/drivers/video/adf/intel/intel_adf_device.c
++++ b/drivers/video/adf/intel/intel_adf_device.c
+@@ -14,6 +14,10 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/mod_devicetable.h>
++#include <drm/i915_drm.h>
++#include <drm/i915_dmabuf.h>
++
+ #include "intel_adf.h"
+ 
+ #define INTEL_ADF_DEVICE_NAME		"intel-adf-dev"
+@@ -167,20 +171,28 @@ static int intel_adf_device_validate_custom_format(struct adf_device *dev,
+ }
+ 
+ static int adf_buffer_to_intel_buffer(struct adf_buffer *adf_buf,
+-	struct intel_buffer *intel_buf)
++	struct adf_buffer_mapping *mapping, struct intel_buffer *intel_buf)
+ {
+-	struct dma_buf *dma_buf = adf_buf->dma_bufs[0];
+ 	u32 gtt_in_pages = 0;
+-	int err;
++#ifdef CONFIG_ADF_INTEL_VLV
++	struct dma_buf_attachment *buf_attach = mapping->attachments[0];
++	struct i915_drm_dmabuf_attachment *i915_buf_attach =
++		(struct i915_drm_dmabuf_attachment *)buf_attach->priv;
+ 
++	gtt_in_pages = i915_buf_attach->gtt_offset;
++#else
++	struct dma_buf *dma_buf = adf_buf->dma_bufs[0];
++	int err;
+ 	err = intel_adf_mm_gtt(dma_buf, &gtt_in_pages);
+ 	if (err)
+ 		return err;
++#endif
+ 
+ 	intel_buf->format = adf_buf->format;
+ 	intel_buf->w = adf_buf->w;
+ 	intel_buf->h = adf_buf->h;
+ 	intel_buf->gtt_offset_in_pages = gtt_in_pages;
++	intel_buf->stride = adf_buf->pitch[0];
+ 
+ 	return 0;
+ }
+@@ -251,7 +263,7 @@ static void driver_state_add_overlay_engine(struct driver_state *state,
+ static struct flip *driver_state_create_add_flip(
+ 	struct driver_state *state, struct intel_adf_overlay_engine *eng,
+ 	struct intel_adf_interface *intf, struct adf_buffer *buf,
+-	struct intel_adf_plane *plane)
++	struct adf_buffer_mapping *mapping, struct intel_adf_plane *plane)
+ {
+ 	struct flip *f = NULL;
+ 	int err;
+@@ -259,7 +271,7 @@ static struct flip *driver_state_create_add_flip(
+ 	f = kzalloc(sizeof(*f), GFP_KERNEL);
+ 	if (f) {
+ 		f->eng = eng;
+-		adf_buffer_to_intel_buffer(buf, &f->buf);
++		adf_buffer_to_intel_buffer(buf, mapping, &f->buf);
+ 		adf_plane_to_intel_plane_config(plane, intf, &f->config);
+ 
+ 		/*validate the buffer and config before adding it*/
+@@ -290,6 +302,7 @@ static int intel_adf_device_validate(struct adf_device *dev,
+ 	struct driver_state *state;
+ 	struct adf_interface *intf;
+ 	struct adf_buffer *buf;
++	struct adf_buffer_mapping *mapping;
+ 	struct flip *f;
+ 
+ 	size_t n_bufs = cfg->n_bufs;
+@@ -350,12 +363,14 @@ static int intel_adf_device_validate(struct adf_device *dev,
+ 
+ 		/*get adf_buffer for this overlay*/
+ 		buf = &cfg->bufs[custom_overlay->plane.buffer_id];
++		mapping = &cfg->mappings[custom_overlay->plane.buffer_id];
+ 		eng = to_intel_eng(buf->overlay_engine);
+ 		driver_state_add_overlay_engine(state, eng);
+ 
+ 		/*create and queue a flip for this overlay*/
+ 		f = driver_state_create_add_flip(state, eng,
+-			to_intel_intf(intf), buf, &custom_overlay->plane);
++			to_intel_intf(intf), buf, mapping,
++				&custom_overlay->plane);
+ 		if (!f) {
+ 			dev_err(dev->dev, "%s: failed to create flip\n",
+ 				__func__);
+@@ -535,6 +550,7 @@ static void intel_adf_device_advance_timeline(struct adf_device *dev,
+ 		dev_err(dev->dev, "%s: vsync fence wait err\n", __func__);
+ 		goto out_err0;
+ 	}
++
+ out_err0:
+ 	sync_fence_put(vsync_fence);
+ 	return;
+@@ -622,6 +638,7 @@ struct intel_adf_device *intel_adf_device_create(struct pci_dev *pdev,
+ 		goto err_out3;
+ 	}
+ 
++#ifndef CONFIG_ADF_INTEL_VLV
+ 	/*init mm*/
+ 	err = intel_adf_mm_init(&dev->mm, &dev->base.base.dev, mem);
+ 	if (err) {
+@@ -629,13 +646,16 @@ struct intel_adf_device *intel_adf_device_create(struct pci_dev *pdev,
+ 			__func__);
+ 		goto err_out4;
+ 	}
++#endif
+ 
+ 	g_intel_adf_dev = dev;
+ 
+ 	dev_info(&pdev->dev, "%s: success\n", __func__);
+ 
+ 	return dev;
++#ifndef CONFIG_ADF_INTEL_VLV
+ err_out4:
++#endif
+ 	adf_device_destroy(&dev->base);
+ err_out3:
+ 	intel_adf_sync_timeline_destroy(dev->post_timeline);
+@@ -650,7 +670,9 @@ err_out0:
+ void intel_adf_device_destroy(struct intel_adf_device *dev)
+ {
+ 	if (dev) {
++#ifndef CONFIG_ADF_INTEL_VLV
+ 		intel_adf_mm_destroy(&dev->mm);
++#endif
+ 		adf_device_destroy(&dev->base);
+ 		intel_adf_sync_timeline_destroy(dev->post_timeline);
+ 		iounmap(dev->mmio);
+diff --git a/drivers/video/adf/intel/intel_adf_interface.c b/drivers/video/adf/intel/intel_adf_interface.c
+index 05bcff2..f50ba520 100644
+--- a/drivers/video/adf/intel/intel_adf_interface.c
++++ b/drivers/video/adf/intel/intel_adf_interface.c
+@@ -102,7 +102,9 @@ static int intel_interface_alloc_simple_buffer(struct adf_interface *intf,
+ 	u32 *pitch)
+ {
+ 	struct intel_adf_device *dev = intf_to_dev(intf);
++#ifndef CONFIG_ADF_INTEL_VLV
+ 	struct intel_adf_mm *mm = &dev->mm;
++#endif
+ 	u8 bpp = adf_format_bpp(format);
+ 	u32 stride = ((w * bpp / 8) + 63) & ~63;
+ 	u32 size = stride * h;
+@@ -112,8 +114,18 @@ static int intel_interface_alloc_simple_buffer(struct adf_interface *intf,
+ 
+ 	dev_info(dev->base.dev, "%s: size %d\n", __func__, size);
+ 
++#ifdef CONFIG_ADF_INTEL_VLV
++	/*
++	 * For VLV we use GEM memory manager. Will be enabled when
++	 * we fix the FB driver. As of now memory is preallocate in
++	 * user space via DRM PRIME interface which gives DMA Buf
++	 * handles over GEM
++	 */
++	return -EOPNOTSUPP;
++#else
+ 	/*allocate buffer*/
+ 	return intel_adf_mm_alloc_buf(mm, size, dma_buf);
++#endif
+ }
+ 
+ static int intel_interface_describe_simple_post(
+-- 
+1.7.9.5
+

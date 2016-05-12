@@ -1,0 +1,96 @@
+From e0b65a6609730c55ea017aa245f57f0d8ff8b01a Mon Sep 17 00:00:00 2001
+Message-Id: <e0b65a6609730c55ea017aa245f57f0d8ff8b01a.1421395644.git.chang-joon.lee@intel.com>
+In-Reply-To: <87b3fd6ee09eca535f11edc6180f37fb5c67ac4d.1421395644.git.chang-joon.lee@intel.com>
+References: <87b3fd6ee09eca535f11edc6180f37fb5c67ac4d.1421395644.git.chang-joon.lee@intel.com>
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 6 Nov 2014 08:40:35 +0000
+Subject: [PATCH 5/7] FROM_UPSTREAM [VPG]: drm/i915: Fix
+ obj->map_and_fenceable across tiling changes
+
+As obj->map_and_fenceable computation has changed to only be set when
+the object is bound inside the global GTT (and is suitable aligned to a
+fence region) we need to accommodate those changes when the tiling is
+adjusted. The easiest solution is to unbind from the global GTT if we
+are currently fenceable, but will not be after the tiling change.
+
+The bug has been exposed by
+
+commit f8fcadba218fe6d23b2e353fea1cf0a4be4c9454
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Oct 31 13:53:52 2014 +0000
+
+    drm/i915: Only mark as map-and-fenceable when bound into the GGTT
+
+which tried to fix an oversight from
+
+commit e6a844687cf929ec053c7578d5ecc794a8a6c5cf
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Mon Aug 11 12:00:12 2014 +0200
+
+    drm/i915: Force CPU relocations if not GTT mapped
+
+which changed the handling of obj->map_and_fenceable.
+
+Note that the alignment check is a vestige from our attempts to reduce
+the alignment requirements of tiled but unfenced buffers on
+gen2/3. Also, that was when unbinding from the GTT meant UC writes and
+clflushing, so we went to great pains to avoid such.
+
+That leaves the actual bug of setting map_and_fenceable to true if we're
+not bound to ggtt, which violates the change introduced in the above
+patch. Unbinding in that case really looks like the simplest and safest
+option, we have to do it anyway.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=85896
+Testcase: igt/gem_concurrent_blit/gttX*
+Tested-by: huax.lu@intel.com
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Tested-by: Valtteri Rantala <valtteri.rantala@intel.com>
+[Jani: amend commit message per input from Daniel and bisect result from
+Valtteri]
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+
+Change-Id: I490a6916c6b05f03875cd20dcb9d9306105e0e6c
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: e9d784d535e43777f9ff44d7e582946f4776c000
+Upstream-as-of-tag: drm-intel-fixes-2014-11-07
+For: GMINL-4004
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_tiling.c |   19 +++----------------
+ 1 file changed, 3 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_tiling.c b/drivers/gpu/drm/i915/i915_gem_tiling.c
+index cb150e8..cf0841b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_tiling.c
++++ b/drivers/gpu/drm/i915/i915_gem_tiling.c
+@@ -357,22 +357,9 @@ i915_gem_set_tiling(struct drm_device *dev, void *data,
+ 		 * has to also include the unfenced register the GPU uses
+ 		 * whilst executing a fenced command for an untiled object.
+ 		 */
+-
+-		obj->map_and_fenceable =
+-			!i915_gem_obj_ggtt_bound(obj) ||
+-			(i915_gem_obj_ggtt_offset(obj) +
+-			 obj->base.size <= dev_priv->gtt.mappable_end &&
+-			 i915_gem_object_fence_ok(obj, args->tiling_mode));
+-
+-		/* Rebind if we need a change of alignment */
+-		if (!obj->map_and_fenceable) {
+-			u32 unfenced_align =
+-				i915_gem_get_gtt_alignment(dev, obj->base.size,
+-							    args->tiling_mode,
+-							    false);
+-			if (i915_gem_obj_ggtt_offset(obj) & (unfenced_align - 1))
+-				ret = i915_gem_object_ggtt_unbind(obj);
+-		}
++		if (obj->map_and_fenceable &&
++		    !i915_gem_object_fence_ok(obj, args->tiling_mode))
++			ret = i915_gem_object_ggtt_unbind(obj);
+ 
+ 		if (ret == 0) {
+ 			obj->fence_dirty =
+-- 
+1.7.9.5
+

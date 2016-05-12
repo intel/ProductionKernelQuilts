@@ -1,0 +1,377 @@
+From afe8703bbcbad7d0d9e40b45b9bc98520a7adf02 Mon Sep 17 00:00:00 2001
+From: Gwenn Bourree <gwenn.bourree@intel.com>
+Date: Tue, 24 Feb 2015 09:03:25 +0100
+Subject: [PATCH] Add new PMIC sequences for 7360
+
+The new 7360 modem is only connected to the PMIC for
+the power off/on signals. Then new sequences must be
+implemented in the Modem Control Driver to switch the
+modem on/off without using AP GPIOs as the former modems.
+
+Change-Id: Id8b040e9e3f0607c9419747c0f1f18fc7f632751
+Signed-off-by: Gwenn Bourree <gwenn.bourree@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-11544
+---
+ drivers/staging/modem_control/mcd_acpi.c |  15 +++-
+ drivers/staging/modem_control/mcd_acpi.h |   8 +++
+ drivers/staging/modem_control/mcd_mdm.c  |  20 +++++-
+ drivers/staging/modem_control/mcd_pmic.c | 114 +++++++++++++++++++++++++++++--
+ drivers/staging/modem_control/mcd_pmic.h |  10 +++
+ drivers/staging/modem_control/mdm_ctrl.c |  20 +++---
+ drivers/staging/modem_control/mdm_util.c |   5 ++
+ 7 files changed, 178 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/staging/modem_control/mcd_acpi.c b/drivers/staging/modem_control/mcd_acpi.c
+index bc722f2..903f6bf 100644
+--- a/drivers/staging/modem_control/mcd_acpi.c
++++ b/drivers/staging/modem_control/mcd_acpi.c
+@@ -117,11 +117,24 @@ int create_sysfs_telephony_entry(void *pdata)
+ 
+ void mcd_set_mdm(struct mcd_base_info *info, int mdm_ver)
+ {
++	int index = MODEM_DATA_INDEX_UNSUP;
++
+ 	if (!info) {
+ 		pr_err("%s: info is NULL\n", __func__);
+ 	} else {
+ 		info->mdm_ver = mdm_ver;
+-		info->modem_data = modem_data[mdm_ver];
++		switch (mdm_ver) {
++		case MODEM_2230:
++			index = MODEM_DATA_INDEX_2230;
++			break;
++		case MODEM_6360:
++			index = MODEM_DATA_INDEX_6360;
++			break;
++		default:
++			index = MODEM_DATA_INDEX_GENERIC;
++			break;
++		}
++		info->modem_data = modem_data[index];
+ 	}
+ }
+ #ifdef CONFIG_ACPI
+diff --git a/drivers/staging/modem_control/mcd_acpi.h b/drivers/staging/modem_control/mcd_acpi.h
+index 567e4e2..646dc44 100644
+--- a/drivers/staging/modem_control/mcd_acpi.h
++++ b/drivers/staging/modem_control/mcd_acpi.h
+@@ -3,5 +3,13 @@
+ 
+ #define NAME_LEN	16
+ 
++#define INVALID_GPIO -1
++
++#define MODEM_DATA_INDEX_UNSUP			0
++#define MODEM_DATA_INDEX_GENERIC		1
++#define MODEM_DATA_INDEX_2230			2
++#define MODEM_DATA_INDEX_6360			3
++
++
+ /* Retrieve modem parameters on ACPI framework */
+ int get_modem_acpi_data(struct platform_device *pdev);
+diff --git a/drivers/staging/modem_control/mcd_mdm.c b/drivers/staging/modem_control/mcd_mdm.c
+index 213d438..8b19852 100644
+--- a/drivers/staging/modem_control/mcd_mdm.c
++++ b/drivers/staging/modem_control/mcd_mdm.c
+@@ -54,6 +54,10 @@ int mcd_mdm_cold_boot(void *data, int rst, int pwr_on)
+ {
+ 	struct mdm_ctrl_mdm_data *mdm_data = data;
+ 
++	if ((rst == INVALID_GPIO)
++		|| (pwr_on == INVALID_GPIO))
++		return -EINVAL;
++
+ 	/* Toggle the RESET_BB_N */
+ 	gpio_set_value(rst, 1);
+ 
+@@ -81,6 +85,9 @@ int mcd_mdm_warm_reset(void *data, int rst)
+ {
+ 	struct mdm_ctrl_mdm_data *mdm_data = data;
+ 
++	if (rst == INVALID_GPIO)
++		return -EINVAL;
++
+ 	gpio_set_value(rst, 0);
+ 	usleep_range(mdm_data->warm_rst_duration,
+ 			mdm_data->warm_rst_duration + 1);
+@@ -100,12 +107,15 @@ int mcd_mdm_power_off(void *data, int rst)
+ {
+ 	struct mdm_ctrl_mdm_data *mdm_data = data;
+ 
++	if (rst == INVALID_GPIO)
++		return -EINVAL;
++
+ 	/* Set the RESET_BB_N to 0 */
+ 	gpio_set_value(rst, 0);
+ 
+ 	/* Wait before doing the pulse on ON1 */
+ 	usleep_range(mdm_data->pre_pwr_down_delay,
+-		     mdm_data->pre_pwr_down_delay + 1);
++		mdm_data->pre_pwr_down_delay + 1);
+ 
+ 	return 0;
+ }
+@@ -143,6 +153,10 @@ int mcd_mdm_cold_boot_ngff(void *data, int rst, int pwr_on)
+ 	cpu_data = container_of(&gpio_rst_desc, struct mdm_ctrl_cpu_data,
+ 				gpio_rst_bbn);
+ 
++	if ((rst == INVALID_GPIO) ||
++		(cpu_data->gpio_rst_usbhub == NULL))
++		return -EINVAL;
++
+ 	/* Toggle the RESET_BB_N */
+ 	gpio_set_value(rst, 1);
+ 
+@@ -159,6 +173,10 @@ int mcd_mdm_cold_boot_2230(void *data, int rst, int pwr_on)
+ {
+ 	struct mdm_ctrl_mdm_data *mdm_data = data;
+ 
++	if ((rst == INVALID_GPIO)
++		&& (pwr_on == INVALID_GPIO))
++		return -EINVAL;
++
+ 	/* Toggle the RESET_BB_N */
+ 	gpio_set_value(rst, 0);
+ 
+diff --git a/drivers/staging/modem_control/mcd_pmic.c b/drivers/staging/modem_control/mcd_pmic.c
+index 08a02d2..5020a72 100644
+--- a/drivers/staging/modem_control/mcd_pmic.c
++++ b/drivers/staging/modem_control/mcd_pmic.c
+@@ -39,10 +39,19 @@
+ #include <linux/delay.h>
+ #include <linux/mfd/intel_soc_pmic.h>
+ #include <linux/mdm_ctrl_board.h>
++#include "mcd_pmic.h"
+ 
+ int pmic_io_init(void *data)
+ {
+-	return 0;
++	int ret = 0;
++	struct mdm_ctrl_pmic_data *pmic_data = data;
++	u16 addr = pmic_data->chipctrl;
++
++	ret = intel_soc_pmic_writeb(addr, PMIC_MODEMCTRL_REG_RESET);
++	if (ret)
++		pr_err(DRVNAME ": intel_soc_pmic_writeb(ON) failed (err: %d)\n",
++			   ret);
++	return ret;
+ }
+ 
+ int pmic_io_power_on_ctp_mdm(void *data)
+@@ -73,7 +82,8 @@ int pmic_io_power_on_mdm(void *data)
+ 	}
+ 	/* Write the new register value (CHIPCNTRL_ON) */
+ 	iodata =
+-		(def_value & pmic_data->chipctrl_mask) | pmic_data->chipctrlon;
++		(def_value & pmic_data->chipctrl_mask) |
++		(pmic_data->chipctrlon << PMIC_MODEMCTRL_REG_MODEMOFF_SHIFT);
+ 	ret = intel_soc_pmic_writeb(addr, iodata);
+ 	if (ret) {
+ 		pr_err(DRVNAME ": intel_soc_pmic_writeb(ON) failed (err: %d)\n",
+@@ -96,7 +106,7 @@ int pmic_io_power_off_mdm(void *data)
+ 	u8 def_value = 0x00;
+ 
+ 	if (pmic_data->chipctrl_mask) {
+-		/* Get the current register value in order to not override it */
++		/* Get the current register value*/
+ 		def_value = intel_soc_pmic_readb(addr);
+ 		if (def_value < 0) {
+ 			pr_err(DRVNAME ": intel_soc_pmic_readb(OFF)  failed (err: %d)\n",
+@@ -107,7 +117,8 @@ int pmic_io_power_off_mdm(void *data)
+ 
+ 	/* Write the new register value (CHIPCNTRL_OFF) */
+ 	iodata =
+-	    (def_value & pmic_data->chipctrl_mask) | pmic_data->chipctrloff;
++		(def_value & pmic_data->chipctrl_mask) |
++	    (pmic_data->chipctrloff << PMIC_MODEMCTRL_REG_MODEMOFF_SHIFT);
+ 	ret = intel_soc_pmic_writeb(addr, iodata);
+ 	if (ret) {
+ 		pr_err(DRVNAME ": intel_soc_pmic_writeb(OFF) failed (err: %d)\n",
+@@ -137,3 +148,98 @@ int pmic_io_get_early_pwr_off(void *data)
+ 	struct mdm_ctrl_pmic_data *pmic_data = data;
+ 	return pmic_data->early_pwr_off;
+ }
++
++int pmic_io_power_on_mdm2(void *data)
++{
++	struct mdm_ctrl_pmic_data *pmic_data = data;
++	int ret = 0;
++	u16 addr = pmic_data->chipctrl;
++	u8 def_value = 0x00;
++	u8 iodata;
++
++	if (pmic_data->chipctrl_mask) {
++		/* Get the current register value in order to not
++		 * override it
++		 */
++		def_value = intel_soc_pmic_readb(addr);
++		if (def_value < 0) {
++			pr_err(DRVNAME ": intel_soc_pmic_readb(MDM_CTRL)  failed (err: %d)\n",
++				   def_value);
++			return -1;
++		}
++	}
++	/* Write the new register value (SDWN_ON) */
++	iodata =
++		(def_value & pmic_data->chipctrl_mask) |
++		(pmic_data->chipctrlon << PMIC_MODEMCTRL_REG_SDWN_SHIFT);
++	ret = intel_soc_pmic_writeb(addr, iodata);
++	if (ret) {
++		pr_err(DRVNAME ": intel_soc_pmic_writeb(SDWN) failed (err: %d)\n",
++			   ret);
++		return -1;
++	}
++
++	usleep_range(TSDWN2ON, TSDWN2ON+1);
++
++	/* Write the new register value (POWER_ON) */
++	iodata =
++		(iodata & pmic_data->chipctrl_mask) |
++		(pmic_data->chipctrlon << PMIC_MODEMCTRL_REG_MODEMOFF_SHIFT);
++	ret = intel_soc_pmic_writeb(addr, iodata);
++	if (ret) {
++		pr_err(DRVNAME ": intel_soc_pmic_writeb(ON) failed (err: %d)\n",
++			   ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++int pmic_io_power_off_mdm2(void *data)
++{
++	struct mdm_ctrl_pmic_data *pmic_data = data;
++	int ret = 0;
++	u16 addr = pmic_data->chipctrl;
++	u8 iodata;
++	u8 def_value = 0x00;
++
++	if (pmic_data->chipctrl_mask) {
++		/* Get the current register value in order to not override it */
++		def_value = intel_soc_pmic_readb(addr);
++		if (def_value < 0) {
++			pr_err(DRVNAME ": intel_soc_pmic_readb(MDM_CTRL)  failed (err: %d)\n",
++				def_value);
++			return -1;
++		}
++	}
++
++	/* Write the new register value (SDWN_OFF) */
++	iodata =
++		(def_value & pmic_data->chipctrl_mask) |
++		(pmic_data->chipctrloff << PMIC_MODEMCTRL_REG_SDWN_SHIFT);
++	ret = intel_soc_pmic_writeb(addr, iodata);
++	if (ret) {
++		pr_err(DRVNAME ": intel_soc_pmic_writeb(SDWN) failed (err: %d)\n",
++			   ret);
++		return -1;
++	}
++
++	usleep_range(TSDWN2OFF, TSDWN2OFF+1);
++
++	/* Write the new register value (POWER_OFF) */
++	iodata =
++		(iodata & pmic_data->chipctrl_mask) |
++		(pmic_data->chipctrloff << PMIC_MODEMCTRL_REG_MODEMOFF_SHIFT);
++	ret = intel_soc_pmic_writeb(addr, iodata);
++	if (ret) {
++		pr_err(DRVNAME ": intel_soc_pmic_writeb(ON) failed (err: %d)\n",
++		   ret);
++		return -1;
++	}
++
++	/* Safety sleep. Avoid to directly call power on. */
++	usleep_range(pmic_data->pwr_down_duration,
++				 pmic_data->pwr_down_duration);
++
++	return 0;
++}
+diff --git a/drivers/staging/modem_control/mcd_pmic.h b/drivers/staging/modem_control/mcd_pmic.h
+index 822f4f7..eaa2454 100644
+--- a/drivers/staging/modem_control/mcd_pmic.h
++++ b/drivers/staging/modem_control/mcd_pmic.h
+@@ -19,10 +19,20 @@
+ 
+ #ifndef _MDM_PMIC_H
+ #define _MDM_PMIC_H
++
++#define PMIC_MODEMCTRL_REG_RESET 0x08
++#define PMIC_MODEMCTRL_REG_SDWN_SHIFT 2
++#define PMIC_MODEMCTRL_REG_MODEMOFF_SHIFT 0
++
++#define TSDWN2OFF	1000
++#define TSDWN2ON	50
++
+ int pmic_io_init(void *data);
+ int pmic_io_power_on_mdm(void *data);
++int pmic_io_power_on_mdm2(void *data);
+ int pmic_io_power_on_ctp_mdm(void *data);
+ int pmic_io_power_off_mdm(void *data);
++int pmic_io_power_off_mdm2(void *data);
+ int pmic_io_cleanup(void *data);
+ int pmic_io_get_early_pwr_on(void *data);
+ int pmic_io_get_early_pwr_off(void *data);
+diff --git a/drivers/staging/modem_control/mdm_ctrl.c b/drivers/staging/modem_control/mdm_ctrl.c
+index e26bfbf..90c48d7 100644
+--- a/drivers/staging/modem_control/mdm_ctrl.c
++++ b/drivers/staging/modem_control/mdm_ctrl.c
+@@ -102,10 +102,12 @@ static int mdm_ctrl_cold_boot(struct mdm_info *mdm)
+ 		}
+ 	}
+ 
+-	if (mdm_ops->power_on(mdm_data, rst, pwr_on)) {
+-		pr_err(DRVNAME ": Error MDM power-ON.");
+-		ret = -1;
+-		goto end;
++	if (mdm->pdata->mdm_ver != MODEM_7360) {
++		if (mdm_ops->power_on(mdm_data, rst, pwr_on)) {
++			pr_err(DRVNAME ": Error MDM power-ON.");
++			ret = -1;
++			goto end;
++		}
+ 	}
+ 
+ 	mdm_ctrl_launch_timer(mdm, cflash_delay, MDM_TIMER_FLASH_ENABLE);
+@@ -196,10 +198,12 @@ static int mdm_ctrl_power_off(struct mdm_info *mdm)
+ 	mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_OFF);
+ 
+ 	rst = cpu->get_gpio_rst(cpu_data);
+-	if (mdm_ops->power_off(mdm_data, rst)) {
+-		pr_err(DRVNAME ": Error MDM power-OFF.");
+-		ret = -1;
+-		goto end;
++	if (mdm->pdata->mdm_ver != MODEM_7360) {
++		if (mdm_ops->power_off(mdm_data, rst)) {
++			pr_err(DRVNAME ": Error MDM power-OFF.");
++			ret = -1;
++			goto end;
++		}
+ 	}
+ 	if (mdm->pdata->mdm_ver != MODEM_2230) {
+ 		if (pmic->power_off_mdm(pmic_data)) {
+diff --git a/drivers/staging/modem_control/mdm_util.c b/drivers/staging/modem_control/mdm_util.c
+index 62ab531..1d65387 100644
+--- a/drivers/staging/modem_control/mdm_util.c
++++ b/drivers/staging/modem_control/mdm_util.c
+@@ -20,6 +20,7 @@
+  * General Public License for more details.
+  */
+ 
++#include <linux/mdm_ctrl.h>
+ #include "mdm_util.h"
+ #include "mcd_mdm.h"
+ #include "mcd_cpu.h"
+@@ -156,6 +157,10 @@ int mdm_ctrl_set_pmic(struct mdm_info *mdm)
+ 			pdata->pmic.init = NULL;
+ 			pdata->pmic.power_on_mdm = pmic_io_power_on_ctp_mdm;
+ 			break;
++		case MODEM_7360:
++			pdata->pmic.power_on_mdm = pmic_io_power_on_mdm2;
++			pdata->pmic.power_off_mdm = pmic_io_power_off_mdm2;
++			break;
+ 		default:
+ 			break;
+ 		}
+-- 
+1.9.1
+

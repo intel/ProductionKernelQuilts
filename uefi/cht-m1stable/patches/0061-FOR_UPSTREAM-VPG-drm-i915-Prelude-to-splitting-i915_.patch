@@ -1,0 +1,217 @@
+From 1f62c219574726cb86b80183a1ad1616b767a4cb Mon Sep 17 00:00:00 2001
+Message-Id: <1f62c219574726cb86b80183a1ad1616b767a4cb.1421835211.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 2 Apr 2014 16:57:46 +0100
+Subject: [PATCH 61/63] FOR_UPSTREAM [VPG]: drm/i915: Prelude to splitting
+ i915_gem_do_execbuffer in two
+
+The scheduler decouples the submission of batch buffers to the driver with their
+submission to the hardware. This basically means splitting the execbuffer()
+function in half. This change rearranges some code ready for the split to
+occur.
+
+Change-Id: Icc9c8afaac18821f3eb8a151a49f918f90c068a3
+For: VIZ-1587
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   82 ++++++++++++++++------------
+ drivers/gpu/drm/i915/intel_lrc.c           |   18 ++++--
+ 2 files changed, 59 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 7b8207f..206532d 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -862,10 +862,7 @@ i915_gem_execbuffer_move_to_gpu(struct intel_engine_cs *ring,
+ 	if (flush_domains & I915_GEM_DOMAIN_GTT)
+ 		wmb();
+ 
+-	/* Unconditionally invalidate gpu caches and ensure that we do flush
+-	 * any residual writes from the previous batch.
+-	 */
+-	return intel_ring_invalidate_all_caches(ring);
++	return 0;
+ }
+ 
+ static bool
+@@ -1119,30 +1116,6 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 		}
+ 	}
+ 
+-	/* Start watchdog timer */
+-	if (args->flags & I915_EXEC_ENABLE_WATCHDOG) {
+-		if (!intel_ring_supports_watchdog(ring)) {
+-			DRM_ERROR("%s does NOT support watchdog timeout!\n",
+-					ring->name);
+-			ret = -EINVAL;
+-			goto error;
+-		}
+-
+-		ret = intel_ring_start_watchdog(ring);
+-		if (ret)
+-			goto error;
+-
+-		watchdog_running = 1;
+-	}
+-
+-	ret = i915_gem_execbuffer_move_to_gpu(ring, vmas);
+-	if (ret)
+-		goto error;
+-
+-	ret = i915_switch_context(ring, ctx);
+-	if (ret)
+-		goto error;
+-
+ 	instp_mode = args->flags & I915_EXEC_CONSTANTS_MASK;
+ 	instp_mask = I915_EXEC_CONSTANTS_MASK;
+ 	switch (instp_mode) {
+@@ -1180,6 +1153,45 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 		goto error;
+ 	}
+ 
++	ret = i915_gem_execbuffer_move_to_gpu(ring, vmas);
++	if (ret)
++		goto error;
++
++	i915_gem_execbuffer_move_to_active(vmas, ring);
++
++	/* To be split into two functions here... */
++
++	intel_runtime_pm_get(dev_priv);
++
++	/* Start watchdog timer */
++	if (args->flags & I915_EXEC_ENABLE_WATCHDOG) {
++		if (!intel_ring_supports_watchdog(ring)) {
++			DRM_ERROR("%s does NOT support watchdog timeout!\n",
++					ring->name);
++			ret = -EINVAL;
++			goto error;
++		}
++
++		ret = intel_ring_start_watchdog(ring);
++		if (ret)
++			goto error;
++
++		watchdog_running = 1;
++	}
++
++	/*
++	 * Unconditionally invalidate gpu caches and ensure that we do flush
++	 * any residual writes from the previous batch.
++	 */
++	ret = intel_ring_invalidate_all_caches(ring);
++	if (ret)
++		goto error;
++
++	/* Switch to the correct context for the batch */
++	ret = i915_switch_context(ring, ctx);
++	if (ret)
++		goto error;
++
+ 	if (ring == &dev_priv->ring[RCS] &&
+ 			instp_mode != dev_priv->relative_constants_mode) {
+ 		ret = intel_ring_begin(ring, 4);
+@@ -1248,7 +1260,6 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 
+ 	trace_i915_gem_ring_dispatch(intel_ring_get_request(ring), dispatch_flags);
+ 
+-	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
+ 
+ 	/* For VLV, modify RC6 promotion timer upon hitting Media workload only
+@@ -1267,6 +1278,12 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 	}
+ 
+ error:
++	/*
++	 * intel_gpu_busy should also get a ref, so it will free when the device
++	 * is really idle.
++	 */
++	intel_runtime_pm_put(dev_priv);
++
+ 	kfree(cliprects);
+ 
+ 	return ret;
+@@ -1334,7 +1351,6 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	struct intel_engine_cs *ring;
+ 	struct intel_context *ctx;
+ 	struct i915_address_space *vm;
+-
+ 	const u32 ctx_id = i915_execbuffer2_get_context_id(*args);
+ 	u64 exec_start = args->batch_start_offset;
+ 	u32 dispatch_flags;
+@@ -1388,8 +1404,6 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 		return -EINVAL;
+ 	}
+ 
+-	intel_runtime_pm_get(dev_priv);
+-
+ 	ret = i915_mutex_lock_interruptible(dev);
+ 	if (ret)
+ 		goto pre_mutex_err;
+@@ -1571,10 +1585,6 @@ err:
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ pre_mutex_err:
+-	/* intel_gpu_busy should also get a ref, so it will free when the device
+-	 * is really idle. */
+-	intel_runtime_pm_put(dev_priv);
+-
+ 	if (ret) {
+ 		if (fd_fence_complete != -1)
+ 			sys_close(fd_fence_complete);
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index d96c4b1..1178465 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1267,10 +1267,7 @@ static int execlists_move_to_gpu(struct intel_ringbuffer *ringbuf,
+ 	if (flush_domains & I915_GEM_DOMAIN_GTT)
+ 		wmb();
+ 
+-	/* Unconditionally invalidate gpu caches and ensure that we do flush
+-	 * any residual writes from the previous batch.
+-	 */
+-	return logical_ring_invalidate_all_caches(ringbuf);
++	return 0;
+ }
+ 
+ static int
+@@ -1390,6 +1387,10 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 	if (ret)
+ 		goto error;
+ 
++	i915_gem_execbuffer_move_to_active(vmas, ring);
++
++	/* To be split into two functions here... */
++
+ 	/* Start watchdog timer */
+ 	if (args->flags & I915_EXEC_ENABLE_WATCHDOG) {
+ 		if (!intel_ring_supports_watchdog(ring)) {
+@@ -1406,6 +1407,14 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 		watchdog_running = 1;
+ 	}
+ 
++	/*
++	 * Unconditionally invalidate gpu caches and ensure that we do flush
++	 * any residual writes from the previous batch.
++	 */
++	ret = logical_ring_invalidate_all_caches(ringbuf);
++	if (ret)
++		return ret;
++
+ 	if (ring == &dev_priv->ring[RCS] &&
+ 	    instp_mode != dev_priv->relative_constants_mode) {
+ 		ret = intel_logical_ring_begin(ringbuf, 4);
+@@ -1459,7 +1468,6 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 
+ 	trace_i915_gem_ring_dispatch(intel_ring_get_request(ring), dispatch_flags);
+ 
+-	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
+ 
+ 	return 0;
+-- 
+1.7.9.5
+

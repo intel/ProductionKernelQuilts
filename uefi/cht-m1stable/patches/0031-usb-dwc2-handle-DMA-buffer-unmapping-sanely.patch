@@ -1,0 +1,226 @@
+From 60d1db8d6b6d6b64820ce8a92b60521707f41c1f Mon Sep 17 00:00:00 2001
+From: Paul Zimmerman <Paul.Zimmerman@synopsys.com>
+Date: Tue, 16 Sep 2014 13:47:27 -0700
+Subject: [PATCH 31/65] usb: dwc2: handle DMA buffer unmapping sanely
+
+The driver's handling of DMA buffers for non-aligned transfers
+was kind of nuts. For IN transfers, it left the URB DMA buffer
+mapped until the transfer completed, then synced it, copied the
+data from the bounce buffer, then synced it again.
+
+Instead of that, just call usb_hcd_unmap_urb_for_dma() to unmap
+the buffer before starting the transfer. Then no syncing is
+required when doing the copy. This should also allow handling of
+other types of mappings besides just dma_map_single() ones.
+
+Also reduce the size of the bounce buffer allocation for Isoc
+endpoints to 3K, since that's the largest possible transfer size.
+
+Tested on Raspberry Pi and Altera SOCFPGA.
+
+Signed-off-by: Paul Zimmerman <paulz@synopsys.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/dwc2/hcd.c       | 42 +++++++++++++++++++++++++++++-------------
+ drivers/usb/dwc2/hcd.h       |  4 +++-
+ drivers/usb/dwc2/hcd_intr.c  | 22 ----------------------
+ drivers/usb/dwc2/hcd_queue.c | 16 ++++------------
+ 4 files changed, 36 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/usb/dwc2/hcd.c b/drivers/usb/dwc2/hcd.c
+index 4d918ed..0a0e6f0 100644
+--- a/drivers/usb/dwc2/hcd.c
++++ b/drivers/usb/dwc2/hcd.c
+@@ -697,29 +697,45 @@ static void *dwc2_hc_init_xfer(struct dwc2_hsotg *hsotg,
+ }
+ 
+ static int dwc2_hc_setup_align_buf(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh,
+-				   struct dwc2_host_chan *chan, void *bufptr)
++				   struct dwc2_host_chan *chan,
++				   struct dwc2_hcd_urb *urb, void *bufptr)
+ {
+ 	u32 buf_size;
+-
+-	if (chan->ep_type != USB_ENDPOINT_XFER_ISOC)
+-		buf_size = hsotg->core_params->max_transfer_size;
+-	else
+-		buf_size = 4096;
++	struct urb *usb_urb;
++	struct usb_hcd *hcd;
+ 
+ 	if (!qh->dw_align_buf) {
++		if (chan->ep_type != USB_ENDPOINT_XFER_ISOC)
++			buf_size = hsotg->core_params->max_transfer_size;
++		else
++			/* 3072 = 3 max-size Isoc packets */
++			buf_size = 3072;
++
+ 		qh->dw_align_buf = dma_alloc_coherent(hsotg->dev, buf_size,
+ 						      &qh->dw_align_buf_dma,
+ 						      GFP_ATOMIC);
+ 		if (!qh->dw_align_buf)
+ 			return -ENOMEM;
++		qh->dw_align_buf_size = buf_size;
+ 	}
+ 
+-	if (!chan->ep_is_in && chan->xfer_len) {
+-		dma_sync_single_for_cpu(hsotg->dev, chan->xfer_dma, buf_size,
+-					DMA_TO_DEVICE);
+-		memcpy(qh->dw_align_buf, bufptr, chan->xfer_len);
+-		dma_sync_single_for_device(hsotg->dev, chan->xfer_dma, buf_size,
+-					   DMA_TO_DEVICE);
++	if (chan->xfer_len) {
++		dev_vdbg(hsotg->dev, "%s(): non-aligned buffer\n", __func__);
++		usb_urb = urb->priv;
++
++		if (usb_urb) {
++			if (usb_urb->transfer_flags &
++			    (URB_SETUP_MAP_SINGLE | URB_DMA_MAP_SG |
++			     URB_DMA_MAP_PAGE | URB_DMA_MAP_SINGLE)) {
++				hcd = dwc2_hsotg_to_hcd(hsotg);
++				usb_hcd_unmap_urb_for_dma(hcd, usb_urb);
++			}
++			if (!chan->ep_is_in)
++				memcpy(qh->dw_align_buf, bufptr,
++				       chan->xfer_len);
++		} else {
++			dev_warn(hsotg->dev, "no URB in dwc2_urb\n");
++		}
+ 	}
+ 
+ 	chan->align_buf = qh->dw_align_buf_dma;
+@@ -828,7 +844,7 @@ static int dwc2_assign_and_init_hc(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh)
+ 	/* Non DWORD-aligned buffer case */
+ 	if (bufptr) {
+ 		dev_vdbg(hsotg->dev, "Non-aligned buffer\n");
+-		if (dwc2_hc_setup_align_buf(hsotg, qh, chan, bufptr)) {
++		if (dwc2_hc_setup_align_buf(hsotg, qh, chan, urb, bufptr)) {
+ 			dev_err(hsotg->dev,
+ 				"%s: Failed to allocate memory to handle non-dword aligned buffer\n",
+ 				__func__);
+diff --git a/drivers/usb/dwc2/hcd.h b/drivers/usb/dwc2/hcd.h
+index fdc6d48..a12bb15 100644
+--- a/drivers/usb/dwc2/hcd.h
++++ b/drivers/usb/dwc2/hcd.h
+@@ -243,7 +243,8 @@ enum dwc2_transaction_type {
+  * @ntd:                Actual number of transfer descriptors in a list
+  * @dw_align_buf:       Used instead of original buffer if its physical address
+  *                      is not dword-aligned
+- * @dw_align_buf_dma:   DMA address for align_buf
++ * @dw_align_buf_size:  Size of dw_align_buf
++ * @dw_align_buf_dma:   DMA address for dw_align_buf
+  * @qtd_list:           List of QTDs for this QH
+  * @channel:            Host channel currently processing transfers for this QH
+  * @qh_list_entry:      Entry for QH in either the periodic or non-periodic
+@@ -276,6 +277,7 @@ struct dwc2_qh {
+ 	u16 start_split_frame;
+ 	u16 ntd;
+ 	u8 *dw_align_buf;
++	int dw_align_buf_size;
+ 	dma_addr_t dw_align_buf_dma;
+ 	struct list_head qtd_list;
+ 	struct dwc2_host_chan *channel;
+diff --git a/drivers/usb/dwc2/hcd_intr.c b/drivers/usb/dwc2/hcd_intr.c
+index f06249c..551ba87 100644
+--- a/drivers/usb/dwc2/hcd_intr.c
++++ b/drivers/usb/dwc2/hcd_intr.c
+@@ -465,12 +465,8 @@ static int dwc2_update_urb_state(struct dwc2_hsotg *hsotg,
+ 	/* Non DWORD-aligned buffer case handling */
+ 	if (chan->align_buf && xfer_length && chan->ep_is_in) {
+ 		dev_vdbg(hsotg->dev, "%s(): non-aligned buffer\n", __func__);
+-		dma_sync_single_for_cpu(hsotg->dev, urb->dma, urb->length,
+-					DMA_FROM_DEVICE);
+ 		memcpy(urb->buf + urb->actual_length, chan->qh->dw_align_buf,
+ 		       xfer_length);
+-		dma_sync_single_for_device(hsotg->dev, urb->dma, urb->length,
+-					   DMA_FROM_DEVICE);
+ 	}
+ 
+ 	dev_vdbg(hsotg->dev, "urb->actual_length=%d xfer_length=%d\n",
+@@ -560,14 +556,9 @@ static enum dwc2_halt_status dwc2_update_isoc_urb_state(
+ 		    chan->ep_is_in) {
+ 			dev_vdbg(hsotg->dev, "%s(): non-aligned buffer\n",
+ 				 __func__);
+-			dma_sync_single_for_cpu(hsotg->dev, urb->dma,
+-						urb->length, DMA_FROM_DEVICE);
+ 			memcpy(urb->buf + frame_desc->offset +
+ 			       qtd->isoc_split_offset, chan->qh->dw_align_buf,
+ 			       frame_desc->actual_length);
+-			dma_sync_single_for_device(hsotg->dev, urb->dma,
+-						   urb->length,
+-						   DMA_FROM_DEVICE);
+ 		}
+ 		break;
+ 	case DWC2_HC_XFER_FRAME_OVERRUN:
+@@ -594,14 +585,9 @@ static enum dwc2_halt_status dwc2_update_isoc_urb_state(
+ 		    chan->ep_is_in) {
+ 			dev_vdbg(hsotg->dev, "%s(): non-aligned buffer\n",
+ 				 __func__);
+-			dma_sync_single_for_cpu(hsotg->dev, urb->dma,
+-						urb->length, DMA_FROM_DEVICE);
+ 			memcpy(urb->buf + frame_desc->offset +
+ 			       qtd->isoc_split_offset, chan->qh->dw_align_buf,
+ 			       frame_desc->actual_length);
+-			dma_sync_single_for_device(hsotg->dev, urb->dma,
+-						   urb->length,
+-						   DMA_FROM_DEVICE);
+ 		}
+ 
+ 		/* Skip whole frame */
+@@ -937,12 +923,8 @@ static int dwc2_xfercomp_isoc_split_in(struct dwc2_hsotg *hsotg,
+ 
+ 	if (chan->align_buf) {
+ 		dev_vdbg(hsotg->dev, "%s(): non-aligned buffer\n", __func__);
+-		dma_sync_single_for_cpu(hsotg->dev, qtd->urb->dma,
+-					qtd->urb->length, DMA_FROM_DEVICE);
+ 		memcpy(qtd->urb->buf + frame_desc->offset +
+ 		       qtd->isoc_split_offset, chan->qh->dw_align_buf, len);
+-		dma_sync_single_for_device(hsotg->dev, qtd->urb->dma,
+-					   qtd->urb->length, DMA_FROM_DEVICE);
+ 	}
+ 
+ 	qtd->isoc_split_offset += len;
+@@ -1170,12 +1152,8 @@ static void dwc2_update_urb_state_abn(struct dwc2_hsotg *hsotg,
+ 	/* Non DWORD-aligned buffer case handling */
+ 	if (chan->align_buf && xfer_length && chan->ep_is_in) {
+ 		dev_vdbg(hsotg->dev, "%s(): non-aligned buffer\n", __func__);
+-		dma_sync_single_for_cpu(hsotg->dev, urb->dma, urb->length,
+-					DMA_FROM_DEVICE);
+ 		memcpy(urb->buf + urb->actual_length, chan->qh->dw_align_buf,
+ 		       xfer_length);
+-		dma_sync_single_for_device(hsotg->dev, urb->dma, urb->length,
+-					   DMA_FROM_DEVICE);
+ 	}
+ 
+ 	urb->actual_length += xfer_length;
+diff --git a/drivers/usb/dwc2/hcd_queue.c b/drivers/usb/dwc2/hcd_queue.c
+index 9540f7e..bb97838 100644
+--- a/drivers/usb/dwc2/hcd_queue.c
++++ b/drivers/usb/dwc2/hcd_queue.c
+@@ -229,19 +229,11 @@ static struct dwc2_qh *dwc2_hcd_qh_create(struct dwc2_hsotg *hsotg,
+  */
+ void dwc2_hcd_qh_free(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh)
+ {
+-	u32 buf_size;
+-
+-	if (hsotg->core_params->dma_desc_enable > 0) {
++	if (hsotg->core_params->dma_desc_enable > 0)
+ 		dwc2_hcd_qh_free_ddma(hsotg, qh);
+-	} else if (qh->dw_align_buf) {
+-		if (qh->ep_type == USB_ENDPOINT_XFER_ISOC)
+-			buf_size = 4096;
+-		else
+-			buf_size = hsotg->core_params->max_transfer_size;
+-		dma_free_coherent(hsotg->dev, buf_size, qh->dw_align_buf,
+-				  qh->dw_align_buf_dma);
+-	}
+-
++	else if (qh->dw_align_buf)
++		dma_free_coherent(hsotg->dev, qh->dw_align_buf_size,
++				  qh->dw_align_buf, qh->dw_align_buf_dma);
+ 	kfree(qh);
+ }
+ 
+-- 
+1.9.1
+

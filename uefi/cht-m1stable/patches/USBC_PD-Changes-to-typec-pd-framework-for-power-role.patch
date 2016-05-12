@@ -1,0 +1,2147 @@
+From 66250f149588b34d947c3b2792199dbf0c1bedfa Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Thu, 30 Jul 2015 17:31:18 +0530
+Subject: [PATCH] USBC_PD: Changes to typec pd framework for power role swap.
+
+Removed unnecessary extcon cable event handling in policy engine
+and protocol as these event will be coming from DPM as dpm
+notifications. Added dpm notification handling in policy engine
+and functions to switch policies, update the DPM, protocol during
+role swap. Added role change event handling/notification and
+functions to pull-up/pull-down the active CC line.
+
+Change-Id: Ib06e18dd8688e91a265369cd70a814285fad4a5a
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-14786
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+---
+ drivers/usb/typec/pd/devpolicy_mgr.c | 502 +++++++++++++++++++++++------------
+ drivers/usb/typec/pd/devpolicy_mgr.h | 201 +++++++-------
+ drivers/usb/typec/pd/message.c       |   8 +-
+ drivers/usb/typec/pd/policy_engine.c | 446 +++++++++++++++++++------------
+ drivers/usb/typec/pd/policy_engine.h |  96 ++++---
+ drivers/usb/typec/pd/protocol.c      | 158 +++--------
+ drivers/usb/typec/pd/protocol.h      |  21 +-
+ drivers/usb/typec/pd/sink_port_pe.c  |   3 +-
+ 8 files changed, 807 insertions(+), 628 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/devpolicy_mgr.c b/drivers/usb/typec/pd/devpolicy_mgr.c
+index 578833fa3dd3..2ec165772292 100644
+--- a/drivers/usb/typec/pd/devpolicy_mgr.c
++++ b/drivers/usb/typec/pd/devpolicy_mgr.c
+@@ -123,13 +123,9 @@ static int dpm_get_max_snkpwr_cap(struct devpolicy_mgr *dpm,
+ 	return 0;
+ }
+ 
+-static int dpm_get_sink_power_cap(struct devpolicy_mgr *dpm,
+-					struct power_cap *cap)
++static enum batt_soc_status dpm_get_batt_status(struct devpolicy_mgr *dpm)
+ {
+ 	int soc;
+-	/* if the battery capacity is > 80% of cap, 5V, 3A
+-	 * <=80% of cpacity 12V, 3A.
+-	 */
+ 
+ 	if (dpm_read_soc(&soc)) {
+ 		pr_err("DPM: Error in getting soc\n");
+@@ -138,11 +134,46 @@ static int dpm_get_sink_power_cap(struct devpolicy_mgr *dpm,
+ 		pr_debug("DPM: capacity = %d\n", soc);
+ 	}
+ 
+-	if (!IS_BATT_SOC_GOOD(soc))
+-		cap->mv = VIN_12V;
++	if (IS_BATT_SOC_FULL(soc))
++		return BATT_SOC_FULL;
++	else if (IS_BATT_SOC_GOOD(soc))
++		return BATT_SOC_GOOD;
++	else if (IS_BATT_SOC_MID2(soc))
++		return BATT_SOC_MID2;
++	else if (IS_BATT_SOC_MID1(soc))
++		return BATT_SOC_MID1;
++	else if (IS_BATT_SOC_LOW(soc))
++		return BATT_SOC_LOW;
++	else if (IS_BATT_SOC_DEAD(soc))
++		return BATT_SOC_DEAD;
+ 	else
+-		cap->mv = VIN_5V;
++		return BATT_SOC_UNKNOWN;
++}
++
++static int dpm_get_sink_power_cap(struct devpolicy_mgr *dpm,
++					struct power_cap *cap)
++{
++	enum batt_soc_status sts;
+ 
++	/* if the battery capacity is >= 80% of cap, 5V, 3A
++	 * <80% of cpacity 12V, 3A.
++	 */
++	sts = dpm_get_batt_status(dpm);
++	switch (sts) {
++	case BATT_SOC_FULL:
++	case BATT_SOC_GOOD:
++		cap->mv = VIN_5V;
++		break;
++	case BATT_SOC_MID2:
++	case BATT_SOC_MID1:
++	case BATT_SOC_LOW:
++	case BATT_SOC_DEAD:
++		cap->mv = VIN_12V;
++		break;
++	case BATT_SOC_UNKNOWN:
++	default:
++		return -EINVAL;
++	}
+ 	cap->ma = ICHRG_3A;
+ 
+ 	return 0;
+@@ -160,32 +191,6 @@ static int dpm_get_sink_power_caps(struct devpolicy_mgr *dpm,
+ 	return 0;
+ }
+ 
+-static enum data_role dpm_get_data_role(struct devpolicy_mgr *dpm)
+-{
+-	return dpm->drole;
+-}
+-
+-static enum pwr_role dpm_get_power_role(struct devpolicy_mgr *dpm)
+-{
+-	return dpm->prole;
+-}
+-
+-static void dpm_set_data_role(struct devpolicy_mgr *dpm, enum data_role role)
+-{
+-	mutex_lock(&dpm->role_lock);
+-	if (dpm->drole != role)
+-		dpm->drole = role;
+-	mutex_unlock(&dpm->role_lock);
+-}
+-
+-static void dpm_set_power_role(struct devpolicy_mgr *dpm, enum pwr_role role)
+-{
+-	mutex_lock(&dpm->role_lock);
+-	if (dpm->prole != role)
+-		dpm->prole = role;
+-	mutex_unlock(&dpm->role_lock);
+-}
+-
+ static int dpm_set_charger_state(struct power_supply *psy, bool state)
+ {
+ 	union power_supply_propval val;
+@@ -270,6 +275,43 @@ error:
+ 
+ }
+ 
++static int dpm_get_sink_pr_swap_status(struct devpolicy_mgr *dpm)
++{
++	enum batt_soc_status sts;
++	int ret;
++
++	/* if the battery capacity is >= 50% returns 1,
++	 * else 0 or error code
++	 */
++	sts = dpm_get_batt_status(dpm);
++	switch (sts) {
++	case BATT_SOC_FULL:
++	case BATT_SOC_GOOD:
++	case BATT_SOC_MID2:
++		ret = 1;
++		break;
++	case BATT_SOC_MID1:
++	case BATT_SOC_LOW:
++	case BATT_SOC_DEAD:
++		ret = 0;
++		break;
++	case BATT_SOC_UNKNOWN:
++	default:
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
++static int dpm_is_pr_swapped(struct devpolicy_mgr *dpm,
++					enum pwr_role prole)
++{
++	if (prole == POWER_ROLE_SINK)
++		return dpm_get_sink_pr_swap_status(dpm);
++
++	return 0;
++}
++
+ static int dpm_get_min_current(struct devpolicy_mgr *dpm,
+ 					int *ma)
+ {
+@@ -288,103 +330,204 @@ static enum cable_state dpm_get_cable_state(struct devpolicy_mgr *dpm,
+ 		return dpm->consumer_state;
+ }
+ 
+-static void dpm_set_cable_state(struct devpolicy_mgr *dpm,
+-				enum cable_type type, enum cable_state state)
++static void dpm_notify_policy_evt(struct devpolicy_mgr *dpm,
++					enum devpolicy_mgr_events evt)
+ {
+-	mutex_lock(&dpm->cable_event_lock);
+-	switch (type) {
+-	case CABLE_TYPE_PROVIDER:
+-		if (dpm->provider_state != state) {
+-			dpm->provider_state = state;
+-			typec_notify_cable_state(dpm->phy, "USB-Host",
+-							(bool)state);
+-		}
+-		break;
+-	case CABLE_TYPE_CONSUMER:
+-		if (dpm->consumer_state != state) {
+-			dpm->consumer_state = state;
+-			typec_notify_cable_state(dpm->phy, "USB", (bool)state);
+-		}
+-		break;
+-	case CABLE_TYPE_DP_SOURCE:
+-		if (dpm->dp_state != state) {
+-			dpm->dp_state = state;
+-			typec_notify_cable_state(dpm->phy,
+-				"USB_TYPEC_DP_SOURCE", (bool)state);
+-		}
+-		break;
+-	default:
+-		pr_warn("DPM: Unknown cable type=%d\n", type);
+-	}
+-	mutex_unlock(&dpm->cable_event_lock);
+-	return;
+-}
++	if (dpm && dpm->pe && dpm->pe->ops && dpm->pe->ops->notify_dpm_evt)
++		dpm->pe->ops->notify_dpm_evt(dpm->pe, evt);
+ 
+-static int dpm_set_provider_state(struct devpolicy_mgr *dpm,
+-					enum cable_state state)
+-{
+-	dpm_set_cable_state(dpm, CABLE_TYPE_PROVIDER, state);
+-	return 0;
+ }
+ 
+-static int dpm_set_consumer_state(struct devpolicy_mgr *dpm,
+-					enum cable_state state)
++static void dpm_set_pu_pd(struct devpolicy_mgr *dpm, bool pu_pd)
+ {
+-	dpm_set_cable_state(dpm, CABLE_TYPE_CONSUMER, state);
+-	return 0;
++	if (dpm && dpm->phy && dpm->phy->set_pu_pd)
++		dpm->phy->set_pu_pd(dpm->phy, pu_pd);
+ }
+ 
+-static int dpm_set_display_port_state(struct devpolicy_mgr *dpm,
+-					enum cable_state state,
+-					enum typec_dp_cable_type type)
++static void dpm_update_data_role(struct devpolicy_mgr *dpm,
++				enum data_role drole)
+ {
+-	dpm->phy->dp_type = type;
+-	dpm_set_cable_state(dpm, CABLE_TYPE_DP_SOURCE, state);
+-	return 0;
+-}
++	enum data_role cur_drole;
++	char *cbl_type = NULL;
++	bool cbl_state = false;
+ 
+-static enum cable_state dpm_get_provider_state(struct devpolicy_mgr *dpm)
+-{
+-	return dpm_get_cable_state(dpm, CABLE_TYPE_PROVIDER);
+-}
++	mutex_lock(&dpm->role_lock);
++	cur_drole = dpm->cur_drole;
++	if (cur_drole == drole)
++		goto drole_err;
++	switch (drole) {
++	case DATA_ROLE_SWAP:
++		if (cur_drole == DATA_ROLE_DFP) {
++			/* Role swap from DFP to UFP, Send DFP disconnect */
++			cbl_type = "USB-Host";
++			cbl_state = CABLE_DETACHED;
++		} else if (cur_drole == DATA_ROLE_UFP) {
++			/* Role swap from UFP to DFP, Send UFP disconnect */
++			cbl_type = "USB";
++			cbl_state = CABLE_DETACHED;
++		} else {
++			pr_warn("DPM:%s:DR_SWAP cann't be processed\n",
++					__func__);
++			goto drole_err;
++		}
++		break;
++	case DATA_ROLE_UFP:
++		/* Send UFP connect */
++		cbl_type = "USB";
++		cbl_state = CABLE_ATTACHED;
++		break;
+ 
+-static enum cable_state dpm_get_consumer_state(struct devpolicy_mgr *dpm)
+-{
+-	return dpm_get_cable_state(dpm, CABLE_TYPE_CONSUMER);
++	case DATA_ROLE_DFP:
++		/* Send DFP connect */
++		cbl_type = "USB-Host";
++		cbl_state = CABLE_ATTACHED;
++		break;
++
++	case DATA_ROLE_NONE:
++		if (cur_drole == DATA_ROLE_SWAP)
++			cur_drole = dpm->prev_drole;
++		if (cur_drole == DATA_ROLE_DFP) {
++			cbl_type = "USB-Host";
++			cbl_state = CABLE_DETACHED;
++		} else if (cur_drole == DATA_ROLE_UFP) {
++			cbl_type = "USB";
++			cbl_state = CABLE_DETACHED;
++		} else
++			goto drole_err;
++		break;
++	default:
++		pr_debug("DPM:%s: unknown data role!!\n", __func__);
++		goto drole_err;
++	}
++	dpm->prev_drole = dpm->cur_drole;
++	dpm->cur_drole = drole;
++	typec_notify_cable_state(dpm->phy, cbl_type, cbl_state);
++
++drole_err:
++	mutex_unlock(&dpm->role_lock);
+ }
+ 
+-static void dpm_set_cur_data_role(struct devpolicy_mgr *dpm)
++static void dpm_update_power_role(struct devpolicy_mgr *dpm,
++				enum pwr_role prole)
+ {
+-	enum cable_state state;
++	enum pwr_role cur_prole;
++	enum pwr_role prev_prole;
++	char *cbl_type = NULL;
++	bool cbl_state = false;
++	bool set_pu_pd = false;
++	bool pu_pd = false;
+ 
+-	state = dpm_get_cable_state(dpm, CABLE_TYPE_PROVIDER);
+-	if (state == CABLE_ATTACHED) {
+-		dpm_set_data_role(dpm, DATA_ROLE_DFP);
+-		return;
++	mutex_lock(&dpm->role_lock);
++	cur_prole = dpm->cur_prole;
++	prev_prole = dpm->prev_prole;
++	if (cur_prole == prole)
++		goto update_prole_err;
++
++	switch (prole) {
++	case POWER_ROLE_SWAP:
++		if (cur_prole == POWER_ROLE_SOURCE) {
++			dpm->provider_state = CABLE_DETACHED;
++			/* Role swap from SRC to SNK, Send SRC disconnect */
++			cbl_type = "USB_TYPEC_SRC";
++			cbl_state = CABLE_DETACHED;
++			/* Pull-Down the CC line */
++			set_pu_pd = true;
++			pu_pd = false;
++		} else if (cur_prole == POWER_ROLE_SINK) {
++			dpm->consumer_state = CABLE_DETACHED;
++			/* Role swap from SNK to SRC, Send SNK disconnect */
++			cbl_type = "USB_TYPEC_SNK";
++			cbl_state = CABLE_DETACHED;
++			/* PR SWAP from SNK to SRC.
++			 * Pull-Up the CC line
++			 */
++			set_pu_pd = true;
++			pu_pd = true;
++		} else {
++			pr_warn("DPM:%s:PR_SWAP cann't be processed\n",
++					__func__);
++			goto update_prole_err;
++		}
++		break;
++	case POWER_ROLE_SINK:
++		if (cur_prole == POWER_ROLE_SWAP
++			&& prev_prole == POWER_ROLE_SINK) {
++			/* PR swap from SINK to SRC failed.
++			 * Pull-Down the CC line.
++			 */
++			set_pu_pd = true;
++			pu_pd = false;
++		} else if (cur_prole == POWER_ROLE_SOURCE
++				&& prev_prole == POWER_ROLE_SWAP) {
++			/* During PR SWAP from SNK to SRC, after source
++			 * is enabled, the other device failed to switch
++			 * to sink and did send PS_RDY ontime. So switch
++			 * back from src to snk.
++			 */
++			set_pu_pd = true;
++			pu_pd = false;
++			dpm->provider_state = CABLE_DETACHED;
++			typec_notify_cable_state(dpm->phy, "USB_TYPEC_SRC",
++						CABLE_DETACHED);
++		}
++		dpm->consumer_state = CABLE_ATTACHED;
++		/* Send SNK connect */
++		cbl_type = "USB_TYPEC_SNK";
++		cbl_state = CABLE_ATTACHED;
++		break;
++
++	case POWER_ROLE_SOURCE:
++		if (cur_prole == POWER_ROLE_SWAP
++			&& prev_prole == POWER_ROLE_SOURCE) {
++			/* PR SWAP from SRC to SNK failed and falling
++			 * back to SRC, Pull-Up the CC line
++			 */
++			set_pu_pd = true;
++			pu_pd = true;
++		}
++		dpm->provider_state = CABLE_ATTACHED;
++		/* Send SRC connect */
++		cbl_type = "USB_TYPEC_SRC";
++		cbl_state = CABLE_ATTACHED;
++		break;
++
++	case POWER_ROLE_NONE:
++		/* Cable disconnected */
++		if (cur_prole == POWER_ROLE_SOURCE) {
++			cbl_type = "USB_TYPEC_SRC";
++			cbl_state = CABLE_DETACHED;
++		} else if (cur_prole == POWER_ROLE_SINK) {
++			cbl_type = "USB_TYPEC_SNK";
++			cbl_state = CABLE_DETACHED;
++		}
++		break;
++	default:
++		pr_debug("DPM:%s: unknown pwr role!!\n", __func__);
++		goto update_prole_err;
+ 	}
++	dpm->prev_prole = cur_prole;
++	dpm->cur_prole = prole;
++	typec_notify_cable_state(dpm->phy, cbl_type, cbl_state);
++	if (set_pu_pd)
++		dpm_set_pu_pd(dpm, pu_pd);
++update_prole_err:
++	mutex_unlock(&dpm->role_lock);
+ 
+-	state = dpm_get_cable_state(dpm, CABLE_TYPE_CONSUMER);
+-	if (state == CABLE_ATTACHED)
+-		dpm_set_data_role(dpm, DATA_ROLE_UFP);
+-	else
+-		dpm_set_data_role(dpm, DATA_ROLE_NONE);
+ }
+ 
+-static void dpm_set_cur_power_role(struct devpolicy_mgr *dpm)
++static int dpm_set_display_port_state(struct devpolicy_mgr *dpm,
++					enum cable_state state,
++					enum typec_dp_cable_type type)
+ {
+-	enum cable_state state;
+-
+-	state = dpm_get_cable_state(dpm, CABLE_TYPE_PROVIDER);
+-	if (state == CABLE_ATTACHED) {
+-		dpm_set_power_role(dpm, POWER_ROLE_SOURCE);
+-		return;
++	mutex_lock(&dpm->role_lock);
++	dpm->phy->dp_type = type;
++	if (dpm->dp_state != state) {
++		dpm->dp_state = state;
++		typec_notify_cable_state(dpm->phy,
++			"USB_TYPEC_DP_SOURCE", state);
+ 	}
+-
+-	state = dpm_get_cable_state(dpm, CABLE_TYPE_CONSUMER);
+-	if (state == CABLE_ATTACHED)
+-		dpm_set_power_role(dpm, POWER_ROLE_SINK);
+-	else
+-		dpm_set_power_role(dpm, POWER_ROLE_NONE);
++	mutex_unlock(&dpm->role_lock);
++	return 0;
+ }
+ 
+ static void dpm_cable_worker(struct work_struct *work)
+@@ -393,7 +536,6 @@ static void dpm_cable_worker(struct work_struct *work)
+ 		container_of(work, struct devpolicy_mgr, cable_event_work);
+ 	struct cable_event *evt, *tmp;
+ 	unsigned long flags;
+-	enum cable_state provider_state;
+ 	struct list_head new_list;
+ 
+ 	if (list_empty(&dpm->cable_event_queue))
+@@ -405,51 +547,50 @@ static void dpm_cable_worker(struct work_struct *work)
+ 	spin_unlock_irqrestore(&dpm->cable_event_queue_lock, flags);
+ 
+ 	list_for_each_entry_safe(evt, tmp, &new_list, node) {
+-		pr_debug("DPM: %s Consumer - %s Provider - %s\n", __func__,
+-			evt->is_consumer_state ? "Connected" : "Disconnected",
+-			evt->is_provider_state ? "Connected" : "Disconnected");
+-
+-		if (evt->is_consumer_state == CABLE_ATTACHED ||
+-			dpm->prev_cable_evt == CABLE_TYPE_CONSUMER) {
+-			dpm_set_cable_state(dpm, CABLE_TYPE_CONSUMER,
+-						evt->is_consumer_state);
+-			if  (dpm->prev_cable_evt == CABLE_TYPE_CONSUMER)
+-				dpm->prev_cable_evt = CABLE_TYPE_UNKNOWN;
+-			else
+-				 dpm->prev_cable_evt = CABLE_TYPE_CONSUMER;
+-		} else if (evt->is_provider_state == CABLE_ATTACHED ||
+-				dpm->prev_cable_evt == CABLE_TYPE_PROVIDER) {
+-			dpm_set_cable_state(dpm, CABLE_TYPE_PROVIDER,
+-						evt->is_provider_state);
+-			if  (dpm->prev_cable_evt == CABLE_TYPE_CONSUMER)
+-				dpm->prev_cable_evt = CABLE_TYPE_UNKNOWN;
+-			else
+-				dpm->prev_cable_evt = CABLE_TYPE_PROVIDER;
+-		}
+-
+-		dpm_set_cur_power_role(dpm);
+-		dpm_set_cur_data_role(dpm);
+-
+-		provider_state = dpm_get_cable_state(dpm, CABLE_TYPE_PROVIDER);
+-		if (provider_state == CABLE_ATTACHED) {
+-			/* FIXME: Notify Policy Engine to Advertise
+-			 * Source Capabilities, in case of provider mode
+-			 */
+-		}
++		pr_debug("DPM:%s: Cable type=%s - %s\n", __func__,
++			((evt->cbl_type == CABLE_TYPE_CONSUMER) ? "Consumer" :
++			((evt->cbl_type == CABLE_TYPE_PROVIDER) ? "Provider" :
++			"Unknown")),
++			evt->cbl_state ? "Connected" : "Disconnected");
++
++		mutex_lock(&dpm->role_lock);
++		if (evt->cbl_type == CABLE_TYPE_CONSUMER
++			&& evt->cbl_state != dpm->consumer_state) {
++			dpm->consumer_state = evt->cbl_state;
++			if (evt->cbl_state == CABLE_ATTACHED) {
++				dpm_notify_policy_evt(dpm,
++					DEVMGR_EVENT_UFP_CONNECTED);
++			} else if (evt->cbl_state == CABLE_DETACHED) {
++				dpm_notify_policy_evt(dpm,
++					DEVMGR_EVENT_UFP_DISCONNECTED);
++			}
++
++		} else if (evt->cbl_type == CABLE_TYPE_PROVIDER
++			&& evt->cbl_state != dpm->provider_state) {
++			dpm->provider_state = evt->cbl_state;
++			if (evt->cbl_state == CABLE_ATTACHED) {
++				dpm_notify_policy_evt(dpm,
++					DEVMGR_EVENT_DFP_CONNECTED);
++			} else if (evt->cbl_state == CABLE_DETACHED) {
++				dpm_notify_policy_evt(dpm,
++					DEVMGR_EVENT_DFP_DISCONNECTED);
++			}
++		} else
++			pr_debug("DPM: consumer/provider state not changed\n");
++
++		mutex_unlock(&dpm->role_lock);
+ 		list_del(&evt->node);
+ 		kfree(evt);
+ 	}
+-
+-	return;
+ }
+ 
+-static int dpm_cable_event(struct notifier_block *nblock,
++static int dpm_consumer_cable_event(struct notifier_block *nblock,
+ 						unsigned long event,
+ 						void *param)
+ {
+ 	struct devpolicy_mgr *dpm = container_of(nblock,
+ 						struct devpolicy_mgr,
+-						nb);
++						consumer_nb);
+ 	struct extcon_dev *edev = param;
+ 	struct cable_event *evt;
+ 
+@@ -462,13 +603,11 @@ static int dpm_cable_event(struct notifier_block *nblock,
+ 		return NOTIFY_DONE;
+ 	}
+ 
+-	evt->is_consumer_state = extcon_get_cable_state(edev, CABLE_CONSUMER);
+-	evt->is_provider_state = extcon_get_cable_state(edev, CABLE_PROVIDER);
+-	pr_debug("DPM: extcon notification evt Consumer - %s Provider - %s\n",
+-			evt->is_consumer_state ? "Connected" : "Disconnected",
+-			evt->is_provider_state ? "Connected" : "Disconnected");
++	evt->cbl_type = CABLE_TYPE_CONSUMER;
++	evt->cbl_state = extcon_get_cable_state(edev, CABLE_CONSUMER);
++	pr_debug("DPM: extcon notification evt Consumer - %s\n",
++			evt->cbl_state ? "Connected" : "Disconnected");
+ 
+-	INIT_LIST_HEAD(&evt->node);
+ 	spin_lock(&dpm->cable_event_queue_lock);
+ 	list_add_tail(&evt->node, &dpm->cable_event_queue);
+ 	spin_unlock(&dpm->cable_event_queue_lock);
+@@ -477,34 +616,50 @@ static int dpm_cable_event(struct notifier_block *nblock,
+ 	return NOTIFY_OK;
+ }
+ 
+-int devpolicy_mgr_reg_notifier(struct notifier_block *nb)
++static int dpm_provider_cable_event(struct notifier_block *nblock,
++						unsigned long event,
++						void *param)
+ {
+-	return atomic_notifier_chain_register(&devpolicy_mgr_notifier, nb);
+-}
+-EXPORT_SYMBOL_GPL(devpolicy_mgr_reg_notifier);
++	struct devpolicy_mgr *dpm = container_of(nblock,
++						struct devpolicy_mgr,
++						provider_nb);
++	struct extcon_dev *edev = param;
++	struct cable_event *evt;
+ 
+-void devpolicy_mgr_unreg_notifier(struct notifier_block *nb)
+-{
+-	atomic_notifier_chain_unregister(&devpolicy_mgr_notifier, nb);
++	if (!edev)
++		return NOTIFY_DONE;
++
++	evt = kzalloc(sizeof(*evt), GFP_ATOMIC);
++	if (!evt) {
++		pr_err("DPM: failed to allocate memory for cable event\n");
++		return NOTIFY_DONE;
++	}
++
++	evt->cbl_type = CABLE_TYPE_PROVIDER;
++	evt->cbl_state = extcon_get_cable_state(edev, CABLE_PROVIDER);
++	pr_debug("DPM: extcon notification evt Provider - %s\n",
++			evt->cbl_state ? "Connected" : "Disconnected");
++
++	spin_lock(&dpm->cable_event_queue_lock);
++	list_add_tail(&evt->node, &dpm->cable_event_queue);
++	spin_unlock(&dpm->cable_event_queue_lock);
++
++	queue_work(system_nrt_wq, &dpm->cable_event_work);
++	return NOTIFY_OK;
+ }
+-EXPORT_SYMBOL_GPL(devpolicy_mgr_unreg_notifier);
+ 
+ static struct dpm_interface interface = {
+ 	.get_max_srcpwr_cap = dpm_get_max_srcpwr_cap,
+ 	.get_max_snkpwr_cap = dpm_get_max_snkpwr_cap,
+ 	.get_sink_power_cap = dpm_get_sink_power_cap,
+ 	.get_sink_power_caps = dpm_get_sink_power_caps,
+-	.set_provider_state = dpm_set_provider_state,
+-	.set_consumer_state = dpm_set_consumer_state,
+-	.get_provider_state = dpm_get_provider_state,
+-	.get_consumer_state = dpm_get_consumer_state,
+-	.get_data_role = dpm_get_data_role,
+-	.get_pwr_role = dpm_get_power_role,
+-	.set_data_role = dpm_set_data_role,
+-	.set_pwr_role = dpm_set_power_role,
++	.get_cable_state = dpm_get_cable_state,
+ 	.set_charger_mode = dpm_set_charger_mode,
+ 	.update_current_lim = dpm_update_current_lim,
+ 	.get_min_current = dpm_get_min_current,
++	.update_data_role = dpm_update_data_role,
++	.update_power_role = dpm_update_power_role,
++	.is_pr_swapped = dpm_is_pr_swapped,
+ 	.set_display_port_state = dpm_set_display_port_state,
+ };
+ 
+@@ -531,17 +686,16 @@ struct devpolicy_mgr *dpm_register_syspolicy(struct typec_phy *phy,
+ 	INIT_LIST_HEAD(&dpm->cable_event_queue);
+ 	INIT_WORK(&dpm->cable_event_work, dpm_cable_worker);
+ 	spin_lock_init(&dpm->cable_event_queue_lock);
+-	mutex_init(&dpm->cable_event_lock);
+ 	mutex_init(&dpm->role_lock);
+ 	mutex_init(&dpm->charger_lock);
+-	dpm->prev_cable_evt = CABLE_TYPE_UNKNOWN;
+ 
+ 	/* register for extcon notifier */
+-	dpm->nb.notifier_call = dpm_cable_event;
++	dpm->consumer_nb.notifier_call = dpm_consumer_cable_event;
++	dpm->provider_nb.notifier_call = dpm_provider_cable_event;
+ 	ret = extcon_register_interest(&dpm->consumer_cable_nb,
+ 						NULL,
+ 						CABLE_CONSUMER,
+-						&dpm->nb);
++						&dpm->consumer_nb);
+ 	if (ret < 0) {
+ 		pr_err("DPM: failed to register notifier for Consumer (%d)\n",
+ 						ret);
+@@ -551,7 +705,7 @@ struct devpolicy_mgr *dpm_register_syspolicy(struct typec_phy *phy,
+ 	ret = extcon_register_interest(&dpm->provider_cable_nb,
+ 						NULL,
+ 						CABLE_PROVIDER,
+-						&dpm->nb);
++						&dpm->provider_nb);
+ 	if (ret < 0) {
+ 		pr_err("DPM: failed to register notifier for Provider\n");
+ 		goto error1;
+diff --git a/drivers/usb/typec/pd/devpolicy_mgr.h b/drivers/usb/typec/pd/devpolicy_mgr.h
+index c053d542f6ac..8de334d7a3f3 100644
+--- a/drivers/usb/typec/pd/devpolicy_mgr.h
++++ b/drivers/usb/typec/pd/devpolicy_mgr.h
+@@ -4,11 +4,8 @@
+ #include <linux/extcon.h>
+ #include <linux/usb_typec_phy.h>
+ 
+-#define CABLE_CONSUMER	"USB_TYPEC_UFP"
+-#define CABLE_PROVIDER	"USB_TYPEC_DFP"
+-
+-/* Assume soc is greater than 80% battery is good */
+-#define IS_BATT_SOC_GOOD(x)	((x > 80) ? 1 : 0)
++#define CABLE_CONSUMER	"USB_TYPEC_SNK"
++#define CABLE_PROVIDER	"USB_TYPEC_SRC"
+ 
+ enum cable_state {
+ 	CABLE_DETACHED,
+@@ -35,6 +32,29 @@ enum psy_type {
+ 	PSY_TYPE_CHARGER,
+ };
+ 
++enum batt_soc_status {
++	BATT_SOC_UNKNOWN = -1,
++	BATT_SOC_DEAD,	/* soc = 0		*/
++	BATT_SOC_LOW,	/* soc > 0 && < 25	*/
++	BATT_SOC_MID1,	/* soc >= 25 && < 50	*/
++	BATT_SOC_MID2,	/* soc >= 50 && < 80	*/
++	BATT_SOC_GOOD,	/* soc >= 80 && < 100	*/
++	BATT_SOC_FULL,	/* soc = 100		*/
++};
++
++#define BATT_CAP_FULL		100
++#define BATT_CAP_GOOD		80
++#define BATT_CAP_MID		50
++#define BATT_CAP_LOW		25
++#define BATT_CAP_DEAD		0
++
++#define IS_BATT_SOC_FULL(x)	((x) == BATT_CAP_FULL)
++#define IS_BATT_SOC_GOOD(x)	((x) >= BATT_CAP_GOOD && (x) < BATT_CAP_FULL)
++#define IS_BATT_SOC_MID2(x)	((x) >= BATT_CAP_MID && (x) < BATT_CAP_GOOD)
++#define IS_BATT_SOC_MID1(x)	((x) >= BATT_CAP_LOW && (x) < BATT_CAP_MID)
++#define IS_BATT_SOC_LOW(x)	((x) > BATT_CAP_DEAD && (x) < BATT_CAP_LOW)
++#define IS_BATT_SOC_DEAD(x)	((x) == BATT_CAP_DEAD)
++
+ #define IS_BATTERY(psy) (psy->type == POWER_SUPPLY_TYPE_BATTERY)
+ #define IS_CHARGER(psy) (psy->type == POWER_SUPPLY_TYPE_USB ||\
+ 			psy->type == POWER_SUPPLY_TYPE_USB_CDP || \
+@@ -66,6 +86,8 @@ enum devpolicy_mgr_events {
+ 	DEVMGR_EVENT_DFP_DISCONNECTED,
+ 	DEVMGR_EVENT_UFP_CONNECTED,
+ 	DEVMGR_EVENT_UFP_DISCONNECTED,
++	DEVMGR_EVENT_PR_SWAP,
++	DEVMGR_EVENT_DR_SWAP,
+ };
+ 
+ enum policy_type {
+@@ -79,12 +101,16 @@ enum pwr_role {
+ 	POWER_ROLE_NONE,
+ 	POWER_ROLE_SINK,
+ 	POWER_ROLE_SOURCE,
++	/* Power role swap in-progress */
++	POWER_ROLE_SWAP,
+ };
+ 
+ enum data_role {
+ 	DATA_ROLE_NONE,
+ 	DATA_ROLE_UFP,
+ 	DATA_ROLE_DFP,
++	/* Data role swap in-progress */
++	DATA_ROLE_SWAP,
+ };
+ 
+ struct power_cap {
+@@ -99,8 +125,8 @@ struct power_caps {
+ 
+ struct cable_event {
+ 	struct list_head node;
+-	bool is_consumer_state;
+-	bool is_provider_state;
++	enum cable_type cbl_type;
++	enum cable_state cbl_state;
+ };
+ 
+ struct pd_policy {
+@@ -108,7 +134,28 @@ struct pd_policy {
+ 	size_t num_policies;
+ };
+ 
+-struct devpolicy_mgr;
++struct devpolicy_mgr {
++	struct pd_policy *policy;
++	struct extcon_specific_cable_nb provider_cable_nb;
++	struct extcon_specific_cable_nb consumer_cable_nb;
++	struct typec_phy *phy;
++	struct notifier_block provider_nb;
++	struct notifier_block consumer_nb;
++	struct list_head cable_event_queue;
++	struct work_struct cable_event_work;
++	struct mutex role_lock;
++	struct mutex charger_lock;
++	struct dpm_interface *interface;
++	spinlock_t cable_event_queue_lock;
++	enum cable_state consumer_state;    /* cosumer cable state */
++	enum cable_state provider_state;    /* provider cable state */
++	enum cable_state dp_state;    /* display cable state */
++	enum pwr_role cur_prole;
++	enum pwr_role prev_prole;
++	enum data_role cur_drole;
++	enum data_role prev_drole;
++	struct policy_engine *pe;
++};
+ 
+ struct dpm_interface {
+ 	int (*get_max_srcpwr_cap)(struct devpolicy_mgr *dpm,
+@@ -121,57 +168,33 @@ struct dpm_interface {
+ 					struct power_caps *caps);
+ 
+ 	/* methods to get/set the sink/source port states */
+-	int (*set_provider_state)(struct devpolicy_mgr *dpm,
+-					enum cable_state state);
+-	int (*set_consumer_state)(struct devpolicy_mgr *dpm,
+-					enum cable_state state);
+-	enum cable_state (*get_provider_state)(struct devpolicy_mgr *dpm);
+-	enum cable_state (*get_consumer_state)(struct devpolicy_mgr *dpm);
+-
+-	/* methods to get/set data/power roles */
+-	enum data_role (*get_data_role)(struct devpolicy_mgr *dpm);
+-	enum pwr_role (*get_pwr_role)(struct devpolicy_mgr *dpm);
+-	void (*set_data_role)(struct devpolicy_mgr *dpm, enum data_role role);
+-	void (*set_pwr_role)(struct devpolicy_mgr *dpm, enum pwr_role role);
++	enum cable_state (*get_cable_state)(struct devpolicy_mgr *dpm,
++						enum cable_type type);
++	/* Policy engine to update the current data and pwr roles*/
++	void (*update_data_role)(struct devpolicy_mgr *dpm,
++					enum data_role drole);
++	void (*update_power_role)(struct devpolicy_mgr *dpm,
++					enum pwr_role prole);
+ 	int (*set_charger_mode)(struct devpolicy_mgr *dpm,
+ 					enum charger_mode mode);
+ 	int (*update_current_lim)(struct devpolicy_mgr *dpm,
+ 					int ilim);
+ 	int (*get_min_current)(struct devpolicy_mgr *dpm,
+ 					int *ma);
++	int (*is_pr_swapped)(struct devpolicy_mgr *dpm,
++					enum pwr_role prole);
+ 	int (*set_display_port_state)(struct devpolicy_mgr *dpm,
+ 					enum cable_state state,
+ 					enum typec_dp_cable_type type);
+ };
+ 
+-struct devpolicy_mgr {
+-	struct pd_policy *policy;
+-	struct extcon_specific_cable_nb provider_cable_nb;
+-	struct extcon_specific_cable_nb consumer_cable_nb;
+-	struct typec_phy *phy;
+-	struct notifier_block nb;
+-	struct list_head cable_event_queue;
+-	struct work_struct cable_event_work;
+-	struct mutex cable_event_lock;
+-	struct mutex role_lock;
+-	struct mutex charger_lock;
+-	struct dpm_interface *interface;
+-	spinlock_t cable_event_queue_lock;
+-	enum cable_state consumer_state;    /* cosumer cable state */
+-	enum cable_state provider_state;    /* provider cable state */
+-	enum cable_state dp_state;    /* display cable state */
+-	enum cable_type prev_cable_evt;
+-	enum pwr_role prole;
+-	enum data_role drole;
+-};
+-
+ static inline int devpolicy_get_max_srcpwr_cap(struct devpolicy_mgr *dpm,
+ 					struct power_cap *caps)
+ {
+ 	if (dpm && dpm->interface && dpm->interface->get_max_srcpwr_cap)
+ 		return dpm->interface->get_max_srcpwr_cap(dpm, caps);
+-	else
+-		return -ENODEV;
++
++	return -ENODEV;
+ }
+ 
+ static inline int devpolicy_get_max_snkpwr_cap(struct devpolicy_mgr *dpm,
+@@ -179,8 +202,8 @@ static inline int devpolicy_get_max_snkpwr_cap(struct devpolicy_mgr *dpm,
+ {
+ 	if (dpm && dpm->interface && dpm->interface->get_max_snkpwr_cap)
+ 		return dpm->interface->get_max_snkpwr_cap(dpm, caps);
+-	else
+-		return -ENODEV;
++
++	return -ENODEV;
+ }
+ 
+ static inline int devpolicy_get_snkpwr_cap(struct devpolicy_mgr *dpm,
+@@ -188,8 +211,8 @@ static inline int devpolicy_get_snkpwr_cap(struct devpolicy_mgr *dpm,
+ {
+ 	if (dpm && dpm->interface && dpm->interface->get_sink_power_cap)
+ 		return dpm->interface->get_sink_power_cap(dpm, cap);
+-	else
+-		return -ENODEV;
++
++	return -ENODEV;
+ }
+ 
+ static inline int devpolicy_get_snkpwr_caps(struct devpolicy_mgr *dpm,
+@@ -197,38 +220,8 @@ static inline int devpolicy_get_snkpwr_caps(struct devpolicy_mgr *dpm,
+ {
+ 	if (dpm && dpm->interface && dpm->interface->get_sink_power_caps)
+ 		return dpm->interface->get_sink_power_caps(dpm, caps);
+-	else
+-		return -ENODEV;
+-}
+-
+-static inline enum data_role devpolicy_get_data_role(struct devpolicy_mgr *dpm)
+-{
+-	if (dpm && dpm->interface && dpm->interface->get_data_role)
+-		return dpm->interface->get_data_role(dpm);
+-	else
+-		return -ENODEV;
+-}
+ 
+-static inline enum pwr_role devpolicy_get_power_role(struct devpolicy_mgr *dpm)
+-{
+-	if (dpm && dpm->interface && dpm->interface->get_pwr_role)
+-		return dpm->interface->get_pwr_role(dpm);
+-	else
+-		return -ENODEV;
+-}
+-
+-static inline void devpolicy_set_data_role(struct devpolicy_mgr *dpm,
+-					enum data_role role)
+-{
+-	if (dpm && dpm->interface && dpm->interface->set_data_role)
+-		dpm->interface->set_data_role(dpm, role);
+-}
+-
+-static inline void devpolicy_set_power_role(struct devpolicy_mgr *dpm,
+-					enum pwr_role role)
+-{
+-	if (dpm && dpm->interface && dpm->interface->set_pwr_role)
+-		dpm->interface->set_pwr_role(dpm, role);
++	return -ENODEV;
+ }
+ 
+ static inline int devpolicy_set_charger_mode(struct devpolicy_mgr *dpm,
+@@ -236,8 +229,8 @@ static inline int devpolicy_set_charger_mode(struct devpolicy_mgr *dpm,
+ {
+ 	if (dpm && dpm->interface && dpm->interface->set_charger_mode)
+ 		return dpm->interface->set_charger_mode(dpm, mode);
+-	else
+-		return -ENODEV;
++
++	return -ENODEV;
+ }
+ 
+ static inline int devpolicy_update_current_limit(struct devpolicy_mgr *dpm,
+@@ -245,8 +238,8 @@ static inline int devpolicy_update_current_limit(struct devpolicy_mgr *dpm,
+ {
+ 	if (dpm && dpm->interface && dpm->interface->update_current_lim)
+ 		return dpm->interface->update_current_lim(dpm, ilim);
+-	else
+-		return -ENODEV;
++
++	return -ENODEV;
+ }
+ 
+ static inline int devpolicy_get_min_snk_current(struct devpolicy_mgr *dpm,
+@@ -254,47 +247,31 @@ static inline int devpolicy_get_min_snk_current(struct devpolicy_mgr *dpm,
+ {
+ 	if (dpm && dpm->interface && dpm->interface->get_min_current)
+ 		return dpm->interface->get_min_current(dpm, ma);
+-	else
+-		return -ENODEV;
+-}
+ 
+-static inline int devpolicy_set_provider_state(struct devpolicy_mgr *dpm,
+-						enum cable_state state)
+-{
+-	if (dpm && dpm->interface && dpm->interface->set_provider_state)
+-		return dpm->interface->set_provider_state(dpm, state);
+-	else
+-		return -ENODEV;
++	return -ENODEV;
+ }
+ 
+-static inline int devpolicy_set_consumer_state(struct devpolicy_mgr *dpm,
+-					enum cable_state state)
++static inline int devpolicy_is_pr_swap_support(struct devpolicy_mgr *dpm,
++							enum pwr_role prole)
+ {
+-	if (dpm && dpm->interface && dpm->interface->set_consumer_state)
+-		return dpm->interface->set_consumer_state(dpm, state);
+-	else
+-		return -ENODEV;
+-}
++	if (dpm && dpm->interface && dpm->interface->is_pr_swapped)
++		return dpm->interface->is_pr_swapped(dpm, prole);
+ 
+-static inline enum cable_state devpolicy_get_provider_state(
+-					struct devpolicy_mgr *dpm)
+-{
+-	if (dpm && dpm->interface && dpm->interface->get_provider_state)
+-		return dpm->interface->get_provider_state(dpm);
+-	else
+-		return -ENODEV;
++	return -ENODEV;
+ }
+ 
+-static inline enum cable_state devpolicy_get_consumer_state(
+-					struct devpolicy_mgr *dpm)
++static inline enum cable_state devpolicy_get_cable_state(
++					struct devpolicy_mgr *dpm,
++					enum cable_type type)
+ {
+-	if (dpm && dpm->interface && dpm->interface->get_consumer_state)
+-		return dpm->interface->get_consumer_state(dpm);
+-	else
+-		return -ENODEV;
++	if (dpm && dpm->interface && dpm->interface->get_cable_state)
++		return dpm->interface->get_cable_state(dpm, type);
++
++	return -ENODEV;
+ }
+ 
+ void typec_notify_cable_state(struct typec_phy *phy, char *type, bool state);
++void typec_set_pu_pd(struct typec_phy *phy, bool pu_pd);
+ 
+ /* methods to register/unregister device manager policy notifier */
+ extern int devpolicy_mgr_reg_notifier(struct notifier_block *nb);
+diff --git a/drivers/usb/typec/pd/message.c b/drivers/usb/typec/pd/message.c
+index 355f2204702f..337c3389d769 100644
+--- a/drivers/usb/typec/pd/message.c
++++ b/drivers/usb/typec/pd/message.c
+@@ -33,9 +33,9 @@ int pd_ctrl_msg(struct pd_prot *pd, u8 msg_type, u8 msg_id)
+ 	struct pd_pkt_header *header = &buf->header;
+ 
+ 	header->msg_type = msg_type & PD_MSG_HEAD_MSG_TYPE;
+-	header->data_role = pd->new_data_role & PD_MSG_HEADER_ROLE_BITS_MASK;
++	header->data_role = pd->data_role & PD_MSG_HEADER_ROLE_BITS_MASK;
+ 	header->rev_id = PD_REV_ID_2 & PD_MSG_HEADER_REVID_BITS_MASK;
+-	if (pd->new_pwr_role == PD_POWER_ROLE_PROVIDER)
++	if (pd->pwr_role == PD_POWER_ROLE_PROVIDER)
+ 		header->pwr_role = 1;
+ 	else
+ 		header->pwr_role = 0;
+@@ -51,9 +51,9 @@ int pd_data_msg(struct pd_prot *pd, int len, u8 msg_type)
+ 	struct pd_pkt_header *header = &buf->header;
+ 
+ 	header->msg_type = msg_type & PD_MSG_HEAD_MSG_TYPE;
+-	header->data_role = pd->new_data_role & PD_MSG_HEADER_ROLE_BITS_MASK;
++	header->data_role = pd->data_role & PD_MSG_HEADER_ROLE_BITS_MASK;
+ 	header->rev_id = PD_REV_ID_2 & PD_MSG_HEADER_REVID_BITS_MASK;
+-	if (pd->new_pwr_role == PD_POWER_ROLE_PROVIDER)
++	if (pd->pwr_role == PD_POWER_ROLE_PROVIDER)
+ 		header->pwr_role = 1;
+ 	else
+ 		header->pwr_role = 0;
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index aeb63a2b7665..86509891d850 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -34,9 +34,6 @@
+ #include <linux/random.h>
+ #include "policy_engine.h"
+ 
+-static LIST_HEAD(pe_list);
+-static DEFINE_SPINLOCK(pe_lock);
+-
+ static void pe_dump_header(struct pd_pkt_header *header);
+ static void pe_dump_data_msg(struct pd_packet *pkt);
+ 
+@@ -248,73 +245,18 @@ static int policy_engine_process_cmd(struct policy_engine *pe,
+ 	return ret;
+ }
+ 
+-static void pe_dpm_worker(struct work_struct *work)
+-{
+-	struct policy_engine *pe =
+-		container_of(work, struct policy_engine, dpm_work);
+-	struct pe_dpm_evt *evt, *tmp;
+-	unsigned long flags;
+-	struct list_head new_list;
+-
+-	if (list_empty(&pe->dpm_queue))
+-		return;
+-
+-	spin_lock_irqsave(&pe->dpm_queue_lock, flags);
+-	list_replace_init(&pe->dpm_queue, &new_list);
+-	spin_unlock_irqrestore(&pe->dpm_queue_lock, flags);
+-
+-	list_for_each_entry_safe(evt, tmp, &new_list, node) {
+-		mutex_lock(&pe->dpmwk_lock);
+-		if (evt != NULL) {
+-			/* FIXME: Send msg to protocol to advertise the the
+-			 * source cap if evt = DEVMGR_EVENT_ADVERTISE_SRC_CAP */
+-		}
+-		mutex_unlock(&pe->dpmwk_lock);
+-		kfree(evt);
+-	}
+-}
+-
+-static int pe_dpm_notification(struct notifier_block *nb,
+-				unsigned long event, void *param)
++static inline void policy_prot_update_data_role(struct policy_engine *pe,
++				enum data_role drole)
+ {
+-	struct policy_engine *pe =
+-		container_of(nb, struct policy_engine, dpm_nb);
+-	struct pe_dpm_evt *evt;
+-
+-	if (!param || event != DEVMGR_EVENT_DFP_CONNECTED)
+-		return NOTIFY_DONE;
+-
+-	evt = kzalloc(sizeof(*evt), GFP_ATOMIC);
+-	if (!evt) {
+-		pr_err("PE: failed to allocate memory for dpm event\n");
+-		return NOTIFY_DONE;
+-	}
+-
+-	memcpy(&evt->caps, param, sizeof(struct pe_dpm_evt));
+-	INIT_LIST_HEAD(&evt->node);
+-	list_add_tail(&evt->node, &pe->dpm_queue);
+-	queue_work(system_nrt_wq, &pe->dpm_work);
+-
+-	return NOTIFY_OK;
++	if (pe && pe->prot && pe->prot->policy_update_data_role)
++		pe->prot->policy_update_data_role(pe->prot, drole);
+ }
+ 
+-static inline int pe_register_dpm_notifications(struct policy_engine *pe)
++static inline void policy_prot_update_power_role(struct policy_engine *pe,
++				enum pwr_role prole)
+ {
+-	int retval;
+-
+-	INIT_LIST_HEAD(&pe->dpm_queue);
+-	INIT_WORK(&pe->dpm_work, pe_dpm_worker);
+-	mutex_init(&pe->dpmwk_lock);
+-	spin_lock_init(&pe->dpm_queue_lock);
+-
+-	pe->dpm_nb.notifier_call = pe_dpm_notification;
+-	retval = devpolicy_mgr_reg_notifier(&pe->dpm_nb);
+-	if (retval < 0) {
+-		pr_err("PE: failed to register dpm notifier\n");
+-		return -EIO;
+-	}
+-
+-	return 0;
++	if (pe && pe->prot && pe->prot->policy_update_power_role)
++		pe->prot->policy_update_power_role(pe->prot, prole);
+ }
+ 
+ static int pe_get_snkpwr_cap(struct policy_engine *pe,
+@@ -346,30 +288,60 @@ static int pe_get_max_snkpwr_cap(struct policy_engine *pe,
+ 
+ static enum data_role pe_get_data_role(struct policy_engine *pe)
+ {
+-	if (pe && pe->dpm)
+-		return devpolicy_get_data_role(pe->dpm);
++	enum data_role drole;
+ 
+-	return DATA_ROLE_NONE;
++	mutex_lock(&pe->pe_lock);
++	drole = pe->cur_drole;
++	mutex_unlock(&pe->pe_lock);
++	return drole;
+ }
+ 
+ static enum pwr_role pe_get_power_role(struct policy_engine *pe)
+ {
+-	if (pe && pe->dpm)
+-		return devpolicy_get_power_role(pe->dpm);
++	enum pwr_role prole;
+ 
+-	return POWER_ROLE_NONE;
++	mutex_lock(&pe->pe_lock);
++	prole = pe->cur_prole;
++	mutex_unlock(&pe->pe_lock);
++	return prole;
+ }
+ 
+-static void  pe_set_data_role(struct policy_engine *pe, enum data_role role)
++static int pe_set_data_role(struct policy_engine *pe, enum data_role role)
+ {
+-	if (pe && pe->dpm)
+-		devpolicy_set_data_role(pe->dpm, role);
++	mutex_lock(&pe->pe_lock);
++	if (pe->cur_drole == role)
++		goto set_drole_out;
++
++	pe->cur_drole = role;
++	policy_dpm_update_data_role(pe, role);
++	/* If role swap, no need to update protocol */
++	if (role != DATA_ROLE_SWAP) {
++		/* Update the protocol */
++		policy_prot_update_data_role(pe, role);
++	}
++
++set_drole_out:
++	mutex_unlock(&pe->pe_lock);
++	return 0;
+ }
+ 
+-static void pe_set_power_role(struct policy_engine *pe, enum pwr_role role)
++static int pe_set_power_role(struct policy_engine *pe, enum pwr_role role)
+ {
+-	if (pe && pe->dpm)
+-		devpolicy_set_power_role(pe->dpm, role);
++	mutex_lock(&pe->pe_lock);
++	if (pe->cur_prole == role)
++		goto set_prole_out;
++
++	pe->cur_prole = role;
++	policy_dpm_update_power_role(pe, role);
++	/* If role swap, no need to update protocol */
++	if (role != POWER_ROLE_SWAP) {
++		/* Update the protocol */
++		policy_prot_update_power_role(pe, role);
++	}
++
++set_prole_out:
++	mutex_unlock(&pe->pe_lock);
++	return 0;
+ }
+ 
+ static int pe_set_charger_mode(struct policy_engine *pe, enum charger_mode mode)
+@@ -396,10 +368,19 @@ static int pe_get_min_snk_current(struct policy_engine *pe, int *ma)
+ 	return -ENODEV;
+ }
+ 
+-static enum cable_state pe_get_vbus_state(struct policy_engine *pe)
++static int pe_is_pr_swap_support(struct policy_engine *pe, enum pwr_role prole)
+ {
+ 	if (pe && pe->dpm)
+-		return devpolicy_get_consumer_state(pe->dpm);
++		return devpolicy_is_pr_swap_support(pe->dpm, prole);
++
++	return -ENODEV;
++}
++
++static enum cable_state pe_get_cable_state(struct policy_engine *pe,
++						enum cable_type type)
++{
++	if (pe && pe->dpm)
++		return devpolicy_get_cable_state(pe->dpm, type);
+ 
+ 	return -ENODEV;
+ }
+@@ -417,6 +398,68 @@ static int pe_set_pd_state(struct policy_engine *pe, bool state)
+ 	return 0;
+ }
+ 
++static int pe_start_policy(struct policy_engine *pe, enum policy_type type)
++
++{
++	struct policy *p;
++
++	p = pe_get_policy(pe, type);
++	if (!p) {
++		pr_err("PE: Unable to get %d policy\n", type);
++		return -ENODEV;
++	}
++
++	if (p->state != POLICY_STATE_ONLINE)
++		p->start(p);
++	else {
++		pr_warn("PE: policy %d is already active!!!\n", type);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int pe_stop_policy(struct policy_engine *pe, enum policy_type type)
++
++{
++	struct policy *p;
++
++	p = pe_get_policy(pe, type);
++	if (!p) {
++		pr_err("PE: Unable to get %d policy\n", type);
++		return -ENODEV;
++	}
++
++	if (p->state == POLICY_STATE_ONLINE)
++		p->stop(p);
++	else {
++		pr_warn("PE: policy %d is not active!!!\n", type);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int pe_switch_policy(struct policy_engine *pe,
++				enum policy_type start_policy_type)
++{
++	enum policy_type stop_policy_type;
++	int ret;
++
++	if (start_policy_type == POLICY_TYPE_SOURCE)
++		stop_policy_type =  POLICY_TYPE_SINK;
++	else if (start_policy_type == POLICY_TYPE_SINK)
++		stop_policy_type = POLICY_TYPE_SOURCE;
++	else
++		return -EINVAL;
++
++	ret = pe_stop_policy(pe, stop_policy_type);
++	if (ret < 0)
++		return ret;
++
++	return pe_start_policy(pe, start_policy_type);
++}
++
+ static int pe_send_packet(struct policy_engine *pe, void *data, int len,
+ 				u8 msg_type, enum pe_event evt)
+ {
+@@ -553,14 +596,60 @@ static void pe_init_policy(struct work_struct *work)
+ 	return;
+ }
+ 
+-static void pe_policy_work(struct work_struct *work)
++static int pe_fwdreq_to_policy(struct policy_engine *pe,
++					enum pe_event evt)
+ {
+-	struct policy_engine *pe = container_of(work, struct policy_engine,
+-						policy_work);
+ 	struct policy *p;
++	int ret = 0;
++
++	p = pe_get_active_src_or_snk_policy(&pe->policy_list);
++	if (!p) {
++		pr_err("PE: No Active policy!\n");
++		return -EINVAL;
++	}
++
++	if (p && p->rcv_request) {
++		p->rcv_request(p, evt);
++	} else {
++		pr_err("PE: Unable to send request\n");
++		ret = -ENODEV;
++	}
+ 
+-	switch (pe->cbl_type) {
+-	case CABLE_TYPE_CONSUMER:
++	return ret;
++}
++
++static int pe_send_role_swap_request(struct policy_engine *pe,
++					enum pe_event evt)
++{
++	int ret = 0;
++
++	pr_debug("PE: %s - request %d\n", __func__, evt);
++	switch (evt) {
++	case PE_EVT_SEND_PR_SWAP:
++	case PE_EVT_SEND_DR_SWAP:
++		ret = pe_fwdreq_to_policy(pe, evt);
++		if (ret < 0)
++			pr_err("PE: Error in handling request\n");
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	return ret;
++}
++
++static void pe_handle_dpm_event(struct policy_engine *pe,
++					enum devpolicy_mgr_events evt)
++{
++	struct policy *p;
++	enum pe_event pevt = PE_EVT_SEND_NONE;
++
++	pr_info("PE: %s event - %d\n", __func__, evt);
++	switch (evt) {
++	case DEVMGR_EVENT_UFP_CONNECTED:
++		pe_set_power_role(pe, POWER_ROLE_SINK);
++		pe_set_data_role(pe, DATA_ROLE_UFP);
+ 		/* Start sink policy */
+ 		p = pe_get_policy(pe, POLICY_TYPE_SINK);
+ 		if (!p) {
+@@ -572,7 +661,9 @@ static void pe_policy_work(struct work_struct *work)
+ 		else
+ 			pr_warn("PE: SINK policy is already active!!!\n");
+ 		break;
+-	case CABLE_TYPE_PROVIDER:
++	case DEVMGR_EVENT_DFP_CONNECTED:
++		pe_set_power_role(pe, POWER_ROLE_SOURCE);
++		pe_set_data_role(pe, DATA_ROLE_DFP);
+ 		/* Start source policy.
+ 		 * Display pe should be started after source pe complete.
+ 		 */
+@@ -586,51 +677,84 @@ static void pe_policy_work(struct work_struct *work)
+ 		else
+ 			pr_warn("PE: SOURCE policy is already active!!!\n");
+ 		break;
+-	case CABLE_TYPE_UNKNOWN:
++
++	case DEVMGR_EVENT_UFP_DISCONNECTED:
++	case DEVMGR_EVENT_DFP_DISCONNECTED:
++		if (pe->cur_prole == POWER_ROLE_SWAP) {
++			/* This disconnect event is due to pwr role swap.
++			 * Hence ignore it.
++			 */
++			 pr_info("PE:%s: Disconnect evt during role swap\n",
++					__func__);
++			 break;
++		}
++		pe_set_power_role(pe, POWER_ROLE_NONE);
++		pe_set_data_role(pe, DATA_ROLE_NONE);
+ 		/* Stop all active policies */
+ 		list_for_each_entry(p, &pe->policy_list, list) {
+ 			if (p && (p->state == POLICY_STATE_ONLINE))
+ 				p->stop(p);
+ 		}
+ 		break;
++	case DEVMGR_EVENT_PR_SWAP:
++		pevt = PE_EVT_SEND_PR_SWAP;
++		break;
++	case DEVMGR_EVENT_DR_SWAP:
++		pevt = PE_EVT_SEND_DR_SWAP;
++		break;
+ 	default:
+-		pr_err("PE: %s Unknown cable_type=%d\n",
+-			__func__, pe->cbl_type);
++		pr_err("PE: %s Unknown dpm event=%d\n",
++			__func__, evt);
+ 	}
++
++	if (pevt != PE_EVT_SEND_NONE)
++		pe_send_role_swap_request(pe, pevt);
+ }
+ 
+-static int sink_port_event(struct notifier_block *nb, unsigned long event,
+-				void *param)
++static void pe_dpm_evt_worker(struct work_struct *work)
+ {
+-	struct policy_engine *pe = container_of(nb, struct policy_engine,
+-						sink_nb);
+-	struct extcon_dev *edev = (struct extcon_dev *)param;
+-	int cable_state;
++	struct policy_engine *pe =
++		container_of(work, struct policy_engine, dpm_evt_work);
++	struct pe_dpm_evt *evt, *tmp;
++	struct list_head new_list;
+ 
+-	cable_state = extcon_get_cable_state(edev, "USB_TYPEC_UFP");
+-	pr_info("PE: %s USB_TYPEC_UFP event with cable_state=%d\n",
+-			__func__, cable_state);
+-	pe->cbl_type = cable_state ? CABLE_TYPE_CONSUMER : CABLE_TYPE_UNKNOWN;
+-	schedule_work(&pe->policy_work);
+-	return 0;
++	if (list_empty(&pe->dpm_evt_queue))
++		return;
++
++	mutex_lock(&pe->dpm_evt_lock);
++	list_replace_init(&pe->dpm_evt_queue, &new_list);
++	mutex_unlock(&pe->dpm_evt_lock);
++
++	list_for_each_entry_safe(evt, tmp, &new_list, node) {
++		pe_handle_dpm_event(pe, evt->evt);
++		kfree(evt);
++	}
+ }
+ 
+-static int source_port_event(struct notifier_block *nb, unsigned long event,
+-				void *param)
++static int pe_dpm_notification(struct policy_engine *pe,
++				enum devpolicy_mgr_events evt)
+ {
+-	struct policy_engine *pe = container_of(nb, struct policy_engine,
+-						source_nb);
+-	struct extcon_dev *edev = (struct extcon_dev *)param;
+-	int cable_state;
++	struct pe_dpm_evt *dpm_evt;
++
++	dpm_evt = kzalloc(sizeof(*dpm_evt), GFP_KERNEL);
++	if (!dpm_evt) {
++		pr_err("PE: failed to allocate memory for dpm event\n");
++		return -ENOMEM;
++	}
+ 
+-	cable_state = extcon_get_cable_state(edev, "USB_TYPEC_DFP");
+-	pr_info("PE: %s USB_TYPEC_DFP event with cable_state=%d\n",
+-			__func__, cable_state);
+-	pe->cbl_type = cable_state ? CABLE_TYPE_PROVIDER : CABLE_TYPE_UNKNOWN;
+-	schedule_work(&pe->policy_work);
+-	return  0;
++	dpm_evt->evt = evt;
++
++	mutex_lock(&pe->dpm_evt_lock);
++	list_add_tail(&dpm_evt->node, &pe->dpm_evt_queue);
++	mutex_unlock(&pe->dpm_evt_lock);
++	queue_work(system_nrt_wq, &pe->dpm_evt_work);
++
++	return 0;
+ }
+ 
++
++
++
+ static struct pe_operations ops = {
+ 	.get_snkpwr_cap = pe_get_snkpwr_cap,
+ 	.get_snkpwr_caps = pe_get_snkpwr_caps,
+@@ -642,14 +766,17 @@ static struct pe_operations ops = {
+ 	.set_charger_mode = pe_set_charger_mode,
+ 	.update_charger_ilim = pe_update_charger_ilim,
+ 	.get_min_snk_current = pe_get_min_snk_current,
++	.is_pr_swap_support = pe_is_pr_swap_support,
+ 	.send_packet = pe_send_packet,
+-	.get_vbus_state = pe_get_vbus_state,
++	.get_cable_state = pe_get_cable_state,
+ 	.get_pd_state = pe_get_pd_state,
+ 	.set_pd_state = pe_set_pd_state,
++	.switch_policy = pe_switch_policy,
+ 	.process_data_msg = policy_engine_process_data_msg,
+ 	.process_ctrl_msg = policy_engine_process_ctrl_msg,
+ 	.process_cmd = policy_engine_process_cmd,
+ 	.policy_status_changed = pe_policy_status_changed,
++	.notify_dpm_evt = pe_dpm_notification,
+ };
+ 
+ int policy_engine_bind_dpm(struct devpolicy_mgr *dpm)
+@@ -668,95 +795,78 @@ int policy_engine_bind_dpm(struct devpolicy_mgr *dpm)
+ 	pe->ops = &ops;
+ 	pe->dpm = dpm;
+ 	pe->supported_policies = dpm->policy;
+-	retval = pe_register_dpm_notifications(pe);
+-	if (retval) {
+-		pr_err("PE: failed to register dpm policy notifier\n");
+-		retval = -EINVAL;
+-		goto error0;
+-	}
+-	INIT_LIST_HEAD(&pe->list);
+ 
+ 	retval = protocol_bind_pe(pe);
+ 	if (retval) {
+ 		pr_err("PE: failed to bind pe to protocol\n");
+ 		retval = -EINVAL;
+-		goto error1;
++		goto bind_error;
+ 	}
++	pe->cur_drole = DATA_ROLE_NONE;
++	pe->cur_prole = POWER_ROLE_NONE;
++	INIT_WORK(&pe->policy_init_work, pe_init_policy);
+ 
+-	pe->sink_nb.notifier_call = sink_port_event;
+-	pe->source_nb.notifier_call = source_port_event;
+-
+-	retval = extcon_register_interest(&pe->sink_cable_nb,
+-						NULL, "USB_TYPEC_UFP",
+-						&pe->sink_nb);
+-	if (retval < 0)
+-		goto error2;
+-
+-	retval = extcon_register_interest(&pe->source_cable_nb,
+-						NULL, "USB_TYPEC_DFP",
+-						&pe->source_nb);
+-	if (retval < 0)
+-		goto error3;
++	INIT_WORK(&pe->dpm_evt_work, pe_dpm_evt_worker);
++	INIT_LIST_HEAD(&pe->dpm_evt_queue);
++	mutex_init(&pe->dpm_evt_lock);
+ 
+-	INIT_WORK(&pe->policy_init_work, pe_init_policy);
+-	INIT_WORK(&pe->policy_work, pe_policy_work);
+ 	mutex_init(&pe->pe_lock);
+ 	INIT_LIST_HEAD(&pe->policy_list);
+-	list_add_tail(&pe->list, &pe_list);
++	dpm->pe = pe;
+ 
+ 	schedule_work(&pe->policy_init_work);
+ 
+ 	return 0;
+ 
+-error3:
+-	extcon_unregister_interest(&pe->sink_cable_nb);
+-error2:
+-	protocol_unbind_pe(pe);
+-error1:
+-	devpolicy_mgr_unreg_notifier(&pe->dpm_nb);
+-error0:
++bind_error:
+ 	kfree(pe);
+ 	return retval;
+ }
+ EXPORT_SYMBOL_GPL(policy_engine_bind_dpm);
+ 
+-static void remove_pe(struct policy_engine *pe)
++void policy_engine_unbind_dpm(struct devpolicy_mgr *dpm)
+ {
+-	struct pd_policy *supported_policy = pe->supported_policies;
++	struct policy_engine *pe = dpm->pe;
+ 	struct policy *p;
++	struct pe_dpm_evt *evt, *tmp;
++	struct pd_policy *supported_policy;
++	struct list_head tmp_list;
+ 	int i;
+ 
+-	if (!pe)
+-		return;
++	mutex_lock(&pe->pe_lock);
++	/* remove the pe ops to avoid further external
++	 * notifications and callbacks.
++	 */
++	pe->ops = NULL;
+ 
++	/* Exit all sub policy engines */
++	supported_policy = pe->supported_policies;
+ 	for (i = 0; i < supported_policy->num_policies; i++) {
+ 		p = __pe_find_policy(&pe->policy_list,
+ 					supported_policy->policies[i]);
+ 		p->exit(p);
+ 	}
+-	extcon_unregister_interest(&pe->source_cable_nb);
+-	extcon_unregister_interest(&pe->sink_cable_nb);
++	/* Unbind from protocol layer */
+ 	protocol_unbind_pe(pe);
+-	devpolicy_mgr_unreg_notifier(&pe->dpm_nb);
+-	kfree(pe);
+-}
++	mutex_unlock(&pe->pe_lock);
+ 
+-void policy_engine_unbind_dpm(struct devpolicy_mgr *dpm)
+-{
+-	struct policy_engine *pe, *temp;
++	/* Clear dpm event list */
++	mutex_lock(&pe->dpm_evt_lock);
++	if (list_empty(&pe->dpm_evt_queue)) {
++		mutex_unlock(&pe->dpm_evt_lock);
++		goto unbind_dpm_out;
++	}
+ 
+-	if (list_empty(&pe_list))
+-		return;
++	list_replace_init(&pe->dpm_evt_queue, &tmp_list);
++	mutex_unlock(&pe->dpm_evt_lock);
+ 
+-	spin_lock(&pe_lock);
+-	list_for_each_entry_safe(pe, temp, &pe_list, list) {
+-		if (pe->dpm == dpm) {
+-			list_del(&pe->list);
+-			remove_pe(pe);
+-			break;
+-		}
++	list_for_each_entry_safe(evt, tmp, &tmp_list, node) {
++		/* Free the event */
++		kfree(evt);
+ 	}
+-	spin_unlock(&pe_lock);
++
++unbind_dpm_out:
++	kfree(pe);
+ }
+ EXPORT_SYMBOL_GPL(policy_engine_unbind_dpm);
+ 
+diff --git a/drivers/usb/typec/pd/policy_engine.h b/drivers/usb/typec/pd/policy_engine.h
+index 58db46e0738f..6c86fcdfc5e6 100644
+--- a/drivers/usb/typec/pd/policy_engine.h
++++ b/drivers/usb/typec/pd/policy_engine.h
+@@ -304,33 +304,26 @@ struct policy {
+ 	int (*rcv_pkt)(struct policy *p, struct pd_packet *pkt,
+ 				enum pe_event evt);
+ 	int (*rcv_cmd)(struct policy *p, enum pe_event evt);
++	int (*rcv_request)(struct policy *p, enum pe_event evt);
+ 	void (*exit)(struct policy *p);
+ };
+ 
+ struct policy_engine {
+ 	struct pd_prot *prot;
+-	struct notifier_block proto_nb;
+-	struct notifier_block dpm_nb;
+-	struct mutex dpmwk_lock;
+ 	struct mutex pe_lock;
+-	struct list_head dpm_queue;
+-	struct work_struct dpm_work;
+-	struct devpolicy_mgr *dpm;
+-	struct pe_operations *ops;
+-	struct list_head list;
+ 
+-	spinlock_t dpm_queue_lock;
++	struct list_head dpm_evt_queue;
++	struct work_struct dpm_evt_work;
++	struct devpolicy_mgr *dpm;
++	struct mutex dpm_evt_lock;
+ 
++	struct pe_operations *ops;
+ 	struct pd_policy *supported_policies;
+-	struct notifier_block sink_nb;
+-	struct notifier_block source_nb;
+-	struct extcon_specific_cable_nb sink_cable_nb;
+-	struct extcon_specific_cable_nb source_cable_nb;
+-	struct work_struct policy_work;
+ 	struct work_struct policy_init_work;
+ 
+ 	struct list_head policy_list;
+-	enum cable_type cbl_type;
++	enum data_role	cur_drole;
++	enum pwr_role cur_prole;
+ 	bool is_pd_connected;
+ };
+ 
+@@ -343,19 +336,23 @@ struct pe_operations {
+ 					struct power_cap *cap);
+ 	enum data_role (*get_data_role)(struct policy_engine *pe);
+ 	enum pwr_role (*get_power_role)(struct policy_engine *pe);
+-	void (*set_data_role)(struct policy_engine *pe, enum data_role role);
+-	void (*set_power_role)(struct policy_engine *pe, enum pwr_role role);
++	int (*set_data_role)(struct policy_engine *pe, enum data_role role);
++	int (*set_power_role)(struct policy_engine *pe, enum pwr_role role);
+ 	int (*set_charger_mode)(struct policy_engine *pe,
+ 					enum charger_mode mode);
+ 	int (*update_charger_ilim)(struct policy_engine *pe,
+ 					int ilim);
+ 	int (*get_min_snk_current)(struct policy_engine *pe,
+ 					int *ma);
++	int (*is_pr_swap_support)(struct policy_engine *pe,
++						enum pwr_role prole);
+ 	int (*send_packet)(struct policy_engine *pe, void *data,
+ 				int len, u8 msg_type, enum pe_event evt);
+-	enum cable_state (*get_vbus_state)(struct policy_engine *pe);
++	enum cable_state (*get_cable_state)(struct policy_engine *pe,
++						enum cable_type type);
+ 	int (*set_pd_state)(struct policy_engine *pe, bool state);
+ 	bool (*get_pd_state)(struct policy_engine *pe);
++	int (*switch_policy)(struct policy_engine *pe,  enum policy_type type);
+ 	int (*process_data_msg)(struct policy_engine *pe, enum pe_event evt,
+ 				struct pd_packet *data);
+ 	int (*process_ctrl_msg)(struct policy_engine *pe, enum pe_event evt,
+@@ -363,16 +360,13 @@ struct pe_operations {
+ 	int (*process_cmd)(struct policy_engine *pe, enum pe_event cmd);
+ 	void (*policy_status_changed)(struct policy_engine *pe, int policy_type,
+ 					int state);
+-};
+-
+-struct pe_proto_evt {
+-	struct list_head node;
+-	struct pd_packet pkt;
++	int (*notify_dpm_evt)(struct policy_engine *pe,
++					enum devpolicy_mgr_events evt);
+ };
+ 
+ struct pe_dpm_evt {
+ 	struct list_head node;
+-	struct power_cap caps;
++	enum devpolicy_mgr_events evt;
+ };
+ 
+ #define pe_get_phy(x)	((x) ?  x->dpm->phy : NULL)
+@@ -434,16 +428,20 @@ static inline enum pwr_role policy_get_power_role(struct policy *p)
+ 	return POWER_ROLE_NONE;
+ }
+ 
+-static inline void policy_set_data_role(struct policy *p, int role)
++static inline int policy_set_data_role(struct policy *p, enum data_role role)
+ {
+ 	if (p && p->pe && p->pe->ops && p->pe->ops->set_data_role)
+-		p->pe->ops->set_data_role(p->pe, role);
++		return p->pe->ops->set_data_role(p->pe, role);
++
++	return -ENOTSUPP;
+ }
+ 
+-static inline void policy_set_power_role(struct policy *p, int role)
++static inline int policy_set_power_role(struct policy *p, enum pwr_role role)
+ {
+ 	if (p && p->pe && p->pe->ops && p->pe->ops->set_power_role)
+-		p->pe->ops->set_power_role(p->pe, role);
++		return p->pe->ops->set_power_role(p->pe, role);
++
++	return -ENOTSUPP;
+ }
+ 
+ static inline int policy_set_charger_mode(struct policy *p,
+@@ -473,6 +471,15 @@ static inline int policy_get_min_current(struct policy *p,
+ 	return -ENOTSUPP;
+ }
+ 
++static inline int policy_is_pr_swap_support(struct policy *p,
++						enum pwr_role prole)
++{
++	if (p && p->pe && p->pe->ops && p->pe->ops->is_pr_swap_support)
++		return p->pe->ops->is_pr_swap_support(p->pe, prole);
++
++	return -ENOTSUPP;
++}
++
+ static inline int policy_send_packet(struct policy *p, void *data, int len,
+ 					u8 msg_type, enum pe_event evt)
+ {
+@@ -489,10 +496,11 @@ static inline void pe_notify_policy_status_changed(struct policy *p,
+ 		p->pe->ops->policy_status_changed(p->pe, type, status);
+ }
+ 
+-static inline enum cable_state policy_get_vbus_state(struct policy *p)
++static inline enum cable_state policy_get_cable_state(struct policy *p,
++							enum cable_type type)
+ {
+-	if (p && p->pe && p->pe->ops && p->pe->ops->get_vbus_state)
+-		return p->pe->ops->get_vbus_state(p->pe);
++	if (p && p->pe && p->pe->ops && p->pe->ops->get_cable_state)
++		return p->pe->ops->get_cable_state(p->pe, type);
+ 
+ 	return -ENOTSUPP;
+ }
+@@ -505,7 +513,7 @@ static inline int policy_set_pd_state(struct policy *p, bool state)
+ 	return -ENOTSUPP;
+ }
+ 
+-static inline bool policy_get_pd_state(struct policy *p)
++static inline int policy_get_pd_state(struct policy *p)
+ {
+ 	if (p && p->pe && p->pe->ops && p->pe->ops->get_pd_state)
+ 		return p->pe->ops->get_pd_state(p->pe);
+@@ -513,6 +521,14 @@ static inline bool policy_get_pd_state(struct policy *p)
+ 	return -ENOTSUPP;
+ }
+ 
++static inline int policy_switch_policy(struct policy *p, enum policy_type type)
++{
++	if (p && p->pe && p->pe->ops && p->pe->ops->switch_policy)
++		return p->pe->ops->switch_policy(p->pe, type);
++
++	return -ENOTSUPP;
++}
++
+ static inline int policy_set_dp_state(struct policy *p,
+ 					enum cable_state state,
+ 					enum typec_dp_cable_type type)
+@@ -564,6 +580,22 @@ static inline int pe_process_ctrl_msg(struct policy_engine *pe,
+ 	return -ENOTSUPP;
+ }
+ 
++static inline void policy_dpm_update_data_role(struct policy_engine *pe,
++				enum data_role drole)
++{
++	if (pe && pe->dpm && pe->dpm->interface &&
++		pe->dpm->interface->update_data_role)
++		pe->dpm->interface->update_data_role(pe->dpm, drole);
++}
++
++static inline void policy_dpm_update_power_role(struct policy_engine *pe,
++				enum pwr_role prole)
++{
++	if (pe && pe->dpm && pe->dpm->interface &&
++		pe->dpm->interface->update_power_role)
++		pe->dpm->interface->update_power_role(pe->dpm, prole);
++}
++
+ extern struct policy *sink_port_policy_init(struct policy_engine *pe);
+ struct policy *src_pe_init(struct policy_engine *pe);
+ struct policy *disp_pe_init(struct policy_engine *pe);
+diff --git a/drivers/usb/typec/pd/protocol.c b/drivers/usb/typec/pd/protocol.c
+index a246e5fa767e..db01147d1f8c 100644
+--- a/drivers/usb/typec/pd/protocol.c
++++ b/drivers/usb/typec/pd/protocol.c
+@@ -30,61 +30,33 @@
+ #include "message.h"
+ #include "protocol.h"
+ 
+-static LIST_HEAD(protocol_list);
+-static DEFINE_SPINLOCK(protocol_lock);
+-
+ struct prot_msg {
+ 	struct list_head node;
+ 	struct pd_packet pkt;
+ };
+ 
+-static int pd_extcon_ufp_ntf(struct notifier_block *nb,
+-				unsigned long event, void *param)
++static void pd_policy_update_data_role(struct pd_prot *prot,
++					enum data_role drole)
+ {
+-	struct pd_prot *prot =
+-		container_of(nb, struct pd_prot, ufp_nb);
+-	struct extcon_dev *edev = param;
+-	bool cable_state;
+-
+-	if (!edev)
+-		return NOTIFY_DONE;
++	if (drole == DATA_ROLE_NONE || drole == DATA_ROLE_UFP)
++		prot->data_role = PD_DATA_ROLE_UFP;
++	else if (drole == DATA_ROLE_DFP)
++		prot->data_role = PD_DATA_ROLE_DFP;
+ 
+-	prot->init_data_role = PD_DATA_ROLE_UFP;
+-	prot->new_data_role = PD_DATA_ROLE_UFP;
+-	prot->init_pwr_role = PD_POWER_ROLE_CONSUMER;
+-	prot->new_pwr_role = PD_POWER_ROLE_CONSUMER;
+-
+-	cable_state = extcon_get_cable_state(edev, CABLE_CONSUMER);
+-	if (cable_state)
+-		queue_work(system_nrt_wq, &prot->cable_event_work);
+-
+-	return NOTIFY_OK;
++	queue_work(system_nrt_wq, &prot->role_chng_work);
+ }
+ 
+-static int pd_extcon_dfp_ntf(struct notifier_block *nb,
+-				unsigned long event, void *param)
++static void pd_policy_update_power_role(struct pd_prot *prot,
++					enum pwr_role prole)
+ {
+-	struct pd_prot *prot =
+-		container_of(nb, struct pd_prot, dfp_nb);
+-	struct extcon_dev *edev = param;
+-	bool cable_state;
++	if (prole == POWER_ROLE_NONE || prole == POWER_ROLE_SINK)
++		prot->pwr_role = PD_POWER_ROLE_CONSUMER;
++	else if (prole == POWER_ROLE_SOURCE)
++		prot->pwr_role = PD_POWER_ROLE_CONSUMER;
+ 
+-	if (!edev)
+-		return NOTIFY_DONE;
+-
+-	prot->init_data_role = PD_DATA_ROLE_DFP;
+-	prot->new_data_role = PD_DATA_ROLE_DFP;
+-	prot->init_pwr_role = PD_POWER_ROLE_PROVIDER;
+-	prot->new_pwr_role = PD_POWER_ROLE_PROVIDER;
+-
+-	cable_state = extcon_get_cable_state(edev, CABLE_PROVIDER);
+-	if (cable_state)
+-		queue_work(system_nrt_wq, &prot->cable_event_work);
+-
+-	return NOTIFY_OK;
++	queue_work(system_nrt_wq, &prot->role_chng_work);
+ }
+ 
+-
+ static struct prot_msg *prot_alloc_msg(void)
+ {
+ 	struct prot_msg *msg;
+@@ -201,14 +173,14 @@ static int pd_prot_rcv_pkt_from_policy(struct pd_prot *prot, u8 msg_type,
+ 	pkt = &prot->tx_buf;
+ 	memset(pkt, 0, sizeof(struct pd_packet));
+ 	pkt->header.msg_type = msg_type;
+-	pkt->header.data_role = prot->new_data_role;
++	pkt->header.data_role = prot->data_role;
+ 	if (prot->pd_version == 2)
+ 		pkt->header.rev_id = 1;
+ 	else
+ 		pkt->header.rev_id = 0;
+ 
+-	if ((prot->new_pwr_role == PD_POWER_ROLE_PROVIDER)
+-		|| (prot->new_pwr_role == PD_POWER_ROLE_CONSUMER_PROVIDER))
++	if ((prot->pwr_role == PD_POWER_ROLE_PROVIDER)
++		|| (prot->pwr_role == PD_POWER_ROLE_CONSUMER_PROVIDER))
+ 		pkt->header.pwr_role = PD_PWR_ROLE_SRC;
+ 
+ 	pkt->header.msg_id = prot->tx_msg_id;
+@@ -452,12 +424,6 @@ phy_rcv_end:
+ 	mutex_unlock(&pd->rx_data_lock);
+ }
+ 
+-static int pd_handle_phy_ntf(struct notifier_block *nb,
+-			unsigned long event, void *data)
+-{
+-	return NOTIFY_OK;
+-}
+-
+ static void pd_notify_protocol(struct typec_phy *phy, unsigned long event)
+ {
+ 	struct pd_prot *pd = phy->proto;
+@@ -509,30 +475,21 @@ static void pd_notify_protocol(struct typec_phy *phy, unsigned long event)
+ 		break;
+ 	}
+ }
+-
+-static void prot_cable_worker(struct work_struct *work)
++static void prot_role_chnage_worker(struct work_struct *work)
+ {
+ 	struct pd_prot *prot =
+-		container_of(work, struct pd_prot, cable_event_work);
++		container_of(work, struct pd_prot, role_chng_work);
+ 
+-	pd_prot_setup_role(prot, prot->new_data_role, prot->new_pwr_role);
+-}
+-
+-static void *to_prot(struct typec_phy *phy)
+-{
+-	struct pd_prot *prot, *temp;
+-	list_for_each_entry_safe(prot, temp, &protocol_list, list) {
+-		if (prot->phy == phy)
+-			return prot;
+-	}
+-	return NULL;
++	pd_prot_setup_role(prot, prot->data_role, prot->pwr_role);
+ }
+ 
+ int protocol_bind_pe(struct policy_engine *pe)
+ {
+ 	struct typec_phy *phy = pe_get_phy(pe);
+-	struct pd_prot *prot = to_prot(phy);
+-
++	struct pd_prot *prot;
++	if (!phy)
++		return -ENODEV;
++	prot = phy->proto;
+ 	if (!prot)
+ 		return -ENODEV;
+ 	pe->prot = prot;
+@@ -543,20 +500,13 @@ EXPORT_SYMBOL_GPL(protocol_bind_pe);
+ 
+ void protocol_unbind_pe(struct policy_engine *pe)
+ {
+-	struct typec_phy *phy = pe_get_phy(pe);
+-	struct pd_prot *prot = to_prot(phy);
+-
+-	if (!prot)
+-		return;
+-
++	pe->prot->pe = NULL;
+ 	pe->prot = NULL;
+-	prot->pe = NULL;
+ }
+ EXPORT_SYMBOL_GPL(protocol_unbind_pe);
+ 
+ int protocol_bind_dpm(struct typec_phy *phy)
+ {
+-	int ret;
+ 	struct pd_prot *prot;
+ 
+ 	prot = devm_kzalloc(phy->dev, sizeof(struct pd_prot), GFP_KERNEL);
+@@ -571,43 +521,26 @@ int protocol_bind_dpm(struct typec_phy *phy)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Bind the phy to the protocol */
+ 	phy->proto = prot;
+ 	prot->phy->notify_protocol = pd_notify_protocol;
+-	prot->phy_nb.notifier_call = pd_handle_phy_ntf;
+-
+-	ret = typec_register_prot_notifier(phy, &prot->phy_nb);
+-	if (ret < 0) {
+-		dev_err(phy->dev, "%s: unable to register notifier", __func__);
+-		kfree(prot);
+-		return -EIO;
+-	}
+-
+-	INIT_LIST_HEAD(&prot->list);
+-
+ 	mutex_init(&prot->tx_lock);
+ 	mutex_init(&prot->tx_data_lock);
+ 	mutex_init(&prot->rx_data_lock);
+ 	init_completion(&prot->tx_complete);
+ 
+-	prot->init_data_role = PD_DATA_ROLE_UFP;
+-	prot->new_data_role = PD_DATA_ROLE_UFP;
+-	prot->init_pwr_role = PD_POWER_ROLE_CONSUMER;
+-	prot->new_pwr_role = PD_POWER_ROLE_CONSUMER;
++	prot->data_role = PD_DATA_ROLE_UFP;
++	prot->pwr_role = PD_POWER_ROLE_CONSUMER;
+ 
+ 	prot->rx_msg_id = -1; /* no message is stored */
+ 	pd_reset_counters(prot);
+ 	pd_tx_fsm_state(prot, PROT_TX_PHY_LAYER_RESET);
+-	INIT_WORK(&prot->cable_event_work, prot_cable_worker);
+-
+-	prot->ufp_nb.notifier_call = pd_extcon_ufp_ntf;
+-	extcon_register_interest(&prot->cable_ufp, "usb-typec",
+-					"USB_TYPEC_UFP", &prot->ufp_nb);
+-	prot->dfp_nb.notifier_call = pd_extcon_dfp_ntf;
+-	extcon_register_interest(&prot->cable_dfp, "usb-typec",
+-					"USB_TYPEC_DFP", &prot->dfp_nb);
++	INIT_WORK(&prot->role_chng_work, prot_role_chnage_worker);
+ 	prot->policy_fwd_pkt = pd_prot_rcv_pkt_from_policy;
+-	list_add_tail(&prot->list, &protocol_list);
++	prot->policy_update_data_role = pd_policy_update_data_role;
++	prot->policy_update_power_role = pd_policy_update_power_role;
+ 
++	/* Init Rx list and the worker to preocess rx msgs */
+ 	INIT_LIST_HEAD(&prot->rx_list);
+ 	INIT_WORK(&prot->proc_rx_msg, prot_process_rx_work);
+ 	mutex_init(&prot->rx_list_lock);
+@@ -616,33 +549,9 @@ int protocol_bind_dpm(struct typec_phy *phy)
+ }
+ EXPORT_SYMBOL_GPL(protocol_bind_dpm);
+ 
+-static void remove_protocol(struct pd_prot *prot)
+-{
+-	if (!prot)
+-		return;
+-
+-	extcon_unregister_interest(&prot->cable_dfp);
+-	extcon_unregister_interest(&prot->cable_ufp);
+-	typec_unregister_prot_notifier(prot->phy, &prot->phy_nb);
+-	kfree(prot);
+-}
+-
+ void protocol_unbind_dpm(struct typec_phy *phy)
+ {
+-	struct pd_prot *prot, *temp;
+-
+-	if (list_empty(&protocol_list))
+-		return;
+-
+-	spin_lock(&protocol_lock);
+-	list_for_each_entry_safe(prot, temp, &protocol_list, list) {
+-		if (prot->phy == phy) {
+-			list_del(&prot->list);
+-			remove_protocol(prot);
+-			break;
+-		}
+-	}
+-	spin_unlock(&protocol_lock);
++	struct pd_prot *prot = phy->proto;
+ 
+ 	/* Clear the rx list and reset phy */
+ 	pd_reset_counters(prot);
+@@ -650,6 +559,7 @@ void protocol_unbind_dpm(struct typec_phy *phy)
+ 	pd_prot_flush_fifo(prot, FIFO_TYPE_TX);
+ 	pd_prot_flush_fifo(prot, FIFO_TYPE_RX);
+ 	pd_prot_reset_phy(prot);
++	kfree(prot);
+ }
+ EXPORT_SYMBOL_GPL(protocol_unbind_dpm);
+ 
+diff --git a/drivers/usb/typec/pd/protocol.h b/drivers/usb/typec/pd/protocol.h
+index 67094410a2a8..48066894bc1e 100644
+--- a/drivers/usb/typec/pd/protocol.h
++++ b/drivers/usb/typec/pd/protocol.h
+@@ -33,12 +33,8 @@ struct pd_prot {
+ 	u32 retry_count;
+ 	u8 pd_version;
+ 
+-	u8 init_data_role;
+-	u8 new_data_role;
+-	u8 assumed_data_role;
+-	u8 init_pwr_role;
+-	u8 new_pwr_role;
+-	u8 assumed_pwr_role;
++	u8 data_role;
++	u8 pwr_role;
+ 	u8 event;
+ 	u8 tx_msg_id;
+ 	u8 retry_counter;
+@@ -54,21 +50,20 @@ struct pd_prot {
+ 	struct mutex tx_data_lock;
+ 	struct mutex tx_lock;
+ 
+-	struct list_head list;
+-	struct work_struct cable_event_work;
++	struct work_struct role_chng_work;
+ 
+ 	/* list and worker to process received messages */
+ 	struct list_head rx_list;
+ 	struct work_struct proc_rx_msg;
+ 	struct mutex rx_list_lock;
+ 
+-	struct extcon_specific_cable_nb cable_ufp;
+-	struct extcon_specific_cable_nb cable_dfp;
+-	struct notifier_block ufp_nb;
+-	struct notifier_block dfp_nb;
+-	struct notifier_block phy_nb;
+ 	int (*policy_fwd_pkt)(struct pd_prot *prot, u8 msg_type,
+ 					void *data, int len);
++
++	void (*policy_update_data_role)(struct pd_prot *prot,
++					enum data_role drole);
++	void (*policy_update_power_role)(struct pd_prot *prot,
++					enum pwr_role prole);
+ };
+ 
+ static inline int pd_prot_send_phy_packet(struct pd_prot *pd, void *buf,
+diff --git a/drivers/usb/typec/pd/sink_port_pe.c b/drivers/usb/typec/pd/sink_port_pe.c
+index 67b7285a8d56..29d4b0e90f87 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.c
++++ b/drivers/usb/typec/pd/sink_port_pe.c
+@@ -252,7 +252,8 @@ static int snkpe_start(struct sink_port_pe *sink)
+ 
+ 	/*---------- Start of Sink Port PE --------------*/
+ 	/* get the vbus state, in case of boot of vbus */
+-	vbus_state = policy_get_vbus_state(&sink->p);
++	vbus_state = policy_get_cable_state(&sink->p,
++				CABLE_TYPE_CONSUMER);
+ 	if (vbus_state < 0) {
+ 		pr_err("SNKPE: Error in getting vbus state!\n");
+ 		return ret;
+-- 
+1.9.1
+

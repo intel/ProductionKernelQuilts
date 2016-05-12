@@ -1,0 +1,394 @@
+From 849234e0257922b7807eb7bfc3d9555ad522a30c Mon Sep 17 00:00:00 2001
+Message-Id: <849234e0257922b7807eb7bfc3d9555ad522a30c.1417780177.git.chang-joon.lee@intel.com>
+In-Reply-To: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+References: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+From: Deepak M <m.deepak@intel.com>
+Date: Tue, 18 Nov 2014 02:55:40 +0530
+Subject: [PATCH 20/30] FOR_UPSTREAM [VPG]: drm/i915: Parsing LPF brightness
+ control from VBT
+
+LPF brighness control from the VBT indicates which
+controller is used for brightness.
+
+Issue: IRDA-2088
+Change-Id: Ib6594e7de9b0c7ad2ee490f4c3c934c176a420e1
+Signed-off-by: Deepak M <m.deepak@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h    |    3 +
+ drivers/gpu/drm/i915/intel_bios.c  |   16 ++++-
+ drivers/gpu/drm/i915/intel_bios.h  |    7 ++
+ drivers/gpu/drm/i915/intel_drv.h   |    5 ++
+ drivers/gpu/drm/i915/intel_dsi.h   |    6 ++
+ drivers/gpu/drm/i915/intel_panel.c |  139 +++++++++++++++++++++++++++++-------
+ 6 files changed, 150 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 54bb04b..a06f128 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1371,6 +1371,8 @@ struct intel_vbt_data {
+ 		u16 pwm_freq_hz;
+ 		bool present;
+ 		bool active_low_pwm;
++		u8 pin;
++		u8 controller;
+ 	} backlight;
+ 
+ 	/* MIPI DSI */
+@@ -1594,6 +1596,7 @@ struct drm_i915_private {
+ 	struct i915_drrs drrs;
+ 	struct intel_opregion opregion;
+ 	struct intel_vbt_data vbt;
++	u16 vbt_version;
+ 	bool scaling_reqd;
+ 
+ 	struct kobject memtrack_kobj;
+diff --git a/drivers/gpu/drm/i915/intel_bios.c b/drivers/gpu/drm/i915/intel_bios.c
+index 32c4677..493fb00 100644
+--- a/drivers/gpu/drm/i915/intel_bios.c
++++ b/drivers/gpu/drm/i915/intel_bios.c
+@@ -345,6 +345,7 @@ parse_lfp_backlight(struct drm_i915_private *dev_priv, struct bdb_header *bdb)
+ {
+ 	const struct bdb_lfp_backlight_data *backlight_data;
+ 	const struct bdb_lfp_backlight_data_entry *entry;
++	const struct bdb_lpf_backlight_brightness_data *brightness;
+ 
+ 	backlight_data = find_section(bdb, BDB_LVDS_BACKLIGHT);
+ 	if (!backlight_data)
+@@ -357,6 +358,7 @@ parse_lfp_backlight(struct drm_i915_private *dev_priv, struct bdb_header *bdb)
+ 	}
+ 
+ 	entry = &backlight_data->data[panel_type];
++	brightness = &backlight_data->brightness[panel_type];
+ 
+ 	dev_priv->vbt.backlight.present = entry->type == BDB_BACKLIGHT_TYPE_PWM;
+ 	if (!dev_priv->vbt.backlight.present) {
+@@ -367,6 +369,13 @@ parse_lfp_backlight(struct drm_i915_private *dev_priv, struct bdb_header *bdb)
+ 
+ 	dev_priv->vbt.backlight.pwm_freq_hz = entry->pwm_freq_hz;
+ 	dev_priv->vbt.backlight.active_low_pwm = entry->active_low_pwm;
++	if (dev_priv->vbt_version < 191)
++		dev_priv->vbt.backlight.controller = DISPLAY_DDI_BKL_CNTL;
++	else {
++		dev_priv->vbt.backlight.pin = brightness->pin;
++		dev_priv->vbt.backlight.controller = brightness->controller;
++	}
++
+ 	DRM_DEBUG_KMS("VBT backlight PWM modulation frequency %u Hz, "
+ 		      "active %s, min brightness %u, level %u\n",
+ 		      dev_priv->vbt.backlight.pwm_freq_hz,
+@@ -1298,6 +1307,7 @@ intel_parse_bios(struct drm_device *dev)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct pci_dev *pdev = dev->pdev;
+ 	struct bdb_header *bdb = NULL;
++	struct vbt_header *vbt;
+ 	u8 __iomem *bios = NULL;
+ 
+ 	if (HAS_PCH_NOP(dev))
+@@ -1306,10 +1316,14 @@ intel_parse_bios(struct drm_device *dev)
+ 	init_vbt_defaults(dev_priv);
+ 
+ 	/* XXX Should this validation be moved to intel_opregion.c? */
+-	if (!dmi_check_system(intel_no_opregion_vbt) && dev_priv->opregion.vbt)
++	if (!dmi_check_system(intel_no_opregion_vbt) &&
++					dev_priv->opregion.vbt) {
+ 		bdb = validate_vbt((char *)dev_priv->opregion.header, OPREGION_SIZE,
+ 				   (struct vbt_header *)dev_priv->opregion.vbt,
+ 				   "OpRegion");
++		vbt = (struct vbt_header *)dev_priv->opregion.vbt;
++		dev_priv->vbt_version = vbt->version;
++	}
+ 
+ 	if (bdb == NULL) {
+ 		size_t i, size;
+diff --git a/drivers/gpu/drm/i915/intel_bios.h b/drivers/gpu/drm/i915/intel_bios.h
+index bf4b539..ebe8d01 100644
+--- a/drivers/gpu/drm/i915/intel_bios.h
++++ b/drivers/gpu/drm/i915/intel_bios.h
+@@ -414,10 +414,17 @@ struct bdb_lfp_backlight_data_entry {
+ 	u8 obsolete3;
+ } __packed;
+ 
++
++struct bdb_lpf_backlight_brightness_data {
++	u8 controller:4;
++	u8 pin:4;
++} __packed;
++
+ struct bdb_lfp_backlight_data {
+ 	u8 entry_size;
+ 	struct bdb_lfp_backlight_data_entry data[16];
+ 	u8 level[16];
++	struct bdb_lpf_backlight_brightness_data brightness[16];
+ } __packed;
+ 
+ struct aimdb_header {
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 35aa295..e1029c8 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -113,6 +113,11 @@
+ #define INTEL_PLANE_STATE_ENABLED true
+ #define INTEL_PLANE_STATE_DISABLED false
+ 
++#define PMIC_BKL_CNTL		0
++#define LPSS_PWM_BKL_CNTL	1
++#define DISPLAY_DDI_BKL_CNTL	2
++#define CABC_BKL_CNTL		3
++
+ struct intel_framebuffer {
+ 	struct drm_framebuffer base;
+ 	struct drm_i915_gem_object *obj;
+diff --git a/drivers/gpu/drm/i915/intel_dsi.h b/drivers/gpu/drm/i915/intel_dsi.h
+index b512426..0748eaa 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.h
++++ b/drivers/gpu/drm/i915/intel_dsi.h
+@@ -390,6 +390,12 @@
+ #define MIPI_DUAL_LINK_FRONT_BACK	1
+ #define MIPI_DUAL_LINK_PIXEL_ALT	2
+ 
++#define VLV_GPIO_CFG			0x2000CC00
++#define VLV_GPIO_INPUT_DIS		0x04
++#define VLV_GPIO_INPUT_EN		0x05
++
++#define LPIO_PWM_ENABLE_MASK		0x80000000
++
+ struct intel_dsi_device {
+ 	unsigned int panel_id;
+ 	const char *name;
+diff --git a/drivers/gpu/drm/i915/intel_panel.c b/drivers/gpu/drm/i915/intel_panel.c
+index 80358c5..6f20a42 100644
+--- a/drivers/gpu/drm/i915/intel_panel.c
++++ b/drivers/gpu/drm/i915/intel_panel.c
+@@ -35,6 +35,7 @@
+ #include <linux/pwm.h>
+ #include "intel_drv.h"
+ #include "intel_dsi.h"
++#include "i915_drv.h"
+ 
+ void
+ intel_fixed_panel_mode(const struct drm_display_mode *fixed_mode,
+@@ -496,14 +497,6 @@ static u32 i9xx_get_backlight(struct intel_connector *connector)
+ 	return val;
+ }
+ 
+-static u32 _vlv_get_backlight(struct drm_device *dev, enum pipe pipe)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+-	return I915_READ(VLV_BLC_PWM_CTL(pipe)) &
+-			BACKLIGHT_DUTY_CYCLE_MASK;
+-}
+-
+ static u32 vlv_get_mipi_backlight(struct intel_connector *connector)
+ {
+ 	struct drm_device *dev = connector->base.dev;
+@@ -515,7 +508,19 @@ static u32 vlv_get_mipi_backlight(struct intel_connector *connector)
+ 		return intel_soc_pmic_readb(PMIC_PWM_LEVEL);
+ }
+ 
+-static u32 vlv_get_backlight(struct intel_connector *connector)
++static u32 _vlv_get_backlight(struct drm_device *dev, enum pipe pipe)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	return I915_READ(VLV_BLC_PWM_CTL(pipe)) &
++			BACKLIGHT_DUTY_CYCLE_MASK;
++}
++
++static u32 vlv_get_backlight_lpss_pwm(struct intel_connector *connector)
++{
++	return lpio_bl_read(0, LPIO_PWM_CTRL) & 0xff;
++}
++static u32 vlv_get_backlight_dis_ddi(struct intel_connector *connector)
+ {
+ 	struct drm_device *dev = connector->base.dev;
+ 	enum pipe pipe = intel_get_pipe_from_connector(connector);
+@@ -599,14 +604,23 @@ static void i9xx_set_backlight(struct intel_connector *connector, u32 level)
+ 	I915_WRITE(BLC_PWM_CTL, tmp | level);
+ }
+ 
+-static void vlv_set_backlight(struct intel_connector *connector, u32 level)
++static void vlv_set_backlight_lpss_pwm(struct intel_connector *connector,
++						u32 level)
++{
++	lpio_bl_write_bits(0, LPIO_PWM_CTRL, (0xff - level), 0xFF);
++	lpio_bl_update(0, LPIO_PWM_CTRL);
++
++}
++static void vlv_set_backlight_dis_ddi(struct intel_connector *connector,
++						u32 level)
+ {
+ 	struct drm_device *dev = connector->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	enum pipe pipe = intel_get_pipe_from_connector(connector);
+ 	u32 tmp;
+ 
+-	tmp = I915_READ(VLV_BLC_PWM_CTL(pipe)) & ~BACKLIGHT_DUTY_CYCLE_MASK;
++	tmp = I915_READ(VLV_BLC_PWM_CTL(pipe)) &
++		~BACKLIGHT_DUTY_CYCLE_MASK;
+ 	I915_WRITE(VLV_BLC_PWM_CTL(pipe), tmp | level);
+ }
+ 
+@@ -712,7 +726,23 @@ static void i965_disable_backlight(struct intel_connector *connector)
+ 	I915_WRITE(BLC_PWM_CTL2, tmp & ~BLM_PWM_ENABLE);
+ }
+ 
+-static void vlv_disable_backlight(struct intel_connector *connector)
++
++static void vlv_disable_backlight_lpss_pwm(struct intel_connector *connector)
++{
++	struct drm_device *dev = connector->base.dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	intel_panel_actually_set_backlight(connector, 0);
++	/* disable the backlight enable signal */
++	vlv_gpio_write(dev_priv, IOSF_PORT_GPIO_NC,
++			PANEL1_BKLTEN_GPIONC_10_PCONF0, VLV_GPIO_CFG);
++	vlv_gpio_write(dev_priv, IOSF_PORT_GPIO_NC,
++			PANEL1_BKLTEN_GPIONC_10_PAD, VLV_GPIO_INPUT_DIS);
++	udelay(500);
++	lpio_bl_write_bits(0, LPIO_PWM_CTRL, 0x00, LPIO_PWM_ENABLE_MASK);
++}
++
++static void vlv_disable_backlight_dis_ddi(struct intel_connector *connector)
+ {
+ 	struct drm_device *dev = connector->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -992,7 +1022,29 @@ static void i965_enable_backlight(struct intel_connector *connector)
+ 	intel_panel_actually_set_backlight(connector, panel->backlight.level);
+ }
+ 
+-static void vlv_enable_backlight(struct intel_connector *connector)
++
++static void vlv_enable_backlight_lpss_pwm(struct intel_connector *connector)
++{
++	struct drm_device *dev = connector->base.dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_panel *panel = &connector->panel;
++	uint32_t val;
++
++	panel->backlight.max = 0xFF;
++	val = vlv_get_backlight_lpss_pwm(connector);
++	panel->backlight.level =
++		intel_panel_compute_brightness(connector, val);
++	lpio_enable_backlight(dev);
++
++	/* Backlight enable */
++	vlv_gpio_write(dev_priv, IOSF_PORT_GPIO_NC,
++			PANEL1_BKLTEN_GPIONC_10_PCONF0, VLV_GPIO_CFG);
++	vlv_gpio_write(dev_priv, IOSF_PORT_GPIO_NC,
++			PANEL1_BKLTEN_GPIONC_10_PAD, VLV_GPIO_INPUT_EN);
++	panel->backlight.enabled = true;
++
++}
++static void vlv_enable_backlight_dis_ddi(struct intel_connector *connector)
+ {
+ 	struct drm_device *dev = connector->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1010,8 +1062,8 @@ static void vlv_enable_backlight(struct intel_connector *connector)
+ 	ctl = panel->backlight.max << 16;
+ 	I915_WRITE(VLV_BLC_PWM_CTL(pipe), ctl);
+ 
+-	/* XXX: combine this into above write? */
+-	intel_panel_actually_set_backlight(connector, panel->backlight.level);
++	intel_panel_actually_set_backlight(connector,
++			panel->backlight.level);
+ 
+ 	ctl2 = 0;
+ 	if (panel->backlight.active_low_pwm)
+@@ -1021,6 +1073,9 @@ static void vlv_enable_backlight(struct intel_connector *connector)
+ 	I915_WRITE(VLV_BLC_PWM_CTL2(pipe), ctl2 | BLM_PWM_ENABLE);
+ }
+ 
++
++
++
+ static void vlv_enable_mipi_backlight(struct intel_connector *connector)
+ {
+ 	struct intel_panel *panel = &connector->panel;
+@@ -1290,7 +1345,22 @@ static int i965_setup_backlight(struct intel_connector *connector)
+ 	return 0;
+ }
+ 
+-static int vlv_setup_backlight(struct intel_connector *connector)
++static int vlv_setup_backlight_lpss_pwm(struct intel_connector *connector)
++{
++	struct intel_panel *panel = &connector->panel;
++	u32 val;
++
++	panel->backlight.max = 0xFF;
++	val = vlv_get_backlight_lpss_pwm(connector);
++	panel->backlight.level =
++		intel_panel_compute_brightness(connector, val);
++	panel->backlight.enabled =
++		lpio_bl_read(0, LPIO_PWM_CTRL) & LPIO_PWM_ENABLE_MASK;
++
++	return 0;
++}
++
++static int vlv_setup_backlight_dis_ddi(struct intel_connector *connector)
+ {
+ 	struct drm_device *dev = connector->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1313,7 +1383,7 @@ static int vlv_setup_backlight(struct intel_connector *connector)
+ 
+ 		cur_val &= BACKLIGHT_DUTY_CYCLE_MASK;
+ 		I915_WRITE(VLV_BLC_PWM_CTL(pipe), (0xf42 << 16) |
+-			   cur_val);
++				cur_val);
+ 	}
+ 
+ 	pipe = vlv_power_sequencer_pipe(intel_dp);
+@@ -1327,7 +1397,8 @@ static int vlv_setup_backlight(struct intel_connector *connector)
+ 		return -ENODEV;
+ 
+ 	val = _vlv_get_backlight(dev, pipe);
+-	panel->backlight.level = intel_panel_compute_brightness(connector, val);
++	panel->backlight.level =
++		intel_panel_compute_brightness(connector, val);
+ 
+ 	panel->backlight.enabled = (ctl2 & BLM_PWM_ENABLE) &&
+ 		panel->backlight.level != 0;
+@@ -1439,13 +1510,31 @@ void intel_panel_init_backlight_funcs(struct drm_device *dev)
+ 			dev_priv->display.get_backlight =
+ 						vlv_get_mipi_backlight;
+ 		} else {
+-			dev_priv->display.setup_backlight = vlv_setup_backlight;
+-			dev_priv->display.enable_backlight =
+-						vlv_enable_backlight;
+-			dev_priv->display.disable_backlight =
+-						vlv_disable_backlight;
+-			dev_priv->display.set_backlight = vlv_set_backlight;
+-			dev_priv->display.get_backlight = vlv_get_backlight;
++			if (dev_priv->vbt.backlight.controller ==
++					DISPLAY_DDI_BKL_CNTL) {
++				dev_priv->display.setup_backlight =
++					vlv_setup_backlight_dis_ddi;
++				dev_priv->display.enable_backlight =
++					vlv_enable_backlight_dis_ddi;
++				dev_priv->display.disable_backlight =
++					vlv_disable_backlight_dis_ddi;
++				dev_priv->display.set_backlight =
++					vlv_set_backlight_dis_ddi;
++				dev_priv->display.get_backlight =
++					vlv_get_backlight_dis_ddi;
++			} else if (dev_priv->vbt.backlight.controller ==
++					LPSS_PWM_BKL_CNTL) {
++				dev_priv->display.setup_backlight =
++					vlv_setup_backlight_lpss_pwm;
++				dev_priv->display.enable_backlight =
++					vlv_enable_backlight_lpss_pwm;
++				dev_priv->display.disable_backlight =
++					vlv_disable_backlight_lpss_pwm;
++				dev_priv->display.set_backlight =
++					vlv_set_backlight_lpss_pwm;
++				dev_priv->display.get_backlight =
++					vlv_get_backlight_lpss_pwm;
++			}
+ 		}
+ 	} else if (IS_GEN4(dev)) {
+ 		dev_priv->display.setup_backlight = i965_setup_backlight;
+-- 
+1.7.9.5
+

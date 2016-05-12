@@ -1,0 +1,475 @@
+From 91857b8adf9144be90b5a4e18694cab4e3f58bb9 Mon Sep 17 00:00:00 2001
+Message-Id: <91857b8adf9144be90b5a4e18694cab4e3f58bb9.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Ramalingam C <ramalingam.c@intel.com>
+Date: Mon, 29 Sep 2014 20:39:53 +0530
+Subject: [PATCH 43/75] MUST_REBASE [VPG]: adf/intel/core: Implementation of
+ backlight support for ADF
+
+Implemented the backlight operations with respect to the dsi_pipe
+and the backlight stack
+
+v2: Move backlight routines to generic intel_gen_backlight.c
+  - Can be used either by eDP of DSI
+  - Today its only DSI, generalization will happen when we enable eDP
+
+v3: Correct the backlight class device pathname. The lights HAL layer in
+    android access - /sys/class/backlight/intel_backlight
+
+v4: Converted pr_err to pr_debug
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I0fe63dc8c327a1d1c91accd3652244e2f933fa9e
+Signed-off-by: Ramalingam C <ramalingam.c@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ drivers/video/adf/intel/core/common/Makefile       |    1 +
+ .../video/adf/intel/core/common/backlight_dev.c    |    5 +
+ .../video/adf/intel/core/common/dsi/dsi_pipe_ops.c |    8 +
+ .../video/adf/intel/core/common/dsi/gen_dsi_pipe.c |   28 ++-
+ .../adf/intel/core/common/intel_gen_backlight.c    |  183 ++++++++++++++++++++
+ .../adf/intel/include/core/common/backlight_dev.h  |    3 +
+ .../adf/intel/include/core/common/dsi/dsi_pipe.h   |    2 +
+ .../include/core/common/intel_gen_backlight.h      |   24 +++
+ .../video/adf/intel/include/core/intel_dc_config.h |    3 +
+ drivers/video/adf/intel/intel_adf.c                |   12 +-
+ 10 files changed, 255 insertions(+), 14 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/common/intel_gen_backlight.c
+ create mode 100644 drivers/video/adf/intel/include/core/common/intel_gen_backlight.h
+
+diff --git a/drivers/video/adf/intel/core/common/Makefile b/drivers/video/adf/intel/core/common/Makefile
+index 8884604..8ac8402 100644
+--- a/drivers/video/adf/intel/core/common/Makefile
++++ b/drivers/video/adf/intel/core/common/Makefile
+@@ -2,3 +2,4 @@
+ ccflags-y := -Idrivers/staging/ -Iinclude/adf -Iinclude/uapi/adf -Idrivers/video/adf/intel/include -Werror
+ 
+ obj-$(CONFIG_ADF_INTEL) += backlight_dev.o
++obj-$(CONFIG_ADF_INTEL) += intel_gen_backlight.o
+diff --git a/drivers/video/adf/intel/core/common/backlight_dev.c b/drivers/video/adf/intel/core/common/backlight_dev.c
+index 86c22ac..e4e44cde 100644
+--- a/drivers/video/adf/intel/core/common/backlight_dev.c
++++ b/drivers/video/adf/intel/core/common/backlight_dev.c
+@@ -98,9 +98,14 @@ int backlight_init(struct intel_adf_context *adf_ctx)
+ 	props.max_brightness = BRIGHTNESS_MAX_LEVEL;
+ 	props.type = BACKLIGHT_RAW;
+ 
++#ifdef CONFIG_ADF_INTEL_VLV
++	adf_ctx->bl_dev = backlight_device_register("intel_backlight",
++			NULL, (void *)adf_ctx, &bl_ops, &props);
++#else
+ 	/* Use the legacy backlight device name 'psb-bl'... */
+ 	adf_ctx->bl_dev = backlight_device_register("psb-bl",
+ 			NULL, (void *)adf_ctx, &bl_ops, &props);
++#endif
+ 	if (IS_ERR(adf_ctx->bl_dev))
+ 		return PTR_ERR(adf_ctx->bl_dev);
+ 
+diff --git a/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c b/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c
+index 5db9ea0..fbc32dc 100644
+--- a/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c
++++ b/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c
+@@ -29,6 +29,9 @@
+ #include <core/common/dsi/dsi_config.h>
+ #include <core/vlv/vlv_dc_regs.h>
+ #include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_dc_gpio.h>
++#include <core/common/intel_gen_backlight.h>
++#include <linux/mfd/intel_soc_pmic.h>
+ #include "intel_dsi.h"
+ #include "intel_dsi_cmd.h"
+ 
+@@ -405,6 +408,9 @@ int intel_dsi_pre_enable(struct dsi_pipe *dsi_pipe)
+ 	 * recommendation, port should be enabled befor plane & pipe */
+ 	intel_dsi_enable(dsi_pipe);
+ 
++	/* Enabling the backlight */
++	intel_enable_backlight(&dsi_pipe->base);
++
+ 	return 0;
+ }
+ 
+@@ -414,6 +420,8 @@ void intel_dsi_pre_disable(struct dsi_pipe *dsi_pipe)
+ 
+ 	pr_debug("ADF: %s\n", __func__);
+ 
++	intel_disable_backlight(&dsi_pipe->base);
++
+ 	if (is_vid_mode(config)) {
+ 		/* Send Shutdown command to the panel in LP mode */
+ 		dpi_send_cmd(dsi_pipe, SHUTDOWN, DPI_LP_MODE_EN);
+diff --git a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+index c1be910..642d4db 100644
+--- a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
++++ b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+@@ -1,8 +1,8 @@
+ /*
+- * ann_dsi_pipe.c
++ * gen_dsi_pipe.c
+  *
+- *  Created on: May 23, 2014
+- *      Author: root
++ *  Created on: September 1, 2014
++ *      Author: Shobhit Kumar <shobhit.kumar@intel.com>
+  */
+ 
+ #include <drm/drm_mode.h>
+@@ -14,6 +14,7 @@
+ #include <core/vlv/vlv_dc_config.h>
+ #include <core/common/dsi/dsi_pipe.h>
+ #include <core/common/dsi/dsi_config.h>
++#include <core/common/intel_gen_backlight.h>
+ #include <core/vlv/vlv_dc_config.h>
+ #include <intel_adf_device.h>
+ #include "dsi_vbt.h"
+@@ -43,24 +44,32 @@ static int dsi_set_brightness(struct intel_pipe *pipe, int level)
+ 	struct dsi_panel *panel = NULL;
+ 	struct dsi_config *config = NULL;
+ 	struct dsi_context *ctx = NULL;
++	struct dsi_vbt *vbt;
+ 	int err = 0;
+ 
++	vbt = dsi_pipe->config.dsi;
++
+ 	if (!dsi_pipe) {
+ 		pr_err("%s: invalid DSI interface", __func__);
+ 		return -EINVAL;
+ 	}
+ 
++	config = &dsi_pipe->config;
++	ctx = &config->ctx;
++
++	mutex_lock(&config->ctx_lock);
++	level = (level * 0xFF / BRIGHTNESS_MAX_LEVEL);
++
++	if (dsi_pipe->ops.set_brightness)
++		dsi_pipe->ops.set_brightness(level);
++
+ 	panel = dsi_pipe->panel;
+ 	if (!panel || !panel->ops || !panel->ops->set_brightness) {
+ 		pr_err("%s: invalid panel\n", __func__);
++		mutex_unlock(&config->ctx_lock);
+ 		return -EINVAL;
+ 	}
+ 
+-	config = &dsi_pipe->config;
+-	ctx = &config->ctx;
+-
+-	mutex_lock(&config->ctx_lock);
+-
+ 	ctx->backlight_level = level;
+ 	err = panel->ops->set_brightness(dsi_pipe, level);
+ 
+@@ -472,6 +481,9 @@ int dsi_pipe_init(struct dsi_pipe *pipe, struct device *dev,
+ 
+ 	pipe->config.pixel_multiplier = 1;
+ 
++	/* initialize the backlight ops */
++	intel_backlight_init(&pipe->base);
++
+ 	return 0;
+ err:
+ 	dsi_pipe_destroy(pipe);
+diff --git a/drivers/video/adf/intel/core/common/intel_gen_backlight.c b/drivers/video/adf/intel/core/common/intel_gen_backlight.c
+new file mode 100644
+index 0000000..0548c37
+--- /dev/null
++++ b/drivers/video/adf/intel/core/common/intel_gen_backlight.c
+@@ -0,0 +1,183 @@
++/*
++ * Copyright © 2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#include <drm/i915_drm.h>
++#include <intel_adf_device.h>
++#include <core/common/dsi/dsi_pipe.h>
++#include <core/common/dsi/dsi_config.h>
++#include <core/vlv/vlv_dc_regs.h>
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_dc_gpio.h>
++#include <core/common/dsi/dsi_pipe.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/pwm.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/delay.h>
++#include <core/common/backlight_dev.h>
++#include "dsi/dsi_vbt.h"
++
++#define PMIC_PWM_LEVEL 0x4E
++
++static void lpio_set_backlight(u32 level)
++{
++	pr_debug("%s setting backlight level = %d\n", __func__, level);
++
++	/* FixMe: if level is zero still a pulse is observed consuming
++	power. To fix this issue if requested level is zero then
++	disable pwm and enabled it again if brightness changes */
++	lpio_bl_write_bits(0, LPIO_PWM_CTRL, (0xff - level), 0xFF);
++	lpio_bl_update(0, LPIO_PWM_CTRL);
++}
++
++static inline u32 lpio_get_backlight(void)
++{
++	return lpio_bl_read(0, LPIO_PWM_CTRL) & 0xff;
++}
++
++static inline u32 pmic_get_backlight(void)
++{
++	return intel_soc_pmic_readb(PMIC_PWM_LEVEL);
++}
++
++static inline void pmic_set_backlight(u32 level)
++{
++	pr_debug("%s setting backlight level = %d\n", __func__, level);
++	intel_soc_pmic_writeb(PMIC_PWM_LEVEL, level);
++}
++
++void intel_backlight_init(struct intel_pipe *pipe)
++{
++	struct dsi_pipe *dsi = to_dsi_pipe(pipe);
++	struct dsi_vbt *vbt = dsi->config.dsi;
++
++	pr_debug("%s: Backlight initialized for pipe = %s\n", __func__,
++			pipe->type == INTEL_PIPE_DSI ? "DSI" : "UNSUPPORTED");
++
++	if (vbt->config->pwm_blc) {
++		dsi->ops.set_brightness = lpio_set_backlight;
++		dsi->ops.get_brightness = lpio_get_backlight;
++	} else {
++		dsi->ops.set_brightness = pmic_set_backlight;
++		dsi->ops.get_brightness = pmic_get_backlight;
++	}
++
++	dsi->config.ctx.backlight_level = BRIGHTNESS_INIT_LEVEL *
++						0xFF / BRIGHTNESS_MAX_LEVEL;
++}
++
++static uint32_t compute_pwm_base(uint16_t freq)
++{
++	uint32_t base_unit;
++
++	if (freq < 400)
++		freq = 400;
++	/*The PWM block is clocked by the 25MHz oscillator clock.
++	* The output frequency can be estimated with the equation:
++	* Target frequency = XOSC * Base_unit_value/256
++	*/
++	base_unit = (freq * 256) / 25;
++
++	/* Also Base_unit_value need to converted to QM.N notation
++	* to program the value in register
++	* Using the following for converting to Q8.8 notation
++	* For QM.N representation, consider a floating point variable 'a' :
++	* Step 1: Calculate b = a* 2^N , where N is the fractional length
++	* of the variable.
++	* Note that a is represented in decimal.
++	* Step 2: Round the value of 'b' to the nearest integer value.
++	* For example:
++	* RoundOff (1.05) --> 1
++	* RoundOff (1.5)  --> 2
++	* Step 3: Convert 'b' from decimal to binary representation and name
++	* the new variable 'c'
++	*/
++	base_unit = base_unit * 256;
++	base_unit = DIV_ROUND_CLOSEST(base_unit, 1000000);
++
++	return base_unit;
++}
++
++void lpio_enable_backlight(void)
++{
++	uint32_t pwm_base, pwm_freq;
++
++	vlv_gps_core_read(0x40A0);
++	vlv_gps_core_write(0x40A0, 0x2000CC01);
++	vlv_gps_core_write(0x40A8, 0x5);
++
++	/* PWM enable
++	* Assuming only 1 LFP
++	*/
++	pwm_freq = intel_adf_get_pwm_vbt_data();
++	pwm_base = compute_pwm_base(pwm_freq);
++	pwm_base = pwm_base << 8;
++	lpio_bl_write(0, LPIO_PWM_CTRL, pwm_base);
++	lpio_bl_update(0, LPIO_PWM_CTRL);
++	lpio_bl_write_bits(0, LPIO_PWM_CTRL, 0x80000000, 0x80000000);
++	lpio_bl_update(0, LPIO_PWM_CTRL);
++}
++
++void intel_enable_backlight(struct intel_pipe *pipe)
++{
++	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
++	struct dsi_vbt *vbt;
++	u32 level = dsi_pipe->config.ctx.backlight_level;
++
++	vbt = dsi_pipe->config.dsi;
++
++	pr_debug("%s\n", __func__);
++
++	if (vbt->config->pwm_blc)
++		lpio_enable_backlight();
++
++	if (dsi_pipe->panel->ops->enable_backlight)
++		dsi_pipe->panel->ops->enable_backlight(dsi_pipe);
++
++	/* set the last backlight level */
++	dsi_pipe->ops.set_brightness(level);
++}
++
++static inline void lpio_disable_backlight(void)
++{
++	lpio_bl_write_bits(0, LPIO_PWM_CTRL, 0x00, 0x80000000);
++}
++
++void intel_disable_backlight(struct intel_pipe *pipe)
++{
++	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
++	struct dsi_vbt *vbt;
++
++	pr_debug("%s\n", __func__);
++
++	vbt = dsi_pipe->config.dsi;
++
++	/* set the backlight to 0 first */
++	dsi_pipe->ops.set_brightness(0);
++
++	if (dsi_pipe->panel->ops->disable_backlight)
++		dsi_pipe->panel->ops->disable_backlight(dsi_pipe);
++
++	if (vbt->config->pwm_blc)
++		lpio_disable_backlight();
++}
+diff --git a/drivers/video/adf/intel/include/core/common/backlight_dev.h b/drivers/video/adf/intel/include/core/common/backlight_dev.h
+index d43ffbb..25c2c7b 100644
+--- a/drivers/video/adf/intel/include/core/common/backlight_dev.h
++++ b/drivers/video/adf/intel/include/core/common/backlight_dev.h
+@@ -16,6 +16,7 @@
+ #define BACKLIGHT_DEV_H_
+ 
+ #include <linux/backlight.h>
++#include <core/intel_dc_config.h>
+ 
+ #define BRIGHTNESS_MIN_LEVEL 1
+ #define BRIGHTNESS_INIT_LEVEL 50
+@@ -26,4 +27,6 @@ struct intel_adf_context;
+ int backlight_init(struct intel_adf_context *adf_ctx);
+ extern void backlight_exit(struct backlight_device *bl_dev);
+ 
++extern void intel_adf_disable_backlight(struct intel_pipe *pipe);
++extern void intel_adf_enable_backlight(struct intel_pipe *pipe);
+ #endif /* BACKLIGHT_DEV_H_ */
+diff --git a/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h b/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
+index 4609523..fa08bfb 100644
+--- a/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
++++ b/drivers/video/adf/intel/include/core/common/dsi/dsi_pipe.h
+@@ -55,6 +55,8 @@ struct dsi_pipe_ops {
+ 	int (*set_event)(struct dsi_pipe *pipe, u8 event, bool enabled);
+ 	void (*get_events)(struct dsi_pipe *pipe, u32 *events);
+ 	void (*handle_events)(struct dsi_pipe *pipe, u32 events);
++	void (*set_brightness)(u32 level);
++	u32 (*get_brightness)(void);
+ };
+ 
+ struct dsi_pipe {
+diff --git a/drivers/video/adf/intel/include/core/common/intel_gen_backlight.h b/drivers/video/adf/intel/include/core/common/intel_gen_backlight.h
+new file mode 100644
+index 0000000..bae30dd
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/common/intel_gen_backlight.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _INTEL_GEN_BACKLIGHT_H_
++#define _INTEL_GEN_BACKLIGHT_H_
++
++#include <core/intel_dc_config.h>
++
++extern int intel_backlight_init(struct intel_pipe *pipe);
++extern void intel_disable_backlight(struct intel_pipe *pipe);
++extern void intel_enable_backlight(struct intel_pipe *pipe);
++
++#endif /* _INTEL_GEN_BACKLIGHT_H_ */
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 3c0514a..8ecc85a 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -268,6 +268,9 @@ struct intel_pipe_ops {
+ 
+ #ifdef CONFIG_BACKLIGHT_CLASS_DEVICE
+ 	int (*set_brightness)(struct intel_pipe *pipe, int level);
++	int (*get_brightness)(struct intel_pipe *pipe);
++	void (*enable_backlight)(struct intel_pipe *pipe);
++	void (*disable_backlight)(struct intel_pipe *pipe);
+ #endif
+ };
+ 
+diff --git a/drivers/video/adf/intel/intel_adf.c b/drivers/video/adf/intel/intel_adf.c
+index ef8a6d5..2b8de73 100644
+--- a/drivers/video/adf/intel/intel_adf.c
++++ b/drivers/video/adf/intel/intel_adf.c
+@@ -237,6 +237,12 @@ struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev)
+ 		goto err;
+ 	}
+ 
++#ifdef CONFIG_BACKLIGHT_CLASS_DEVICE
++	err = backlight_init(ctx);
++	if (err)
++		goto err;
++#endif
++
+ 	/*create ADF device*/
+ 	dev = intel_adf_device_create(pdev, config->memory);
+ 	if (IS_ERR(dev)) {
+@@ -299,12 +305,6 @@ struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev)
+ 	}
+ #endif
+ 
+-#ifdef CONFIG_BACKLIGHT_CLASS_DEVICE
+-	err = backlight_init(ctx);
+-	if (err)
+-		goto err;
+-#endif
+-
+ 	return ctx;
+ err:
+ 	intel_adf_context_destroy(ctx);
+-- 
+1.7.9.5
+

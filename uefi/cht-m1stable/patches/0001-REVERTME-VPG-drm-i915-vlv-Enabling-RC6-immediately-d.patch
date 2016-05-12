@@ -1,0 +1,130 @@
+From 55165e324aa18c65d2b754de3f9d891b8a8477e9 Mon Sep 17 00:00:00 2001
+Message-Id: <55165e324aa18c65d2b754de3f9d891b8a8477e9.1421390813.git.chang-joon.lee@intel.com>
+From: Sagar Kamble <sagar.a.kamble@intel.com>
+Date: Thu, 13 Nov 2014 14:12:43 +0530
+Subject: [PATCH 1/6] REVERTME [VPG]: drm/i915/vlv: Enabling RC6 immediately
+ during init/resume
+
+Previously RC6 was getting enabled through deferred work item which was scheduled
+after 1s. This will keep render and media well ON for 1s. Since RC6 enabling does
+not involve PCU communication, processing time in intel_enable_gt_powersave will
+not be increased. Enabling RC6 immediately will help power gate render and media
+well immediately that will save power.
+This is helping meet power requirements for Active Idle KPI - AREQ-2568.
+
+Patch is marked as REVERTME, as we intend to replace this VLV specific solution
+with a platform agnostic implementation from upstream.
+
+v2:
+1. gen6_gt_force_wake_get/put is not needed around RC6 enabling since RC6 is
+already disabled and device in D0. (Sagar)
+2. Due to call to VLV specific RC6 enabling function, CHT reboot was happening.
+Fix the reboot issue on CHT, restricted the RC6 enabling to VLV only. (Akash)
+
+v3: Removing irrelevant comment from valleyview_enable_rps. (Jon)
+
+v4: Taking rps mutex lock while enabling RC6. (Sagar)
+
+For: GMINL-2847
+Change-Id: I2872bb45bd76cf0d8cade3737a1b44e6bf9dab86
+Signed-off-by: Sagar Kamble <sagar.a.kamble@intel.com>
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+---
+ drivers/gpu/drm/i915/intel_pm.c |   57 +++++++++++++++++++++++++--------------
+ 1 file changed, 37 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index f7f4363..7fb5673 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4707,11 +4707,11 @@ static void cherryview_enable_rps(struct drm_device *dev)
+ 	gen6_gt_force_wake_put(dev_priv, FORCEWAKE_ALL);
+ }
+ 
+-static void valleyview_enable_rps(struct drm_device *dev)
++static void valleyview_enable_rc6(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_engine_cs *ring;
+-	u32 gtfifodbg, val, rc6_mode = 0, pcbr;
++	u32 gtfifodbg, rc6_mode = 0, pcbr;
+ 	int i;
+ 
+ 	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
+@@ -4724,24 +4724,6 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 		I915_WRITE(GTFIFODBG, gtfifodbg);
+ 	}
+ 
+-	/* If VLV, Forcewake all wells, else re-direct to regular path */
+-	gen6_gt_force_wake_get(dev_priv, FORCEWAKE_ALL);
+-
+-	I915_WRITE(GEN6_RP_UP_THRESHOLD, 59400);
+-	I915_WRITE(GEN6_RP_DOWN_THRESHOLD, 245000);
+-	I915_WRITE(GEN6_RP_UP_EI, 66000);
+-	I915_WRITE(GEN6_RP_DOWN_EI, 350000);
+-
+-	I915_WRITE(GEN6_RP_IDLE_HYSTERSIS, 10);
+-	I915_WRITE(GEN6_RP_DOWN_TIMEOUT, 0xf4240);
+-
+-	dev_priv->rps.rps_mask = GEN6_RP_MEDIA_TURBO |
+-				   GEN6_RP_MEDIA_HW_NORMAL_MODE |
+-				   GEN6_RP_MEDIA_IS_GFX |
+-				   GEN6_RP_ENABLE |
+-				   GEN6_RP_UP_BUSY_AVG |
+-				   GEN6_RP_DOWN_IDLE_CONT;
+-
+ 	I915_WRITE(GEN6_RC6_WAKE_RATE_LIMIT, 0x00280000);
+ 	I915_WRITE(GEN6_RC_EVALUATION_INTERVAL, 125000);
+ 	I915_WRITE(GEN6_RC_IDLE_HYSTERSIS, 25);
+@@ -4766,6 +4748,31 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 		vlv_set_rc6_mode(dev, false);
+ 
+ 	intel_print_rc6_info(dev, rc6_mode);
++}
++
++static void valleyview_enable_rps(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u32 val;
++
++	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
++
++	gen6_gt_force_wake_get(dev_priv, FORCEWAKE_ALL);
++
++	I915_WRITE(GEN6_RP_UP_THRESHOLD, 59400);
++	I915_WRITE(GEN6_RP_DOWN_THRESHOLD, 245000);
++	I915_WRITE(GEN6_RP_UP_EI, 66000);
++	I915_WRITE(GEN6_RP_DOWN_EI, 350000);
++
++	I915_WRITE(GEN6_RP_IDLE_HYSTERSIS, 10);
++	I915_WRITE(GEN6_RP_DOWN_TIMEOUT, 0xf4240);
++
++	dev_priv->rps.rps_mask = GEN6_RP_MEDIA_TURBO |
++				   GEN6_RP_MEDIA_HW_NORMAL_MODE |
++				   GEN6_RP_MEDIA_IS_GFX |
++				   GEN6_RP_ENABLE |
++				   GEN6_RP_UP_BUSY_AVG |
++				   GEN6_RP_DOWN_IDLE_CONT;
+ 
+ 	val = vlv_punit_read(dev_priv, PUNIT_REG_GPU_FREQ_STS);
+ 
+@@ -5641,6 +5648,16 @@ void intel_enable_gt_powersave(struct drm_device *dev)
+ 		}
+ 
+ 		/*
++		 * Enabling RC6 for VLV here itself and only deferring turbo
++		 * enabling.
++		 */
++		if (IS_VALLEYVIEW(dev) && !IS_CHERRYVIEW(dev)) {
++			mutex_lock(&dev_priv->rps.hw_lock);
++			valleyview_enable_rc6(dev);
++			mutex_unlock(&dev_priv->rps.hw_lock);
++		}
++
++		/*
+ 		 * PCU communication is slow and this doesn't need to be
+ 		 * done at any specific time, so do this out of our fast path
+ 		 * to make resume and init faster.
+-- 
+1.7.9.5
+

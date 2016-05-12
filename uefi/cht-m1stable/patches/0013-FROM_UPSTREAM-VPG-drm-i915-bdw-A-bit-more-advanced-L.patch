@@ -1,0 +1,171 @@
+From 9f7cb058e9a3e7132a4f867876043c2cbcbecfe0 Mon Sep 17 00:00:00 2001
+Message-Id: <9f7cb058e9a3e7132a4f867876043c2cbcbecfe0.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 24 Jul 2014 17:04:14 +0100
+Subject: [PATCH 13/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: A bit more advanced
+ LR context alloc/free
+
+Now that we have the ability to allocate our own context backing objects
+and we have multiplexed one of them per engine inside the context structs,
+we can finally allocate and free them correctly.
+
+Regarding the context size, reading the register to calculate the sizes
+can work, I think, however the docs are very clear about the actual
+context sizes on GEN8, so just hardcode that and use it.
+
+v2: Rebased on top of the Full PPGTT series. It is important to notice
+that at this point we have one global default context per engine, all
+of them using the aliasing PPGTT (as opposed to the single global
+default context we have with legacy HW contexts).
+
+v3:
+- Go back to one single global default context, this time with multiple
+  backing objects inside.
+- Use different context sizes for non-render engines, as suggested by
+  Damien (still hardcoded, since the information about the context size
+  registers in the BSpec is, well, *lacking*).
+- Render ctx size is 20 (or 19) pages, but not 21 (caught by Damien).
+- Move default context backing object creation to intel_init_ring (so
+  that we don't waste memory in rings that might not get initialized).
+
+v4:
+- Reuse the HW legacy context init/fini.
+- Create a separate free function.
+- Rename the functions with an intel_ preffix.
+
+v5: Several rebases to account for the changes in the previous patches.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net> (v1)
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 8c8579176a144b1dca1d99ebb92510924168d508)
+
+Change-Id: Ic1a48fb1a0cdd154a943dcb0fe2baee26a6a00f7
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 8c8579176a144b1dca1d99ebb92510924168d508
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    2 ++
+ drivers/gpu/drm/i915/i915_gem_context.c |    2 +-
+ drivers/gpu/drm/i915/intel_lrc.c        |   59 +++++++++++++++++++++++++++++--
+ 3 files changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index fc7342b..54d1550 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2652,6 +2652,8 @@ int i915_switch_context(struct intel_engine_cs *ring,
+ struct intel_context *
+ i915_gem_context_get(struct drm_i915_file_private *file_priv, u32 id);
+ void i915_gem_context_free(struct kref *ctx_ref);
++struct drm_i915_gem_object *
++i915_gem_alloc_context_obj(struct drm_device *dev, size_t size);
+ static inline void i915_gem_context_reference(struct intel_context *ctx)
+ {
+ 	kref_get(&ctx->ref);
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index c73d6c2..69b5eab 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -201,7 +201,7 @@ void i915_gem_context_free(struct kref *ctx_ref)
+ 	kfree(ctx);
+ }
+ 
+-static struct drm_i915_gem_object *
++struct drm_i915_gem_object *
+ i915_gem_alloc_context_obj(struct drm_device *dev, size_t size)
+ {
+ 	struct drm_i915_gem_object *obj;
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 09ffb9c..d036a48 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -41,6 +41,11 @@
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+ 
++#define GEN8_LR_CONTEXT_RENDER_SIZE (20 * PAGE_SIZE)
++#define GEN8_LR_CONTEXT_OTHER_SIZE (2 * PAGE_SIZE)
++
++#define GEN8_LR_CONTEXT_ALIGN 4096
++
+ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists)
+ {
+ 	if (enable_execlists == 0)
+@@ -54,15 +59,65 @@ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists
+ 
+ void intel_lr_context_free(struct intel_context *ctx)
+ {
+-	/* TODO */
++	int i;
++
++	for (i = 0; i < I915_NUM_RINGS; i++) {
++		struct drm_i915_gem_object *ctx_obj = ctx->engine[i].state;
++		if (ctx_obj) {
++			i915_gem_object_ggtt_unpin(ctx_obj);
++			drm_gem_object_unreference(&ctx_obj->base);
++		}
++	}
++}
++
++static uint32_t get_lr_context_size(struct intel_engine_cs *ring)
++{
++	int ret = 0;
++
++	WARN_ON(INTEL_INFO(ring->dev)->gen != 8);
++
++	switch (ring->id) {
++	case RCS:
++		ret = GEN8_LR_CONTEXT_RENDER_SIZE;
++		break;
++	case VCS:
++	case BCS:
++	case VECS:
++	case VCS2:
++		ret = GEN8_LR_CONTEXT_OTHER_SIZE;
++		break;
++	}
++
++	return ret;
+ }
+ 
+ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 				     struct intel_engine_cs *ring)
+ {
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_gem_object *ctx_obj;
++	uint32_t context_size;
++	int ret;
++
+ 	WARN_ON(ctx->legacy_hw_ctx.rcs_state != NULL);
+ 
+-	/* TODO */
++	context_size = round_up(get_lr_context_size(ring), 4096);
++
++	ctx_obj = i915_gem_alloc_context_obj(dev, context_size);
++	if (IS_ERR(ctx_obj)) {
++		ret = PTR_ERR(ctx_obj);
++		DRM_DEBUG_DRIVER("Alloc LRC backing obj failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = i915_gem_obj_ggtt_pin(ctx_obj, GEN8_LR_CONTEXT_ALIGN, 0);
++	if (ret) {
++		DRM_DEBUG_DRIVER("Pin LRC backing obj failed: %d\n", ret);
++		drm_gem_object_unreference(&ctx_obj->base);
++		return ret;
++	}
++
++	ctx->engine[ring->id].state = ctx_obj;
+ 
+ 	return 0;
+ }
+-- 
+1.7.9.5
+

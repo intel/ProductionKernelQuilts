@@ -1,0 +1,550 @@
+From 0dd43cd189f39f81da59ec4517e17a366a4eaa01 Mon Sep 17 00:00:00 2001
+Message-Id: <0dd43cd189f39f81da59ec4517e17a366a4eaa01.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Vidya Srinivas <vidya.srinivas@intel.com>
+Date: Sat, 5 Jul 2014 01:21:50 +0530
+Subject: [PATCH 091/312] FOR_UPSTREAM [VPG]: drm/i915: Implement CSC
+ infrastructure
+
+The following changes have been ported:
+	1. Sysfs entry for csc_adjust and csc_enable
+	2. Parser function to extract these values
+	3. Apply CSC correction on PIPE.
+
+Issue: GMIN-1465
+Change-Id: I37155b8b9a885ca6c541f8e3829f730697b18770
+Signed-off-by: Shashank Sharma <shashank.sharma@intel.com>
+Signed-off-by: Uma Shankar <uma.shankar@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/Makefile        |    3 +-
+ drivers/gpu/drm/i915/i915_debugfs.c  |  161 ++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h      |    1 +
+ drivers/gpu/drm/i915/i915_reg.h      |    4 +-
+ drivers/gpu/drm/i915/intel_clrmgr.c  |  139 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_clrmgr.h  |   52 +++++++++++
+ drivers/gpu/drm/i915/intel_display.c |   47 +---------
+ drivers/gpu/drm/i915/intel_drv.h     |    4 +-
+ 8 files changed, 360 insertions(+), 51 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/intel_clrmgr.c
+ create mode 100644 drivers/gpu/drm/i915/intel_clrmgr.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index af2326d..940d686 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -71,7 +71,8 @@ i915-y += dvo_ch7017.o \
+ 	  intel_panel.o \
+ 	  intel_sdvo.o \
+ 	  intel_tv.o \
+-	  i915_dpst.o
++	  i915_dpst.o \
++	  intel_clrmgr.o
+ 
+ # legacy horrors
+ i915-y += i915_dma.o \
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 5e264c7..2d598df 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -39,6 +39,7 @@
+ #include "intel_ringbuffer.h"
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
++#include "intel_clrmgr.h"
+ 
+ enum {
+ 	ACTIVE_LIST,
+@@ -1789,6 +1790,153 @@ static int i915_emon_status(struct seq_file *m, void *unused)
+ 	return 0;
+ }
+ 
++ssize_t i915_csc_adjust_write(struct file *filp,
++		  const char __user *ubuf,
++		  size_t count,
++		  loff_t *ppos)
++{
++	int ret = 0;
++	char *buf  = NULL;
++
++	if (!count) {
++		DRM_ERROR("CSC adjust: insufficient data\n");
++		return -EINVAL;
++	}
++
++	buf = kzalloc(count, GFP_KERNEL);
++	if (!buf) {
++		DRM_ERROR("CSC adjust: insufficient memory\n");
++		return -ENOMEM;
++	}
++
++	/* Get the data */
++	if (copy_from_user(buf, ubuf, count)) {
++		DRM_ERROR("CSC adjust: copy failed\n");
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	/* Parse data and load the csc  table */
++	ret = parse_clrmgr_input(csc_softlut, buf,
++		CSC_MAX_COEFF_COUNT, count);
++	if (ret < 0)
++		DRM_ERROR("CSC table loading failed\n");
++	else
++		DRM_DEBUG("CSC table loading done\n");
++EXIT:
++	kfree(buf);
++	/* If cant read the full buffer, read from last left */
++	if (ret < 0)
++		return ret;
++
++	return count;
++}
++
++ssize_t i915_csc_enable_read(struct file *filp,
++		 char __user *ubuf,
++		 size_t max,
++		 loff_t *ppos)
++{
++	int len = 0;
++	char buf[10] = {0,};
++	struct drm_device *dev = filp->private_data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	len = scnprintf(buf, sizeof(buf), "%s\n",
++		dev_priv->csc_enabled ? "Enabled" : "Disabled");
++	return simple_read_from_buffer(ubuf, max, ppos,
++		(const void *) buf, len);
++}
++
++ssize_t i915_csc_enable_write(struct file *filp,
++		  const char __user *ubuf,
++		  size_t count,
++		  loff_t *ppos)
++{
++	int ret = 0;
++	unsigned int status = 0;
++	char *buf = NULL;
++	struct drm_crtc *crtc = NULL;
++	struct drm_device *dev = filp->private_data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* Validate input */
++	if (!count) {
++		DRM_ERROR("CSC enable: insufficient data\n");
++		return -EINVAL;
++	}
++
++	buf = kzalloc(count, GFP_KERNEL);
++	if (!buf) {
++		DRM_ERROR("CSC enable: Out of mem\n");
++		return -ENOMEM;
++	}
++
++	/* Get the data */
++	if (copy_from_user(buf, ubuf, count)) {
++		DRM_ERROR("CSC enable: copy failed\n");
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	/* Finally, get the status */
++	if (kstrtouint((const char *)buf, 10,
++		&status)) {
++		DRM_ERROR("CSC enable: Invalid limit\n");
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	dev_priv->csc_enabled = status;
++
++	/* Search for a CRTC,
++	Assumption: Either MIPI or EDP is fix panel */
++	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
++		if ((intel_pipe_has_type(crtc, INTEL_OUTPUT_DSI)) ||
++			(intel_pipe_has_type(crtc, INTEL_OUTPUT_EDP)))
++			break;
++	}
++
++	/* No CRTC */
++	if (!crtc) {
++		DRM_ERROR("CSC enable: No local panel found\n");
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	/* if CSC enabled, apply CSC correction */
++	if (dev_priv->csc_enabled) {
++		if (do_intel_enable_csc(dev,
++			(void *) csc_softlut, crtc)) {
++			DRM_ERROR("CSC correction failed\n");
++			ret = -EINVAL;
++		} else
++			ret = count;
++	} else {
++		/* Disable CSC on this CRTC */
++		do_intel_disable_csc(dev, crtc);
++		ret = count;
++	}
++
++EXIT:
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations i915_csc_adjust_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = i915_csc_adjust_write,
++	.llseek = default_llseek,
++};
++
++static const struct file_operations i915_csc_enable_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = i915_csc_enable_read,
++	.write = i915_csc_enable_write,
++	.llseek = default_llseek,
++};
+ static int i915_ring_freq_table(struct seq_file *m, void *unused)
+ {
+ 	struct drm_info_node *node = m->private;
+@@ -4342,6 +4490,19 @@ int i915_debugfs_init(struct drm_minor *minor)
+ 			return ret;
+ 	}
+ 
++	ret = i915_debugfs_create(minor->debugfs_root, minor,
++					"csc_adjust",
++					&i915_csc_adjust_fops);
++	if (ret)
++		return ret;
++
++	ret = i915_debugfs_create(minor->debugfs_root, minor,
++					"csc_enable",
++					&i915_csc_enable_fops);
++
++	if (ret)
++		return ret;
++
+ 	return drm_debugfs_create_files(i915_debugfs_list,
+ 					I915_DEBUGFS_ENTRIES,
+ 					minor->debugfs_root, minor);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 300445d..56af80a 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1498,6 +1498,7 @@ struct drm_i915_private {
+ 
+ 	bool is_first_modeset;
+ 	bool maxfifo_enabled;
++	bool csc_enabled;
+ 
+ 	/* PCH chipset type */
+ 	enum intel_pch pch_type;
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 34441c0..836ec30 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -2240,8 +2240,8 @@ enum punit_power_well {
+ #define GEN8_CXT_TOTAL_SIZE		(18 * PAGE_SIZE)
+ 
+ /* CSC Control Register */
+-#define	_PIPEACSC	0x600b0
+-#define	_PIPEBCSC	0x610b0
++#define	_PIPEACSC	(dev_priv->info.display_mmio_offset + 0x600b0)
++#define	_PIPEBCSC	(dev_priv->info.display_mmio_offset + 0x610b0)
+ #define	PIPECONF_CSC_ENABLE	(1<<15)
+ 
+ #define VLV_CLK_CTL2			0x101104
+diff --git a/drivers/gpu/drm/i915/intel_clrmgr.c b/drivers/gpu/drm/i915/intel_clrmgr.c
+new file mode 100644
+index 0000000..ce55b5a
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_clrmgr.c
+@@ -0,0 +1,139 @@
++/*
++ * Copyright © 2008 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Authors:
++ *Shashank Sharma <shashank.sharma@intel.com>
++ *Uma Shankar <uma.shankar@intel.com>
++ *Shobhit Kumar <skumar40@intel.com>
++ */
++
++#include "drmP.h"
++#include "intel_drv.h"
++#include "i915_drm.h"
++#include "i915_drv.h"
++#include "intel_clrmgr.h"
++
++/* Color space conversion coff's */
++u32 csc_softlut[CSC_MAX_COEFF_COUNT] = {
++	1024,	 0, 67108864, 0, 0, 1024
++};
++
++/* Enable color space conversion on PIPE */
++int
++do_intel_enable_csc(struct drm_device *dev, void *data, struct drm_crtc *crtc)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_crtc *intel_crtc = NULL;
++	u32 pipeconf = 0;
++	int pipe = 0;
++	u32 csc_reg = 0;
++	int i = 0, j = 0;
++
++	if (!data) {
++		DRM_ERROR("NULL input to enable CSC");
++		return -EINVAL;
++	}
++
++	intel_crtc = to_intel_crtc(crtc);
++	pipe = intel_crtc->pipe;
++	DRM_DEBUG_DRIVER("pipe = %d\n", pipe);
++	pipeconf = I915_READ(PIPECONF(pipe));
++	pipeconf |= PIPECONF_CSC_ENABLE;
++
++	if (pipe == 0)
++		csc_reg = _PIPEACSC;
++	else if (pipe == 1)
++		csc_reg = _PIPEBCSC;
++	else {
++		DRM_ERROR("Invalid pipe input");
++		return -EINVAL;
++	}
++
++	/* Enable csc correction */
++	I915_WRITE(PIPECONF(pipe), pipeconf);
++	POSTING_READ(PIPECONF(pipe));
++
++	/* Write csc coeff to csc regs */
++	for (i = 0; i < 6; i++) {
++		I915_WRITE(csc_reg + j, ((u32 *)data)[i]);
++		j = j + 0x4;
++	}
++	return 0;
++}
++
++/* Disable color space conversion on PIPE */
++void
++do_intel_disable_csc(struct drm_device *dev, struct drm_crtc *crtc)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_crtc *intel_crtc = NULL;
++	u32 pipeconf = 0;
++	int pipe = 0;
++	dev_priv->csc_enabled = 0;
++
++	intel_crtc = to_intel_crtc(crtc);
++	pipe = intel_crtc->pipe;
++	pipeconf = I915_READ(PIPECONF(pipe));
++	pipeconf &= ~(PIPECONF_CSC_ENABLE);
++
++	/* Disable CSC on PIPE */
++	I915_WRITE(PIPECONF(pipe), pipeconf);
++	POSTING_READ(PIPECONF(pipe));
++	return;
++}
++
++/* Parse userspace input coming from dev node*/
++int parse_clrmgr_input(uint *dest, char *src, int max, int read)
++{
++	int size = 0;
++	int bytes = 0;
++	char *populate = NULL;
++
++	/*Check for trailing comma or \n */
++	if (!dest || !src || *src == ',' || *src == '\n' || !read) {
++		DRM_ERROR("Invalid input to parse");
++		return -EINVAL;
++	}
++
++	/* limit check */
++	if (read < max) {
++		DRM_ERROR("Invalid input to parse");
++		return -EINVAL;
++	}
++
++	/* Extract values from buffer */
++	while ((size < max) && (*src != '\n')) {
++		populate = strsep(&src, ",");
++		if (!populate)
++			break;
++
++		bytes += (strlen(populate)+1);
++		if (kstrtouint((const char *)populate, 16,
++			&dest[size++])) {
++			DRM_ERROR("Parse: Invalid limit\n");
++			return -EINVAL;
++		}
++		if (src == NULL || *src == '\0')
++			break;
++	}
++	return read;
++}
+diff --git a/drivers/gpu/drm/i915/intel_clrmgr.h b/drivers/gpu/drm/i915/intel_clrmgr.h
+new file mode 100644
+index 0000000..350a6ed
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_clrmgr.h
+@@ -0,0 +1,52 @@
++/*
++ * Copyright © 2008 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Authors:
++ * Shashank Sharma <shashank.sharma@intel.com>
++ * Uma Shankar <uma.shankar@intel.com>
++ * Shobhit Kumar <skumar40@intel.com>
++ */
++
++#ifndef _I915_CLR_MNGR_H_
++#define _I915_CLR_MNGR_H_
++
++/* CSC correction */
++#define CSC_MAX_COEFF_COUNT		6
++#define CLR_MGR_PARSE_MAX		128
++
++/* Color manager features */
++enum clrmgrfeatures {
++	clrmgrcsc = 1,
++	clrmgrgamma,
++	clrmgrcontrbright,
++	clrmgrhuesat,
++};
++
++/* Required for sysfs entry calls */
++extern u32 csc_softlut[CSC_MAX_COEFF_COUNT];
++
++/* Prototypes */
++int parse_clrmgr_input(uint *dest, char *src, int max, int read);
++int do_intel_enable_csc(struct drm_device *dev, void *data,
++				struct drm_crtc *crtc);
++void do_intel_disable_csc(struct drm_device *dev, struct drm_crtc *crtc);
++#endif
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 8021f8b..c8ceacf 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -390,7 +390,7 @@ static void vlv_clock(int refclk, intel_clock_t *clock)
+ /**
+  * Returns whether any output on the specified pipe is of the specified type
+  */
+-static bool intel_pipe_has_type(struct drm_crtc *crtc, int type)
++bool intel_pipe_has_type(struct drm_crtc *crtc, int type)
+ {
+ 	struct drm_device *dev = crtc->dev;
+ 	struct intel_encoder *encoder;
+@@ -7372,51 +7372,6 @@ static void lpt_init_pch_refclk(struct drm_device *dev)
+ 		lpt_disable_clkout_dp(dev);
+ }
+ 
+-int intel_enable_CSC(struct drm_device *dev, void *data, struct drm_file *priv)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct CSC_Coeff *wgCSCCoeff = data;
+-	struct drm_mode_object *obj;
+-	struct drm_crtc *crtc;
+-	struct intel_crtc *intel_crtc;
+-	u32 pipeconf;
+-	int pipe;
+-	u32 csc_reg=_PIPEACSC;
+-	int i = 0, j = 0;
+-
+-	obj = drm_mode_object_find(dev, wgCSCCoeff->crtc_id,
+-			DRM_MODE_OBJECT_CRTC);
+-	if (!obj) {
+-		DRM_DEBUG_DRIVER("Unknown CRTC ID %d\n", wgCSCCoeff->crtc_id);
+-			return -EINVAL;
+-	}
+-
+-	crtc = obj_to_crtc(obj);
+-	DRM_DEBUG_DRIVER("[CRTC:%d]\n", crtc->base.id);
+-	intel_crtc = to_intel_crtc(crtc);
+-	pipe = intel_crtc->pipe;
+-	DRM_DEBUG_DRIVER("pipe = %d\n", pipe);
+-	pipeconf = I915_READ(PIPECONF(pipe));
+-	pipeconf |= PIPECONF_CSC_ENABLE;
+-
+-	if (pipe == 0)
+-		csc_reg = _PIPEACSC;
+-	else if (pipe == 1)
+-		csc_reg = _PIPEBCSC;
+-	else
+-		BUG();
+-
+-	I915_WRITE(PIPECONF(pipe), pipeconf);
+-	POSTING_READ(PIPECONF(pipe));
+-
+-	for (i = 0; i < 6; i++) {
+-		I915_WRITE(csc_reg + j, wgCSCCoeff->VLV_CSC_Coeff[i].Value);
+-		j = j + 0x4;
+-	}
+-
+-	return 0;
+-}
+-
+ /*
+  * Initialize reference clocks when the driver loads
+  */
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 161b132..b80a6a5 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -800,8 +800,6 @@ void intel_wait_for_pipe_off(struct drm_device *dev, int pipe);
+ int ironlake_get_lanes_required(int target_clock, int link_bw, int bpp);
+ void vlv_wait_port_ready(struct drm_i915_private *dev_priv,
+ 			 struct intel_digital_port *dport);
+-extern int intel_enable_CSC(struct drm_device *dev, void *csc_params,
+-		struct drm_file *file_priv);
+ int intel_configure_csc(struct drm_device *dev, void *csc_params,
+ 					struct drm_file *file_priv);
+ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+@@ -1074,4 +1072,6 @@ bool is_cursor_enabled(struct drm_i915_private *dev_priv,
+ 
+ extern void intel_unpin_work_fn(struct work_struct *__work);
+ extern void intel_unpin_sprite_work_fn(struct work_struct *__work);
++extern bool intel_pipe_has_type(struct drm_crtc *crtc, int type);
++
+ #endif /* __INTEL_DRV_H__ */
+-- 
+1.7.9.5
+

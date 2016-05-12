@@ -1,0 +1,124 @@
+From 259d5dae45adcfb7694354069c997f5ee62203b2 Mon Sep 17 00:00:00 2001
+From: Rom Lemarchand <romlem@android.com>
+Date: Fri, 7 Nov 2014 12:48:17 -0800
+Subject: [PATCH 497/634] cgroup: refactor allow_attach function into common
+ code
+
+move cpu_cgroup_allow_attach to a common subsys_cgroup_allow_attach.
+This allows any process with CAP_SYS_NICE to move tasks across cgroups if
+they use this function as their allow_attach handler.
+
+Bug: 18260435
+Change-Id: I6bb4933d07e889d0dc39e33b4e71320c34a2c90f
+Signed-off-by: Rom Lemarchand <romlem@android.com>
+---
+ include/linux/cgroup.h | 16 ++++++++++++++++
+ kernel/cgroup.c        | 19 +++++++++++++++++++
+ kernel/sched/core.c    | 20 +-------------------
+ 3 files changed, 36 insertions(+), 19 deletions(-)
+
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index bbda8c0..ffd563d 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -850,6 +850,17 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from);
+ struct cgroup_subsys_state *css_from_dir(struct dentry *dentry,
+ 					 struct cgroup_subsys *ss);
+ 
++/*
++ * Default Android check for whether the current process is allowed to move a
++ * task across cgroups, either because CAP_SYS_NICE is set or because the uid
++ * of the calling process is the same as the moved task or because we are
++ * running as root.
++ * Returns 0 if this is allowed, or -EACCES otherwise.
++ */
++int subsys_cgroup_allow_attach(struct cgroup_subsys_state *css,
++			       struct cgroup_taskset *tset);
++
++
+ #else /* !CONFIG_CGROUPS */
+ 
+ static inline int cgroup_init_early(void) { return 0; }
+@@ -871,6 +882,11 @@ static inline int cgroup_attach_task_all(struct task_struct *from,
+ 	return 0;
+ }
+ 
++static inline int subsys_cgroup_allow_attach(struct cgroup_subsys_state *css,
++					     struct cgroup_taskset *tset)
++{
++	return 0;
++}
+ #endif /* !CONFIG_CGROUPS */
+ 
+ #endif /* _LINUX_CGROUP_H */
+diff --git a/kernel/cgroup.c b/kernel/cgroup.c
+index 5a79f4b..a822ed2 100644
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@ -2129,6 +2129,25 @@ static int cgroup_allow_attach(struct cgroup *cgrp, struct cgroup_taskset *tset)
+ 	return 0;
+ }
+ 
++int subsys_cgroup_allow_attach(struct cgroup_subsys_state *css, struct cgroup_taskset *tset)
++{
++	const struct cred *cred = current_cred(), *tcred;
++	struct task_struct *task;
++
++	if (capable(CAP_SYS_NICE))
++		return 0;
++
++	cgroup_taskset_for_each(task, css, tset) {
++		tcred = __task_cred(task);
++
++		if (current != task && !uid_eq(cred->euid, tcred->uid) &&
++		    !uid_eq(cred->euid, tcred->suid))
++			return -EACCES;
++	}
++
++	return 0;
++}
++
+ /*
+  * Find the task_struct of the task to attach by vpid and pass it along to the
+  * function to attach either it or all tasks in its threadgroup. Will lock
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 0a7e273..0f10fe7 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7656,24 +7656,6 @@ static void cpu_cgroup_css_offline(struct cgroup_subsys_state *css)
+ 	sched_offline_group(tg);
+ }
+ 
+-static int cpu_cgroup_allow_attach(struct cgroup_subsys_state *css,
+-				   struct cgroup_taskset *tset)
+-{
+-	const struct cred *cred = current_cred(), *tcred;
+-	struct task_struct *task;
+-
+-	cgroup_taskset_for_each(task, css, tset) {
+-		tcred = __task_cred(task);
+-
+-		if ((current != task) && !capable(CAP_SYS_NICE) &&
+-		    !uid_eq(cred->euid, tcred->uid) &&
+-		    !uid_eq(cred->euid, tcred->suid))
+-			return -EACCES;
+-	}
+-
+-	return 0;
+-}
+-
+ static int cpu_cgroup_can_attach(struct cgroup_subsys_state *css,
+ 				 struct cgroup_taskset *tset)
+ {
+@@ -8044,7 +8026,7 @@ struct cgroup_subsys cpu_cgroup_subsys = {
+ 	.css_offline	= cpu_cgroup_css_offline,
+ 	.can_attach	= cpu_cgroup_can_attach,
+ 	.attach		= cpu_cgroup_attach,
+-	.allow_attach	= cpu_cgroup_allow_attach,
++	.allow_attach	= subsys_cgroup_allow_attach,
+ 	.exit		= cpu_cgroup_exit,
+ 	.subsys_id	= cpu_cgroup_subsys_id,
+ 	.base_cftypes	= cpu_files,
+-- 
+1.9.1
+

@@ -1,0 +1,392 @@
+From 5e93faa9ac8fc98f77b5f14746ccb2bff5149373 Mon Sep 17 00:00:00 2001
+From: haiqiang yao <haiqiangx.yao@intel.com>
+Date: Thu, 15 Jan 2015 12:26:18 +0800
+Subject: [PATCH 245/255] atomisp2: Implement cropping region functionality.
+
+Mapping cropping region setting from APP to css pipe crop region
+setting.
+
+Change-Id: I9b277fc3d811ab143e4a7c1e822848447e1ded64
+Tracked-On:
+https://hsdes.intel.com/home/default.html#article?id=1503903826
+Signed-off-by: haiqiang yao <haiqiangx.yao@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/36361
+Reviewed-by: Tian Shu Qiu <tian.shu.qiu@intel.com>
+Approver: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.c      | 191 ++++++++++++++++-----
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.h      |  12 +-
+ .../atomisp_driver/atomisp_compat_ioctl32.c        |   2 +-
+ .../pci/atomisp2/atomisp_driver/atomisp_fops.c     |  15 +-
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.c    |   4 +-
+ .../pci/atomisp2/atomisp_driver/atomisp_subdev.h   |   1 +
+ 6 files changed, 174 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index a55e980..2b9444a 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -2316,23 +2316,20 @@ int atomisp_get_dis_stat(struct atomisp_sub_device *asd,
+ }
+ 
+ /*
+- * Function to get current sensor output effective resolution
++ * Function  set camrea_prefiles.xml current sensor pixel array size
+  */
+-int atomisp_get_effective_res(struct atomisp_sub_device *asd,
++int atomisp_set_array_res(struct atomisp_sub_device *asd,
+ 			 struct atomisp_resolution  *config)
+ {
+-	struct atomisp_stream_env stream_env =
+-		asd->stream_env[ATOMISP_INPUT_STREAM_GENERAL];
+-
+ 	dev_dbg(asd->isp->dev, ">%s start\n", __func__);
+-	if (config == NULL) {
+-		dev_err(asd->isp->dev, "Get effective struct address is not valid.\n");
++	if (config == NULL || config->width < 0
++		|| config->height < 0) {
++		dev_err(asd->isp->dev, "Set sensor array size is not valid\n");
+ 		return -EINVAL;
+ 	}
+-	config->width =
+-		stream_env.stream_config.input_config.effective_res.width;
+-	config->height =
+-		stream_env.stream_config.input_config.effective_res.height;
++
++	asd->sensor_array_res.width = config->width;
++	asd->sensor_array_res.height = config->height;
+ 	return 0;
+ }
+ 
+@@ -2725,48 +2722,156 @@ int atomisp_get_metadata_by_type(struct atomisp_sub_device *asd, int flag,
+ }
+ 
+ /*
++ * Function to calculate real zoom region for every pipe
++ */
++int atomisp_calculate_real_zoom_region(struct atomisp_sub_device *asd,
++				struct ia_css_dz_config   *dz_config,
++				enum atomisp_css_pipe_id css_pipe_id)
++
++{
++	struct atomisp_stream_env *stream_env =
++			&asd->stream_env[ATOMISP_INPUT_STREAM_GENERAL];
++	struct atomisp_resolution  max_res, eff_res, out_res;
++
++	memset(&eff_res, 0, sizeof(eff_res));
++	memset(&max_res, 0, sizeof(max_res));
++	memset(&out_res, 0, sizeof(out_res));
++
++	if (dz_config->dx || dz_config->dy)
++		return 0;
++
++	if (css_pipe_id != IA_CSS_PIPE_ID_PREVIEW
++		&& css_pipe_id != IA_CSS_PIPE_ID_CAPTURE) {
++		dev_err(asd->isp->dev, "%s the set pipe no support crop region"
++			, __func__);
++		return -EINVAL;
++	}
++
++	eff_res.width =
++		stream_env->stream_config.input_config.effective_res.width;
++	eff_res.height =
++		stream_env->stream_config.input_config.effective_res.height;
++	if (eff_res.width == 0 || eff_res.height == 0) {
++		dev_err(asd->isp->dev, "%s err effective resolution"
++				, __func__);
++		return -EINVAL;
++	}
++
++	if (dz_config->zoom_region.resolution.width
++		== asd->sensor_array_res.width
++		|| dz_config->zoom_region.resolution.height
++		== asd->sensor_array_res.height) {
++		/*no need crop region*/
++		dz_config->zoom_region.origin.x = 0;
++		dz_config->zoom_region.origin.y = 0;
++		dz_config->zoom_region.resolution.width = eff_res.width;
++		dz_config->zoom_region.resolution.height = eff_res.height;
++		return 0;
++	}
++
++	/* FIXME:
++	 * This is not the correct implementation with Google's definition, due
++	 * to firmware limitation.
++	 */
++	if (eff_res.width * asd->sensor_array_res.height
++		> asd->sensor_array_res.width * eff_res.height) {
++		max_res.width = asd->sensor_array_res.width;
++		max_res.height = asd->sensor_array_res.width
++				* eff_res.height / eff_res.width;
++	} else {
++		max_res.width = asd->sensor_array_res.height
++				* eff_res.width / eff_res.height;
++		max_res.height = asd->sensor_array_res.height;
++	}
++	/*
++	 * Map real crop region base on above calculating base max crop region.
++	 */
++	dz_config->zoom_region.origin.x =
++			dz_config->zoom_region.origin.x
++			* max_res.width
++			/ asd->sensor_array_res.width;
++	dz_config->zoom_region.origin.y =
++			dz_config->zoom_region.origin.y
++			* max_res.height
++			/ asd->sensor_array_res.height;
++	dz_config->zoom_region.resolution.width =
++			dz_config->zoom_region.resolution.width
++			* max_res.width
++			/ asd->sensor_array_res.width;
++	dz_config->zoom_region.resolution.height =
++			dz_config->zoom_region.resolution.height
++			* max_res.height
++			/ eff_res.height;
++
++	/*
++	  * Set same ratio of crop region resolution and current pipe output
++	  * resolution
++	  */
++	out_res.width =
++		stream_env->pipe_configs[css_pipe_id].output_info[0].res.width;
++	out_res.height =
++		stream_env->pipe_configs[css_pipe_id].output_info[0].res.height;
++	if (out_res.width == 0 || out_res.height == 0) {
++		dev_err(asd->isp->dev, "%s err current pipe output resolution"
++				, __func__);
++		return -EINVAL;
++	}
++
++	if (out_res.width * dz_config->zoom_region.resolution.height
++		> dz_config->zoom_region.resolution.width * out_res.height) {
++		dz_config->zoom_region.resolution.height =
++				dz_config->zoom_region.resolution.width
++				* out_res.height / out_res.width;
++	} else {
++		dz_config->zoom_region.resolution.width =
++				dz_config->zoom_region.resolution.height
++				* out_res.width / out_res.height;
++	}
++
++	if ((dz_config->zoom_region.origin.x +
++		dz_config->zoom_region.resolution.width
++		> eff_res.width) ||
++		(dz_config->zoom_region.origin.y +
++		dz_config->zoom_region.resolution.height
++		> eff_res.height))
++		return -EINVAL;
++
++	return 0;
++}
++
++
++/*
+  * Function to check the zoom region whether is effective
+  */
+ static bool atomisp_check_zoom_region(
+ 			struct atomisp_sub_device *asd,
+-			struct atomisp_parameters *arg)
++			struct ia_css_dz_config *dz_config)
+ {
+-	struct atomisp_stream_env *stream_env;
+ 	struct atomisp_resolution  config;
+-	struct atomisp_dz_config dz_config;
+ 	bool flag = false;
+ 	unsigned int w , h;
+ 
+-	stream_env = &(asd->stream_env[ATOMISP_INPUT_STREAM_GENERAL]);
+-	memset(&dz_config, 0, sizeof(struct atomisp_dz_config));
+ 	memset(&config, 0, sizeof(struct atomisp_resolution));
+ 
+-	if (arg->dz_config)
+-		if (copy_from_user(&dz_config, arg->dz_config,
+-			   sizeof(struct atomisp_css_dz_config)))
+-			return flag;
+-
+-	if (dz_config.dx && dz_config.dy)
++	if (dz_config->dx && dz_config->dy)
+ 		return true;
+ 
+-	config.width =
+-		stream_env->stream_config.input_config.effective_res.width;
+-	config.height =
+-		stream_env->stream_config.input_config.effective_res.height;
+-	w = dz_config.zoom_region.origin.x +
+-		dz_config.zoom_region.resolution.width;
+-	h = dz_config.zoom_region.origin.y +
+-		dz_config.zoom_region.resolution.height;
++	config.width = asd->sensor_array_res.width;
++	config.height = asd->sensor_array_res.height;
++	w = dz_config->zoom_region.origin.x +
++		dz_config->zoom_region.resolution.width;
++	h = dz_config->zoom_region.origin.y +
++		dz_config->zoom_region.resolution.height;
+ 
+ 	if ((w <= config.width) && (h <= config.height) && w > 0 && h > 0)
+ 		flag = true;
+ 	else
+ 		/* setting error zoom region */
+-		dev_err(asd->isp->dev, "%s zoom region ERROR:dz_config:origin (%d,%d),region(%d,%d)eff_res(%d, %d)\n",
+-				__func__, dz_config.zoom_region.origin.x,
+-				dz_config.zoom_region.origin.y,
+-				dz_config.zoom_region.resolution.width,
+-				dz_config.zoom_region.resolution.height,
++		dev_err(asd->isp->dev, "%s zoom region ERROR:dz_config:(%d,%d),(%d,%d)array_res(%d, %d)\n",
++				__func__, dz_config->zoom_region.origin.x,
++				dz_config->zoom_region.origin.y,
++				dz_config->zoom_region.resolution.width,
++				dz_config->zoom_region.resolution.height,
+ 				config.width, config.height);
+ 
+ 	return flag;
+@@ -2786,9 +2891,6 @@ void atomisp_apply_css_parameters(
+ 	if (arg->dp_config)
+ 		atomisp_css_set_dp_config(asd, &css_param->dp_config);
+ 
+-	if (arg->dz_config && (asd->run_mode->val != ATOMISP_RUN_MODE_VIDEO))
+-		atomisp_css_set_dz_config(asd, &css_param->dz_config);
+-
+ 	if (arg->nr_config)
+ 		atomisp_css_set_nr_config(asd, &css_param->nr_config);
+ 
+@@ -2910,12 +3012,12 @@ static int __atomisp_cp_general_isp_parameters(
+ 			return -EFAULT;
+ 	if (asd->run_mode->val != ATOMISP_RUN_MODE_VIDEO) {
+ 		if (arg->dz_config) {
+-			if (atomisp_check_zoom_region(asd, arg)) {
+-				if (copy_from_user(&css_param->dz_config,
+-					arg->dz_config,
+-					sizeof(struct atomisp_css_dz_config)))
+-					return -EFAULT;
+-			} else {
++			if (copy_from_user(&css_param->dz_config,
++				arg->dz_config,
++				sizeof(struct atomisp_css_dz_config)))
++				return -EFAULT;
++			if (!atomisp_check_zoom_region(asd,
++						&css_param->dz_config)) {
+ 				dev_err(asd->isp->dev, "crop region error!");
+ 				return -EINVAL;
+ 			}
+@@ -3442,7 +3544,6 @@ int atomisp_set_parameters(struct video_device *vdev,
+ 	dev_dbg(asd->isp->dev, "%s: set parameter(per_frame_setting %d) with isp_config_id %d of %s\n",
+ 		__func__, arg->per_frame_setting, arg->isp_config_id,
+ 		vdev->name);
+-
+ 	if (arg->per_frame_setting && !atomisp_is_vf_pipe(pipe)) {
+ 		/*
+ 		 * Per-frame setting enabled, we allocate a new paramter
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.h
+index 4ccbbb9..07793a9 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.h
+@@ -286,11 +286,19 @@ int atomisp_digital_zoom(struct atomisp_sub_device *asd, int flag,
+ 			 __s32 *value);
+ 
+ /*
+- * Function to get current sensor output effective resolution
++ * Function  set camera_prefiles.xml current sensor pixel array size
+  */
+-int atomisp_get_effective_res(struct atomisp_sub_device *asd,
++int atomisp_set_array_res(struct atomisp_sub_device *asd,
+ 			struct atomisp_resolution  *config);
+ 
++/*
++ * Function to calculate real zoom region for every pipe
++ */
++int atomisp_calculate_real_zoom_region(struct atomisp_sub_device *asd,
++			struct atomisp_css_dz_config   *dz_config,
++			enum atomisp_css_pipe_id css_pipe_id);
++
++
+ int atomisp_cp_dvs_6axis_config(struct atomisp_sub_device *asd,
+ 			struct atomisp_dvs_6axis_config *user_6axis_config,
+ 			struct atomisp_css_params *css_param);
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_ioctl32.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_ioctl32.c
+index cb6ead5..8e319b2 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_ioctl32.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_ioctl32.c
+@@ -1162,7 +1162,7 @@ long atomisp_compat_ioctl32(struct file *file,
+ 	case ATOMISP_IOC_S_SENSOR_AE_BRACKETING_MODE:
+ 	case ATOMISP_IOC_G_SENSOR_AE_BRACKETING_MODE:
+ 	case ATOMISP_IOC_G_INVALID_FRAME_NUM:
+-	case ATOMISP_IOC_G_EFFECTIVE_RESOLUTION:
++	case ATOMISP_IOC_S_ARRAY_RESOLUTION:
+ 		ret = native_ioctl(file, cmd, arg);
+ 		break;
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
+index 4240d0e..e42cc88 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
+@@ -126,10 +126,20 @@ int atomisp_q_video_buffers_to_css(struct atomisp_sub_device *asd,
+ 			atomisp_apply_css_parameters(asd,
+ 						&param->us_params,
+ 						&param->params);
++
++			if (param->us_params.dz_config &&
++				asd->run_mode->val != ATOMISP_RUN_MODE_VIDEO) {
++				err = atomisp_calculate_real_zoom_region(asd,
++					&param->params.dz_config, css_pipe_id);
++				if (!err)
++					atomisp_css_set_dz_config(asd,
++						&param->params.dz_config);
++			}
+ 			atomisp_css_set_isp_config_applied_frame(asd,
+ 						vm_mem->vaddr);
+ 			atomisp_css_update_isp_params_on_pipe(asd,
+ 				asd->stream_env[stream_id].pipes[css_pipe_id]);
++
+ 			/*
+ 			 * WORKAROUND:
+ 			 * Because the camera halv3 can't ensure to set zoom
+@@ -139,7 +149,8 @@ int atomisp_q_video_buffers_to_css(struct atomisp_sub_device *asd,
+ 			 * zoom region,I will set it to global setting.
+ 			 */
+ 			if (param->us_params.dz_config &&
+-				asd->run_mode->val != ATOMISP_RUN_MODE_VIDEO) {
++				asd->run_mode->val != ATOMISP_RUN_MODE_VIDEO
++				&& !err) {
+ 				atomisp_css_set_dz_config(asd,
+ 						&param->params.dz_config);
+ 				atomisp_css_update_isp_params(asd);
+@@ -753,6 +764,8 @@ static void atomisp_subdev_init_struct(struct atomisp_sub_device *asd)
+ 
+ 	asd->stream_prepared = false;
+ 	asd->high_speed_mode = false;
++	asd->sensor_array_res.height = 0;
++	asd->sensor_array_res.width = 0;
+ 	atomisp_css_init_struct(asd);
+ }
+ /*
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index 7ba2385..fc6a730 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -2922,8 +2922,8 @@ static long atomisp_vidioc_default(struct file *file, void *fh,
+ 	case ATOMISP_IOC_G_INVALID_FRAME_NUM:
+ 		err = atomisp_get_invalid_frame_num(vdev, arg);
+ 		break;
+-	case ATOMISP_IOC_G_EFFECTIVE_RESOLUTION:
+-		err = atomisp_get_effective_res(asd, arg);
++	case ATOMISP_IOC_S_ARRAY_RESOLUTION:
++		err = atomisp_set_array_res(asd, arg);
+ 		break;
+ 	default:
+ 		err = -EINVAL;
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+index 418b207..8b31104 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+@@ -381,6 +381,7 @@ struct atomisp_sub_device {
+ 	unsigned int wdt_duration;	/* in jiffies */
+ 	unsigned long wdt_expires;
+ 
++	struct atomisp_resolution sensor_array_res;
+ 	bool high_speed_mode; /* Indicate whether now is a high speed mode */
+ 	int pending_capture_request; /* Indicates the number of pending capture requests. */
+ };
+-- 
+1.9.1
+

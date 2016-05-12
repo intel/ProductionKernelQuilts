@@ -1,0 +1,292 @@
+From 5f52caa3786493a97e2b43686db21bec454e11f8 Mon Sep 17 00:00:00 2001
+Message-Id: <5f52caa3786493a97e2b43686db21bec454e11f8.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:43 +0000
+Subject: [PATCH 37/63] FROM_UPSTREAM [VPG]: drm/i915: Remove the now
+ redundant 'obj->ring'
+
+The ring member of the object structure was always updated with the
+last_read_seqno member. Thus with the conversion to last_read_req, obj->ring is
+now a direct copy of obj->last_read_req->ring. This makes it somewhat redundant
+and potentially misleading (especially as there was no comment to explain its
+purpose).
+
+This checkin removes the redundant field. Many uses were simply testing for
+non-null to see if the object is active on the GPU. Some of these have been
+converted to check 'obj->active' instead. Others (where the last_read_req is
+about to be used anyway) have been changed to check obj->last_read_req. The rest
+simply pull the ring out from the request structure and proceed as before.
+
+Change-Id: I0dbd049b3a60984c62a82453a757fdf2e382534e
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 41c5241555d762810f975d5d9d70143aa93834cd
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |    9 +++++----
+ drivers/gpu/drm/i915/i915_drv.h         |    2 --
+ drivers/gpu/drm/i915/i915_gem.c         |   32 +++++++++++++++++++------------
+ drivers/gpu/drm/i915/i915_gem_context.c |    3 ++-
+ drivers/gpu/drm/i915/i915_gem_dmabuf.c  |    4 +++-
+ drivers/gpu/drm/i915/i915_gpu_error.c   |    3 ++-
+ drivers/gpu/drm/i915/intel_display.c    |   11 ++++++-----
+ 7 files changed, 38 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 7861b73..4c1889f 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -169,8 +169,9 @@ describe_obj(struct seq_file *m, struct drm_i915_gem_object *obj)
+ 		*t = '\0';
+ 		seq_printf(m, " (%s mappable)", s);
+ 	}
+-	if (obj->ring != NULL)
+-		seq_printf(m, " (%s)", obj->ring->name);
++	if (obj->last_read_req != NULL)
++		seq_printf(m, " (%s)",
++			   i915_gem_request_get_ring(obj->last_read_req)->name);
+ }
+ 
+ static void describe_ctx(struct seq_file *m, struct intel_context *ctx)
+@@ -335,7 +336,7 @@ static int per_file_stats(int id, void *ptr, void *data)
+ 			if (ppgtt->file_priv != stats->file_priv)
+ 				continue;
+ 
+-			if (obj->ring) /* XXX per-vma statistic */
++			if (obj->active) /* XXX per-vma statistic */
+ 				stats->active += obj->base.size;
+ 			else
+ 				stats->inactive += obj->base.size;
+@@ -345,7 +346,7 @@ static int per_file_stats(int id, void *ptr, void *data)
+ 	} else {
+ 		if (i915_gem_obj_ggtt_bound(obj)) {
+ 			stats->global += obj->base.size;
+-			if (obj->ring)
++			if (obj->active)
+ 				stats->active += obj->base.size;
+ 			else
+ 				stats->inactive += obj->base.size;
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 4f0c124..82bcdd9 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2013,8 +2013,6 @@ struct drm_i915_gem_object {
+ 	void *dma_buf_vmapping;
+ 	int vmapping_count;
+ 
+-	struct intel_engine_cs *ring;
+-
+ 	/** Breadcrumb of last rendering to the buffer. */
+ 	struct drm_i915_gem_request *last_read_req;
+ 	struct drm_i915_gem_request *last_write_req;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 01832ea..71b9296 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2298,14 +2298,18 @@ i915_gem_object_move_to_active(struct drm_i915_gem_object *obj,
+ {
+ 	struct drm_device *dev = obj->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct drm_i915_gem_request *req = intel_ring_get_request(ring);
++	struct drm_i915_gem_request *req;
++	struct intel_engine_cs *old_ring;
+ 
+ 	BUG_ON(ring == NULL);
+-	if (obj->ring != ring && obj->last_write_req) {
++
++	req = intel_ring_get_request(ring);
++	old_ring = i915_gem_request_get_ring(obj->last_read_req);
++
++	if (old_ring != ring && obj->last_write_req) {
+ 		/* Keep the request relative to the current ring */
+ 		i915_gem_request_assign(&obj->last_write_req, req);
+ 	}
+-	obj->ring = ring;
+ 
+ 	/* Add a reference if we're newly entering the active list. */
+ 	if (!obj->active) {
+@@ -2355,7 +2359,6 @@ i915_gem_object_move_to_inactive(struct drm_i915_gem_object *obj)
+ 	}
+ 
+ 	list_del_init(&obj->ring_list);
+-	obj->ring = NULL;
+ 
+ 	i915_gem_request_assign(&obj->last_read_req, NULL);
+ 	i915_gem_request_assign(&obj->last_write_req, NULL);
+@@ -2373,9 +2376,7 @@ i915_gem_object_move_to_inactive(struct drm_i915_gem_object *obj)
+ static void
+ i915_gem_object_retire(struct drm_i915_gem_object *obj)
+ {
+-	struct intel_engine_cs *ring = obj->ring;
+-
+-	if (ring == NULL)
++	if (obj->last_read_req == NULL)
+ 		return;
+ 
+ 	if (i915_gem_request_completed(obj->last_read_req, true))
+@@ -2949,14 +2950,17 @@ i915_gem_idle_work_handler(struct work_struct *work)
+ static int
+ i915_gem_object_flush_active(struct drm_i915_gem_object *obj)
+ {
++	struct intel_engine_cs *ring;
+ 	int ret;
+ 
+ 	if (obj->active) {
++		ring = i915_gem_request_get_ring(obj->last_read_req);
++
+ 		ret = i915_gem_check_olr(obj->last_read_req);
+ 		if (ret)
+ 			return ret;
+ 
+-		i915_gem_retire_requests_ring(obj->ring);
++		i915_gem_retire_requests_ring(ring);
+ 	}
+ 
+ 	return 0;
+@@ -3064,10 +3068,12 @@ int
+ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 		     struct intel_engine_cs *to)
+ {
+-	struct intel_engine_cs *from = obj->ring;
++	struct intel_engine_cs *from;
+ 	u32 seqno;
+ 	int ret, idx;
+ 
++	from = i915_gem_request_get_ring(obj->last_read_req);
++
+ 	if (from == NULL || to == from)
+ 		return 0;
+ 
+@@ -4062,7 +4068,7 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 	bool was_pin_display;
+ 	int ret;
+ 
+-	if (pipelined != obj->ring) {
++	if (pipelined != i915_gem_request_get_ring(obj->last_read_req)) {
+ 		ret = i915_gem_object_sync(obj, pipelined);
+ 		if (ret)
+ 			return ret;
+@@ -4522,9 +4528,11 @@ i915_gem_busy_ioctl(struct drm_device *dev, void *data,
+ 	ret = i915_gem_object_flush_active(obj);
+ 
+ 	args->busy = obj->active;
+-	if (obj->ring) {
++	if (obj->last_read_req) {
++		struct intel_engine_cs *ring;
+ 		BUILD_BUG_ON(I915_NUM_RINGS > 16);
+-		args->busy |= intel_ring_flag(obj->ring) << 16;
++		ring = i915_gem_request_get_ring(obj->last_read_req);
++		args->busy |= intel_ring_flag(ring) << 16;
+ 	}
+ 
+ 	drm_gem_object_unreference(&obj->base);
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 5bba965..d04702b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -700,7 +700,8 @@ static int do_switch(struct intel_engine_cs *ring,
+ 		 * swapped, but there is no way to do that yet.
+ 		 */
+ 		from->legacy_hw_ctx.rcs_state->dirty = 1;
+-		BUG_ON(from->legacy_hw_ctx.rcs_state->ring != ring);
++		BUG_ON(i915_gem_request_get_ring(
++			from->legacy_hw_ctx.rcs_state->last_read_req) != ring);
+ 
+ 		/* obj is kept alive until the next request by its active ref */
+ 		i915_gem_object_ggtt_unpin(from->legacy_hw_ctx.rcs_state);
+diff --git a/drivers/gpu/drm/i915/i915_gem_dmabuf.c b/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+index 4f82868..f79c10b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_dmabuf.c
++++ b/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+@@ -42,6 +42,7 @@ static int i915_gem_attach_dma_buf(struct dma_buf *dmabuf,
+ 	struct drm_gem_object *gem_obj = dmabuf->priv;
+ 	struct drm_i915_gem_object *obj = to_intel_bo(gem_obj);
+ 	struct drm_device *drm_dev = gem_obj->dev;
++	struct intel_engine_cs *ring;
+ 	u32 ret;
+ 
+ 	i915_attach = kzalloc(sizeof(*i915_attach), GFP_KERNEL);
+@@ -49,7 +50,8 @@ static int i915_gem_attach_dma_buf(struct dma_buf *dmabuf,
+ 		return -ENOMEM;
+ 
+ 	mutex_lock(&drm_dev->struct_mutex);
+-	ret = intel_pin_and_fence_fb_obj(drm_dev, obj, obj->ring);
++	ring = i915_gem_request_get_ring(obj->last_read_req);
++	ret = intel_pin_and_fence_fb_obj(drm_dev, obj, ring);
+ 	if (ret) {
+ 		drm_gem_object_unreference(&obj->base);
+ 		mutex_unlock(&drm_dev->struct_mutex);
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 526fae3..7f1f780 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -666,7 +666,8 @@ static void capture_bo(struct drm_i915_error_buffer *err,
+ 	err->dirty = obj->dirty;
+ 	err->purgeable = obj->madv != I915_MADV_WILLNEED;
+ 	err->userptr = obj->userptr.mm != NULL;
+-	err->ring = obj->ring ? obj->ring->id : -1;
++	err->ring = obj->last_read_req ?
++			i915_gem_request_get_ring(obj->last_read_req)->id : -1;
+ 	err->cache_level = obj->cache_level;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 9edad00..12002e7 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10372,7 +10372,7 @@ static bool use_mmio_flip(struct intel_engine_cs *ring,
+ 	else if (i915.enable_execlists)
+ 		return true;
+ 	else
+-		return ring != obj->ring;
++		return ring != i915_gem_request_get_ring(obj->last_read_req);
+ }
+ 
+ static void intel_do_mmio_flip(struct intel_crtc *intel_crtc)
+@@ -10398,11 +10398,11 @@ static int intel_postpone_flip(struct drm_i915_gem_object *obj)
+ 	if (!obj->last_write_req)
+ 		return 0;
+ 
+-	ring = obj->ring;
++	ring = i915_gem_request_get_ring(obj->last_write_req);
+ 
+ 	dev_priv = to_i915(ring->dev);
+ 	ret = i915_gem_check_wedge(&dev_priv->gpu_error,
+-				   dev_priv->mm.interruptible, obj->ring);
++				   dev_priv->mm.interruptible, ring);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -10476,13 +10476,14 @@ static int intel_queue_mmio_flip(struct drm_device *dev,
+ 	spin_lock_irqsave(&dev_priv->mmio_flip_lock, irq_flags);
+ 	i915_gem_request_assign(&intel_crtc->mmio_flip.req,
+ 				obj->last_write_req);
++	WARN_ON(ring != i915_gem_request_get_ring(intel_crtc->mmio_flip.req));
+ 	spin_unlock_irqrestore(&dev_priv->mmio_flip_lock, irq_flags);
+ 
+ 	/*
+ 	 * Double check to catch cases where irq fired before
+ 	 * mmio flip data was ready
+ 	 */
+-	intel_notify_mmio_flip(obj->ring);
++	intel_notify_mmio_flip(ring);
+ 	return 0;
+ }
+ 
+@@ -10610,7 +10611,7 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 	if (IS_VALLEYVIEW(dev)) {
+ 		ring = &dev_priv->ring[BCS];
+ 	} else if (INTEL_INFO(dev)->gen >= 7) {
+-		ring = obj->ring;
++		ring = i915_gem_request_get_ring(obj->last_read_req);
+ 		if (ring == NULL || ring->id != RCS)
+ 			ring = &dev_priv->ring[BCS];
+ 	} else {
+-- 
+1.7.9.5
+

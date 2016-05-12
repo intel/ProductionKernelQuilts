@@ -1,0 +1,110 @@
+From c4e072f5a3ccd5872854f1b038fdd1ffcb794a48 Mon Sep 17 00:00:00 2001
+Message-Id: <c4e072f5a3ccd5872854f1b038fdd1ffcb794a48.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 9 Oct 2014 17:31:08 +0100
+Subject: [PATCH 37/61] FOR_UPSTREAM [VPG]: drm/i915: Defer seqno allocation
+ until actual hardware submission time
+
+The seqno value is now only used for the final test for completion of a request.
+It is no longer used to track the request through the software stack. Thus it is
+no longer necessary to allocate the seqno immediately with the request. Instead,
+it can be done lazily and left until the request is actually sent to the
+hardware. This is particular advantageous with a GPU scheduler as the requests
+can then be re-ordered between their creation and their hardware submission
+without having out of order seqnos.
+
+Change-Id: I0d922b84c517611a79fa6c2b9e730d4fe3671d6a
+For: VIZ-4377
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c         |   11 +++++++++++
+ drivers/gpu/drm/i915/intel_lrc.c        |    7 -------
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    7 -------
+ 3 files changed, 11 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 505ec06..8c9ddec 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2486,6 +2486,9 @@ i915_gem_get_seqno(struct drm_device *dev, u32 *seqno)
+ 
+ 	/* reserve 0 for non-seqno */
+ 	if (dev_priv->next_seqno == 0) {
++		/* Why is the full re-initialisation required? Is it only for
++		 * hardware semaphores? If so, could skip it in the case where
++		 * semaphores are disabled? */
+ 		int ret = i915_gem_init_seqno(dev, 0);
+ 		if (ret)
+ 			return ret;
+@@ -2567,6 +2570,11 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 			goto end;
+ 	}
+ 
++	/* Assign an identifier to track this request through the hardware: */
++	ret = i915_gem_get_seqno(ring->dev, &request->seqno);
++	if (ret)
++		goto end;
++
+ 	/* Record the position of the start of the request so that
+ 	 * should we detect the updated seqno part-way through the
+ 	 * GPU processing the request, we never over-estimate the
+@@ -2889,6 +2897,9 @@ void i915_gem_complete_requests_ring(struct intel_engine_cs *ring,
+ 		if (req->complete)
+ 			continue;
+ 
++		if (req->seqno == 0)
++			continue;
++
+ 		if (i915_scheduler_is_request_tracked(req, &req->complete, NULL)) {
+ 			if (req->complete)
+ 				trace_i915_gem_request_complete(req);
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index e8ea96b..c0097e9 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1707,13 +1707,6 @@ int intel_logical_ring_alloc_request(struct intel_engine_cs *ring,
+ 	request->ring = ring;
+ 	request->uniq = dev_private->request_uniq++;
+ 
+-	ret = i915_gem_get_seqno(ring->dev, &request->seqno);
+-	if (ret) {
+-		intel_lr_context_unpin(ring, ctx);
+-		kfree(request);
+-		return ret;
+-	}
+-
+ 	/*
+ 	 * Hold a reference to the context this request belongs to
+ 	 * (we will need it when the time comes to emit/retire the
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 53ff5c8..02cda90 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2501,7 +2501,6 @@ int intel_ring_idle(struct intel_engine_cs *ring, bool flush)
+ int
+ intel_ring_alloc_request(struct intel_engine_cs *ring, struct intel_context *ctx)
+ {
+-	int ret;
+ 	struct drm_i915_gem_request *request;
+ 	struct drm_i915_private *dev_private = ring->dev->dev_private;
+ 
+@@ -2517,12 +2516,6 @@ intel_ring_alloc_request(struct intel_engine_cs *ring, struct intel_context *ctx
+ 	request->ringbuf = ring->buffer;
+ 	request->uniq = dev_private->request_uniq++;
+ 
+-	ret = i915_gem_get_seqno(ring->dev, &request->seqno);
+-	if (ret) {
+-		kfree(request);
+-		return ret;
+-	}
+-
+ 	ring->outstanding_lazy_request = request;
+ 	return 0;
+ }
+-- 
+1.7.9.5
+

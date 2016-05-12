@@ -1,0 +1,1355 @@
+From 05b44d8bbddbc4e73b353acf023c0f84c0824fb0 Mon Sep 17 00:00:00 2001
+Message-Id: <05b44d8bbddbc4e73b353acf023c0f84c0824fb0.1414710611.git.chang-joon.lee@intel.com>
+From: Sourab Gupta <sourab.gupta@intel.com>
+Date: Mon, 11 Aug 2014 13:12:04 +0530
+Subject: [PATCH] MUST_REBASE [VPG]: drm/i915: Sysfs interface to get GFX
+ shmem usage stats per process
+
+NOT_FOR_UPSTREAM: The Process based accounting of GFX shmem usage doesn't handle
+all the diverse scenarios in linux stack. Particularly the case when the
+drm file descriptor is explicitly shared over DRI3 protocol.
+
+There is a requirement of a new interface for achieving below
+functionalities:
+1) Need to provide Client based detailed information about the
+distribution of Graphics memory
+2) Need to provide an interface which can provide info about the
+sharing of Graphics buffers between the clients.
+
+The client based interface would also aid in debugging of
+memory usage/consumption by each client & debug memleak related issues.
+
+With this new interface,
+1) In case of memleak scenarios, we can easily zero in on the culprit
+client which is unexpectedly holding on the Graphics buffers for an
+inordinate amount of time.
+2) We can get an estimate of the instantaneous memory footprint of
+every Graphics client.
+3) We can now trace all the processes sharing a particular Graphics buffer.
+
+By means of this patch we try to provide a sysfs interface to achieve
+the mentioned functionalities.
+
+There are two files created in sysfs:
+'i915_gem_meminfo' will provide summary of the graphics resources used by
+each graphics client.
+'i915_gem_objinfo' will provide detailed view of each object created by
+individual clients.
+
+v2: Changes for
+    - Reporting the user virtual address of all the mapped GFX buffers.
+      This is needed for Android meminfo service, so that the double counting
+      of GFX buffers(mapped into userspace) is avoided.
+    - Design change involving replacing of pid based object stats by tgid based
+      one. This is required to cover the scenarios, in which the drm file may
+      be opened by one thread of the process, while the other thread creates the
+      objects. The tgid based object reporting allows for this and accounts the
+      objects to tgid instead of drm file's pid.
+    - Checkpatch and other misc cleanup.
+
+v3: Changes for
+    - i915_gem_objinfo will now show summarized details also at the end, to
+      provide a single shot view of the mem stats.
+    - Replacing the pid_array obj field with a linked list. This is to reduce
+      the memory overhead of having a static array present in the obj.
+    - General cleanup
+
+v4: General cleanup in code organization
+
+v5: Changes for
+    - Adding a module parameter 'memtrack_debug' to enable the tracking code and
+      creating sysfs entries. By default, this parameter will be enabled. If
+      required, this may be disabled at boot time.
+    - Adding some missing error checking for allocation failed.
+    - In the function 'i915_obj_virt_addr_is_valid', previously we used to
+      continue in case of not acquiring the mm_sem lock. This behaviour is
+      changed and we just return assuming the address is valid (which should be
+      default behaviour).
+
+v6: Some more error handling and cleanup
+
+v7: Removal of a redundant WARN_ON in i915_gem_obj_insert_pid().
+
+v8: Changes for
+    - Proper format for multi-line comment
+    - using mutex lock for i915_obj_insert_pid when it is called from mmap_ioctl
+    - releasing mutex in some error path's which was missing previously
+
+v9: Adding read permission for group and others, to sysfs file.
+
+v10: Fixing the memleak caused due to task_struct references being taken in 'get_pid_task'
+    not being released.
+
+v11: Fixing the deadlock due to recursive locking of i915 mutex, in case of last
+     mmput call.
+
+Issue: GMIN-3397
+Change-Id: I02552d54a753fcfb94b5bdd9bc9c82702bbf514d
+Signed-off-by: Sourab Gupta <sourab.gupta@intel.com>
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c       |    1 +
+ drivers/gpu/drm/i915/i915_drv.c       |    2 +
+ drivers/gpu/drm/i915/i915_drv.h       |   25 +
+ drivers/gpu/drm/i915/i915_gem.c       |   84 +++-
+ drivers/gpu/drm/i915/i915_gem_debug.c |  807 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gpu_error.c |    2 +-
+ drivers/gpu/drm/i915/i915_params.c    |    5 +
+ drivers/gpu/drm/i915/i915_sysfs.c     |   88 ++++
+ 8 files changed, 1008 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 7ec8e31..c8a6b4f 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -2032,6 +2032,7 @@ void i915_driver_postclose(struct drm_device *dev, struct drm_file *file)
+ {
+ 	struct drm_i915_file_private *file_priv = file->driver_priv;
+ 
++	kfree(file_priv->process_name);
+ 	if (file_priv && file_priv->bsd_ring)
+ 		file_priv->bsd_ring = NULL;
+ 	kfree(file_priv);
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index f065fc4..b6f3b8c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -1903,6 +1903,8 @@ static struct drm_driver driver = {
+ 	.debugfs_init = i915_debugfs_init,
+ 	.debugfs_cleanup = i915_debugfs_cleanup,
+ #endif
++	.gem_open_object = i915_gem_open_object,
++	.gem_close_object = i915_gem_close_object,
+ 	.gem_free_object = i915_gem_free_object,
+ 	.gem_vm_ops = &i915_gem_vm_ops,
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9588b6a..dc18213 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1234,6 +1234,8 @@ struct i915_gem_mm {
+ 	spinlock_t object_stat_lock;
+ 	size_t object_memory;
+ 	u32 object_count;
++
++	size_t phys_mem_total;
+ };
+ 
+ struct drm_i915_error_state_buf {
+@@ -1945,6 +1947,7 @@ struct drm_i915_gem_object {
+ 	 * Is the object associated with user created FB
+ 	 */
+ 	unsigned int user_fb:1;
++	unsigned int has_backing_pages:1;
+ 
+ 	struct sg_table *pages;
+ 	int pages_pin_count;
+@@ -1999,6 +2002,8 @@ struct drm_i915_gem_object {
+ 	* reaches 0, dev_priv->pending_flip_queue will be woken up.
+ 	*/
+ 	atomic_t pending_flip;
++
++	struct list_head pid_info;
+ };
+ 
+ #define to_intel_bo(x) container_of(x, struct drm_i915_gem_object, base)
+@@ -2046,6 +2051,8 @@ struct drm_i915_gem_request {
+ struct drm_i915_file_private {
+ 	struct drm_i915_private *dev_priv;
+ 	struct drm_file *file;
++	char *process_name;
++	struct pid *tgid;
+ 
+ 	struct {
+ 		spinlock_t lock;
+@@ -2336,6 +2343,7 @@ struct i915_params {
+ 	bool disable_vtd_wa;
+ 	int drrs_interval;
+ 	int use_mmio_flip;
++	int memtrack_debug;
+ };
+ extern struct i915_params i915 __read_mostly;
+ 
+@@ -2477,6 +2485,10 @@ void i915_init_vm(struct drm_i915_private *dev_priv,
+ 		  struct i915_address_space *vm);
+ void i915_gem_free_object(struct drm_gem_object *obj);
+ void i915_gem_vma_destroy(struct i915_vma *vma);
++int i915_gem_open_object(struct drm_gem_object *gem_obj,
++			struct drm_file *file_priv);
++void i915_gem_close_object(struct drm_gem_object *gem_obj,
++			struct drm_file *file_priv);
+ 
+ #define PIN_MAPPABLE 0x1
+ #define PIN_NONBLOCK 0x2
+@@ -2793,6 +2805,17 @@ int i915_verify_lists(struct drm_device *dev);
+ #else
+ #define i915_verify_lists(dev) 0
+ #endif
++int i915_get_pid_cmdline(struct task_struct *task, char *buffer);
++int i915_gem_obj_insert_pid(struct drm_i915_gem_object *obj);
++void i915_gem_obj_remove_pid(struct drm_i915_gem_object *obj);
++void i915_gem_obj_remove_all_pids(struct drm_i915_gem_object *obj);
++int i915_obj_insert_virt_addr(struct drm_i915_gem_object *obj,
++				unsigned long addr, bool is_map_gtt,
++				bool is_mutex_locked);
++int i915_get_drm_clients_info(struct drm_i915_error_state_buf *m,
++				struct drm_device *dev);
++int i915_gem_get_all_obj_info(struct drm_i915_error_state_buf *m,
++				struct drm_device *dev);
+ 
+ /* i915_debugfs.c */
+ int i915_debugfs_init(struct drm_minor *minor);
+@@ -2806,6 +2829,8 @@ static inline void intel_display_crc_init(struct drm_device *dev) {}
+ /* i915_gpu_error.c */
+ __printf(2, 3)
+ void i915_error_printf(struct drm_i915_error_state_buf *e, const char *f, ...);
++void i915_error_puts(struct drm_i915_error_state_buf *e,
++			    const char *str);
+ int i915_error_state_to_str(struct drm_i915_error_state_buf *estr,
+ 			    const struct i915_error_state_file_priv *error);
+ int i915_error_state_buf_init(struct drm_i915_error_state_buf *eb,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 820057e..baae06e 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1530,6 +1530,7 @@ i915_gem_mmap_ioctl(struct drm_device *dev, void *data,
+ 	struct drm_i915_gem_mmap *args = data;
+ 	struct drm_gem_object *obj;
+ 	unsigned long addr;
++	int ret;
+ 
+ 	obj = drm_gem_object_lookup(dev, file, args->handle);
+ 	if (obj == NULL)
+@@ -1550,6 +1551,10 @@ i915_gem_mmap_ioctl(struct drm_device *dev, void *data,
+ 	if (IS_ERR((void *)addr))
+ 		return addr;
+ 
++	ret = i915_obj_insert_virt_addr(to_intel_bo(obj), addr, false, false);
++	if (ret)
++		return ret;
++
+ 	args->addr_ptr = (uint64_t) addr;
+ 
+ 	return 0;
+@@ -1636,10 +1641,11 @@ int i915_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 				(unsigned long)vma->vm_start + i * PAGE_SIZE,
+ 				pfn + i);
+ 			if (ret)
+-				break;
++				goto unpin;
+ 		}
+-
+ 		obj->fault_mappable = true;
++		ret = i915_obj_insert_virt_addr(obj,
++				(unsigned long)vma->vm_start, true, true);
+ 	} else
+ 		ret = vm_insert_pfn(vma,
+ 			    (unsigned long)vmf->virtual_address,
+@@ -1908,6 +1914,17 @@ i915_gem_object_truncate(struct drm_i915_gem_object *obj)
+ 	 */
+ 	shmem_truncate_range(file_inode(obj->base.filp), 0, (loff_t)-1);
+ 	obj->madv = __I915_MADV_PURGED;
++
++	/*
++	 * Mark the object as not having backing pages, as physical space
++	 * returned back to kernel
++	 */
++	if (obj->has_backing_pages == 1) {
++		struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
++
++		dev_priv->mm.phys_mem_total -= obj->base.size;
++		obj->has_backing_pages = 0;
++	}
+ }
+ 
+ /* Try to discard unwanted pages */
+@@ -2177,6 +2194,13 @@ i915_gem_object_get_pages_gtt(struct drm_i915_gem_object *obj)
+ 	if (i915_gem_object_needs_bit17_swizzle(obj))
+ 		i915_gem_object_do_bit_17_swizzle(obj);
+ 
++	if (obj->has_backing_pages == 0) {
++		struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
++
++		dev_priv->mm.phys_mem_total += obj->base.size;
++		obj->has_backing_pages = 1;
++	}
++
+ 	return 0;
+ 
+ err_pages:
+@@ -4476,6 +4500,13 @@ void i915_gem_object_init(struct drm_i915_gem_object *obj,
+ 	/* Avoid an unnecessary call to unbind on the first bind. */
+ 	obj->map_and_fenceable = true;
+ 
++	/*
++	 * Mark the object as not having backing pages, as no allocation
++	 * for it yet
++	 */
++	obj->has_backing_pages = 0;
++	INIT_LIST_HEAD(&obj->pid_info);
++
+ 	i915_gem_info_add_obj(obj->base.dev->dev_private, obj->base.size);
+ }
+ 
+@@ -4561,6 +4592,25 @@ static bool discard_backing_storage(struct drm_i915_gem_object *obj)
+ 	return atomic_long_read(&obj->base.filp->f_count) == 1;
+ }
+ 
++int
++i915_gem_open_object(struct drm_gem_object *gem_obj,
++			struct drm_file *file_priv)
++{
++	struct drm_i915_gem_object *obj = to_intel_bo(gem_obj);
++
++	return i915_gem_obj_insert_pid(obj);
++}
++
++void
++i915_gem_close_object(struct drm_gem_object *gem_obj,
++			struct drm_file *file_priv)
++{
++	struct drm_i915_gem_object *obj = to_intel_bo(gem_obj);
++	int ret;
++
++	i915_gem_obj_remove_pid(obj);
++}
++
+ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ {
+ 	struct drm_i915_gem_object *obj = to_intel_bo(gem_obj);
+@@ -4609,6 +4659,14 @@ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ 	if (obj->base.import_attach)
+ 		drm_prime_gem_destroy(&obj->base, NULL);
+ 
++	if (!obj->stolen && (obj->has_backing_pages == 1)) {
++		struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
++
++		dev_priv->mm.phys_mem_total -= obj->base.size;
++		obj->has_backing_pages = 0;
++	}
++	i915_gem_obj_remove_all_pids(obj);
++
+ 	if (obj->ops->release)
+ 		obj->ops->release(obj);
+ 
+@@ -5142,13 +5200,12 @@ i915_gem_file_idle_work_handler(struct work_struct *work)
+ 	atomic_set(&file_priv->rps_wait_boost, false);
+ }
+ 
++
+ int i915_gem_open(struct drm_device *dev, struct drm_file *file)
+ {
+ 	struct drm_i915_file_private *file_priv;
+ 	int ret;
+ 
+-	DRM_DEBUG_DRIVER("\n");
+-
+ 	file_priv = kzalloc(sizeof(*file_priv), GFP_KERNEL);
+ 	if (!file_priv)
+ 		return -ENOMEM;
+@@ -5156,6 +5213,16 @@ int i915_gem_open(struct drm_device *dev, struct drm_file *file)
+ 	file->driver_priv = file_priv;
+ 	file_priv->dev_priv = dev->dev_private;
+ 	file_priv->file = file;
++	file_priv->tgid = find_vpid(task_tgid_nr(current));
++	file_priv->process_name =  kzalloc(PAGE_SIZE, GFP_ATOMIC);
++	if (!file_priv->process_name) {
++		ret = -ENOMEM;
++		goto out_free_file;
++	}
++
++	ret = i915_get_pid_cmdline(current, file_priv->process_name);
++	if (ret)
++		goto out_free_name;
+ 
+ 	spin_lock_init(&file_priv->mm.lock);
+ 	INIT_LIST_HEAD(&file_priv->mm.request_list);
+@@ -5164,7 +5231,14 @@ int i915_gem_open(struct drm_device *dev, struct drm_file *file)
+ 
+ 	ret = i915_gem_context_open(dev, file);
+ 	if (ret)
+-		kfree(file_priv);
++		goto out_free_name;
++
++	return 0;
++
++out_free_name:
++	kfree(file_priv->process_name);
++out_free_file:
++	kfree(file_priv);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_debug.c b/drivers/gpu/drm/i915/i915_gem_debug.c
+index f462d1b..e61a9cc 100644
+--- a/drivers/gpu/drm/i915/i915_gem_debug.c
++++ b/drivers/gpu/drm/i915/i915_gem_debug.c
+@@ -25,8 +25,11 @@
+  *
+  */
+ 
++#include <linux/pid.h>
++#include <linux/shmem_fs.h>
+ #include <drm/drmP.h>
+ #include <drm/i915_drm.h>
++#include <linux/async.h>
+ #include "i915_drv.h"
+ 
+ #if WATCH_LISTS
+@@ -116,3 +119,807 @@ i915_verify_lists(struct drm_device *dev)
+ 	return warned = err;
+ }
+ #endif /* WATCH_LIST */
++
++struct per_file_obj_mem_info {
++	int num_obj;
++	int num_obj_shared;
++	int num_obj_private;
++	int num_obj_gtt_bound;
++	int num_obj_purged;
++	int num_obj_purgeable;
++	int num_obj_allocated;
++	int num_obj_fault_mappable;
++	int num_obj_stolen;
++	size_t gtt_space_allocated_shared;
++	size_t gtt_space_allocated_priv;
++	size_t phys_space_allocated_shared;
++	size_t phys_space_allocated_priv;
++	size_t phys_space_purgeable;
++	size_t phys_space_shared_proportion;
++	size_t fault_mappable_size;
++	size_t stolen_space_allocated;
++	char *process_name;
++};
++
++struct name_entry {
++	struct list_head head;
++	struct drm_hash_item hash_item;
++};
++
++struct pid_stat_entry {
++	struct list_head head;
++	struct list_head namefree;
++	struct drm_open_hash namelist;
++	struct per_file_obj_mem_info stats;
++	struct pid *tgid;
++	int pid_num;
++};
++
++struct drm_i915_obj_virt_addr {
++	struct list_head head;
++	unsigned long user_virt_addr;
++};
++
++struct drm_i915_obj_pid_info {
++	struct list_head head;
++	pid_t tgid;
++	int open_handle_count;
++	struct list_head virt_addr_head;
++};
++
++#define err_printf(e, ...) i915_error_printf(e, __VA_ARGS__)
++#define err_puts(e, s) i915_error_puts(e, s)
++
++static const char *get_pin_flag(struct drm_i915_gem_object *obj)
++{
++	if (obj->user_pin_count > 0)
++		return "P";
++	else if (i915_gem_obj_is_pinned(obj))
++		return "p";
++	else
++		return " ";
++}
++
++static const char *get_tiling_flag(struct drm_i915_gem_object *obj)
++{
++	switch (obj->tiling_mode) {
++	default:
++	case I915_TILING_NONE: return " ";
++	case I915_TILING_X: return "X";
++	case I915_TILING_Y: return "Y";
++	}
++}
++
++/*
++ * If this mmput call is the last one, it will tear down the mmaps of the
++ * process and calls drm_gem_vm_close(), which leads deadlock on i915 mutex.
++ * Instead, asynchronously schedule mmput function here, to avoid recursive
++ * calls to acquire i915_mutex.
++ */
++static void async_mmput_func(void *data, async_cookie_t cookie)
++{
++	struct mm_struct *mm = data;
++	mmput(mm);
++}
++
++static void async_mmput(struct mm_struct *mm)
++{
++	async_schedule(async_mmput_func, mm);
++}
++
++int i915_get_pid_cmdline(struct task_struct *task, char *buffer)
++{
++	int res = 0;
++	unsigned int len;
++	struct mm_struct *mm = get_task_mm(task);
++
++	if (!mm)
++		goto out;
++	if (!mm->arg_end)
++		goto out_mm;
++
++	len = mm->arg_end - mm->arg_start;
++
++	if (len > PAGE_SIZE)
++		len = PAGE_SIZE;
++
++	res = access_process_vm(task, mm->arg_start, buffer, len, 0);
++	if (res < 0) {
++		async_mmput(mm);
++		return res;
++	}
++
++	if (res > 0 && buffer[res-1] != '\0' && len < PAGE_SIZE)
++		buffer[res-1] = '\0';
++out_mm:
++	async_mmput(mm);
++out:
++	return 0;
++}
++
++static int i915_obj_get_shmem_pages_alloced(struct drm_i915_gem_object *obj)
++{
++	int ret;
++
++	if (obj->base.filp) {
++		struct inode *inode = file_inode(obj->base.filp);
++		struct shmem_inode_info *info = SHMEM_I(inode);
++
++		if (!inode)
++			return 0;
++		spin_lock(&info->lock);
++		ret = inode->i_mapping->nrpages;
++		spin_unlock(&info->lock);
++		return ret;
++	}
++	return 0;
++}
++
++int i915_gem_obj_insert_pid(struct drm_i915_gem_object *obj)
++{
++	int ret = 0, found = 0;
++	struct drm_i915_obj_pid_info *entry;
++	pid_t current_tgid = task_tgid_nr(current);
++
++	if (!i915.memtrack_debug)
++		return 0;
++
++	ret = i915_mutex_lock_interruptible(obj->base.dev);
++	if (ret)
++		return ret;
++
++	list_for_each_entry(entry, &obj->pid_info, head) {
++		if (entry->tgid == current_tgid) {
++			entry->open_handle_count++;
++			found = 1;
++			break;
++		}
++	}
++	if (found == 0) {
++		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++		if (entry == NULL) {
++			DRM_ERROR("alloc failed\n");
++			ret = -ENOMEM;
++			goto out;
++		}
++		entry->tgid = current_tgid;
++		entry->open_handle_count = 1;
++		INIT_LIST_HEAD(&entry->virt_addr_head);
++		list_add_tail(&entry->head, &obj->pid_info);
++	}
++out:
++	mutex_unlock(&obj->base.dev->struct_mutex);
++	return ret;
++}
++
++void i915_gem_obj_remove_pid(struct drm_i915_gem_object *obj)
++{
++	pid_t current_tgid = task_tgid_nr(current);
++	struct drm_i915_obj_pid_info *pid_entry, *pid_next;
++	struct drm_i915_obj_virt_addr *virt_entry, *virt_next;
++	int ret, found = 0;
++
++	if (!i915.memtrack_debug)
++		return;
++
++	ret = i915_mutex_lock_interruptible(obj->base.dev);
++	if (ret)
++		return;
++
++	list_for_each_entry_safe(pid_entry, pid_next, &obj->pid_info, head) {
++		if (pid_entry->tgid == current_tgid) {
++			pid_entry->open_handle_count--;
++			found = 1;
++			if (pid_entry->open_handle_count == 0) {
++				list_for_each_entry_safe(virt_entry,
++						virt_next,
++						&pid_entry->virt_addr_head,
++						head) {
++					list_del(&virt_entry->head);
++					kfree(virt_entry);
++				}
++				list_del(&pid_entry->head);
++				kfree(pid_entry);
++			}
++			break;
++		}
++	}
++	mutex_unlock(&obj->base.dev->struct_mutex);
++
++	if (found == 0)
++		DRM_DEBUG("Couldn't find matching tgid %d for obj 0x%x\n",
++				current_tgid, (u32) obj);
++}
++
++void i915_gem_obj_remove_all_pids(struct drm_i915_gem_object *obj)
++{
++	struct drm_i915_obj_pid_info *pid_entry, *pid_next;
++	struct drm_i915_obj_virt_addr *virt_entry, *virt_next;
++
++	list_for_each_entry_safe(pid_entry, pid_next, &obj->pid_info, head) {
++		list_for_each_entry_safe(virt_entry,
++					 virt_next,
++					 &pid_entry->virt_addr_head,
++					 head) {
++			list_del(&virt_entry->head);
++			kfree(virt_entry);
++		}
++		list_del(&pid_entry->head);
++		kfree(pid_entry);
++	}
++}
++
++int
++i915_obj_insert_virt_addr(struct drm_i915_gem_object *obj,
++				unsigned long addr,
++				bool is_map_gtt,
++				bool is_mutex_locked)
++{
++	struct drm_i915_obj_pid_info *pid_entry;
++	pid_t current_tgid = task_tgid_nr(current);
++	int ret = 0, found = 0;
++
++	if (!i915.memtrack_debug)
++		return 0;
++
++	if (is_map_gtt)
++		addr |= 1;
++
++	if (!is_mutex_locked) {
++		ret = i915_mutex_lock_interruptible(obj->base.dev);
++		if (ret)
++			return ret;
++	}
++
++	list_for_each_entry(pid_entry, &obj->pid_info, head) {
++		if (pid_entry->tgid == current_tgid) {
++			struct drm_i915_obj_virt_addr *virt_entry, *new_entry;
++
++			list_for_each_entry(virt_entry,
++					    &pid_entry->virt_addr_head,
++					    head) {
++				if (virt_entry->user_virt_addr == addr) {
++					found = 1;
++					break;
++				}
++			}
++			if (found)
++				break;
++			new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
++			if (new_entry == NULL) {
++				DRM_ERROR("alloc failed\n");
++				ret = -ENOMEM;
++				goto out;
++			}
++			new_entry->user_virt_addr = addr;
++			list_add_tail(&new_entry->head,
++				&pid_entry->virt_addr_head);
++			break;
++		}
++	}
++
++out:
++	if (!is_mutex_locked)
++		mutex_unlock(&obj->base.dev->struct_mutex);
++
++	return ret;
++}
++
++static int i915_obj_virt_addr_is_invalid(struct drm_gem_object *obj,
++				struct pid *tgid, unsigned long addr)
++{
++	struct task_struct *task;
++	struct mm_struct *mm;
++	struct vm_area_struct *vma;
++	int locked, ret = 0;
++
++	task = get_pid_task(tgid, PIDTYPE_PID);
++	if (task == NULL) {
++		DRM_DEBUG("null task for tgid=%d\n", pid_nr(tgid));
++		return -EINVAL;
++	}
++
++	mm = get_task_mm(task);
++	if (mm == NULL) {
++		DRM_DEBUG("null mm for tgid=%d\n", pid_nr(tgid));
++		ret = -EINVAL;
++		goto out_task;
++	}
++
++	locked = down_read_trylock(&mm->mmap_sem);
++	if (!locked)
++		goto out_mm;
++
++	vma = find_vma(mm, addr);
++	if (vma) {
++		if (addr & 1) { /* mmap_gtt case */
++			if (vma->vm_pgoff*PAGE_SIZE == (unsigned long)
++				drm_vma_node_offset_addr(&obj->vma_node))
++				ret = 0;
++			else
++				ret = -EINVAL;
++		} else { /* mmap case */
++			if (vma->vm_file == obj->filp)
++				ret = 0;
++			else
++				ret = -EINVAL;
++		}
++	} else
++		ret = -EINVAL;
++
++	up_read(&mm->mmap_sem);
++
++out_mm:
++	async_mmput(mm);
++out_task:
++	put_task_struct(task);
++	return ret;
++}
++
++static void i915_obj_pidarray_validate(struct drm_gem_object *gem_obj)
++{
++	struct drm_i915_gem_object *obj = to_intel_bo(gem_obj);
++	struct drm_device *dev = gem_obj->dev;
++	struct drm_i915_obj_virt_addr *virt_entry, *virt_next;
++	struct drm_i915_obj_pid_info *pid_entry, *pid_next;
++	struct drm_file *file;
++	struct drm_i915_file_private *file_priv;
++	struct pid *tgid;
++	int pid_num, present;
++
++	/*
++	 * Run a sanity check on pid_array. All entries in pid_array should
++	 * be subset of the the drm filelist pid entries.
++	 */
++	list_for_each_entry_safe(pid_entry, pid_next, &obj->pid_info, head) {
++		present = 0;
++		list_for_each_entry(file, &dev->filelist, lhead) {
++			file_priv = file->driver_priv;
++			tgid = file_priv->tgid;
++			pid_num = pid_nr(tgid);
++
++			if (pid_num == pid_entry->tgid) {
++				present = 1;
++				break;
++			}
++		}
++		if (present == 0) {
++			DRM_DEBUG("stale_tgid=%d\n", pid_entry->tgid);
++			list_for_each_entry_safe(virt_entry, virt_next,
++					&pid_entry->virt_addr_head,
++					head) {
++				list_del(&virt_entry->head);
++				kfree(virt_entry);
++			}
++			list_del(&pid_entry->head);
++			kfree(pid_entry);
++		} else {
++			/* Validate the virtual address list */
++			struct task_struct *task =
++				get_pid_task(tgid, PIDTYPE_PID);
++			if (task == NULL)
++				continue;
++
++			list_for_each_entry_safe(virt_entry, virt_next,
++					&pid_entry->virt_addr_head,
++					head) {
++				if (i915_obj_virt_addr_is_invalid(gem_obj, tgid,
++					virt_entry->user_virt_addr)) {
++					DRM_DEBUG("stale_addr=%ld\n",
++					virt_entry->user_virt_addr);
++					list_del(&virt_entry->head);
++					kfree(virt_entry);
++				}
++			}
++			put_task_struct(task);
++		}
++	}
++}
++
++static int
++i915_describe_obj(struct drm_i915_error_state_buf *m,
++		struct drm_i915_gem_object *obj)
++{
++	struct i915_vma *vma;
++	struct drm_i915_obj_pid_info *pid_entry;
++	struct drm_i915_obj_virt_addr *virt_entry;
++
++	err_printf(m,
++		"%p: %7zdK  %s    %s     %s      %s     %s      %s       %s     ",
++		   &obj->base,
++		   obj->base.size / 1024,
++		   get_pin_flag(obj),
++		   get_tiling_flag(obj),
++		   obj->dirty ? "Y" : "N",
++		   obj->base.name ? "Y" : "N",
++		   (obj->userptr.mm != 0) ? "Y" : "N",
++		   obj->stolen ? "Y" : "N",
++		   (obj->pin_mappable || obj->fault_mappable) ? "Y" : "N");
++
++	if (obj->madv == __I915_MADV_PURGED)
++		err_puts(m, " purged    ");
++	else if (obj->madv == I915_MADV_DONTNEED)
++		err_puts(m, " purgeable   ");
++	else if (i915_obj_get_shmem_pages_alloced(obj) != 0)
++		err_puts(m, " allocated   ");
++	else
++		err_puts(m, "             ");
++
++	list_for_each_entry(vma, &obj->vma_list, vma_link) {
++		if (!i915_is_ggtt(vma->vm))
++			err_puts(m, " PP    ");
++		else
++			err_puts(m, " G     ");
++		err_printf(m, "  %08lx ", vma->node.start);
++	}
++	if (list_empty(&obj->vma_list))
++		err_puts(m, "                  ");
++
++	list_for_each_entry(pid_entry, &obj->pid_info, head) {
++		err_printf(m, " (%d: %d:",
++			   pid_entry->tgid,
++			   pid_entry->open_handle_count);
++		list_for_each_entry(virt_entry,
++				    &pid_entry->virt_addr_head, head) {
++			if (virt_entry->user_virt_addr & 1)
++				err_printf(m, " %p",
++				(void *)(virt_entry->user_virt_addr & ~1));
++			else
++				err_printf(m, " %p*",
++				(void *)virt_entry->user_virt_addr);
++		}
++		err_puts(m, ") ");
++	}
++
++	err_puts(m, "\n");
++
++	if (m->bytes == 0 && m->err)
++		return m->err;
++
++	return 0;
++}
++
++static int
++i915_drm_gem_obj_info(int id, void *ptr, void *data)
++{
++	struct drm_i915_gem_object *obj = ptr;
++	struct drm_i915_error_state_buf *m = data;
++	int ret;
++
++	i915_obj_pidarray_validate(&obj->base);
++	ret = i915_describe_obj(m, obj);
++
++	return ret;
++}
++
++static int
++i915_drm_gem_object_per_file_summary(int id, void *ptr, void *data)
++{
++	struct pid_stat_entry *pid_entry = data;
++	struct drm_i915_gem_object *obj = ptr;
++	struct per_file_obj_mem_info *stats = &pid_entry->stats;
++	struct drm_i915_obj_pid_info *entry;
++	struct drm_hash_item *hash_item;
++	int obj_shared_count = 0;
++
++	i915_obj_pidarray_validate(&obj->base);
++
++	stats->num_obj++;
++
++	if (obj->base.name) {
++
++		if (drm_ht_find_item(&pid_entry->namelist,
++				(unsigned long)obj->base.name, &hash_item)) {
++			struct name_entry *entry =
++				kzalloc(sizeof(*entry), GFP_KERNEL);
++			if (entry == NULL) {
++				DRM_ERROR("alloc failed\n");
++				return -ENOMEM;
++			}
++			entry->hash_item.key = obj->base.name;
++			drm_ht_insert_item(&pid_entry->namelist,
++					&entry->hash_item);
++			list_add_tail(&entry->head, &pid_entry->namefree);
++		} else {
++			DRM_DEBUG("Duplicate obj with name %d for process %s\n",
++				obj->base.name, stats->process_name);
++			return 0;
++		}
++		list_for_each_entry(entry, &obj->pid_info, head)
++			obj_shared_count++;
++		if (WARN_ON(obj_shared_count == 0))
++			return -EINVAL;
++
++		DRM_DEBUG("Obj: %p, shared count =%d\n",
++			&obj->base, obj_shared_count);
++
++		if (obj_shared_count > 1)
++			stats->num_obj_shared++;
++		else
++			stats->num_obj_private++;
++	} else {
++		obj_shared_count = 1;
++		stats->num_obj_private++;
++	}
++
++	if (i915_gem_obj_bound_any(obj)) {
++		stats->num_obj_gtt_bound++;
++		if (obj_shared_count > 1)
++			stats->gtt_space_allocated_shared += obj->base.size;
++		else
++			stats->gtt_space_allocated_priv += obj->base.size;
++	}
++
++	if (obj->stolen) {
++		stats->num_obj_stolen++;
++		stats->stolen_space_allocated += obj->base.size;
++	} else if (obj->madv == __I915_MADV_PURGED) {
++		stats->num_obj_purged++;
++	} else if (obj->madv == I915_MADV_DONTNEED) {
++		stats->num_obj_purgeable++;
++		stats->num_obj_allocated++;
++		if (i915_obj_get_shmem_pages_alloced(obj) != 0) {
++			stats->phys_space_purgeable += obj->base.size;
++			if (obj_shared_count > 1) {
++				stats->phys_space_allocated_shared +=
++					obj->base.size;
++				stats->phys_space_shared_proportion +=
++					obj->base.size/obj_shared_count;
++			} else
++				stats->phys_space_allocated_priv +=
++					obj->base.size;
++		} else
++			WARN_ON(1);
++	} else if (i915_obj_get_shmem_pages_alloced(obj) != 0) {
++		stats->num_obj_allocated++;
++			if (obj_shared_count > 1) {
++				stats->phys_space_allocated_shared +=
++					obj->base.size;
++				stats->phys_space_shared_proportion +=
++					obj->base.size/obj_shared_count;
++			}
++		else
++			stats->phys_space_allocated_priv += obj->base.size;
++	}
++	if (obj->fault_mappable) {
++		stats->num_obj_fault_mappable++;
++		stats->fault_mappable_size += obj->base.size;
++	}
++	return 0;
++}
++
++static int
++__i915_get_drm_clients_info(struct drm_i915_error_state_buf *m,
++			struct drm_device *dev)
++{
++	struct drm_file *file;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	struct name_entry *entry, *next;
++	struct pid_stat_entry *pid_entry, *temp_entry;
++	struct pid_stat_entry *new_pid_entry, *new_temp_entry;
++	struct list_head per_pid_stats, sorted_pid_stats;
++	int ret = 0, total_shared_prop_space = 0, total_priv_space = 0;
++
++	INIT_LIST_HEAD(&per_pid_stats);
++	INIT_LIST_HEAD(&sorted_pid_stats);
++
++	err_puts(m,
++		"\n\n  pid   Total  Shared  Priv   Purgeable  Alloced  SharedPHYsize   SharedPHYprop    PrivPHYsize   PurgeablePHYsize   process\n");
++
++	list_for_each_entry(file, &dev->filelist, lhead) {
++		struct pid *tgid;
++		struct drm_i915_file_private *file_priv = file->driver_priv;
++		int pid_num, found = 0;
++
++		tgid = file_priv->tgid;
++		pid_num = pid_nr(tgid);
++
++		list_for_each_entry(pid_entry, &per_pid_stats, head) {
++			if (pid_entry->pid_num == pid_num) {
++				found = 1;
++				break;
++			}
++		}
++
++		if (!found) {
++			struct pid_stat_entry *new_entry =
++				kzalloc(sizeof(*new_entry), GFP_KERNEL);
++			if (new_entry == NULL) {
++				DRM_ERROR("alloc failed\n");
++				ret = -ENOMEM;
++				goto out;
++			}
++			new_entry->tgid = tgid;
++			new_entry->pid_num = pid_num;
++			list_add_tail(&new_entry->head, &per_pid_stats);
++			drm_ht_create(&new_entry->namelist,
++				DRM_MAGIC_HASH_ORDER);
++			INIT_LIST_HEAD(&new_entry->namefree);
++			new_entry->stats.process_name = file_priv->process_name;
++			pid_entry = new_entry;
++		}
++
++		ret = idr_for_each(&file->object_idr,
++			&i915_drm_gem_object_per_file_summary, pid_entry);
++		if (ret)
++			break;
++	}
++
++	list_for_each_entry_safe(pid_entry, temp_entry, &per_pid_stats, head) {
++		if (list_empty(&sorted_pid_stats)) {
++			list_del(&pid_entry->head);
++			list_add_tail(&pid_entry->head, &sorted_pid_stats);
++			continue;
++		}
++
++		list_for_each_entry_safe(new_pid_entry, new_temp_entry,
++			&sorted_pid_stats, head) {
++			int prev_space =
++				pid_entry->stats.phys_space_shared_proportion +
++				pid_entry->stats.phys_space_allocated_priv;
++			int new_space =
++				new_pid_entry->
++				stats.phys_space_shared_proportion +
++				new_pid_entry->stats.phys_space_allocated_priv;
++			if (prev_space > new_space) {
++				list_del(&pid_entry->head);
++				list_add_tail(&pid_entry->head,
++					&new_pid_entry->head);
++				break;
++			}
++			if (list_is_last(&new_pid_entry->head,
++				&sorted_pid_stats)) {
++				list_del(&pid_entry->head);
++				list_add_tail(&pid_entry->head,
++						&sorted_pid_stats);
++			}
++		}
++	}
++
++	list_for_each_entry_safe(pid_entry, temp_entry,
++				&sorted_pid_stats, head) {
++		struct task_struct *task = get_pid_task(pid_entry->tgid,
++							PIDTYPE_PID);
++		err_printf(m,
++			"%5d %6d %6d %6d %9d %8d %14zdK %14zdK %14zdK  %14zdK     %s",
++			   pid_entry->pid_num,
++			   pid_entry->stats.num_obj,
++			   pid_entry->stats.num_obj_shared,
++			   pid_entry->stats.num_obj_private,
++			   pid_entry->stats.num_obj_purgeable,
++			   pid_entry->stats.num_obj_allocated,
++			   pid_entry->stats.phys_space_allocated_shared/1024,
++			   pid_entry->stats.phys_space_shared_proportion/1024,
++			   pid_entry->stats.phys_space_allocated_priv/1024,
++			   pid_entry->stats.phys_space_purgeable/1024,
++			   pid_entry->stats.process_name);
++
++		if (task == NULL)
++			err_puts(m, "*\n");
++		else
++			err_puts(m, "\n");
++
++		total_shared_prop_space +=
++			pid_entry->stats.phys_space_shared_proportion/1024;
++		total_priv_space +=
++			pid_entry->stats.phys_space_allocated_priv/1024;
++		list_del(&pid_entry->head);
++
++		list_for_each_entry_safe(entry, next,
++					&pid_entry->namefree, head) {
++			list_del(&entry->head);
++			drm_ht_remove_item(&pid_entry->namelist,
++					&entry->hash_item);
++			kfree(entry);
++		}
++		drm_ht_remove(&pid_entry->namelist);
++		kfree(pid_entry);
++		if (task)
++			put_task_struct(task);
++	}
++
++	err_puts(m,
++		"\t\t\t\t\t\t\t\t--------------\t-------------\t--------\n");
++	err_printf(m,
++		"\t\t\t\t\t\t\t\t%13zdK\t%12zdK\tTotal\n",
++			total_shared_prop_space, total_priv_space);
++
++	err_printf(m, "\nTotal used GFX Shmem Physical space %8zdK\n",
++		   dev_priv->mm.phys_mem_total/1024);
++
++out:
++	if (ret)
++		return ret;
++	if (m->bytes == 0 && m->err)
++		return m->err;
++
++	return 0;
++}
++
++static int
++__i915_gem_get_all_obj_info(struct drm_i915_error_state_buf *m,
++			struct drm_device *dev)
++{
++	struct drm_file *file;
++	int pid_num, ret = 0;
++
++	list_for_each_entry(file, &dev->filelist, lhead) {
++		struct pid *tgid;
++		struct drm_i915_file_private *file_priv = file->driver_priv;
++
++		tgid = file_priv->tgid;
++		pid_num = pid_nr(tgid);
++
++		err_puts(m, "\n\n  PID  process\n");
++
++		err_printf(m, "%5d  %s\n",
++			   pid_num, file_priv->process_name);
++
++		err_puts(m,
++			"\n Obj Identifier       Size Pin Tiling Dirty Shared Vmap Stolen Mappable  AllocState Global/PP  GttOffset (PID: handle count: user virt addrs)\n");
++		ret = idr_for_each(&file->object_idr,
++				&i915_drm_gem_obj_info, m);
++		if (ret)
++			break;
++	}
++
++	if (ret)
++		return ret;
++	if (m->bytes == 0 && m->err)
++		return m->err;
++	return 0;
++}
++
++int i915_get_drm_clients_info(struct drm_i915_error_state_buf *m,
++			struct drm_device *dev)
++{
++	int ret = 0;
++
++	/*
++	 * Protect the access to global drm resources such as filelist. Protect
++	 * against their removal under our noses, while in use.
++	 */
++	mutex_lock(&drm_global_mutex);
++	ret = i915_mutex_lock_interruptible(dev);
++	if (ret) {
++		mutex_unlock(&drm_global_mutex);
++		return ret;
++	}
++
++	ret = __i915_get_drm_clients_info(m, dev);
++
++	mutex_unlock(&dev->struct_mutex);
++	mutex_unlock(&drm_global_mutex);
++
++	return ret;
++}
++
++int i915_gem_get_all_obj_info(struct drm_i915_error_state_buf *m,
++			struct drm_device *dev)
++{
++	int ret = 0;
++
++	/*
++	 * Protect the access to global drm resources such as filelist. Protect
++	 * against their removal under our noses, while in use.
++	 */
++	mutex_lock(&drm_global_mutex);
++	ret = i915_mutex_lock_interruptible(dev);
++	if (ret) {
++		mutex_unlock(&drm_global_mutex);
++		return ret;
++	}
++
++	ret = __i915_gem_get_all_obj_info(m, dev);
++	if (ret)
++		goto out_unlock;
++
++	ret = __i915_get_drm_clients_info(m, dev);
++
++out_unlock:
++	mutex_unlock(&dev->struct_mutex);
++	mutex_unlock(&drm_global_mutex);
++
++	return ret;
++}
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 40c3233..f79556d7 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -161,7 +161,7 @@ static void i915_error_vprintf(struct drm_i915_error_state_buf *e,
+ 	__i915_error_advance(e, len);
+ }
+ 
+-static void i915_error_puts(struct drm_i915_error_state_buf *e,
++void i915_error_puts(struct drm_i915_error_state_buf *e,
+ 			    const char *str)
+ {
+ 	unsigned len;
+diff --git a/drivers/gpu/drm/i915/i915_params.c b/drivers/gpu/drm/i915/i915_params.c
+index 5ec96ee..3b9ac90 100644
+--- a/drivers/gpu/drm/i915/i915_params.c
++++ b/drivers/gpu/drm/i915/i915_params.c
+@@ -57,6 +57,7 @@ struct i915_params i915 __read_mostly = {
+ 	.ring_reset_min_alive_period = 0,
+ 	.gpu_reset_min_alive_period = 0,
+ 	.enable_watchdog = 1,
++	.memtrack_debug = 1,
+ };
+ module_param_named(limitbw, i915.limitbw, int, 0400);
+ MODULE_PARM_DESC(limitbw,
+@@ -240,3 +241,7 @@ MODULE_PARM_DESC(gpu_reset_min_alive_period,
+ 		"following the previous GPU reset then declare it wedged and "
+ 		"prevent further resets. "
+ 		"default=0 seconds (disabled)");
++
++module_param_named(memtrack_debug, i915.memtrack_debug, int, 0600);
++MODULE_PARM_DESC(memtrack_debug,
++		 "use Memtrack debug capability (0=never, 1=always)");
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.c b/drivers/gpu/drm/i915/i915_sysfs.c
+index bf05b81..a841b46 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -602,6 +602,64 @@ static ssize_t error_state_write(struct file *file, struct kobject *kobj,
+ 	return count;
+ }
+ 
++static ssize_t i915_gem_clients_state_read(struct file *filp,
++				struct kobject *kobj,
++				struct bin_attribute *attr,
++				char *buf, loff_t off, size_t count)
++{
++	struct device *kdev = container_of(kobj, struct device, kobj);
++	struct drm_minor *minor = dev_to_drm_minor(kdev);
++	struct drm_device *dev = minor->dev;
++	struct drm_i915_error_state_buf error_str;
++	ssize_t ret_count = 0;
++	int ret;
++
++	ret = i915_error_state_buf_init(&error_str, count, off);
++	if (ret)
++		return ret;
++
++	ret = i915_get_drm_clients_info(&error_str, dev);
++	if (ret)
++		goto out;
++
++	ret_count = count < error_str.bytes ? count : error_str.bytes;
++
++	memcpy(buf, error_str.buf, ret_count);
++out:
++	i915_error_state_buf_release(&error_str);
++
++	return ret ?: ret_count;
++}
++
++static ssize_t i915_gem_objects_state_read(struct file *filp,
++				struct kobject *kobj,
++				struct bin_attribute *attr,
++				char *buf, loff_t off, size_t count)
++{
++	struct device *kdev = container_of(kobj, struct device, kobj);
++	struct drm_minor *minor = dev_to_drm_minor(kdev);
++	struct drm_device *dev = minor->dev;
++	struct drm_i915_error_state_buf error_str;
++	ssize_t ret_count = 0;
++	int ret;
++
++	ret = i915_error_state_buf_init(&error_str, count, off);
++	if (ret)
++		return ret;
++
++	ret = i915_gem_get_all_obj_info(&error_str, dev);
++	if (ret)
++		goto out;
++
++	ret_count = count < error_str.bytes ? count : error_str.bytes;
++
++	memcpy(buf, error_str.buf, ret_count);
++out:
++	i915_error_state_buf_release(&error_str);
++
++	return ret ?: ret_count;
++}
++
+ static struct bin_attribute error_state_attr = {
+ 	.attr.name = "error",
+ 	.attr.mode = S_IRUSR | S_IWUSR,
+@@ -610,6 +668,20 @@ static struct bin_attribute error_state_attr = {
+ 	.write = error_state_write,
+ };
+ 
++static struct bin_attribute i915_gem_client_state_attr = {
++	.attr.name = "i915_gem_meminfo",
++	.attr.mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH,
++	.size = 0,
++	.read = i915_gem_clients_state_read,
++};
++
++static struct bin_attribute i915_gem_objects_state_attr = {
++	.attr.name = "i915_gem_objinfo",
++	.attr.mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH,
++	.size = 0,
++	.read = i915_gem_objects_state_read,
++};
++
+ void i915_setup_sysfs(struct drm_device *dev)
+ {
+ 	int ret;
+@@ -647,6 +719,22 @@ void i915_setup_sysfs(struct drm_device *dev)
+ 				    &error_state_attr);
+ 	if (ret)
+ 		DRM_ERROR("error_state sysfs setup failed\n");
++
++	if (i915.memtrack_debug) {
++		ret = sysfs_create_bin_file(&dev->primary->kdev->kobj,
++					    &i915_gem_client_state_attr);
++		if (ret)
++			DRM_ERROR(
++			"i915_gem_client_state sysfs setup failed\n"
++				);
++
++		ret = sysfs_create_bin_file(&dev->primary->kdev->kobj,
++					    &i915_gem_objects_state_attr);
++		if (ret)
++			DRM_ERROR(
++				"i915_gem_objects_state sysfs setup failed\n"
++				);
++	}
+ }
+ 
+ void i915_teardown_sysfs(struct drm_device *dev)
+-- 
+1.7.9.5
+

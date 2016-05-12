@@ -1,0 +1,357 @@
+From 733630ee11814d99642d96836c77c8da84c35064 Mon Sep 17 00:00:00 2001
+From: Albin B <albin.bala.krishnan@intel.com>
+Date: Thu, 28 May 2015 15:01:22 +0530
+Subject: [PATCH] [USB_TYPEC_PD]: Add autocrc support for usb typec pd messages
+
+In power delivery support to meet the timing requirment for the USB PD
+messages, add the autocrc support in the fusb phy driver only for
+fusb302 chip.
+
+Change-Id: I4d9bbb1b4079ec0d2539c3e41bfeb487c8a9b61d
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-37737
+Signed-off-by: Albin B <albin.bala.krishnan@intel.com>
+Signed-off-by: R, Kannappan <r.kannappan@intel.com>
+---
+ drivers/usb/typec/phy-fusb300.c      | 133 ++++++++++++++++++++++-------------
+ drivers/usb/typec/usb_typec_detect.c |   3 +
+ include/linux/usb_typec_phy.h        |  15 ++--
+ 3 files changed, 97 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/usb/typec/phy-fusb300.c b/drivers/usb/typec/phy-fusb300.c
+index 430cc16610d0..62683f022ab5 100644
+--- a/drivers/usb/typec/phy-fusb300.c
++++ b/drivers/usb/typec/phy-fusb300.c
+@@ -297,6 +297,7 @@ struct fusb300_chip {
+ 	int activity_count;
+ 	struct completion int_complete;
+ 	spinlock_t irqlock;
++	bool process_pd;
+ 	int is_fusb300;
+ };
+ 
+@@ -385,7 +386,7 @@ static int fusb300_en_pu(struct fusb300_chip *chip, bool en_pu, int cur)
+ 	} else {
+ 		val &= ~FUSB300_SWITCH0_PU_EN;
+ 	}
+-	dev_dbg(chip->dev, "%s: assigning switch0 %x = %x", __func__,
++	dev_dbg(chip->dev, "%s: switch0 %x = %x", __func__,
+ 				FUSB300_SWITCH0_REG, val);
+ 	mutex_unlock(&chip->lock);
+ 	ret = fusb300_set_host_current(&chip->phy, cur);
+@@ -590,8 +591,6 @@ static inline int fusb302_configure_pd(struct fusb300_chip *chip)
+ 		FUSB302_CONTROL3_AUTO_HARD_RST;
+ 
+ 	regmap_write(chip->map, FUSB302_CONTROL3_REG, val);
+-	regmap_update_bits(chip->map, FUSB300_SWITCH1_REG,
+-		FUSB302_SWITCH1_AUTOCRC, FUSB302_SWITCH1_AUTOCRC);
+ 	return 0;
+ }
+ 
+@@ -610,7 +609,9 @@ static int fusb300_init_chip(struct fusb300_chip *chip)
+ 	}
+ 	udelay(25);
+ 
+-	ret = regmap_write(regmap, FUSB300_PWR_REG, 7);
++	val = (FUSB300_PWR_BG_WKUP | FUSB300_PWR_BMC |
++		 FUSB300_PWR_MEAS | FUSB300_PWR_OSC);
++	ret = regmap_write(regmap, FUSB300_PWR_REG, val);
+ 	if (ret < 0) {
+ 		dev_err(chip->dev, "error(%d) writing to reg:%x\n",
+ 				ret, FUSB300_PWR_REG);
+@@ -656,9 +657,6 @@ static int fusb300_init_chip(struct fusb300_chip *chip)
+ 		/* FUSB302_CONTROL1_FAST_I2C, FUSB302_CONTROL1_FAST_I2C); */
+ 		fusb302_configure_pd(chip);
+ 	}
+-	/* AutoCRC , TXCC2 , SPECREV2 */
+-	regmap_write(regmap, FUSB300_SWITCH1_REG, 0x26);
+-
+ 	regmap_write(chip->map, FUSB300_SLICE_REG, 0x2A);
+ 
+ 	return 0;
+@@ -810,7 +808,7 @@ static irqreturn_t fusb300_interrupt(int id, void *dev)
+ 		}
+ 	}
+ 
+-	if ((int_stat.int_reg & FUSB300_INT_ACTIVITY) &&
++	if (chip->process_pd && (int_stat.int_reg & FUSB300_INT_ACTIVITY) &&
+ 		(int_stat.int_reg & FUSB300_INT_COLLISION) &&
+ 		!(int_stat.stat_reg & FUSB300_STAT0_ACTIVITY)) {
+ 		mutex_lock(&chip->lock);
+@@ -820,25 +818,12 @@ static irqreturn_t fusb300_interrupt(int id, void *dev)
+ 			phy->notify_protocol(phy, PROT_PHY_EVENT_COLLISION);
+ 	}
+ 
+-	if (int_stat.int_reg & FUSB300_INT_CRCCHK) {
+-		if (int_stat.stat_reg & FUSB300_STAT0_CRCCHK) {
+-			if (phy->notify_protocol)
+-				phy->notify_protocol(phy,
+-						PROT_PHY_EVENT_GOODCRC);
+-		} else {
+-			/* we shouldnt get here, as FUSB300 generate I_CRCCHK
+-			 * only when there is a goodcrc found */
+-			dev_info(phy->dev, "invalid crc, do flush...");
+-			mutex_lock(&chip->lock);
+-			/* RX FLUSH */
+-			regmap_update_bits(chip->map, FUSB300_CONTROL1_REG,
+-					0x4, 0x4);
+-			mutex_unlock(&chip->lock);
+-		}
++	if (chip->process_pd && (int_stat.int_reg & FUSB300_INT_CRCCHK)) {
++		if (phy->notify_protocol)
++			phy->notify_protocol(phy, PROT_PHY_EVENT_MSG_RCV);
+ 	}
+ 
+ 	if (int_stat.int_reg & FUSB300_INT_ALERT) {
+-		regmap_write(chip->map, FUSB300_PWR_REG, 0xf);
+ 		if (int_stat.stat1_reg & FUSB300_STAT1_TXFULL) {
+ 			dev_info(phy->dev, "alert int tx fifo full");
+ 			mutex_lock(&chip->lock);
+@@ -855,6 +840,14 @@ static irqreturn_t fusb300_interrupt(int id, void *dev)
+ 		}
+ 	}
+ 
++	if (!chip->is_fusb300 && chip->process_pd) {
++		if (int_stat.inta_reg & FUSB302_INTB_GCRC_SENT) {
++			dev_dbg(phy->dev, "GoodCRC sent");
++			if (phy->notify_protocol)
++				phy->notify_protocol(phy,
++						PROT_PHY_EVENT_GOODCRC_SENT);
++		}
++	}
+ 	/* indication of activity means there is some transaction on CC
+ 	 * FUSB302 has TXSENT interrupt  for TX completion
+ 	 */
+@@ -868,8 +861,7 @@ static irqreturn_t fusb300_interrupt(int id, void *dev)
+ 						PROT_PHY_EVENT_TX_SENT);
+ 		}
+ 	}
+-
+-	if (!chip->is_fusb300) {
++	if (!chip->is_fusb300 && chip->process_pd) {
+ 		/* handle FUSB302 specific interrupt */
+ 
+ 		if (int_stat.inta_reg & FUSB302_INTA_HARD_RST) {
+@@ -912,13 +904,6 @@ static irqreturn_t fusb300_interrupt(int id, void *dev)
+ 				phy->notify_protocol(phy,
+ 						PROT_PHY_EVENT_TX_HARD_RST);
+ 		}
+-
+-		if (int_stat.inta_reg & FUSB302_INTB_GCRC_SENT) {
+-			dev_dbg(phy->dev, "GoodCRC sent");
+-			if (phy->notify_protocol)
+-				phy->notify_protocol(phy,
+-						PROT_PHY_EVENT_GOODCRC_SENT);
+-		}
+ 	}
+ 
+ 	pm_runtime_put_sync(chip->dev);
+@@ -1098,14 +1083,10 @@ static inline int fusb302_pd_send_hard_rst(struct typec_phy *phy)
+ 
+ 	chip = dev_get_drvdata(phy->dev);
+ 
+-	if (chip->is_fusb300)
+-		ret = fusb300_pd_send_hard_rst(&chip->phy);
+-	else
+-		ret = regmap_update_bits(chip->map, FUSB302_CONTROL3_REG,
++	return regmap_update_bits(chip->map, FUSB302_CONTROL3_REG,
+ 				FUSB302_CONTROL3_SEND_HARD_RST,
+ 				FUSB302_CONTROL3_SEND_HARD_RST);
+ 
+-	return ret;
+ }
+ 
+ static int fusb300_measure_cc(struct typec_phy *phy, enum typec_cc_pin pin,
+@@ -1270,8 +1251,10 @@ static int fusb300_wake_on_cc_change(struct fusb300_chip *chip)
+ 			mutex_unlock(&chip->lock);
+ 			return ret;
+ 		}
+-	} else /* enable chip level toggle */
++	} else {
++		/* enable chip level toggle */
+ 		ret = fusb302_enable_toggle(chip, true, FUSB302_TOG_MODE_DRP);
++	}
+ 
+ 	chip->phy.state = TYPEC_STATE_UNATTACHED_UFP;
+ 	mutex_unlock(&chip->lock);
+@@ -1311,6 +1294,59 @@ end:
+ 	return ret;
+ }
+ 
++static int fusb300_enable_autocrc(struct typec_phy *phy, bool en)
++{
++	struct fusb300_chip *chip;
++	unsigned int val, int_mask;
++	int ret;
++
++	chip = dev_get_drvdata(phy->dev);
++	if (chip->is_fusb300)
++		return -ENOTSUPP;
++
++	mutex_lock(&chip->lock);
++
++	regmap_read(chip->map, FUSB300_SWITCH1_REG, &val);
++
++	val &= ~(1<<2);
++
++	if (en) {
++		val |= FUSB302_SWITCH1_AUTOCRC;
++		int_mask = FUSB300_INT_MASK_COMP;
++	} else {
++		int_mask = (FUSB300_INT_MASK_COMP |
++			FUSB300_INT_MASK_ACTIVITY |
++			FUSB300_INT_MASK_CRCCHK);
++	}
++
++
++	regmap_update_bits(chip->map, FUSB300_SOFT_POR_REG, 2, 2);
++
++	mutex_unlock(&chip->lock);
++
++	fusb300_flush_fifo(phy, FIFO_TYPE_TX);
++	fusb300_flush_fifo(phy, FIFO_TYPE_RX);
++
++	mutex_lock(&chip->lock);
++	ret = regmap_write(chip->map, FUSB300_SWITCH1_REG, val);
++
++	if (ret < 0)
++		goto err;
++
++	ret = regmap_write(chip->map, FUSB300_INT_MASK_REG, int_mask);
++	if (ret < 0)
++		goto err;
++
++	chip->process_pd = en;
++
++	mutex_unlock(&chip->lock);
++	return ret;
++err:
++	chip->process_pd = false;
++	mutex_unlock(&chip->lock);
++	return ret;
++}
++
+ static int fusb300_probe(struct i2c_client *client,
+ 			const struct i2c_device_id *id)
+ {
+@@ -1348,6 +1384,7 @@ static int fusb300_probe(struct i2c_client *client,
+ 		chip->phy.support_drp_toggle = true;
+ 		chip->is_fusb300 = false;
+ 		chip->phy.support_auto_goodcrc = true;
++		chip->phy.support_retry = true;
+ 	}
+ 	dev_info(&client->dev, "ID-reg(%x)=%x, is_fusb300:%d\n",
+ 		       FUSB30x_DEV_ID_REG, val, chip->is_fusb300);
+@@ -1367,8 +1404,10 @@ static int fusb300_probe(struct i2c_client *client,
+ 	chip->phy.flush_fifo = fusb300_flush_fifo;
+ 	chip->phy.send_packet = fusb300_send_pkt;
+ 	chip->phy.recv_packet = fusb300_recv_pkt;
+-	if (!chip->is_fusb300)
++	if (!chip->is_fusb300) {
+ 		chip->phy.setup_role = fusb300_setup_role;
++		chip->phy.enable_autocrc = fusb300_enable_autocrc;
++	}
+ 
+ 	if (IS_ENABLED(CONFIG_ACPI))
+ 		client->irq = fusb300_get_irq(client);
+@@ -1383,13 +1422,13 @@ static int fusb300_probe(struct i2c_client *client,
+ 	typec_bind_detect(&chip->phy);
+ 
+ 	fusb300_init_chip(chip);
+-
+ 	if (client->irq > 0) {
+ 		u8 int_mask;
+ 
+-		int_mask = (chip->is_fusb300) ? 0 : FUSB300_INT_MASK_COMP;
+-		regmap_update_bits(chip->map, FUSB300_INT_MASK_REG,
+-				FUSB300_INT_MASK_COMP, int_mask);
++		int_mask = (chip->is_fusb300) ? 0 : (FUSB300_INT_MASK_COMP |
++						FUSB300_INT_MASK_ACTIVITY |
++						FUSB300_INT_MASK_CRCCHK);
++		regmap_write(chip->map, FUSB300_INT_MASK_REG, int_mask);
+ 
+ 		ret = devm_request_threaded_irq(&client->dev, client->irq,
+ 				NULL, fusb300_interrupt,
+@@ -1401,10 +1440,8 @@ static int fusb300_probe(struct i2c_client *client,
+ 				"error registering interrupt %d", ret);
+ 			return -EIO;
+ 		}
+-		regmap_write(chip->map, FUSB300_INT_MASK_REG, 0);
+-	} else
+-		dev_warn(&client->dev,
+-				"irq-no invalid: %d\n", client->irq);
++	}
++
+ 
+ 	regmap_read(chip->map, FUSB300_CONTROL0_REG, &val);
+ 	val &= ~FUSB300_CONTROL0_MASK_INT;
+diff --git a/drivers/usb/typec/usb_typec_detect.c b/drivers/usb/typec/usb_typec_detect.c
+index a090922239a2..49ccfd5b5f20 100644
+--- a/drivers/usb/typec/usb_typec_detect.c
++++ b/drivers/usb/typec/usb_typec_detect.c
+@@ -287,6 +287,7 @@ static void detect_lock_ufp_work(struct work_struct *work)
+ 	unsigned long timeout = msecs_to_jiffies(TYPEC_DRPLOCK_TIMEOUT);
+ 
+ 	phy = detect->phy;
++	typec_enable_autocrc(detect->phy, false);
+ 	typec_switch_mode(detect->phy, TYPEC_MODE_UFP);
+ 	ret = wait_for_completion_timeout(&detect->lock_ufp_complete, timeout);
+ 	if (ret == 0) {
+@@ -398,6 +399,7 @@ static void update_phy_state(struct work_struct *work)
+ 			mutex_unlock(&detect->lock);
+ 			typec_setup_cc(phy, use_cc, TYPEC_STATE_ATTACHED_UFP);
+ 			extcon_set_cable_state(detect->edev, "USB", true);
++			typec_enable_autocrc(detect->phy, true);
+ 
+ 			/* notify power supply */
+ 			cable_props.chrg_evt =
+@@ -429,6 +431,7 @@ static void update_phy_state(struct work_struct *work)
+ 			atomic_notifier_call_chain(&power_supply_notifier,
+ 							PSY_CABLE_EVENT,
+ 							&cable_props);
++			typec_enable_autocrc(detect->phy, false);
+ 		} else {
+ 			/* state = DFP; disable VBUS */
+ 			/* [WA] Since neccessary pmic-gpio isn't exposed
+diff --git a/include/linux/usb_typec_phy.h b/include/linux/usb_typec_phy.h
+index fc167ec153bd..c8bf57e0b19a 100644
+--- a/include/linux/usb_typec_phy.h
++++ b/include/linux/usb_typec_phy.h
+@@ -147,12 +147,6 @@ struct typec_ops {
+ 					enum typec_state state);
+ };
+ 
+-struct bmc_ops {
+-	int pd_revision;
+-	int (*send_packet)(struct typec_phy *phy, void *msg, int len);
+-	int (*recv_packet)(struct typec_phy *phy, void *msg);
+-};
+-
+ struct typec_phy {
+ 	const char *label;
+ 	struct device *dev;
+@@ -184,6 +178,7 @@ struct typec_phy {
+ 	int (*setup_role)(struct typec_phy *phy, int data_role, int pwr_role);
+ 	int (*notify_protocol)(struct typec_phy *phy, unsigned long event);
+ 	bool (*is_pd_capable)(struct typec_phy *phy);
++	int (*enable_autocrc)(struct typec_phy *phy, bool en);
+ };
+ 
+ extern struct typec_phy *typec_get_phy(int type);
+@@ -274,6 +269,14 @@ static inline int typec_setup_cc(struct typec_phy *phy, enum typec_cc_pin cc,
+ 	return -ENOTSUPP;
+ }
+ 
++static inline int typec_enable_autocrc(struct typec_phy *phy, bool en)
++{
++	if (phy && phy->enable_autocrc)
++		return phy->enable_autocrc(phy, en);
++
++	return -ENOTSUPP;
++}
++
+ static inline int typec_register_prot_notifier(struct typec_phy *phy,
+ 						struct notifier_block *nb)
+ {
+-- 
+1.9.1
+

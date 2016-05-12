@@ -1,0 +1,144 @@
+From 8780241847c3c1cd160f9dc9daf2ff78d092f22c Mon Sep 17 00:00:00 2001
+From: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Date: Fri, 12 Sep 2014 11:45:54 +0800
+Subject: [PATCH 12/18] mmc: host: add soc specific quirks support
+
+This patch add soc specific quirks support in sdhci-acpi.c which
+can be used for current Baytrail and Cherrytrail
+
+Change-Id: Id7c30ee6e4d3a40a1576df75244a8712797c58e1
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+---
+ drivers/mmc/host/sdhci-acpi.c |   40 +++++++++++++++++++++++++++++++++-------
+ drivers/mmc/host/sdhci.c      |    4 ++++
+ include/linux/mmc/sdhci.h     |    1 +
+ 3 files changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/mmc/host/sdhci-acpi.c b/drivers/mmc/host/sdhci-acpi.c
+index b227d92ef473..d904dcf95b10 100644
+--- a/drivers/mmc/host/sdhci-acpi.c
++++ b/drivers/mmc/host/sdhci-acpi.c
+@@ -69,6 +69,7 @@ struct sdhci_acpi_slot {
+ 	mmc_pm_flag_t	pm_caps;
+ 	unsigned int	flags;
+ 	int (*probe_slot) (struct platform_device *);
++	int (*remove_slot)(struct platform_device *);
+ };
+ 
+ struct sdhci_acpi_host {
+@@ -139,31 +140,50 @@ static int sdhci_acpi_probe_slot(struct platform_device *pdev)
+ 
+ 	return 0;
+ }
++static int sdhci_acpi_remove_slot(struct platform_device *pdev)
++{
++	struct sdhci_acpi_host *c = platform_get_drvdata(pdev);
++	struct sdhci_host *host;
++
++	if (!c || !c->host)
++		return 0;
++
++	host = c->host;
++
++	if (host->mmc && host->mmc->qos)
++		kfree(host->mmc->qos);
++
++	return 0;
++}
+ 
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_emmc = {
+ 	.chip    = &sdhci_acpi_chip_int,
+-	.caps    = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE | MMC_CAP_HW_RESET,
++	.caps    = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE | MMC_CAP_HW_RESET
++		| MMC_CAP_1_8V_DDR,
+ 	.caps2   = MMC_CAP2_HC_ERASE_SZ | MMC_CAP2_POLL_R1B_BUSY |
+-		MMC_CAP2_CACHE_CTRL,
++		MMC_CAP2_CACHE_CTRL | MMC_CAP2_HS200_1_8V_SDR,
+ 	.flags   = SDHCI_ACPI_RUNTIME_PM,
+-	.quirks2 = SDHCI_QUIRK2_TUNING_POLL | SDHCI_QUIRK2_BROKEN_HS200,
++	.quirks2 = SDHCI_QUIRK2_TUNING_POLL | SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
+ 	.probe_slot = sdhci_acpi_probe_slot,
++	.remove_slot = sdhci_acpi_remove_slot,
+ };
+ 
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sdio = {
+ 	.quirks2 = SDHCI_QUIRK2_HOST_OFF_CARD_ON |
+-		   SDHCI_QUIRK2_TUNING_POLL,
++		   SDHCI_QUIRK2_PRESET_VALUE_BROKEN |
++		   SDHCI_QUIRK2_FAKE_VDD,
+ 	.caps    = MMC_CAP_NONREMOVABLE | MMC_CAP_POWER_OFF_CARD,
+ 	.flags   = SDHCI_ACPI_RUNTIME_PM,
+ 	.pm_caps = MMC_PM_KEEP_POWER,
+ 	.probe_slot = sdhci_acpi_probe_slot,
++	.remove_slot = sdhci_acpi_remove_slot,
+ };
+ 
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sd = {
+ 	.flags   = SDHCI_ACPI_SD_CD | SDHCI_ACPI_RUNTIME_PM,
+-	.quirks2 = SDHCI_QUIRK2_CARD_ON_NEEDS_BUS_ON |
+-		   SDHCI_QUIRK2_TUNING_POLL,
++	.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
+ 	.probe_slot = sdhci_acpi_probe_slot,
++	.remove_slot = sdhci_acpi_remove_slot,
+ };
+ 
+ struct sdhci_acpi_uid_slot {
+@@ -367,7 +387,7 @@ static int sdhci_acpi_probe(struct platform_device *pdev)
+ 
+ 	err = sdhci_add_host(host);
+ 	if (err)
+-		goto err_free;
++		goto remove_slot;
+ 
+ 	if (sdhci_acpi_flag(c, SDHCI_ACPI_SD_CD)) {
+ 		if (sdhci_acpi_add_own_cd(dev, host->mmc))
+@@ -384,6 +404,9 @@ static int sdhci_acpi_probe(struct platform_device *pdev)
+ 
+ 	return 0;
+ 
++remove_slot:
++	if (c->slot && c->slot->remove_slot)
++		c->slot->remove_slot(pdev);
+ err_free:
+ 	sdhci_free_host(c->host);
+ 	return err;
+@@ -401,6 +424,9 @@ static int sdhci_acpi_remove(struct platform_device *pdev)
+ 		pm_runtime_put_noidle(dev);
+ 	}
+ 
++	if (c->slot && c->slot->remove_slot)
++		c->slot->remove_slot(pdev);
++
+ 	dead = (sdhci_readl(c->host, SDHCI_INT_STATUS) == ~0);
+ 	sdhci_remove_host(c->host, dead);
+ 	sdhci_free_host(c->host);
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index cfebb5ce32e0..64ed8c709094 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -3154,6 +3154,10 @@ int sdhci_add_host(struct sdhci_host *host)
+ 		}
+ 	}
+ 
++	if (host->quirks2 & SDHCI_QUIRK2_FAKE_VDD)
++		caps[0] |= SDHCI_CAN_VDD_330 | SDHCI_CAN_VDD_300 |
++			SDHCI_CAN_VDD_180;
++
+ 	if (caps[0] & SDHCI_CAN_VDD_330) {
+ 		ocr_avail |= MMC_VDD_32_33 | MMC_VDD_33_34;
+ 
+diff --git a/include/linux/mmc/sdhci.h b/include/linux/mmc/sdhci.h
+index e8ed1b1774bb..6672c6e2f291 100644
+--- a/include/linux/mmc/sdhci.h
++++ b/include/linux/mmc/sdhci.h
+@@ -101,6 +101,7 @@ struct sdhci_host {
+ /* Controller does not support HS200 */
+ #define SDHCI_QUIRK2_BROKEN_HS200			(1<<6)
+ #define SDHCI_QUIRK2_TUNING_POLL			(1<<7)
++#define SDHCI_QUIRK2_FAKE_VDD				(1<<8)
+ 
+ 	int irq;		/* Device IRQ */
+ 	void __iomem *ioaddr;	/* Mapped address */
+-- 
+1.7.9.5
+

@@ -1,0 +1,155 @@
+From 88407cf00ead027087dfbfe8ea3d30771903d201 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Fri, 22 Jan 2016 12:27:50 +0530
+Subject: [PATCH 3/7] USBC/FUSB: Fix audio and debug accessory detect issue.
+
+The audio and debug accessory detection is not yet
+handled in fsub driver. This patch will add these
+accessory support to fusb driver.
+
+Change-Id: I44202a97e929e496d8387374616d32735c41dc00
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-17109
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Reviewed-on: https://android.intel.com:443/461211
+---
+ drivers/usb/typec/phy-fusb300.c      | 30 +++++++++++++++++++++++++-----
+ drivers/usb/typec/usb_typec_detect.c | 10 ++++++++++
+ include/linux/usb_typec_phy.h        |  2 ++
+ 3 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/typec/phy-fusb300.c b/drivers/usb/typec/phy-fusb300.c
+index d73d5bb..ff1d727 100644
+--- a/drivers/usb/typec/phy-fusb300.c
++++ b/drivers/usb/typec/phy-fusb300.c
+@@ -528,6 +528,7 @@ static int fusb300_setup_cc(struct typec_phy *phy, enum typec_cc_pin cc,
+ {
+ 	struct fusb300_chip *chip;
+ 	unsigned int val = 0;
++	unsigned int int_mask;
+ 	u8 val_s1;
+ 
+ 	if (!phy)
+@@ -546,6 +547,18 @@ static int fusb300_setup_cc(struct typec_phy *phy, enum typec_cc_pin cc,
+ 	case TYPEC_STATE_POWERED:
+ 		phy->state = state;
+ 		break;
++	case TYPEC_STATE_ATTACHED_AUDIO_ACC:
++	case TYPEC_STATE_ATTACHED_DEBUG_ACC:
++		phy->state = state;
++		regmap_read(chip->map, FUSB300_INT_MASK_REG, &int_mask);
++		int_mask &= ~FUSB300_INT_MASK_COMP;
++		regmap_write(chip->map, FUSB300_INT_MASK_REG, int_mask);
++		regmap_write(chip->map, FUSB300_SWITCH0_REG,
++				FUSB300_SWITCH0_MEASURE_CC1 |
++				FUSB300_SWITCH0_PU_CC1_EN);
++		mutex_unlock(&chip->lock);
++		fusb300_set_host_current(phy, TYPEC_CURRENT_USB);
++		return 0;
+ 	default:
+ 		break;
+ 	}
+@@ -988,8 +1001,10 @@ static irqreturn_t fusb300_interrupt(int id, void *dev)
+ 		 * DFP or UFP state as comp change can also happen
+ 		 * during role swap.
+ 		 */
+-		if ((phy_state == TYPEC_STATE_ATTACHED_UFP) ||
+-			(phy_state == TYPEC_STATE_ATTACHED_DFP)) {
++		if (phy_state == TYPEC_STATE_ATTACHED_UFP ||
++			phy_state == TYPEC_STATE_ATTACHED_DFP ||
++			phy_state == TYPEC_STATE_ATTACHED_AUDIO_ACC ||
++			phy_state == TYPEC_STATE_ATTACHED_DEBUG_ACC) {
+ 			schedule_delayed_work(&chip->dfp_disconn_work, 0);
+ 		}
+ 	}
+@@ -1005,7 +1020,8 @@ static irqreturn_t fusb300_interrupt(int id, void *dev)
+ 			phy->notify_protocol(phy, PROT_PHY_EVENT_COLLISION);
+ 	}
+ 
+-	if (process_pd && (chip->int_stat.int_reg & FUSB300_INT_CRCCHK)) {
++	if (process_pd && (chip->int_stat.int_reg & FUSB300_INT_CRCCHK
++		|| chip->int_stat.stat1_reg & FUSB300_STAT1_RXEMPTY)) {
+ 		if (phy->notify_protocol)
+ 			phy->notify_protocol(phy, PROT_PHY_EVENT_MSG_RCV);
+ 	}
+@@ -1893,7 +1909,9 @@ static int fusb300_late_suspend(struct device *dev)
+ 	struct typec_phy *phy = &chip->phy;
+ 
+ 	if (phy->state == TYPEC_STATE_ATTACHED_UFP ||
+-		phy->state == TYPEC_STATE_ATTACHED_DFP) {
++		phy->state == TYPEC_STATE_ATTACHED_DFP ||
++		phy->state == TYPEC_STATE_ATTACHED_AUDIO_ACC ||
++		phy->state == TYPEC_STATE_ATTACHED_DEBUG_ACC) {
+ 		/* enable power for wakeup block and measure block*/
+ 		regmap_write(chip->map, FUSB300_PWR_REG,
+ 			FUSB300_PWR_BG_WKUP | FUSB300_PWR_BMC |
+@@ -1920,7 +1938,9 @@ static int fusb300_early_resume(struct device *dev)
+ 	struct typec_phy *phy = &chip->phy;
+ 
+ 	if (phy->state == TYPEC_STATE_ATTACHED_UFP ||
+-		phy->state == TYPEC_STATE_ATTACHED_DFP) {
++		phy->state == TYPEC_STATE_ATTACHED_DFP ||
++		phy->state == TYPEC_STATE_ATTACHED_AUDIO_ACC ||
++		phy->state == TYPEC_STATE_ATTACHED_DEBUG_ACC) {
+ 		/* enable the power for wakeup + measurement block and
+ 		 * internal osc */
+ 		regmap_write(chip->map, FUSB300_PWR_REG,
+diff --git a/drivers/usb/typec/usb_typec_detect.c b/drivers/usb/typec/usb_typec_detect.c
+index 14999b3..efbdb57 100644
+--- a/drivers/usb/typec/usb_typec_detect.c
++++ b/drivers/usb/typec/usb_typec_detect.c
+@@ -473,6 +473,7 @@ static void detect_dfp_work(struct work_struct *work)
+ 	int ret, vbus_on;
+ 	enum typec_cc_pin use_cc = 0;
+ 	struct typec_phy *phy = detect->phy;
++	bool audio_debug_detected = 0;
+ 
+ 	/**
+ 	 * when processing cable event if phy goes to suspend, there is an i2c
+@@ -524,8 +525,14 @@ static void detect_dfp_work(struct work_struct *work)
+ 		/* enable VBUS */
+ 	} else if (detect_audio_attached(&phy->cc1, &phy->cc2)) {
+ 		dev_info(detect->phy->dev, "Audio Accessory Detected");
++		audio_debug_detected = 1;
++		typec_setup_cc(phy, TYPEC_PIN_CC2,
++					TYPEC_STATE_ATTACHED_AUDIO_ACC);
+ 	} else if (detect_debug_attached(&phy->cc1, &phy->cc2)) {
+ 		dev_info(detect->phy->dev, "Debug Accessory Detected");
++		audio_debug_detected = 1;
++		typec_setup_cc(phy, TYPEC_PIN_CC2,
++					TYPEC_STATE_ATTACHED_DEBUG_ACC);
+ 	} else
+ 		goto end;
+ 
+@@ -534,6 +541,8 @@ static void detect_dfp_work(struct work_struct *work)
+ 	detect->state = DETECT_STATE_ATTACHED_DFP;
+ 	mutex_unlock(&detect->lock);
+ 
++	if (audio_debug_detected)
++		goto end_ra_rd_detect;
+ 	typec_detect_notify_extcon(detect,
+ 				TYPEC_CABLE_USB_SRC, true);
+ 	typec_detect_notify_extcon(detect,
+@@ -554,6 +563,7 @@ end:
+ 		mutex_unlock(&detect->lock);
+ 		typec_switch_mode(phy, TYPEC_MODE_DRP);
+ 	}
++end_ra_rd_detect:
+ 	pm_runtime_put(detect->phy->dev);
+ }
+ 
+diff --git a/include/linux/usb_typec_phy.h b/include/linux/usb_typec_phy.h
+index 3a05e85..1362acb 100644
+--- a/include/linux/usb_typec_phy.h
++++ b/include/linux/usb_typec_phy.h
+@@ -36,6 +36,8 @@ enum typec_state {
+ 	TYPEC_STATE_UNATTACHED_DFP,
+ 	TYPEC_STATE_ATTACHED_UFP,
+ 	TYPEC_STATE_ATTACHED_DFP,
++	TYPEC_STATE_ATTACHED_AUDIO_ACC,
++	TYPEC_STATE_ATTACHED_DEBUG_ACC,
+ 	/* CC pull-down to pull-up during PR SWAP*/
+ 	TYPEC_STATE_PD_PU_SWAP,
+ 	/* CC pull-up to pull-down during PR SWAP*/
+-- 
+1.9.1
+

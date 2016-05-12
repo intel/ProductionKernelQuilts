@@ -1,0 +1,114 @@
+From 4e163489f4d283b56c375b0ae2c0e03734f1126e Mon Sep 17 00:00:00 2001
+From: Sonika Jindal <sonika.jindal@intel.com>
+Date: Wed, 29 Apr 2015 17:54:49 +0530
+Subject: [PATCH] FOR_UPSTREAM [VPG]: drm/i915: Check for display while
+ resuming
+
+When HDMI monitor is connected or disconnected during suspended state,
+the driver needs to detect it while resuming and inform the userspace
+accordingly. So, while resuming:
+
+1. From runtime resume: Inside a work func, try reading edid. If
+monitor got connected/got removed, call detect and send uevent.
+2. From deep sleep: Detect and sending of uevent was already present
+in this path using drm_helper_hpd_irq_event. Removing this and
+schedule the same work function as above.
+
+In both the above cases, i915 sends the hotplug event only after resume
+events are sent to avoid userspace from ignoring the hotplug event while
+in suspended state.
+
+Change-Id: I676a3f271591a28bfb59e2b302159d99d2637461
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9694
+Signed-off-by: Sonika Jindal <sonika.jindal@intel.com>
+Reviewed-on: https://android.intel.com:443/447850
+---
+ drivers/gpu/drm/i915/i915_drv.c |  7 +++++--
+ drivers/gpu/drm/i915/i915_drv.h |  1 +
+ drivers/gpu/drm/i915/i915_irq.c | 19 +++++++++++++++++++
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index ec8efa3..aaae75a 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -789,8 +789,6 @@ static int __i915_drm_thaw(struct drm_device *dev, bool restore_gtt_mappings)
+ 		 * notifications.
+ 		 * */
+ 		intel_hpd_init(dev);
+-		/* Config may have changed between suspend and resume */
+-		drm_helper_hpd_irq_event(dev);
+ 	}
+ 
+ 	intel_opregion_init(dev);
+@@ -814,6 +812,9 @@ static int __i915_drm_thaw(struct drm_device *dev, bool restore_gtt_mappings)
+ 	sysfs_notify(&dev->primary->kdev->kobj, NULL, "thaw");
+ 	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp);
+ 
++	/* Config may have changed between suspend and resume */
++	schedule_work(&dev_priv->probe_hotplug_work);
++
+ 	return 0;
+ }
+ 
+@@ -2102,6 +2103,8 @@ static int intel_runtime_resume(struct device *device)
+ 
+ 	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp);
+ 
++	schedule_work(&dev_priv->probe_hotplug_work);
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9adda04..10b5cd2 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1726,6 +1726,7 @@ struct drm_i915_private {
+ 	u32 pipestat_irq_mask[I915_MAX_PIPES];
+ 
+ 	struct work_struct hotplug_work;
++	struct work_struct probe_hotplug_work;
+ 	struct {
+ 		unsigned long hpd_last_jiffies;
+ 		int hpd_cnt;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index d905b36..08468c3 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1341,6 +1341,24 @@ static void i915_hotplug_work_func(struct work_struct *work)
+ 
+ }
+ 
++static void i915_probe_hotplug_work_func(struct work_struct *work)
++{
++	struct drm_i915_private *dev_priv =
++		container_of(work, struct drm_i915_private, probe_hotplug_work);
++
++	struct drm_device *dev = dev_priv->dev;
++	struct drm_mode_config *mode_config = &dev->mode_config;
++	struct intel_encoder *intel_encoder;
++
++	mutex_lock(&mode_config->mutex);
++	list_for_each_entry(intel_encoder, &mode_config->encoder_list, base.head)
++		if (intel_encoder->hot_plug)
++			intel_encoder->hot_plug(intel_encoder);
++
++	mutex_unlock(&mode_config->mutex);
++	drm_helper_hpd_irq_event(dev);
++}
++
+ static void intel_hpd_irq_uninstall(struct drm_i915_private *dev_priv)
+ {
+ 	del_timer_sync(&dev_priv->hotplug_reenable_timer);
+@@ -5393,6 +5411,7 @@ void intel_irq_init(struct drm_device *dev)
+ 	INIT_WORK(&dev_priv->hotplug_work, i915_hotplug_work_func);
+ 	INIT_WORK(&dev_priv->dig_port_work, i915_digport_work_func);
+ 	INIT_WORK(&dev_priv->gpu_error.work, i915_error_work_func);
++	INIT_WORK(&dev_priv->probe_hotplug_work, i915_probe_hotplug_work_func);
+ 	INIT_WORK(&dev_priv->rps.work, gen6_pm_rps_work);
+ 	INIT_WORK(&dev_priv->l3_parity.error_work, ivybridge_parity_work);
+ 	INIT_DELAYED_WORK(&dev_priv->simulate_work,
+-- 
+1.9.1
+

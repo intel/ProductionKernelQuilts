@@ -1,0 +1,477 @@
+From 749c3f2bc8d5c574ce1d7e396991f0e8dacaa47c Mon Sep 17 00:00:00 2001
+From: Huiquan Zhong <huiquan.zhong@intel.com>
+Date: Tue, 10 Mar 2015 00:16:00 +0800
+Subject: [PATCH] serial: HSU: Add UART GPIO inband wakeup mechanism
+
+Some UART device don't have independent wake up pin, should be woken
+up by incoming dummy RX data, also need to switch the UART pins to
+gpio function before suspended.
+
+Manages only one UART default configuration per platform. The port
+configurations are now dynamically allocated.
+
+Enable UART RXD wakeup for Cherrytrail GPS port.
+
+Change-Id: Ibde1e3630d6699654b3a7d3c2f2eb9bebf6674a7
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-2310
+Signed-off-by: Nicolas SUET <nicolas.suet@intel.com>
+Signed-off-by: Huiquan Zhong <huiquan.zhong@intel.com>
+---
+ drivers/tty/serial/hsu/hsu.h      |  25 +++++
+ drivers/tty/serial/hsu/hsu_core.c |  27 ++++-
+ drivers/tty/serial/hsu/hsu_plat.c | 215 +++++++++++++++++++++++++++++++++++---
+ 3 files changed, 246 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/tty/serial/hsu/hsu.h b/drivers/tty/serial/hsu/hsu.h
+index d9915e0..56d94a8 100644
+--- a/drivers/tty/serial/hsu/hsu.h
++++ b/drivers/tty/serial/hsu/hsu.h
+@@ -43,14 +43,38 @@ enum {
+ 	hsu_dw,
+ };
+ 
++enum hsu_acpi_pin_idx {
++	hsu_rxd_idx,
++	hsu_txd_idx,
++	hsu_rts_idx,
++	hsu_cts_idx
++};
++
++enum hsu_wake_src {
++	no_wake,
++	rxd_wake,
++	cts_wake
++};
++
+ struct uart_hsu_port;
+ 
++struct hsu_port_pin_cfg {
++	int wake_gpio;
++	int wake_src;
++	int rx_gpio;
++	int tx_gpio;
++	int rts_gpio;
++	int cts_gpio;
++};
++
+ struct hsu_port_cfg {
+ 	int hw_ip;
+ 	int idle;
+ 	int hw_context_save;
+ 	int hw_ctrl_cts;
+ 	struct device *dev;
++	struct hsu_port_pin_cfg pin_cfg;
++	int (*hw_set_rts)(struct uart_hsu_port *up, int value);
+ 	int (*hw_suspend)(struct uart_hsu_port *up);
+ 	int (*hw_resume)(struct uart_hsu_port *up);
+ 	unsigned int (*get_uartclk)(struct uart_hsu_port *up);
+@@ -205,6 +229,7 @@ struct uart_hsu_port {
+ 	unsigned int		workq_done;
+ 	unsigned int		in_workq;
+ 	unsigned int		in_tasklet;
++	unsigned int		byte_delay;
+ 
+ 	int			use_dma;	/* flag for DMA/PIO */
+ 	unsigned int		dma_irq;
+diff --git a/drivers/tty/serial/hsu/hsu_core.c b/drivers/tty/serial/hsu/hsu_core.c
+index 2196999..838247b 100644
+--- a/drivers/tty/serial/hsu/hsu_core.c
++++ b/drivers/tty/serial/hsu/hsu_core.c
+@@ -1033,32 +1033,40 @@ serial_hsu_do_set_termios(struct uart_port *port, struct ktermios *termios,
+ 	struct hsu_port_cfg *cfg = up->port_cfg;
+ 	unsigned char cval, fcr = 0;
+ 	unsigned long flags;
+-	unsigned int baud, quot;
++	unsigned int baud, quot, bits;
+ 	u32 ps = 0, mul = 0, m = 0, n = 0;
+ 
+ 	switch (termios->c_cflag & CSIZE) {
+ 	case CS5:
+ 		cval = UART_LCR_WLEN5;
++		bits = 7;
+ 		break;
+ 	case CS6:
+ 		cval = UART_LCR_WLEN6;
++		bits = 8;
+ 		break;
+ 	case CS7:
+ 		cval = UART_LCR_WLEN7;
++		bits = 9;
+ 		break;
+ 	default:
+ 	case CS8:
+ 		cval = UART_LCR_WLEN8;
++		bits = 10;
+ 		break;
+ 	}
+ 
+ 	/* CMSPAR isn't supported by this driver */
+ 	termios->c_cflag &= ~CMSPAR;
+ 
+-	if (termios->c_cflag & CSTOPB)
++	if (termios->c_cflag & CSTOPB) {
+ 		cval |= UART_LCR_STOP;
+-	if (termios->c_cflag & PARENB)
++		bits++;
++	}
++	if (termios->c_cflag & PARENB) {
+ 		cval |= UART_LCR_PARITY;
++		bits++;
++	}
+ 	if (!(termios->c_cflag & PARODD))
+ 		cval |= UART_LCR_EPAR;
+ 
+@@ -1164,6 +1172,9 @@ serial_hsu_do_set_termios(struct uart_port *port, struct ktermios *termios,
+ 		}
+ 	}
+ 
++	/* one byte transfer duration unit microsecond */
++	up->byte_delay = (bits * 1000000 + baud - 1) / baud;
++
+ 	pm_runtime_get_sync(up->dev);
+ 	serial_sched_stop(up);
+ 	/*
+@@ -1506,7 +1517,8 @@ static void hsu_regs_context(struct uart_hsu_port *up, int op)
+ 		serial_out(up, UART_MCR, up->mcr);
+ 		serial_out(up, UART_FCR, up->fcr);
+ 		serial_out(up, UART_IER, up->ier);
+-	}
++	} else	/* Disable interrupt mask bits  */
++		serial_out(up, UART_IER, 0);
+ 
+ 	if (up->use_dma && up->dma_ops->context_op)
+ 		up->dma_ops->context_op(up, op);
+@@ -1527,6 +1539,9 @@ int serial_hsu_do_suspend(struct uart_hsu_port *up)
+ 			&& serial_in(up, UART_DW_USR) & UART_DW_USR_RFNE)
+ 			goto busy;
+ 
++	if (cfg->hw_set_rts)
++		cfg->hw_set_rts(up, 1);
++
+ 	disable_irq(up->port.irq);
+ 	disable_irq(up->dma_irq);
+ 
+@@ -1574,6 +1589,8 @@ int serial_hsu_do_suspend(struct uart_hsu_port *up)
+ 
+ 	return 0;
+ err:
++	if (cfg->hw_set_rts)
++		cfg->hw_set_rts(up, 0);
+ 	clear_bit(flag_suspend, &up->flags);
+ 	enable_irq(up->port.irq);
+ 	enable_irq(up->dma_irq);
+@@ -1605,6 +1622,8 @@ int serial_hsu_do_resume(struct uart_hsu_port *up)
+ 		cfg->hw_resume(up);
+ 	if (up->use_dma)
+ 		up->dma_ops->resume(up);
++	if (cfg->hw_set_rts)
++		cfg->hw_set_rts(up, 0);
+ 
+ 	enable_irq(up->port.irq);
+ 
+diff --git a/drivers/tty/serial/hsu/hsu_plat.c b/drivers/tty/serial/hsu/hsu_plat.c
+index 98e9bf0..ab049f3 100644
+--- a/drivers/tty/serial/hsu/hsu_plat.c
++++ b/drivers/tty/serial/hsu/hsu_plat.c
+@@ -16,6 +16,8 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/acpi.h>
+ #include <linux/clk.h>
++#include <linux/gpio.h>
++#include <linux/delay.h>
+ 
+ #include "hsu.h"
+ 
+@@ -23,13 +25,137 @@
+ #define CHT_HSU_RESET	0x0804
+ #define CHT_GENERAL_REG 0x0808
+ #define CHT_HSU_OVF_IRQ	0x0820	/* Overflow interrupt related */
+-
+ #define CHT_GENERAL_DIS_RTS_N_OVERRIDE (1 << 3)
++
+ enum {
+-	hsu_chv_0,
+-	hsu_chv_1,
++	hsu_chv,
+ };
+ 
++static irqreturn_t wakeup_irq(int irq, void *data)
++{
++	struct uart_hsu_port *up = data;
++	struct hsu_port_cfg *cfg = up->port_cfg;
++	struct hsu_port_pin_cfg *pin_cfg = &cfg->pin_cfg;
++
++	set_bit(flag_active, &up->flags);
++	if (cfg->hw_set_rts && pin_cfg->wake_src == rxd_wake)
++		cfg->hw_set_rts(up, 1);
++	pm_runtime_get(up->dev);
++	pm_runtime_put(up->dev);
++
++	return IRQ_HANDLED;
++}
++
++int cht_hw_set_rts(struct uart_hsu_port *up, int value)
++{
++	struct hsu_port_pin_cfg *pin_cfg = &up->port_cfg->pin_cfg;
++	struct gpio_desc *gpio;
++
++	if (!pin_cfg || pin_cfg->wake_src == no_wake)
++		return 0;
++
++	if (value) {
++		if (!pin_cfg->rts_gpio) {
++			gpio = devm_gpiod_get_index(up->dev, "hsu_rts",
++					hsu_rts_idx);
++			if (!IS_ERR(gpio))
++				pin_cfg->rts_gpio = desc_to_gpio(gpio);
++		}
++
++		if (pin_cfg->rts_gpio) {
++			gpio_direction_output(pin_cfg->rts_gpio, 1);
++			if (!in_interrupt())
++				usleep_range(up->byte_delay,
++						up->byte_delay + 1);
++		}
++	} else
++		if (pin_cfg->rts_gpio) {
++			gpio_free(pin_cfg->rts_gpio);
++			pin_cfg->rts_gpio = 0;
++		}
++
++	return 0;
++}
++
++int cht_hsu_hw_suspend(struct uart_hsu_port *up)
++{
++	struct hsu_port_pin_cfg *pin_cfg = &up->port_cfg->pin_cfg;
++	struct gpio_desc *gpio;
++	int ret;
++
++	if (!pin_cfg || pin_cfg->wake_src == no_wake)
++		return 0;
++
++	switch (pin_cfg->wake_src) {
++	case rxd_wake:
++		if (!pin_cfg->rx_gpio) {
++			gpio = devm_gpiod_get_index(up->dev, "hsu_rxd",
++					hsu_rxd_idx);
++			if (!IS_ERR(gpio))
++				pin_cfg->rx_gpio = desc_to_gpio(gpio);
++		}
++		pin_cfg->wake_gpio = pin_cfg->rx_gpio;
++		break;
++	case cts_wake:
++		if (!pin_cfg->cts_gpio) {
++			gpio = devm_gpiod_get_index(up->dev, "hsu_cts",
++					hsu_cts_idx);
++			if (!IS_ERR(gpio))
++				pin_cfg->cts_gpio = desc_to_gpio(gpio);
++		}
++		pin_cfg->wake_gpio = pin_cfg->cts_gpio;
++		break;
++	default:
++		pin_cfg->wake_gpio = -1;
++		break;
++	}
++	dev_dbg(up->dev, "wake_gpio=%d\n", pin_cfg->wake_gpio);
++
++	if (pin_cfg->wake_gpio != -1) {
++		gpio_direction_input(pin_cfg->wake_gpio);
++		ret = request_irq(gpio_to_irq(pin_cfg->wake_gpio), wakeup_irq,
++				IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_EDGE_RISING,
++				"hsu_wake_irq", up);
++		if (ret)
++			dev_err(up->dev, "failed to register 'hsu_wake_irq'\n");
++
++		if (pin_cfg->rts_gpio && pin_cfg->wake_src == rxd_wake)
++			gpio_direction_output(pin_cfg->rts_gpio, 0);
++	}
++
++	return 0;
++}
++
++int cht_hsu_hw_resume(struct uart_hsu_port *up)
++{
++	struct hsu_port_pin_cfg *pin_cfg = &up->port_cfg->pin_cfg;
++
++	if (!pin_cfg || pin_cfg->wake_src == no_wake)
++		return 0;
++
++	if (pin_cfg->wake_gpio != -1) {
++		free_irq(gpio_to_irq(pin_cfg->wake_gpio), up);
++		pin_cfg->wake_gpio = -1;
++	}
++
++	switch (pin_cfg->wake_src) {
++	case rxd_wake:
++		if (pin_cfg->rx_gpio) {
++			gpio_free(pin_cfg->rx_gpio);
++			pin_cfg->rx_gpio = 0;
++		}
++		break;
++	case cts_wake:
++		if (pin_cfg->cts_gpio) {
++			gpio_free(pin_cfg->cts_gpio);
++			pin_cfg->cts_gpio = 0;
++		}
++		break;
++	}
++
++	return 0;
++}
++
+ void cht_hsu_reset(void __iomem *addr)
+ {
+ 	writel(0, addr + CHT_HSU_RESET);
+@@ -92,17 +218,15 @@ unsigned int cht_hsu_get_uartclk(struct uart_hsu_port *up)
+ }
+ 
+ static struct hsu_port_cfg hsu_port_cfgs[] = {
+-	[hsu_chv_0] = {
+-		.hw_ip = hsu_dw,
+-		.idle = 100,
+-		.hw_reset = cht_hsu_reset,
+-		.get_uartclk = cht_hsu_get_uartclk,
+-		.set_clk = cht_hsu_set_clk,
+-		.hw_context_save = 1,
+-	},
+-	[hsu_chv_1] = {
++	[hsu_chv] = {
+ 		.hw_ip = hsu_dw,
+-		.idle = 100,
++		.idle = 20,
++		.pin_cfg = {
++			.wake_src = no_wake,
++		},
++		.hw_set_rts = cht_hw_set_rts,
++		.hw_suspend = cht_hsu_hw_suspend,
++		.hw_resume = cht_hsu_hw_resume,
+ 		.hw_reset = cht_hsu_reset,
+ 		.get_uartclk = cht_hsu_get_uartclk,
+ 		.set_clk = cht_hsu_set_clk,
+@@ -112,10 +236,42 @@ static struct hsu_port_cfg hsu_port_cfgs[] = {
+ 
+ #ifdef CONFIG_ACPI
+ static const struct acpi_device_id hsu_acpi_ids[] = {
+-	{ "8086228A", hsu_chv_0 },
++	{ "8086228A", hsu_chv },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(acpi, hsu_acpi_ids);
++
++/* Manages child driver_data as a 32 bits field. */
++#define CHILD_CFG(wake_src, idle) (((wake_src) & 0x3) | ((idle) << 2))
++#define CHILD_CFG_WAKE(cfg)       ((cfg) & 0x3)
++#define CHILD_CFG_IDLE(cfg)       (((cfg) >> 2) & 0x3FFFFFFF)
++
++static const struct acpi_device_id child_acpi_ids[] = {
++	{ "BCM4752" , CHILD_CFG(rxd_wake, 40) },
++	{ "LNV4752" , CHILD_CFG(rxd_wake, 40) },
++	{ "BCM4752E", CHILD_CFG(rxd_wake, 40) },
++	{ "BCM47521", CHILD_CFG(rxd_wake, 40) },
++	{ "INT33A2" , CHILD_CFG(cts_wake, 40) },
++	{ },
++};
++MODULE_DEVICE_TABLE(acpi, child_acpi_ids);
++
++static const struct acpi_device_id *match_device_ids(struct acpi_device *device,
++					const struct acpi_device_id *ids)
++{
++	const struct acpi_device_id *id;
++	struct acpi_hardware_id *hwid;
++
++	if (!device->status.present)
++		return NULL;
++
++	for (id = ids; id->id[0]; id++)
++		list_for_each_entry(hwid, &device->pnp.ids, list)
++			if (!strcmp((char *) id->id, hwid->id))
++				return id;
++
++	return NULL;
++}
+ #endif
+ 
+ #ifdef CONFIG_PM_SLEEP
+@@ -176,8 +332,8 @@ static const struct dev_pm_ops serial_hsu_plat_pm_ops = {
+ 
+ static int serial_hsu_plat_port_probe(struct platform_device *pdev)
+ {
+-	const struct acpi_device_id *id;
+-	struct acpi_device *adev;
++	const struct acpi_device_id *id, *child_id;
++	struct acpi_device *adev, *child;
+ 	struct uart_hsu_port *up;
+ 	int port = pdev->id, irq;
+ 	struct resource *mem, *ioarea;
+@@ -197,13 +353,34 @@ static int serial_hsu_plat_port_probe(struct platform_device *pdev)
+ 		return -ENODEV;
+ 	port--;
+ 
+-	cfg = &hsu_port_cfgs[id->driver_data + port];
++	cfg = kmalloc(sizeof(struct hsu_port_cfg), GFP_KERNEL);
++	if (!cfg)
++		return -ENOMEM;
++
++	*cfg = hsu_port_cfgs[id->driver_data];
+ 	cfg->dev = &pdev->dev;
++
++	/* Sets a particular config if required by device child. */
++	list_for_each_entry(child, &adev->children, node) {
++		/* child_id = acpi_match_device(child_acpi_ids, &child->dev); */
++		child_id = match_device_ids(child, child_acpi_ids);
++		if (child_id) {
++			pr_warn("uart(%d) device(%s) wake_src(%ld) idle(%ld)\n",
++				port, child_id->id,
++				CHILD_CFG_WAKE(child_id->driver_data),
++				CHILD_CFG_IDLE(child_id->driver_data));
++
++			cfg->pin_cfg.wake_src =
++				    CHILD_CFG_WAKE(child_id->driver_data);
++			cfg->idle = CHILD_CFG_IDLE(child_id->driver_data);
++		}
++	}
+ #endif
+ 
+ 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!mem) {
+ 		dev_err(&pdev->dev, "no mem resource?\n");
++		kfree(cfg);
+ 		return -EINVAL;
+ 	}
+ 	start = mem->start;
+@@ -212,6 +389,7 @@ static int serial_hsu_plat_port_probe(struct platform_device *pdev)
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq < 0) {
+ 		dev_err(&pdev->dev, "no irq resource?\n");
++		kfree(cfg);
+ 		return -ENXIO;
+ 	}
+ 
+@@ -219,6 +397,7 @@ static int serial_hsu_plat_port_probe(struct platform_device *pdev)
+ 			pdev->name);
+ 	if (!ioarea) {
+ 		dev_err(&pdev->dev, "HSU region already claimed\n");
++		kfree(cfg);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -227,6 +406,7 @@ static int serial_hsu_plat_port_probe(struct platform_device *pdev)
+ 	if (IS_ERR(up)) {
+ 		release_mem_region(mem->start, resource_size(mem));
+ 		dev_err(&pdev->dev, "failed to setup HSU\n");
++		kfree(cfg);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -253,6 +433,7 @@ static int serial_hsu_plat_port_remove(struct platform_device *pdev)
+ 
+ 	pm_runtime_forbid(&pdev->dev);
+ 	serial_hsu_port_free(up);
++	kfree(up->port_cfg);
+ 	platform_set_drvdata(pdev, NULL);
+ 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (mem)
+-- 
+1.9.1
+

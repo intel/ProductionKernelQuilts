@@ -1,0 +1,227 @@
+From 3d06c024dc30f3c0e5ae0cea14f754fbd1548a9f Mon Sep 17 00:00:00 2001
+Message-Id: <3d06c024dc30f3c0e5ae0cea14f754fbd1548a9f.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: Ramalingam C <ramalingam.c@intel.com>
+Date: Thu, 5 Feb 2015 19:09:34 +0530
+Subject: [PATCH 58/68] FOR_UPSTREAM [VPG]: drm/i915: generic eDP DRRS
+ implementation
+
+This patch adds methods that define the general routines of eDP
+DRRS. These methods register themselves with the DRRS framework
+during initialization, and when called during runtime, access
+the hardware registers through the platform specific methods.
+
+Issue: GMINL-8115
+Change-Id: Iaa9747764c20fd605ee52588208aae21ab986af7
+Signed-off-by: Ramalingam C <ramalingam.c@intel.com>
+Signed-off-by: Durgadoss R <durgadoss.r@intel.com>
+---
+ drivers/gpu/drm/i915/Makefile         |    3 -
+ drivers/gpu/drm/i915/intel_dp.c       |    6 ++
+ drivers/gpu/drm/i915/intel_drrs.c     |    2 
+ drivers/gpu/drm/i915/intel_drv.h      |    2 
+ drivers/gpu/drm/i915/intel_edp_drrs.c |   95 ++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_edp_drrs.h |   29 ++++++++++
+ 6 files changed, 136 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/i915/intel_edp_drrs.c
+ create mode 100644 drivers/gpu/drm/i915/intel_edp_drrs.h
+
+Index: b/drivers/gpu/drm/i915/Makefile
+===================================================================
+--- a/drivers/gpu/drm/i915/Makefile	2016-03-08 15:12:41.479302145 -0800
++++ b/drivers/gpu/drm/i915/Makefile	2016-03-08 15:12:49.383382621 -0800
+@@ -80,7 +80,8 @@
+ 	  i915_sprite_csc.o \
+ 	  i915_adf_wrapper.o \
+ 	  intel_drrs.o \
+-	  intel_dsi_drrs.o
++	  intel_dsi_drrs.o \
++	  intel_edp_drrs.o
+ 
+ # legacy horrors
+ i915-y += i915_dma.o \
+Index: b/drivers/gpu/drm/i915/intel_dp.c
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_dp.c	2016-03-08 15:12:41.479302145 -0800
++++ b/drivers/gpu/drm/i915/intel_dp.c	2016-03-08 15:12:49.387382662 -0800
+@@ -1139,6 +1139,12 @@
+ 			       pipe_config->port_clock,
+ 			       &pipe_config->dp_m_n);
+ 
++	if (intel_connector->panel.downclock_mode)
++		intel_link_compute_m_n(bpp, lane_count,
++			       intel_connector->panel.downclock_mode->clock,
++			       pipe_config->port_clock,
++			       &pipe_config->dp_m2_n2);
++
+ 	intel_dp_set_clock(encoder, pipe_config, intel_dp->link_bw);
+ 
+ 	return true;
+Index: b/drivers/gpu/drm/i915/intel_drrs.c
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_drrs.c	2016-03-08 15:12:41.483302185 -0800
++++ b/drivers/gpu/drm/i915/intel_drrs.c	2016-03-08 15:12:49.387382662 -0800
+@@ -312,6 +312,8 @@
+ 
+ 	if (intel_encoder->type == INTEL_OUTPUT_DSI) {
+ 		drrs->encoder_ops = get_intel_dsi_drrs_ops();
++	} else if (intel_encoder->type == INTEL_OUTPUT_EDP) {
++		drrs->encoder_ops = get_intel_edp_drrs_ops();
+ 	} else {
+ 		DRM_ERROR("DRRS: Unsupported Encoder\n");
+ 		ret = -EINVAL;
+Index: b/drivers/gpu/drm/i915/intel_drv.h
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_drv.h	2016-03-08 15:12:41.483302185 -0800
++++ b/drivers/gpu/drm/i915/intel_drv.h	2016-03-08 15:14:42.980540563 -0800
+@@ -35,6 +35,7 @@
+ #include <drm/drm_dp_helper.h>
+ 
+ #include "intel_drrs.h"
++#include "intel_edp_drrs.h"
+ 
+ /**
+  * _wait_for - magic (register) wait macro
+@@ -720,6 +721,7 @@
+ 				     int send_bytes,
+ 				     uint32_t aux_clock_divider);
+ 
++	struct edp_drrs_platform_ops *drrs_ops;
+ 	int notify_had;
+ 
+ 	/* Displayport compliance testing */
+Index: b/drivers/gpu/drm/i915/intel_edp_drrs.c
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ b/drivers/gpu/drm/i915/intel_edp_drrs.c	2016-03-08 15:12:49.387382662 -0800
+@@ -0,0 +1,95 @@
++/*
++ * Copyright (C) 2015, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Authors:
++ * Ramalingam C <ramalingam.c@intel.com>
++ * Durgadoss R <durgadoss.r@intel.com>
++ */
++
++#include <linux/delay.h>
++#include <drm/i915_drm.h>
++
++#include "i915_drv.h"
++
++void intel_edp_set_drrs_state(struct i915_drrs *drrs)
++{
++	struct intel_encoder *intel_encoder = drrs->connector->encoder;
++	struct intel_dp *intel_dp = enc_to_intel_dp(&intel_encoder->base);
++
++	intel_dp->drrs_ops->set_drrs_state(intel_encoder,
++					drrs->drrs_state.target_rr_type);
++}
++
++int intel_edp_drrs_init(struct i915_drrs *drrs,
++					struct drm_display_mode *fixed_mode)
++{
++	struct intel_encoder *intel_encoder = drrs->connector->encoder;
++	struct intel_dp *intel_dp = enc_to_intel_dp(&intel_encoder->base);
++	struct drm_display_mode *downclock_mode;
++	int ret = -EINVAL;
++
++	if (!intel_dp->drrs_ops ||
++			!intel_dp->drrs_ops->set_drrs_state) {
++		DRM_ERROR("Required platform ops are NULL\n");
++		return ret;
++	}
++
++	if (fixed_mode->vrefresh == 0)
++		fixed_mode->vrefresh = drm_mode_vrefresh(fixed_mode);
++
++	downclock_mode = intel_find_panel_downclock(intel_encoder->base.dev,
++					fixed_mode, &drrs->connector->base);
++	if (!downclock_mode) {
++		DRM_DEBUG("No Downclock mode is found\n");
++		return ret;
++	}
++
++	if (intel_dp->drrs_ops->init) {
++		ret = intel_dp->drrs_ops->init(intel_encoder);
++		if (ret < 0)
++			return ret;
++	}
++
++	DRM_DEBUG("eDP DRRS modes:\n");
++	drm_mode_debug_printmodeline(fixed_mode);
++	drm_mode_debug_printmodeline(downclock_mode);
++
++	/* We are good to go .. */
++	intel_panel_init(&drrs->connector->panel, fixed_mode, downclock_mode);
++	drrs->connector->panel.target_mode = NULL;
++
++	drrs->drrs_state.type = SEAMLESS_DRRS_SUPPORT;
++	return ret;
++}
++
++void intel_edp_drrs_exit(struct i915_drrs *drrs)
++{
++	struct intel_encoder *intel_encoder = drrs->connector->encoder;
++	struct intel_dp *intel_dp = enc_to_intel_dp(&intel_encoder->base);
++
++	if (intel_dp->drrs_ops->exit)
++		intel_dp->drrs_ops->exit(intel_encoder);
++
++	drrs->drrs_state.type = DRRS_NOT_SUPPORTED;
++}
++
++struct drrs_encoder_ops edp_drrs_ops = {
++	.init = intel_edp_drrs_init,
++	.exit = intel_edp_drrs_exit,
++	.set_drrs_state = intel_edp_set_drrs_state,
++};
++
++/* Called by intel_drrs_init() to get ->ops for edp panel */
++struct drrs_encoder_ops *get_intel_edp_drrs_ops(void)
++{
++	return &edp_drrs_ops;
++}
+Index: b/drivers/gpu/drm/i915/intel_edp_drrs.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ b/drivers/gpu/drm/i915/intel_edp_drrs.h	2016-03-08 15:12:49.387382662 -0800
+@@ -0,0 +1,29 @@
++/*
++ * Copyright (C) 2015, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Author:
++ * Ramalingam C <ramalingam.c@intel.com>
++ */
++
++#ifndef INTEL_EDP_DRRS_H
++#define INTEL_EDP_DRRS_H
++
++struct intel_encoder;
++struct edp_drrs_platform_ops {
++	int (*init)(struct intel_encoder *encoder);
++	void (*exit)(struct intel_encoder *encoder);
++	int (*set_drrs_state)(struct intel_encoder *encoder,
++				enum drrs_refresh_rate_type target_rr_type);
++};
++
++extern inline struct drrs_encoder_ops *get_intel_edp_drrs_ops(void);
++#endif /* INTEL_EDP_DRRS_H */

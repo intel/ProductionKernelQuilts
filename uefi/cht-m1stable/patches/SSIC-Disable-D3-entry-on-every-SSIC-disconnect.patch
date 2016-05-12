@@ -1,0 +1,277 @@
+From 0cee7c98cc181184cd7485fda4ed475de10008de Mon Sep 17 00:00:00 2001
+From: yangzhon <yang.zhong@intel.com>
+Date: Thu, 10 Sep 2015 10:53:32 +0800
+Subject: [PATCH] [SSIC] Disable D3 entry on every SSIC disconnect.
+
+This patch is a WA to disable D3 entry on every SSIC disconnect.
+It was observed that the xHCI enters the D0i3 state before
+the SSIC device (Intel modem) has a chance to fully enumerate,
+as a consequence the enumeration fails.
+
+After the disconnect (recovery case), the SSIC device has 15 seconds
+to fully enumerate, otherwise the counter will be decremented,
+thus the xHCI will enter suspend state.
+
+The timer is initialized with the hub port init, enabled on
+disconnect, uninitialized on successful SSIC enumeration or
+hub disconnect.
+
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-19633
+Change-Id: Idc3bdc92b3d70b3d3fc8bc49702aa01de169b6e6
+Signed-off-by: Konrad Leszczynski <konrad.leszczynski@intel.com>
+---
+ drivers/usb/core/hub.c            | 39 ++++++++++++++++--
+ drivers/usb/host/Makefile         |  1 +
+ drivers/usb/host/hub-intel-cap.c  | 84 +++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/hub-intel-cap.h  | 27 +++++++++++++
+ drivers/usb/host/xhci-intel-cap.c |  1 +
+ drivers/usb/host/xhci.h           |  4 ++
+ 6 files changed, 153 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/usb/host/hub-intel-cap.c
+ create mode 100644 drivers/usb/host/hub-intel-cap.h
+
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 3a292f6..b5bb14a 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -32,6 +32,7 @@
+ #include <asm/byteorder.h>
+ 
+ #include "hub.h"
++#include "../host/hub-intel-cap.h"
+ 
+ #define USB_VENDOR_GENESYS_LOGIC		0x05e3
+ #define HUB_QUIRK_CHECK_PORT_AUTOSUSPEND	0x01
+@@ -1652,6 +1653,14 @@ static void hub_disconnect(struct usb_interface *intf)
+ 	if (hub->hdev->speed == USB_SPEED_HIGH)
+ 		highspeed_hubs--;
+ 
++	/* Free the timer as the context will be freed */
++	if (hub_intel_ssic_port_check(hdev)) {
++		struct usb_port	*port_dev = hub->ports[hdev->portnum - 1];
++		dev_dbg(&hdev->dev, "Enable D3 timer, portnum %d\n",
++				hdev->portnum);
++		hub_intel_ssic_d3_timer_set(hdev, port_dev, false);
++	}
++
+ 	usb_free_urb(hub->urb);
+ 	kfree(hub->ports);
+ 	kfree(hub->descriptor);
+@@ -2110,9 +2119,17 @@ void usb_disconnect(struct usb_device **pdev)
+ 		sysfs_remove_link(&udev->dev.kobj, "port");
+ 		sysfs_remove_link(&port_dev->dev.kobj, "device");
+ 
+-		if (!port_dev->did_runtime_put)
+-			pm_runtime_put(&port_dev->dev);
+-		else
++		if (!port_dev->did_runtime_put) {
++			/* Check for SSIC port disconnect
++			 * and enable the timer */
++			if (hub_intel_ssic_port_check(udev)) {
++				dev_dbg(&udev->dev, "Enable D3 timer, portnum %d\n",
++						udev->portnum);
++				hub_intel_ssic_d3_timer_set(udev,
++						port_dev, true);
++			} else
++				pm_runtime_put(&port_dev->dev);
++		} else
+ 			port_dev->did_runtime_put = false;
+ 	}
+ 
+@@ -2427,6 +2444,13 @@ int usb_new_device(struct usb_device *udev)
+ 		}
+ 
+ 		pm_runtime_get_sync(&port_dev->dev);
++
++		/* Remove the timer as SSIC has enumerated correctly */
++		if (hub_intel_ssic_port_check(udev)) {
++			dev_dbg(&udev->dev, "Disable D3 timer, portnum %d\n",
++					udev->portnum);
++			hub_intel_ssic_d3_timer_set(udev, port_dev, false);
++		}
+ 	}
+ 
+ 	(void) usb_create_ep_devs(&udev->dev, &udev->ep0, udev);
+@@ -4495,6 +4519,15 @@ hub_port_init (struct usb_hub *hub, struct usb_device *udev, int port1,
+ 	}
+ 
+ 	retval = 0;
++
++	/* Initialize the timer if it's empty */
++	if (hub_intel_ssic_port_check(udev)) {
++		struct usb_port	*port_dev = hub->ports[udev->portnum - 1];
++		dev_dbg(&udev->dev, "Initialize D3 timer, portnum %d\n",
++				udev->portnum);
++		hub_intel_ssic_d3_timer_init(hcd, port_dev);
++	}
++
+ 	/* notify HCD that we have a device connected and addressed */
+ 	if (hcd->driver->update_device)
+ 		hcd->driver->update_device(hcd, udev);
+diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
+index ee6b036..5b2e873 100644
+--- a/drivers/usb/host/Makefile
++++ b/drivers/usb/host/Makefile
+@@ -17,6 +17,7 @@ xhci-hcd-y += xhci-ring.o xhci-hub.o xhci-dbg.o
+ xhci-hcd-y += xhci-trace.o
+ xhci-hcd-$(CONFIG_PCI)	+= xhci-pci.o
+ xhci-hcd-y += xhci-intel-cap.o
++xhci-hcd-y += hub-intel-cap.o
+ 
+ ifneq ($(CONFIG_USB_XHCI_PLATFORM), )
+ 	xhci-hcd-y		+= xhci-plat.o
+diff --git a/drivers/usb/host/hub-intel-cap.c b/drivers/usb/host/hub-intel-cap.c
+new file mode 100644
+index 0000000..ff82063
+--- /dev/null
++++ b/drivers/usb/host/hub-intel-cap.c
+@@ -0,0 +1,84 @@
++/*
++ * Intel Vendor Defined xHCI hub-specific capability
++ *
++ * Copyright (C) 2015 Intel Corp.
++ *
++ * Author: Leszczynski, Konrad
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program;
++ */
++
++#include <linux/usb/phy.h>
++#include <linux/usb/otg.h>
++
++#include "xhci.h"
++#include "../core/hub.h"
++#include "hub-intel-cap.h"
++
++bool hub_intel_ssic_port_check(struct usb_device *udev)
++{
++	struct usb_hcd *hcd = bus_to_hcd(udev->bus);
++	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++
++	/* Check if device present and the port matches */
++	return (xhci->ssic_device_present) &&
++			(udev->portnum == xhci->ssic_port_number);
++}
++
++void hub_intel_ssic_d3_set(unsigned long data)
++{
++	struct usb_port *port_dev = (struct usb_port *) data;
++
++	/* Decrement the usage counter */
++	pm_runtime_put(&port_dev->dev);
++}
++
++void hub_intel_ssic_d3_timer_init(struct usb_hcd *hcd,
++		struct usb_port *port_dev)
++{
++	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++
++	/* Check if already initialized */
++	if (xhci->set_d3_timer.data)
++		return;
++
++	/* Initialize the timer */
++	init_timer(&xhci->set_d3_timer);
++
++	/* Set the values for the timer */
++	xhci->set_d3_timer.data = (unsigned long) port_dev;
++	xhci->set_d3_timer.function = hub_intel_ssic_d3_set;
++	xhci->set_d3_timer.expires = jiffies +
++			msecs_to_jiffies(SSIC_D3_TIMEOUT);
++
++	xhci_dbg(xhci, "set_d3_timer initialized\n");
++}
++
++void hub_intel_ssic_d3_timer_set(struct usb_device *udev,
++		struct usb_port *port_dev, bool enable)
++{
++	struct usb_hcd *hcd = bus_to_hcd(udev->bus);
++	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++
++	/* Update the timer's data context */
++	xhci->set_d3_timer.data = (unsigned long) port_dev;
++
++	/* Enable the timer in disconnect case,
++	 * remove it on successful enumeration
++	 * (we need to decrease to counter) */
++	if (enable)
++		add_timer(&xhci->set_d3_timer);
++	else
++		if (del_timer(&xhci->set_d3_timer))
++			hub_intel_ssic_d3_set((unsigned long) port_dev);
++}
+diff --git a/drivers/usb/host/hub-intel-cap.h b/drivers/usb/host/hub-intel-cap.h
+new file mode 100644
+index 0000000..a40dbd1
+--- /dev/null
++++ b/drivers/usb/host/hub-intel-cap.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2015 Intel Corp.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program;
++ */
++
++/* SSIC D3 Disable Workaround
++ * Timeout is set to 15 seconds.
++ */
++#define SSIC_D3_TIMEOUT	15000
++
++extern bool hub_intel_ssic_port_check(struct usb_device *udev);
++extern void hub_intel_ssic_d3_set(unsigned long data);
++extern void hub_intel_ssic_d3_timer_init(struct usb_hcd *hcd,
++		struct usb_port *port_dev);
++extern void hub_intel_ssic_d3_timer_set(struct usb_device *udev,
++		struct usb_port *port_dev, bool enable);
+diff --git a/drivers/usb/host/xhci-intel-cap.c b/drivers/usb/host/xhci-intel-cap.c
+index 22f4415c..5daabff 100644
+--- a/drivers/usb/host/xhci-intel-cap.c
++++ b/drivers/usb/host/xhci-intel-cap.c
+@@ -76,6 +76,7 @@ int xhci_intel_need_disable_stall(struct xhci_hcd *xhci)
+ 
+ 	/* Assign the values */
+ 	modem_present = modem_data->package.elements[0].integer.value;
++	xhci->ssic_device_present = modem_present;
+ 	xhci->ssic_port_number = modem_data->package.elements[1].integer.value;
+ 	modem_type = modem_data->package.elements[2].integer.value;
+ 
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 79de0d0..42b603b 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1589,8 +1589,12 @@ struct xhci_hcd {
+ 	u32			port_status_u0;
+ /* Compliance Mode Timer Triggered every 2 seconds */
+ #define COMP_MODE_RCVRY_MSECS 2000
++	/* SSIC device present */
++	bool ssic_device_present;
+ 	/* SSIC port number */
+ 	int ssic_port_number;
++	/* Timer for SSIC D3 entry */
++	struct timer_list	set_d3_timer;
+ };
+ 
+ /* convert between an HCD pointer and the corresponding EHCI_HCD */
+-- 
+1.9.1
+

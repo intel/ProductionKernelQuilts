@@ -1,0 +1,166 @@
+From af407f94b05f4ffe9cde297ac3a8a5e641905bb8 Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Thu, 12 Dec 2013 21:50:21 -0800
+Subject: [PATCH 1/2] acpi button: Add polling interface for power button
+ release
+
+The core ACPI standard provides only a single notification for the
+PWRB object to indicate a power button press.  But some platforms can
+get a release notification via mechanisms outside the standard.  Allow
+them to register a "poll" function that returns power button state.
+
+Change-Id: I1965956d67282d9d6b670db18473577050c7640a
+Orig-Change-Id: Ib5c6cd25329a6e2be205fed307806894fdb9ca10
+For: APDEV-575
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+Signed-off-by: Hakan Englund <hakan.englund@intel.com>
+---
+ drivers/acpi/button.c |   89 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ include/acpi/button.h |   17 +++++++++
+ 2 files changed, 104 insertions(+), 2 deletions(-)
+
+--- linux.orig/drivers/acpi/button.c
++++ linux/drivers/acpi/button.c
+@@ -107,6 +107,18 @@ struct acpi_button {
+ static BLOCKING_NOTIFIER_HEAD(acpi_lid_notifier);
+ static struct acpi_device *lid_device;
+ 
++static struct acpi_pwrbtn_poll_dev *pwrbtn_poll;
++static DEFINE_SPINLOCK(pwrbtn_lock);
++
++/* Polling frequency.  Intel ICH hardware documents a 12ms debounce
++ * timer, and 60Hz is about right generally. */
++#define PWRBTN_POLL_JIFFIES	max(HZ/60, 1)
++
++/* Safety valve vs. buggy (potentially in firmware) power button
++ * polling implementations.  4 seconds is the default system reset
++ * timer on Intel hardware. */
++#define PWRBTN_POLL_MAX		(HZ*4)
++
+ /* --------------------------------------------------------------------------
+                               FS Interface (/proc)
+    -------------------------------------------------------------------------- */
+@@ -279,6 +291,66 @@ static int acpi_lid_send_state(struct ac
+ 	return ret;
+ }
+ 
++static void pwrbtn_timer(unsigned long arg)
++{
++	struct acpi_button *button = (struct acpi_button *)arg;
++	int toolong, pressed;
++	unsigned long flags;
++
++	spin_lock_irqsave(&pwrbtn_lock, flags);
++	pressed = pwrbtn_poll->poll(pwrbtn_poll);
++	spin_unlock_irqrestore(&pwrbtn_lock, flags);
++
++	toolong = (jiffies - pwrbtn_poll->started) > PWRBTN_POLL_MAX;
++
++	if (toolong)
++		dev_err(&button->input->dev, "Power button poll failed to detect release");
++
++	if (!pressed || toolong) {
++		input_report_key(button->input, KEY_POWER, 0);
++		input_sync(button->input);
++	} else {
++		mod_timer(&pwrbtn_poll->timer, jiffies + PWRBTN_POLL_JIFFIES);
++	}
++}
++
++int acpi_pwrbtn_poll_register(struct acpi_pwrbtn_poll_dev *dev)
++{
++	int ret = 0;
++	unsigned long flags;
++
++	spin_lock_irqsave(&pwrbtn_lock, flags);
++	if (pwrbtn_poll)
++		ret = -EBUSY;
++	else
++		pwrbtn_poll = dev;
++
++	init_timer(&pwrbtn_poll->timer);
++	pwrbtn_poll->timer.function = pwrbtn_timer;
++
++	spin_unlock_irqrestore(&pwrbtn_lock, flags);
++	return ret;
++}
++
++int acpi_pwrbtn_poll_unregister(struct acpi_pwrbtn_poll_dev *dev)
++{
++	unsigned long flags;
++	if (!pwrbtn_poll || pwrbtn_poll != dev)
++		return -EINVAL;
++	del_timer_sync(&pwrbtn_poll->timer);
++	spin_lock_irqsave(&pwrbtn_lock, flags);
++	pwrbtn_poll = NULL;
++	spin_unlock_irqrestore(&pwrbtn_lock, flags);
++	return 0;
++}
++
++static int start_pwrbtn_poll(struct acpi_button *button)
++{
++	pwrbtn_poll->timer.data = (unsigned long)button;
++	pwrbtn_poll->started = jiffies;
++	return mod_timer(&pwrbtn_poll->timer, jiffies + PWRBTN_POLL_JIFFIES);
++}
++
+ static void acpi_button_notify(struct acpi_device *device, u32 event)
+ {
+ 	struct acpi_button *button = acpi_driver_data(device);
+@@ -298,8 +370,21 @@ static void acpi_button_notify(struct ac
+ 
+ 			input_report_key(input, keycode, 1);
+ 			input_sync(input);
+-			input_report_key(input, keycode, 0);
+-			input_sync(input);
++
++			if (button->type == ACPI_BUTTON_TYPE_POWER
++			    && pwrbtn_poll) {
++				if (start_pwrbtn_poll(button)) {
++					/* Error, fall back to
++					 * synchronous event */
++					input_report_key(input, keycode, 0);
++					input_sync(input);
++				}
++			} else {
++				/* No release detection; emit the UP
++				 * synchronously */
++				input_report_key(input, keycode, 0);
++				input_sync(input);
++			}
+ 
+ 			pm_wakeup_event(&device->dev, 0);
+ 			acpi_bus_generate_netlink_event(
+--- linux.orig/include/acpi/button.h
++++ linux/include/acpi/button.h
+@@ -7,6 +7,15 @@
+ extern int acpi_lid_notifier_register(struct notifier_block *nb);
+ extern int acpi_lid_notifier_unregister(struct notifier_block *nb);
+ extern int acpi_lid_open(void);
++
++struct acpi_pwrbtn_poll_dev {
++	int (*poll)(struct acpi_pwrbtn_poll_dev *dev);
++	struct timer_list timer;
++	unsigned long started;
++};
++extern int acpi_pwrbtn_poll_register(struct acpi_pwrbtn_poll_dev *dev);
++extern int acpi_pwrbtn_poll_unregister(struct acpi_pwrbtn_poll_dev *dev);
++
+ #else
+ static inline int acpi_lid_notifier_register(struct notifier_block *nb)
+ {
+@@ -20,6 +29,14 @@ static inline int acpi_lid_open(void)
+ {
+ 	return 1;
+ }
++static inline int acpi_register_pwrbtn_poll(struct acpi_pwrbtn_poll_dev *dev)
++{
++	return 0;
++}
++static inline int acpi_unregister_pwrbtn_poll(struct acpi_pwrbtn_poll_dev *dev)
++{
++	return 0;
++}
+ #endif /* defined(CONFIG_ACPI_BUTTON) || defined(CONFIG_ACPI_BUTTON_MODULE) */
+ 
+ #endif /* ACPI_BUTTON_H */

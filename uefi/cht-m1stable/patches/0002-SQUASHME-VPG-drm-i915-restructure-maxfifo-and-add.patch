@@ -1,0 +1,484 @@
+From 7f1e23ef732e3b5d1cf90bc1a5bf09c84b0a5051 Mon Sep 17 00:00:00 2001
+Message-Id: <7f1e23ef732e3b5d1cf90bc1a5bf09c84b0a5051.1429601425.git.chang-joon.lee@intel.com>
+In-Reply-To: <20df33cbe9e95d11653023b1a6201653c517d353.1429601425.git.chang-joon.lee@intel.com>
+References: <20df33cbe9e95d11653023b1a6201653c517d353.1429601425.git.chang-joon.lee@intel.com>
+From: vandita kulkarni <vandita.kulkarni@intel.com>
+Date: Mon, 20 Apr 2015 19:31:25 +0530
+Subject: [PATCH 2/9] SQUASHME!: [VPG]: drm/i915: restructure maxfifo and add 
+ ddr dvfs.
+
+This patch enables ddrdvfs in maxfifo mode.
+
+SQUASHME: This patch restructures the maxfifo function and plane
+status bits which was added by the below patch
+
+	commit 719069970fee8c1a7b4d01ef5a68966649806666
+	Author: vanditak <vandita.kulkarni@intel.com>
+	Date:   Fri Sep 12 21:43:24 2014 +0530
+
+		FOR_UPSTREAM [VPG]: drm/i915: Add maxfifo support
+
+Change-Id: I27bd9ed787558d0f59997225796aab04515a976e
+Signed-off-by: vandita kulkarni <vandita.kulkarni@intel.com>
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    6 ++-
+ drivers/gpu/drm/i915/i915_reg.h      |   14 +++++++
+ drivers/gpu/drm/i915/intel_display.c |   70 +++++++++++++++++-----------------
+ drivers/gpu/drm/i915/intel_drv.h     |   11 +++++-
+ drivers/gpu/drm/i915/intel_pm.c      |   50 +++++++++---------------
+ drivers/gpu/drm/i915/intel_sprite.c  |   21 +++++-----
+ 6 files changed, 87 insertions(+), 85 deletions(-)
+
+Index: linux/drivers/gpu/drm/i915/i915_drv.h
+===================================================================
+--- linux.orig/drivers/gpu/drm/i915/i915_drv.h	2015-04-24 15:24:07.329617773 -0700
++++ linux/drivers/gpu/drm/i915/i915_drv.h	2015-04-24 15:24:11.525617724 -0700
+@@ -47,6 +47,7 @@
+ #include <linux/intel-iommu.h>
+ #include <linux/kref.h>
+ #include <linux/pm_qos.h>
++#include <linux/bitops.h>
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+ 	#include "hdmi_audio_if.h"
+ #endif
+@@ -1750,7 +1751,8 @@
+ 	bool last_media_active_state;
+ 
+ 	/* Indicates currently enabled planes */
+-	unsigned int plane_stat;
++	unsigned int pipe_plane_stat;
++	unsigned int prev_pipe_plane_stat;
+ 
+ 	/* PCH chipset type */
+ 	enum intel_pch pch_type;
+@@ -3168,7 +3170,7 @@
+ extern void intel_detect_pch(struct drm_device *dev);
+ extern int intel_trans_dp_port_sel(struct drm_crtc *crtc);
+ extern int intel_enable_rc6(const struct drm_device *dev);
+-extern void valleyview_update_wm_pm5(struct drm_crtc *crtc);
++extern void valleyview_update_wm_pm5(struct intel_crtc *crtc);
+ 
+ extern bool i915_semaphore_is_enabled(struct drm_device *dev);
+ int i915_reg_read_ioctl(struct drm_device *dev, void *data,
+Index: linux/drivers/gpu/drm/i915/i915_reg.h
+===================================================================
+--- linux.orig/drivers/gpu/drm/i915/i915_reg.h	2015-04-24 15:24:07.329617773 -0700
++++ linux/drivers/gpu/drm/i915/i915_reg.h	2015-04-24 15:24:11.525617724 -0700
+@@ -4180,8 +4180,14 @@
+ #define PIPE_C_ENABLE_MASK	0x4000
+ 
+ #define	DSPARB	(dev_priv->info.display_mmio_offset + 0x70030)
++#define DSPARB_PIPEA_MASK	0xffff
++#define DSPARB_PIPEB_MASK	(0xffff << 16)
+ #define	DSPARB2	(dev_priv->info.display_mmio_offset + 0x70060)
++#define DSPARB2_PIPEA_MASK	0xff
++#define DSPARB2_PIPEB_MASK	(0xff << 8)
++#define DSPARB2_PIPEC_MASK	(0xff << 16)
+ #define	DSPARB3	(dev_priv->info.display_mmio_offset + 0x7006c)
++#define DSPARB3_PIPEC_MASK	0xffff
+ 
+ #define	DSPARB_VLV_DEFAULT	0x80008000
+ #define	DSPARB_CSTART_MASK	(0x7f << 7)
+@@ -4192,6 +4198,14 @@
+ #define	DSPARB_AEND_SHIFT	0
+ #define	DSPARB2_VLV_DEFAULT	0x00111111
+ #define	DSPARB3_VLV_DEFAULT	0x80008000
++#define DSPARB_50_25_25		0x8000
++#define DSPARB2_50_25_25	0x11
++#define DSPARB_PRI50_SA50	0xff00
++#define DSPARB2_PRI50_SA50	0x11
++#define DSPARB_PRI50_SB50	0x0000
++#define DSPARB2_PRI50_SB50	0x11
++#define DSPARB_SA50_SB50	0x0000
++#define DSPARB2_SA50_SB50	0x10
+ 
+ #define DSPFW1			(dev_priv->info.display_mmio_offset + 0x70034)
+ #define   DSPFW_SR_SHIFT	23
+Index: linux/drivers/gpu/drm/i915/intel_display.c
+===================================================================
+--- linux.orig/drivers/gpu/drm/i915/intel_display.c	2015-04-24 15:24:07.333617773 -0700
++++ linux/drivers/gpu/drm/i915/intel_display.c	2015-04-24 15:26:15.241616287 -0700
+@@ -40,14 +40,16 @@
+ #include <drm/drm_dp_helper.h>
+ #include <drm/drm_crtc_helper.h>
+ #include <linux/dma_remapping.h>
++#include <linux/bitops.h>
+ #include "intel_clrmgr.h"
+ #include "intel_dsi.h"
+ #include "i915_scheduler.h"
+ 
+ #define DIV_ROUND_CLOSEST_ULL(ll, d)	\
+ 	({ unsigned long long _tmp = (ll)+(d)/2; do_div(_tmp, d); _tmp; })
+-
+-#define PIPE_ENABLE(pipe)	(1 << (pipe+12))
++#define NIBBLE	4
++#define PIPE_ENABLE(pipe)	(1 << (pipe + ((sizeof(int) * BITS_PER_BYTE) \
++								- NIBBLE)))
+ 
+ 
+ void intel_save_clr_mgr_status(struct drm_device *dev);
+@@ -2263,8 +2265,7 @@
+ 		return;
+ 
+ 	intel_crtc->primary_enabled = true;
+-
+-	dev_priv->plane_stat |= VLV_UPDATEPLANE_STAT_PRIM_PER_PIPE(pipe);
++	dev_priv->pipe_plane_stat |= VLV_UPDATEPLANE_STAT_PRIM_PER_PIPE(pipe);
+ 
+ 	reg = DSPCNTR(plane);
+ 	val = I915_READ(reg);
+@@ -2304,7 +2305,7 @@
+ 	intel_crtc->primary_enabled = false;
+ 
+ 	/* update the flags for the planes enabled/disabled */
+-	dev_priv->plane_stat &=
++	dev_priv->pipe_plane_stat &=
+ 			~VLV_UPDATEPLANE_STAT_PRIM_PER_PIPE(pipe);
+ 
+ 	reg = DSPCNTR(plane);
+@@ -2822,8 +2823,7 @@
+ 	/* When in maxfifo dspcntr cannot be changed */
+ 	if (dspcntr != I915_READ(DSPCNTR(pipe)) && dev_priv->maxfifo_enabled
+ 			&& dev_priv->atomic_update) {
+-		I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+-		dev_priv->maxfifo_enabled = false;
++		intel_update_maxfifo(dev_priv, crtc, false);
+ 		dev_priv->wait_vbl = true;
+ 		dev_priv->vblcount =
+ 			atomic_read(&dev->vblank[intel_crtc->pipe].count);
+@@ -5377,8 +5377,8 @@
+ 
+ 	intel_crtc->active = true;
+ 
+-	dev_priv->plane_stat = dev_priv->plane_stat |
+-		PIPE_ENABLE(intel_crtc->pipe);
++	dev_priv->pipe_plane_stat |= PIPE_ENABLE(intel_crtc->pipe);
++
+ 	intel_set_cpu_fifo_underrun_reporting(dev, pipe, true);
+ 
+ 	for_each_encoder_on_crtc(dev, crtc, encoder)
+@@ -5657,8 +5657,7 @@
+ 		intel_wait_for_vblank(dev, pipe);
+ 
+ 	intel_disable_pipe(dev_priv, pipe);
+-	dev_priv->plane_stat = dev_priv->plane_stat &
+-		(~PIPE_ENABLE(intel_crtc->pipe));
++	dev_priv->pipe_plane_stat &= ~PIPE_ENABLE(intel_crtc->pipe);
+ 
+ 	i9xx_pfit_disable(intel_crtc);
+ 
+@@ -11087,7 +11086,9 @@
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	int i, ret = 0;
+ 	int plane_cnt = 0;
+-	u32 val = 0;
++	int pipe_stat = VLV_PIPE_STATS(dev_priv->pipe_plane_stat);
++	int plane_stat;
++	int pipe = intel_crtc->pipe;
+ 	disp->errored = 0;
+ 	disp->presented = 0;
+ 
+@@ -11117,32 +11118,21 @@
+ 			plane_cnt++;
+ 	}
+ 
+-	/* Disable maxfifo and ddrdvfs if multiple planes are enabled */
+-	if (((plane_cnt > 1) || ((dev_priv->plane_stat & PIPE_C_ENABLE_MASK)
+-				== PIPE_C_ENABLE_MASK))
+-		&& dev_priv->maxfifo_enabled) {
+-		if (IS_CHERRYVIEW(dev_priv->dev)) {
+-			mutex_lock(&dev_priv->rps.hw_lock);
+-			val = CHV_FORCE_DDR_HIGH_FREQ | CHV_DDR_DVFS_DOORBELL;
+-			vlv_punit_write(dev_priv, CHV_DDR_DVFS, val);
+-			intel_wait_for_vblank(dev, intel_crtc->pipe);
+-			I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+-			val = vlv_punit_read(dev_priv, CHV_DPASSC);
+-			vlv_punit_write(dev_priv, CHV_DPASSC,
+-				(val | CHV_PW_MAXFIFO_MASK));
+-			mutex_unlock(&dev_priv->rps.hw_lock);
+-			intel_wait_for_vblank(dev, intel_crtc->pipe);
+-		}
+-
+-		dev_priv->maxfifo_enabled = false;
++	/* Disable maxfifo when moving from single plane to multiple plane */
++	if (dev_priv->maxfifo_enabled && ((plane_cnt > 1) ||
++				!single_pipe_enabled(pipe_stat) ||
++				(pipe_stat & PIPE_ENABLE(PIPE_C)))) {
++		intel_update_maxfifo(dev_priv, crtc, false);
+ 		dev_priv->wait_vbl = true;
+ 		dev_priv->vblcount =
+-		atomic_read(&dev->vblank[intel_crtc->pipe].count);
++			atomic_read(&dev->vblank[intel_crtc->pipe].count);
+ 	}
+ 
++
+ 	/* Calculation for Flips */
+ 	ret = intel_set_disp_calc_flip(disp, dev, file_priv, intel_crtc);
+ 
++	plane_stat = VLV_PLANE_STATS(dev_priv->pipe_plane_stat, pipe);
+ 	/* Check if we need to a vblank, if so wait for vblank */
+ 	if (intel_dsi_is_enc_on_crtc_cmd_mode(crtc)) {
+ 		/*
+@@ -11168,12 +11158,17 @@
+ 	/* Commit to registers */
+ 	ret = intel_set_disp_commit_regs(disp, dev, intel_crtc);
+ 
+-	/* PM5 requires that we update the watermarks straight way */
+ 	if (IS_CHERRYVIEW(dev))
+-		valleyview_update_wm_pm5(crtc);
++		valleyview_update_wm_pm5(intel_crtc);
+ 
+ 	/* Enable maxfifo if needed */
+-	intel_update_maxfifo(dev_priv, intel_crtc->pipe, plane_cnt);
++	if (!dev_priv->maxfifo_enabled && single_pipe_enabled(pipe_stat)
++				&& single_plane_enabled(plane_stat)
++				&& !(pipe_stat & PIPE_ENABLE(PIPE_C)))
++		intel_update_maxfifo(dev_priv, crtc, true);
++
++	dev_priv->prev_pipe_plane_stat = dev_priv->pipe_plane_stat;
++
+ 	dev_priv->atomic_update = false;
+ 
+ 	intel_runtime_pm_put(dev_priv);
+@@ -12259,11 +12254,8 @@
+ 		if (dev_priv->display.modeset_global_resources)
+ 			dev_priv->display.modeset_global_resources(dev);
+ 	}
+-
+ 	/* DO it only once */
+ 	if (IS_VALLEYVIEW(dev) && dev_priv->is_first_modeset) {
+-		valleyview_update_wm_pm5(crtc);
+-
+ 		/* This will drop reference taken in i915_driver_load */
+ 		intel_runtime_pm_put(dev_priv);
+ 		dev_priv->is_first_modeset = false;
+@@ -12328,6 +12320,11 @@
+ 		}
+ 	}
+ 
++	/* DO it only once */
++	if (IS_VALLEYVIEW(dev))
++		if (dev_priv->is_first_modeset)
++			valleyview_update_wm_pm5(intel_crtc);
++
+ 	/* FIXME: add subpixel order */
+ done:
+ 	if (ret && crtc->enabled)
+Index: linux/drivers/gpu/drm/i915/intel_drv.h
+===================================================================
+--- linux.orig/drivers/gpu/drm/i915/intel_drv.h	2015-04-24 15:24:07.333617773 -0700
++++ linux/drivers/gpu/drm/i915/intel_drv.h	2015-04-24 15:24:11.529617724 -0700
+@@ -70,6 +70,12 @@
+ 
+ #define KHz(x) (1000 * (x))
+ #define MHz(x) KHz(1000 * (x))
++#define single_plane_enabled(mask) is_power_of_2(mask)
++#define single_pipe_enabled(mask) is_power_of_2(mask)
++#define VLV_PIPE_STATS(x) (x & (0xF << (((sizeof(int)) * 8) - \
++					VLV_PLANES_PER_PIPE)))
++#define VLV_PLANE_STATS(x, pipe) (((x & ~(0xF << (((sizeof(int)) * 8) - 4))) \
++					>> (4 * pipe)) & (0xf))
+ 
+ /*
+  * Display related stuff
+@@ -1163,6 +1169,9 @@
+ 					    bool media_active);
+ bool i915_is_device_suspended(struct drm_device *drm_dev);
+ 
++void intel_update_maxfifo(struct drm_i915_private *dev_priv,
++				struct drm_crtc *crtc, bool enable);
++
+ /* intel_sdvo.c */
+ bool intel_sdvo_init(struct drm_device *dev, uint32_t sdvo_reg, bool is_sdvob);
+ 
+@@ -1188,8 +1197,6 @@
+ 			enum pipe pipe, enum plane plane);
+ bool is_cursor_enabled(struct drm_i915_private *dev_priv,
+ 			enum pipe pipe);
+-void intel_update_maxfifo(struct drm_i915_private *dev_priv,
+-			  enum pipe pipe, int count);
+ 
+ extern void intel_unpin_work_fn(struct work_struct *__work);
+ extern void intel_unpin_sprite_work_fn(struct work_struct *__work);
+Index: linux/drivers/gpu/drm/i915/intel_pm.c
+===================================================================
+--- linux.orig/drivers/gpu/drm/i915/intel_pm.c	2015-04-24 15:24:07.337617773 -0700
++++ linux/drivers/gpu/drm/i915/intel_pm.c	2015-04-24 15:24:11.529617724 -0700
+@@ -74,6 +74,10 @@
+ #define INTEL_RC6p_ENABLE			(1<<1)
+ #define INTEL_RC6pp_ENABLE			(1<<2)
+ 
++#define PRI_SA	0x3
++#define PRI_SB	0x5
++#define SA_SB	0x6
++
+ /* FBC, or Frame Buffer Compression, is a technique employed to compress the
+  * framebuffer contents in-memory, aiming at reducing the required bandwidth
+  * during in-memory transfers and, therefore, reduce the power packet.
+@@ -1538,38 +1542,22 @@
+ 	return true;
+ }
+ 
+-#define single_plane_enabled(mask) is_power_of_2(mask)
+-
+-void intel_update_maxfifo(struct drm_i915_private *dev_priv, enum pipe pipe,
+-			  int plane_cnt)
++void intel_update_maxfifo(struct drm_i915_private *dev_priv,
++				struct drm_crtc *crtc, bool enable)
+ {
+ 	unsigned int val = 0;
+-	struct drm_device *dev = dev_priv->dev;
+-
+ 
+ 	if (!IS_VALLEYVIEW(dev_priv->dev))
+ 		return;
+ 
+-	/*
+-	 * Maxfifo is not supported for PIPEC single plane
+-	 * Hence having a check while enabling maxfifo
+-	 * No need of a check on pipec in disable path
+-	 * as it is doens't get enabled. In this function
+-	 * we also enable ddrdvfs in case of single plane
+-	 * enabled.
+-	 */
+-	if (single_plane_enabled(dev_priv->plane_stat
+-			& (PIPE_A_PLANES_MASK | PIPE_B_PLANES_MASK))
+-		&& !(dev_priv->plane_stat & PIPE_C_MASK)
+-		&& (single_plane_enabled(dev_priv->plane_stat
+-			& PIPE_ENABLE_MASK))
+-		&& !dev_priv->maxfifo_enabled) {
++	if (enable) {
+ 		if (IS_CHERRYVIEW(dev_priv->dev)) {
++			val = 0x0;
+ 			mutex_lock(&dev_priv->rps.hw_lock);
+-			val = CHV_FORCE_DDR_LOW_FREQ | CHV_DDR_DVFS_DOORBELL;
+ 			vlv_punit_write(dev_priv, CHV_DDR_DVFS, val);
+-			intel_wait_for_vblank(dev, pipe);
++			mutex_unlock(&dev_priv->rps.hw_lock);
+ 			I915_WRITE(FW_BLC_SELF_VLV, FW_CSPWRDWNEN);
++			mutex_lock(&dev_priv->rps.hw_lock);
+ 			val = vlv_punit_read(dev_priv, CHV_DPASSC);
+ 			vlv_punit_write(dev_priv, CHV_DPASSC,
+ 					(val | CHV_PW_MAXFIFO_MASK));
+@@ -1577,32 +1565,28 @@
+ 		} else
+ 			I915_WRITE(FW_BLC_SELF_VLV, FW_CSPWRDWNEN);
+ 		dev_priv->maxfifo_enabled = true;
+-	} else if (dev_priv->maxfifo_enabled
+-			&& (!single_plane_enabled(dev_priv->plane_stat
+-				& (PIPE_A_PLANES_MASK | PIPE_B_PLANES_MASK
+-					| PIPE_C_PLANES_MASK)))
+-			&& (!single_plane_enabled(dev_priv->plane_stat
+-				& PIPE_ENABLE_MASK))) {
++	} else {
+ 		if (IS_CHERRYVIEW(dev_priv->dev)) {
+-			mutex_lock(&dev_priv->rps.hw_lock);
+ 			val = CHV_FORCE_DDR_HIGH_FREQ |	CHV_DDR_DVFS_DOORBELL;
++			mutex_lock(&dev_priv->rps.hw_lock);
+ 			vlv_punit_write(dev_priv, CHV_DDR_DVFS, val);
+-			intel_wait_for_vblank(dev, pipe);
++			mutex_unlock(&dev_priv->rps.hw_lock);
++			valleyview_update_wm_pm5(to_intel_crtc(crtc));
++			mutex_lock(&dev_priv->rps.hw_lock);
+ 			val = vlv_punit_read(dev_priv, CHV_DPASSC);
+ 			I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+ 			vlv_punit_write(dev_priv, CHV_DPASSC,
+ 					(val & ~(CHV_PW_MAXFIFO_MASK)));
+ 			mutex_unlock(&dev_priv->rps.hw_lock);
+-			intel_wait_for_vblank(dev, pipe);
+ 		} else
+ 			I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+ 		dev_priv->maxfifo_enabled = false;
+ 	}
+ }
+ 
+-void valleyview_update_wm_pm5(struct drm_crtc *crtc)
++void valleyview_update_wm_pm5(struct intel_crtc *crtc)
+ {
+-	struct drm_device *dev = crtc->dev;
++	struct drm_device *dev = crtc->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	I915_WRITE(DSPARB, DSPARB_VLV_DEFAULT);
+Index: linux/drivers/gpu/drm/i915/intel_sprite.c
+===================================================================
+--- linux.orig/drivers/gpu/drm/i915/intel_sprite.c	2015-04-24 15:24:07.337617773 -0700
++++ linux/drivers/gpu/drm/i915/intel_sprite.c	2015-04-24 15:24:11.529617724 -0700
+@@ -159,7 +159,7 @@
+ 		if (!dev_priv->atomic_update)
+ 			I915_WRITE(dspreg,
+ 				I915_READ(dspreg) | DISPLAY_PLANE_ENABLE);
+-		dev_priv->plane_stat |=
++		dev_priv->pipe_plane_stat |=
+ 				VLV_UPDATEPLANE_STAT_PRIM_PER_PIPE(pipe);
+ 	}
+ 	else {
+@@ -177,7 +177,7 @@
+ 
+ 			intel_dsi_send_fb_on_crtc(&intel_crtc->base);
+ 		}
+-		dev_priv->plane_stat &=
++		dev_priv->pipe_plane_stat &=
+ 				~VLV_UPDATEPLANE_STAT_PRIM_PER_PIPE(pipe);
+ 		I915_WRITE_BITS(VLV_DDL(pipe), 0x00, mask);
+ 	}
+@@ -358,8 +358,7 @@
+ 	/* Clear the older Z-order */
+ 	val = I915_READ(SPCNTR(pipe, 0));
+ 	if (dev_priv->maxfifo_enabled && !(val & SPRITE_ZORDER_ENABLE)) {
+-		I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+-		dev_priv->maxfifo_enabled = false;
++		intel_update_maxfifo(dev_priv, obj_to_crtc(obj), false);
+ 		intel_wait_for_vblank(dev, pipe);
+ 	}
+ 	val &= ~(SPRITE_FORCE_BOTTOM | SPRITE_ZORDER_ENABLE);
+@@ -367,8 +366,7 @@
+ 
+ 	val = I915_READ(SPCNTR(pipe, 1));
+ 	if (dev_priv->maxfifo_enabled && !(val & SPRITE_ZORDER_ENABLE)) {
+-		I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+-		dev_priv->maxfifo_enabled = false;
++		intel_update_maxfifo(dev_priv, obj_to_crtc(obj), false);
+ 		intel_wait_for_vblank(dev, pipe);
+ 	}
+ 	val &= ~(SPRITE_FORCE_BOTTOM | SPRITE_ZORDER_ENABLE);
+@@ -643,8 +641,7 @@
+ 	if (sprctl != I915_READ(SPCNTR(pipe, plane)) &&
+ 				dev_priv->maxfifo_enabled &&
+ 				dev_priv->atomic_update) {
+-		I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+-		dev_priv->maxfifo_enabled = false;
++		intel_update_maxfifo(dev_priv, crtc, false);
+ 		dev_priv->wait_vbl = true;
+ 		dev_priv->vblcount =
+ 			atomic_read(&dev->vblank[intel_crtc->pipe].count);
+@@ -693,7 +690,8 @@
+ 		intel_dsi_send_fb_on_crtc(crtc);
+ 	}
+ 
+-	dev_priv->plane_stat |= VLV_UPDATEPLANE_STAT_SP_PER_PIPE(pipe, plane);
++	dev_priv->pipe_plane_stat |=
++			VLV_UPDATEPLANE_STAT_SP_PER_PIPE(pipe, plane);
+ 
+ 	if (!dev_priv->atomic_update)
+ 		intel_flush_primary_plane(dev_priv, intel_crtc->plane);
+@@ -730,7 +728,7 @@
+ 		intel_update_primary_plane(dplane, intel_crtc);
+ 	}
+ 
+-	dev_priv->plane_stat &=
++	dev_priv->pipe_plane_stat &=
+ 			~VLV_UPDATEPLANE_STAT_SP_PER_PIPE(pipe, plane);
+ 
+ 	intel_plane->reg.cntr = I915_READ(SPCNTR(pipe, plane)) & ~SP_ENABLE;
+@@ -1843,8 +1841,7 @@
+ 	INIT_WORK(&intel_plane_wq->work, intel_disable_plane_unpin_work_fn);
+ 
+ 	if (dev_priv->maxfifo_enabled) {
+-		I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+-		dev_priv->maxfifo_enabled = false;
++		intel_update_maxfifo(dev_priv, plane->crtc, false);
+ 	}
+ 
+ 	if (intel_crtc->active) {

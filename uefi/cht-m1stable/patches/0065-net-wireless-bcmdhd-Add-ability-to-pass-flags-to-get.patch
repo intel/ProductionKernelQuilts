@@ -1,0 +1,267 @@
+From f30292289dd17beaaaf05cc749425185be21edf4 Mon Sep 17 00:00:00 2001
+From: Dmitry Shmidt <dimitrysh@google.com>
+Date: Fri, 22 Aug 2014 15:01:20 -0700
+Subject: [PATCH 65/77] net: wireless: bcmdhd: Add ability to pass flags to
+ get_country_code
+
+Change-Id: Ifff040c88c2e268cf67293b51c5bcda1c5b15910
+Signed-off-by: Dmitry Shmidt <dimitrysh@google.com>
+---
+ drivers/net/wireless/bcmdhd/dhd.h               |  5 ++++-
+ drivers/net/wireless/bcmdhd/dhd_custom_gpio.c   |  6 ++++--
+ drivers/net/wireless/bcmdhd/dhd_linux.c         | 19 +++++++++++++++--
+ drivers/net/wireless/bcmdhd/dhd_linux.h         | 18 ++++++++++++++++-
+ drivers/net/wireless/bcmdhd/dhd_linux_platdev.c | 19 +++--------------
+ drivers/net/wireless/bcmdhd/wl_cfgvendor.c      | 27 +++++++++++++++++++++++++
+ drivers/net/wireless/bcmdhd/wl_cfgvendor.h      |  4 +++-
+ 7 files changed, 75 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/net/wireless/bcmdhd/dhd.h b/drivers/net/wireless/bcmdhd/dhd.h
+index 7ed592e62ba3..c776e48ff9e4 100644
+--- a/drivers/net/wireless/bcmdhd/dhd.h
++++ b/drivers/net/wireless/bcmdhd/dhd.h
+@@ -292,6 +292,7 @@ typedef struct dhd_pub {
+ 	int pktfilter_count;
+ 
+ 	wl_country_t dhd_cspec;		/* Current Locale info */
++	u32 dhd_cflags;
+ 	char eventmask[WL_EVENTING_MASK_LEN];
+ 	int	op_mode;				/* STA, HostAPD, WFD, SoftAP */
+ 
+@@ -622,6 +623,7 @@ extern void dhd_txcomplete(dhd_pub_t *dhdp, void *txp, bool success);
+ 
+ extern int dhd_dev_get_feature_set(struct net_device *dev);
+ extern int *dhd_dev_get_feature_set_matrix(struct net_device *dev, int *num);
++extern int dhd_dev_set_nodfs(struct net_device *dev, u32 nodfs);
+ 
+ /* OS independent layer functions */
+ extern int dhd_os_proto_block(dhd_pub_t * pub);
+@@ -650,7 +652,8 @@ extern void dhd_os_tcpackunlock(dhd_pub_t *pub);
+ extern int dhd_customer_oob_irq_map(void *adapter, unsigned long *irq_flags_ptr);
+ extern int dhd_customer_gpio_wlan_ctrl(void *adapter, int onoff);
+ extern int dhd_custom_get_mac_address(void *adapter, unsigned char *buf);
+-extern void get_customized_country_code(void *adapter, char *country_iso_code, wl_country_t *cspec);
++extern void get_customized_country_code(void *adapter, char *country_iso_code,
++	wl_country_t *cspec, u32 flags);
+ extern void dhd_os_sdunlock_sndup_rxq(dhd_pub_t * pub);
+ extern void dhd_os_sdlock_eventq(dhd_pub_t * pub);
+ extern void dhd_os_sdunlock_eventq(dhd_pub_t * pub);
+diff --git a/drivers/net/wireless/bcmdhd/dhd_custom_gpio.c b/drivers/net/wireless/bcmdhd/dhd_custom_gpio.c
+index 4b9287c8e69f..b7d162c2172e 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_custom_gpio.c
++++ b/drivers/net/wireless/bcmdhd/dhd_custom_gpio.c
+@@ -256,7 +256,8 @@ const struct cntry_locales_custom translate_custom_table[] = {
+ *  input : ISO 3166-1 country abbreviation
+ *  output: customized cspec
+ */
+-void get_customized_country_code(void *adapter, char *country_iso_code, wl_country_t *cspec)
++void get_customized_country_code(void *adapter, char *country_iso_code,
++				 wl_country_t *cspec, u32 flags)
+ {
+ #if defined(CUSTOMER_HW2) && (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39))
+ 
+@@ -265,7 +266,8 @@ void get_customized_country_code(void *adapter, char *country_iso_code, wl_count
+ 	if (!cspec)
+ 		return;
+ 
+-	cloc_ptr = wifi_platform_get_country_code(adapter, country_iso_code);
++	cloc_ptr = wifi_platform_get_country_code(adapter, country_iso_code,
++						  flags);
+ 	if (cloc_ptr) {
+ 		strlcpy(cspec->ccode, cloc_ptr->custom_locale, WLC_CNTRY_BUF_SZ);
+ 		cspec->rev = cloc_ptr->custom_locale_rev;
+diff --git a/drivers/net/wireless/bcmdhd/dhd_linux.c b/drivers/net/wireless/bcmdhd/dhd_linux.c
+index 3dc303a0e088..033971e0e243 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_linux.c
++++ b/drivers/net/wireless/bcmdhd/dhd_linux.c
+@@ -4401,7 +4401,8 @@ dhd_attach(osl_t *osh, struct dhd_bus *bus, uint bus_hdrlen)
+ #endif /* GET_CUSTOM_MAC_ENABLE */
+ #ifdef CUSTOM_COUNTRY_CODE
+ 	get_customized_country_code(dhd->adapter,
+-		dhd->pub.dhd_cspec.country_abbrev, &dhd->pub.dhd_cspec);
++		dhd->pub.dhd_cspec.country_abbrev, &dhd->pub.dhd_cspec,
++		dhd->pub.dhd_cflags);
+ #endif /* CUSTOM_COUNTRY_CODE */
+ 	dhd->thr_dpc_ctl.thr_pid = DHD_PID_KT_TL_INVALID;
+ 	dhd->thr_wdt_ctl.thr_pid = DHD_PID_KT_INVALID;
+@@ -7376,6 +7377,18 @@ int *dhd_dev_get_feature_set_matrix(struct net_device *dev, int *num)
+ 	return ret;
+ }
+ 
++int
++dhd_dev_set_nodfs(struct net_device *dev, u32 nodfs)
++{
++	dhd_info_t *dhd = DHD_DEV_INFO(dev);
++
++	if (nodfs)
++		dhd->pub.dhd_cflags |= WLAN_PLAT_NODFS_FLAG;
++	else
++		dhd->pub.dhd_cflags &= ~WLAN_PLAT_NODFS_FLAG;
++	return 0;
++}
++
+ #ifdef PNO_SUPPORT
+ /* Linux wrapper to call common dhd_pno_stop_for_ssid */
+ int
+@@ -7666,8 +7679,10 @@ void dhd_get_customized_country_code(struct net_device *dev, char *country_iso_c
+ 	wl_country_t *cspec)
+ {
+ 	dhd_info_t *dhd = DHD_DEV_INFO(dev);
+-	get_customized_country_code(dhd->adapter, country_iso_code, cspec);
++	get_customized_country_code(dhd->adapter, country_iso_code, cspec,
++				    dhd->pub.dhd_cflags);
+ }
++
+ void dhd_bus_country_set(struct net_device *dev, wl_country_t *cspec, bool notify)
+ {
+ 	dhd_info_t *dhd = DHD_DEV_INFO(dev);
+diff --git a/drivers/net/wireless/bcmdhd/dhd_linux.h b/drivers/net/wireless/bcmdhd/dhd_linux.h
+index 59f0aff418e9..878fc1ffb79b 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_linux.h
++++ b/drivers/net/wireless/bcmdhd/dhd_linux.h
+@@ -47,6 +47,21 @@
+ #if defined(CONFIG_HAS_EARLYSUSPEND) && defined(DHD_USE_EARLYSUSPEND)
+ #include <linux/earlysuspend.h>
+ #endif /* defined(CONFIG_HAS_EARLYSUSPEND) && defined(DHD_USE_EARLYSUSPEND) */
++#if defined(CONFIG_WIFI_CONTROL_FUNC)
++#include <linux/wlan_plat.h>
++#endif
++
++#if !defined(CONFIG_WIFI_CONTROL_FUNC)
++#define WLAN_PLAT_NODFS_FLAG	0x01
++struct wifi_platform_data {
++	int (*set_power)(int val);
++	int (*set_reset)(int val);
++	int (*set_carddetect)(int val);
++	void *(*mem_prealloc)(int section, unsigned long size);
++	int (*get_mac_addr)(unsigned char *buf);
++	void *(*get_country_code)(char *ccode, u32 flags);
++};
++#endif /* CONFIG_WIFI_CONTROL_FUNC */
+ 
+ #define DHD_REGISTRATION_TIMEOUT  12000  /* msec : allowed time to finished dhd registration */
+ 
+@@ -86,7 +101,8 @@ int wifi_platform_set_power(wifi_adapter_info_t *adapter, bool on, unsigned long
+ int wifi_platform_bus_enumerate(wifi_adapter_info_t *adapter, bool device_present);
+ int wifi_platform_get_irq_number(wifi_adapter_info_t *adapter, unsigned long *irq_flags_ptr);
+ int wifi_platform_get_mac_addr(wifi_adapter_info_t *adapter, unsigned char *buf);
+-void *wifi_platform_get_country_code(wifi_adapter_info_t *adapter, char *ccode);
++void *wifi_platform_get_country_code(wifi_adapter_info_t *adapter, char *ccode,
++	u32 flags);
+ void* wifi_platform_prealloc(wifi_adapter_info_t *adapter, int section, unsigned long size);
+ void* wifi_platform_get_prealloc_func_ptr(wifi_adapter_info_t *adapter);
+ 
+diff --git a/drivers/net/wireless/bcmdhd/dhd_linux_platdev.c b/drivers/net/wireless/bcmdhd/dhd_linux_platdev.c
+index 076f175c045f..6913500f805c 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_linux_platdev.c
++++ b/drivers/net/wireless/bcmdhd/dhd_linux_platdev.c
+@@ -36,20 +36,6 @@
+ #include <dhd_bus.h>
+ #include <dhd_linux.h>
+ #include <wl_android.h>
+-#if defined(CONFIG_WIFI_CONTROL_FUNC)
+-#include <linux/wlan_plat.h>
+-#endif
+-
+-#if !defined(CONFIG_WIFI_CONTROL_FUNC)
+-struct wifi_platform_data {
+-	int (*set_power)(int val);
+-	int (*set_reset)(int val);
+-	int (*set_carddetect)(int val);
+-	void *(*mem_prealloc)(int section, unsigned long size);
+-	int (*get_mac_addr)(unsigned char *buf);
+-	void *(*get_country_code)(char *ccode);
+-};
+-#endif /* CONFIG_WIFI_CONTROL_FUNC */
+ 
+ #define WIFI_PLAT_NAME		"bcmdhd_wlan"
+ #define WIFI_PLAT_NAME2		"bcm4329_wlan"
+@@ -208,7 +194,8 @@ int wifi_platform_get_mac_addr(wifi_adapter_info_t *adapter, unsigned char *buf)
+ 	return -EOPNOTSUPP;
+ }
+ 
+-void *wifi_platform_get_country_code(wifi_adapter_info_t *adapter, char *ccode)
++void *wifi_platform_get_country_code(wifi_adapter_info_t *adapter, char *ccode,
++				     u32 flags)
+ {
+ 	/* get_country_code was added after 2.6.39 */
+ #if	(LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39))
+@@ -220,7 +207,7 @@ void *wifi_platform_get_country_code(wifi_adapter_info_t *adapter, char *ccode)
+ 
+ 	DHD_TRACE(("%s\n", __FUNCTION__));
+ 	if (plat_data->get_country_code) {
+-		return plat_data->get_country_code(ccode);
++		return plat_data->get_country_code(ccode, flags);
+ 	}
+ #endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)) */
+ 
+diff --git a/drivers/net/wireless/bcmdhd/wl_cfgvendor.c b/drivers/net/wireless/bcmdhd/wl_cfgvendor.c
+index 5f854f2c270d..a041d3a29043 100644
+--- a/drivers/net/wireless/bcmdhd/wl_cfgvendor.c
++++ b/drivers/net/wireless/bcmdhd/wl_cfgvendor.c
+@@ -210,6 +210,24 @@ static int wl_cfgvendor_set_pno_mac_oui(struct wiphy *wiphy,
+ 	return err;
+ }
+ 
++static int wl_cfgvendor_set_nodfs_flag(struct wiphy *wiphy,
++	struct wireless_dev *wdev, const void *data, int len)
++{
++	int err = 0;
++	struct bcm_cfg80211 *cfg = wiphy_priv(wiphy);
++	int type;
++	u32 nodfs;
++
++	type = nla_type(data);
++	if (type == ANDR_WIFI_ATTRIBUTE_NODFS_SET) {
++		nodfs = nla_get_u32(data);
++		err = dhd_dev_set_nodfs(bcmcfg_to_prmry_ndev(cfg), nodfs);
++	} else {
++		err = -1;
++	}
++	return err;
++}
++
+ #ifdef GSCAN_SUPPORT
+ int wl_cfgvendor_send_hotlist_event(struct wiphy *wiphy,
+ 	struct net_device *dev, void  *data, int len, wl_vendor_event_t event)
+@@ -1256,6 +1274,15 @@ static const struct wiphy_vendor_command wl_vendor_cmds [] = {
+ 		.flags = WIPHY_VENDOR_CMD_NEED_WDEV | WIPHY_VENDOR_CMD_NEED_NETDEV,
+ 		.doit = wl_cfgvendor_set_pno_mac_oui
+ 	},
++	{
++		{
++			.vendor_id = OUI_GOOGLE,
++			.subcmd = ANDR_WIFI_NODFS_CHANNELS
++		},
++		.flags = WIPHY_VENDOR_CMD_NEED_WDEV | WIPHY_VENDOR_CMD_NEED_NETDEV,
++		.doit = wl_cfgvendor_set_nodfs_flag
++
++	},
+ #ifdef LINKSTAT_SUPPORT
+ 	{
+ 		{
+diff --git a/drivers/net/wireless/bcmdhd/wl_cfgvendor.h b/drivers/net/wireless/bcmdhd/wl_cfgvendor.h
+index 4f600182e8c7..5bc840fc18e4 100644
+--- a/drivers/net/wireless/bcmdhd/wl_cfgvendor.h
++++ b/drivers/net/wireless/bcmdhd/wl_cfgvendor.h
+@@ -99,6 +99,7 @@ enum wl_vendor_subcmd {
+ 	ANDR_WIFI_SUBCMD_GET_FEATURE_SET,
+ 	ANDR_WIFI_SUBCMD_GET_FEATURE_SET_MATRIX,
+ 	ANDR_WIFI_PNO_RANDOM_MAC_OUI,
++	ANDR_WIFI_NODFS_CHANNELS,
+ 	RTT_SUBCMD_SET_CONFIG = ANDROID_NL80211_SUBCMD_RTT_RANGE_START,
+ 	RTT_SUBCMD_CANCEL_CONFIG,
+ 	RTT_SUBCMD_GETCAPABILITY,
+@@ -212,7 +213,8 @@ typedef enum wl_vendor_event {
+ enum andr_wifi_attr {
+     ANDR_WIFI_ATTRIBUTE_NUM_FEATURE_SET,
+     ANDR_WIFI_ATTRIBUTE_FEATURE_SET,
+-    ANDR_WIFI_ATTRIBUTE_PNO_RANDOM_MAC_OUI
++    ANDR_WIFI_ATTRIBUTE_PNO_RANDOM_MAC_OUI,
++    ANDR_WIFI_ATTRIBUTE_NODFS_SET,
+ };
+ 
+ typedef enum wl_vendor_gscan_attribute {
+-- 
+2.0.3
+

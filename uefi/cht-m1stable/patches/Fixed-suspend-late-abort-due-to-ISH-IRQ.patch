@@ -1,0 +1,107 @@
+From ae175d32579ebdc54a810e90886e4a0ad1b05130 Mon Sep 17 00:00:00 2001
+From: Daniel Drubin <daniel.drubin@intel.com>
+Date: Tue, 14 Jul 2015 17:19:51 +0300
+Subject: [PATCH] Fixed suspend late abort due to ISH IRQ; Raised host->FW
+ clock sync frequency to once in 20 seconds; Moved check for
+ HECI_DEVICE_DISABLED to a more appropriate place
+
+Change-Id: I64edc6a5d152a64cb59545629dda558212e11956
+Signed-off-by: Daniel Drubin <daniel.drubin@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-2059
+---
+ drivers/misc/heci/hw-ish.c          | 10 +++++-----
+ drivers/misc/heci/pci-ish.c         |  8 ++++++--
+ drivers/misc/heci/platform-config.h |  2 +-
+ 3 files changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/misc/heci/hw-ish.c b/drivers/misc/heci/hw-ish.c
+index 98025da686b4..6d43787e07d5 100644
+--- a/drivers/misc/heci/hw-ish.c
++++ b/drivers/misc/heci/hw-ish.c
+@@ -479,7 +479,7 @@ static void	sync_fw_clock(struct heci_device *dev)
+ 	struct timespec	ts;
+ 	uint64_t	usec;
+ 
+-	if (prev_sync && jiffies - prev_sync < 120 * HZ)
++	if (prev_sync && jiffies - prev_sync < 20 * HZ)
+ 		return;
+ 
+ 	prev_sync = jiffies;
+@@ -558,10 +558,6 @@ irqreturn_t ish_irq_handler(int irq, void *dev_id)
+ 
+ 	ISH_DBG_PRINT(KERN_ALERT "%s(): irq=%d +++\n", __func__, irq);
+ 
+-	/* CHECKME: double check this */
+-	if (dev->dev_state == HECI_DEV_DISABLED)
+-		return	IRQ_NONE;
+-
+ 	/* Check that it's interrupt from ISH (may be shared) */
+ 	pisr_val = ish_reg_read(dev, IPC_REG_PISR);
+ 	interrupt_generated = IPC_INT_FROM_ISH_TO_HOST(pisr_val);
+@@ -580,6 +576,10 @@ irqreturn_t ish_irq_handler(int irq, void *dev_id)
+ 
+ 	ISH_DBG_PRINT("%s(): doorbell is busy - YES\n", __func__);
+ 
++	/* CHECKME: double check this */
++	if (dev->dev_state == HECI_DEV_DISABLED)
++		return	IRQ_HANDLED;
++
+ 	ish_intr_disable(dev);
+ 
+ 	/* Sanity check: IPC dgram length in header */
+diff --git a/drivers/misc/heci/pci-ish.c b/drivers/misc/heci/pci-ish.c
+index 5004d26b1aed..b2ac0ab0cdc1 100644
+--- a/drivers/misc/heci/pci-ish.c
++++ b/drivers/misc/heci/pci-ish.c
+@@ -870,7 +870,7 @@ out_err:
+ /**********************************/
+ 
+ /**
+- * heci_probe - Device Initialization Routine
++ * ish_probe - Device Initialization Routine
+  *
+  * @pdev: PCI device structure
+  * @ent: entry in ish_pci_tbl
+@@ -957,7 +957,7 @@ static int ish_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ 	/* request and enable interrupt   */
+ #ifndef TIMER_POLLING
+-	err = request_irq(pdev->irq, ish_irq_handler, IRQF_SHARED,
++	err = request_irq(pdev->irq, ish_irq_handler, IRQF_NO_SUSPEND,
+ 		KBUILD_MODNAME, dev);
+ 	if (err) {
+ 		dev_err(&pdev->dev, "heci: request_irq failure. irq = %d\n",
+@@ -1094,6 +1094,8 @@ int ish_suspend(struct device *device)
+ 	struct pci_dev *pdev = to_pci_dev(device);
+ 	struct heci_device *dev = pci_get_drvdata(pdev);
+ 
++	enable_irq_wake(pdev->irq);
++
+ 	/* If previous suspend hasn't been asnwered then ISH is likely dead,
+ 	don't attempt nested notification */
+ 	if (suspend_flag)
+@@ -1112,6 +1114,8 @@ int ish_resume(struct device *device)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(device);
+ 	struct heci_device *dev = pci_get_drvdata(pdev);
++
++	disable_irq_wake(pdev->irq);
+ 	send_resume(dev);
+ 	return 0;
+ }
+diff --git a/drivers/misc/heci/platform-config.h b/drivers/misc/heci/platform-config.h
+index 02e130702361..24e73089bdab 100644
+--- a/drivers/misc/heci/platform-config.h
++++ b/drivers/misc/heci/platform-config.h
+@@ -17,7 +17,7 @@
+ #define PLATFORM_CONFIG__H
+ 
+ /* Build ID string */
+-#define	BUILD_ID	"0178-poweroff-fix"
++#define	BUILD_ID	"0181-fix-wake-irq"
+ 
+ #define	ISH_DEBUG	0
+ #if ISH_DEBUG
+-- 
+1.9.1
+

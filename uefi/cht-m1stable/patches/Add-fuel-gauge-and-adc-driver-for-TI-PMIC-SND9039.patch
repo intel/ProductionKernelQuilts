@@ -1,0 +1,2225 @@
+From 41b800ca99524508c565d68f5e5801347a79f6b3 Mon Sep 17 00:00:00 2001
+From: Fei Yang <fei.yang@intel.com>
+Date: Tue, 17 Jun 2014 14:51:34 -0700
+Subject: [PATCH] Add fuel gauge and adc driver for TI PMIC (SND9039)
+
+This includes intel fuel gauge driver, sysfs interface for user
+space fuel gauge interface and adc driver for reading Coulomb
+Counter.
+The drivers were forklifted from MCG's tree with following history
+
+90cb8c4 intel_fule_gauge: Add OCV smoothening or filter logic for VOCV
+3723912 dc_ti_cc: Fix boot up voltage calculation
+768d2ff dc_ti_cc: remove SW Trim on accumilator
+d9cd03a intel_fuel_gauge: Send notifications for low battery conditions
+2b955bf intel_fg_uiface: add sys/class/ entry to intel fg interface
+2501828 EM/FG: Correct battery extreme vol and temp params.
+e09cf25 EM/FG: Added valid/invalid battery handling to FG driver.
+8d07b37 dollar_cove_ti_GPADC: Report proper BPTHERM value to FG
+e7662d0 intel_fuel_gauge: Report FG values even when no algo is registered
+e61288c intel_fuel_gauge: Add Intel Fuel Gauge driver
+5b988b6 dc_ti_cc: Add TI Dollar Cove Battery ADC/CC driver
+
+Change-Id: I27ebcf7085b6b3e54845e3820334447b7110a100
+Signed-off-by: Fei Yang <fei.yang@intel.com>
+---
+ drivers/platform/x86/Makefile          |   5 +-
+ drivers/platform/x86/dc_ti_cc.c        | 752 +++++++++++++++++++++++++++++++++
+ drivers/power/Kconfig                  |  16 +
+ drivers/power/Makefile                 |   2 +
+ drivers/power/intel_fg_uiface.c        | 514 ++++++++++++++++++++++
+ drivers/power/intel_fuel_gauge.c       | 718 +++++++++++++++++++++++++++++++
+ include/linux/power/intel_fuel_gauge.h | 125 ++++++
+ 7 files changed, 2130 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/platform/x86/dc_ti_cc.c
+ create mode 100644 drivers/power/intel_fg_uiface.c
+ create mode 100644 drivers/power/intel_fuel_gauge.c
+ create mode 100644 include/linux/power/intel_fuel_gauge.h
+
+diff --git a/drivers/platform/x86/Makefile b/drivers/platform/x86/Makefile
+index ad49c65..32caae3 100644
+--- a/drivers/platform/x86/Makefile
++++ b/drivers/platform/x86/Makefile
+@@ -54,6 +54,7 @@ obj-$(CONFIG_APPLE_GMUX)	+= apple-gmux.o
+ obj-$(CONFIG_INTEL_RST)		+= intel-rst.o
+ obj-$(CONFIG_INTEL_SMARTCONNECT)	+= intel-smartconnect.o
+ 
+-obj-$(CONFIG_PVPANIC)           += pvpanic.o
++obj-$(CONFIG_PVPANIC)		+= pvpanic.o
+ obj-$(CONFIG_INTEL_BAYTRAIL_MBI)	+= intel_baytrail.o
+-obj-$(CONFIG_ACPI) += intel_em_config.o
++obj-$(CONFIG_INTEL_SOC_PMIC)	+= dc_ti_cc.o
++obj-$(CONFIG_ACPI)		+= intel_em_config.o
+diff --git a/drivers/platform/x86/dc_ti_cc.c b/drivers/platform/x86/dc_ti_cc.c
+new file mode 100644
+index 0000000..d80259f
+--- /dev/null
++++ b/drivers/platform/x86/dc_ti_cc.c
+@@ -0,0 +1,752 @@
++/*
++ * dc_ti_cc.c - Intel Dollar Cove(TI) Coulomb Counter Driver
++ *
++ * Copyright (C) 2014 Intel Corporation
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the GNU
++ * General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ * Author: Ramakrishna Pallala <ramakrishna.pallala@intel.com>
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/io.h>
++#include <linux/slab.h>
++#include <linux/jiffies.h>
++#include <linux/pm_runtime.h>
++#include <linux/interrupt.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/workqueue.h>
++#include <linux/delay.h>
++#include <linux/notifier.h>
++#include <linux/acpi.h>
++#include <linux/iio/consumer.h>
++#include <linux/mfd/intel_soc_pmic.h>
++#include <linux/power/intel_fuel_gauge.h>
++
++#define DC_TI_CC_CNTL_REG		0x60
++#define CC_CNTL_CC_CTR_EN		(1 << 0)
++#define CC_CNTL_CC_CLR_EN		(1 << 1)
++#define CC_CNTL_CC_CAL_EN		(1 << 2)
++#define CC_CNTL_CC_OFFSET_EN		(1 << 3)
++#define CC_CNTL_SMPL_INTVL_MASK		(3 << 4)
++#define CC_CNTL_SMPL_INTVL_15MS		(0 << 4)
++#define CC_CNTL_SMPL_INTVL_62MS		(1 << 4)
++#define CC_CNTL_SMPL_INTVL_125MS	(2 << 4)
++#define CC_CNTL_SMPL_INTVL_250MS	(3 << 4)
++
++#define DC_TI_SMPL_CTR0_REG		0x69
++#define DC_TI_SMPL_CTR1_REG		0x68
++#define DC_TI_SMPL_CTR2_REG		0x67
++
++#define DC_TI_CC_OFFSET_HI_REG		0x61
++#define CC_OFFSET_HI_MASK		0x3F
++#define DC_TI_CC_OFFSET_LO_REG		0x62
++
++#define DC_TI_SW_OFFSET_REG		0x6C
++
++#define DC_TI_CC_ACC3_REG		0x63
++#define DC_TI_CC_ACC2_REG		0x64
++#define DC_TI_CC_ACC1_REG		0x65
++#define DC_TI_CC_ACC0_REG		0x66
++
++#define DC_TI_CC_INTG1_REG		0x6A
++#define DC_TI_CC_INTG1_MASK		0x3F
++#define DC_TI_CC_INTG0_REG		0x6B
++
++#define DC_TI_ADC_VBAT_HI_REG		0x54
++#define ADC_VBAT_HI_MASK		0x3
++#define DC_TI_ADC_VBAT_LO_REG		0x55
++
++#define CC_SMPL_CTR_MAX_VAL		0xFFFFFF
++
++#define ADC_TO_BPTH_IN(a)		((a * 18) / 1023)
++
++#define BPTH_IN_TO_RNTC(a)		((47 * a) / (18 - a))
++
++#define CC_INTG_TO_UA(a)		(a * 183)
++
++#define CC_INTG_TO_MA(a)		((a * 367) / 1000)
++
++#define CC_ACC_TO_UA(a)			(a * 367)
++
++#define CC_ACC_TO_UAH(a)		(a / 3600)
++
++#define ADC_TO_OCV(a)			(a * 4687)
++
++#define ADC_TO_VBATT(a)			(a * 4687)
++
++#define CC_SEC_TO_HR			3600
++
++#define DRV_NAME		"dollar_cove_ti_cc"
++
++#define THERM_CURVE_MAX_SAMPLES		13
++#define THERM_CURVE_MAX_VALUES		4
++#define RBATT_TYPICAL			150
++
++struct dc_ti_cc_info {
++	struct platform_device *pdev;
++	struct work_struct	init_work;
++
++	int		vbat_socv;
++	int		vbat_bocv;
++	int		ibat_boot;
++	int		ibatt_avg;
++	unsigned int	smpl_ctr_prev;
++	long		cc_val_prev;
++};
++
++static struct dc_ti_cc_info *info_ptr;
++
++static int const dc_ti_bptherm_curve_data[THERM_CURVE_MAX_SAMPLES]
++[THERM_CURVE_MAX_VALUES] = {
++	/* {temp_max, temp_min, adc_max, adc_min} */
++	{-5, -10, 834, 796},
++	{0, -5, 796, 753},
++	{5, 0, 753, 708},
++	{10, 5, 708, 660},
++	{15, 10, 660, 610},
++	{20, 15, 610, 561},
++	{25, 20, 561, 512},
++	{30, 25, 512, 464},
++	{35, 30, 464, 418},
++	{40, 35, 418, 376},
++	{45, 40, 376, 336},
++	{50, 45, 336, 299},
++	{55, 50, 299, 266},
++};
++/* Temperature Interpolation Macros */
++static int platform_interpolate_temp(int adc_val,
++	int adc_max, int adc_diff, int temp_diff)
++{
++	int ret;
++
++	pr_debug("%s\n", __func__);
++	ret = (adc_max - adc_val) * temp_diff;
++	return ret / adc_diff;
++}
++/* platform_adc_to_temp - Convert ADC code to temperature
++ * @adc_val : ADC sensor reading
++ * @tmp : finally read temperature
++ *
++ * Returns 0 on success or -ERANGE in error case
++ */
++static int platform_adc_to_temp(uint16_t adc_val, int *tmp)
++{
++	int temp = 0;
++	int i;
++
++	pr_debug("%s\n", __func__);
++
++/*
++* If the value returned as an ERANGE the battery icon shows an
++* exclaimation mark in the COS.In order to fix the issue, if
++* the ADC returns a value which is not in range specified, we
++* update the value within the bound.
++*/
++	adc_val = clamp_t(uint16_t, adc_val,
++			dc_ti_bptherm_curve_data[THERM_CURVE_MAX_SAMPLES-1][0],
++			dc_ti_bptherm_curve_data[0][2]);
++
++	for (i = 0; i < THERM_CURVE_MAX_SAMPLES; i++) {
++		/* linear approximation for battery pack temperature */
++		if (adc_val >= dc_ti_bptherm_curve_data[i][2]) {
++			temp = platform_interpolate_temp(adc_val,
++					dc_ti_bptherm_curve_data[i][2],
++					dc_ti_bptherm_curve_data[i][2] -
++					dc_ti_bptherm_curve_data[i][3],
++					dc_ti_bptherm_curve_data[i][0] -
++					dc_ti_bptherm_curve_data[i][1]);
++
++			temp += dc_ti_bptherm_curve_data[i][1];
++			break;
++		}
++	}
++
++	*tmp = temp;
++
++	return 0;
++}
++/**
++ * dc_ti_read_adc_val - read ADC value of specified sensors
++ * @channel: channel of the sensor to be sampled
++ * @sensor_val: pointer to the charger property to hold sampled value
++ * @chc :  battery info pointer
++ *
++ * Returns 0 if success
++ */
++static int dc_ti_read_adc_val(const char *map, const char *name,
++			int *raw_val, struct dc_ti_cc_info *info)
++{
++	int ret, val;
++	struct iio_channel *indio_chan;
++
++	indio_chan = iio_channel_get(NULL, name);
++	if (IS_ERR_OR_NULL(indio_chan)) {
++		ret = PTR_ERR(indio_chan);
++		goto exit;
++	}
++	ret = iio_read_channel_raw(indio_chan, &val);
++	if (ret) {
++		dev_err(&info->pdev->dev, "IIO channel read error\n");
++		goto err_exit;
++	}
++
++	dev_dbg(&info->pdev->dev, "adc raw val=%x\n", val);
++	*raw_val = val;
++
++err_exit:
++	iio_channel_release(indio_chan);
++exit:
++	return ret;
++}
++
++static int dc_ti_fg_get_vbatt(struct dc_ti_cc_info *info, int *vbatt)
++{
++	int ret, raw_val;
++
++	ret = dc_ti_read_adc_val("VIBAT", "VBAT", &raw_val, info);
++	if (ret < 0)
++		goto vbatt_read_fail;
++
++	*vbatt = ADC_TO_VBATT(raw_val);
++vbatt_read_fail:
++	return ret;
++}
++
++static int dc_ti_adc_to_temp(struct dc_ti_cc_info *info,
++				int adc_val, int *btemp)
++{
++	int val = 0, ret_val = 0;
++
++	/*
++	 * Look up for the temperature value from
++	 * the Thermistor ADC conversion table.
++	 */
++	ret_val = platform_adc_to_temp(adc_val, &val);
++	if (ret_val != 0) {
++		dev_err(&info->pdev->dev,
++			"Error while converting adc to temp :%d\n", ret_val);
++		return ret_val;
++	}
++	*btemp = val * 10;
++
++	return 0;
++}
++
++static int dc_ti_fg_get_btemp(struct dc_ti_cc_info *info, int *btemp)
++{
++	int ret, raw_val;
++
++	ret = dc_ti_read_adc_val("THERMAL", "BATTEMP", &raw_val, info);
++	if (ret < 0)
++		goto btemp_read_fail;
++
++	ret = dc_ti_adc_to_temp(info, raw_val, btemp);
++	if (ret < 0)
++		dev_warn(&info->pdev->dev, "ADC conversion error:%d\n", ret);
++	else
++		dev_dbg(&info->pdev->dev,
++				"ADC code:%d, TEMP:%d\n", raw_val, *btemp);
++btemp_read_fail:
++	return ret;
++}
++
++static int dc_ti_get_cc_acc_val(struct dc_ti_cc_info *info, int *acc_val)
++{
++	int ret, val;
++	long cc_val;
++
++	/* Read coulomb counter accumulator */
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC0_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	else
++		val = ret;
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC1_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	else
++		val |= (ret << 8);
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC2_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	else
++		val |= (ret << 16);
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC3_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	else
++		val |= (ret << 24);
++
++	/* convert the cc_val to uAs */
++	cc_val = CC_ACC_TO_UA((long)val);
++	/* convert uAS to uAH */
++	*acc_val = CC_ACC_TO_UAH(cc_val);
++
++	return 0;
++
++cc_read_failed:
++	dev_err(&info->pdev->dev, "cc acc read failed:%d\n", ret);
++	return ret;
++}
++
++static int dc_ti_get_cc_delta(struct dc_ti_cc_info *info, int *acc_val)
++{
++	int ret, delta_q, delta_smpl, val;
++	long cc_val;
++	unsigned int smpl_ctr;
++
++	/* Read coulomb counter accumulator */
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC0_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	val = ret;
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC1_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	val |= (ret << 8);
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC2_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	val |= (ret << 16);
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC3_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	val |= (ret << 24);
++
++	/*convert the cc_val to uAs */
++	cc_val = val;
++	delta_q = cc_val - info->cc_val_prev;
++	info->cc_val_prev = cc_val;
++	dev_info(&info->pdev->dev, "delta_q raw:%d\n", delta_q);
++
++	/* Read sample counter */
++	ret = intel_soc_pmic_readb(DC_TI_SMPL_CTR0_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	smpl_ctr = ret;
++
++	ret = intel_soc_pmic_readb(DC_TI_SMPL_CTR1_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	smpl_ctr |= (ret << 8);
++
++	ret = intel_soc_pmic_readb(DC_TI_SMPL_CTR2_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	smpl_ctr |= (ret << 16);
++
++	/* scale the counter to seconds */
++	smpl_ctr /= 4;
++	delta_smpl = smpl_ctr - info->smpl_ctr_prev;
++	info->smpl_ctr_prev = smpl_ctr;
++	/* handle sample counter overflow */
++	if (delta_smpl < 0) {
++		val = (int)((CC_SMPL_CTR_MAX_VAL/4) - info->smpl_ctr_prev);
++		delta_smpl = val + smpl_ctr;
++	}
++
++	dev_info(&info->pdev->dev, "delta_smpl:%d\n", delta_smpl);
++
++	/* ibatt_avg in uA */
++	if (delta_smpl)
++		info->ibatt_avg = (CC_ACC_TO_UA(delta_q)) / delta_smpl;
++
++	/* convert CC to to uAhr */
++	delta_q = CC_ACC_TO_UA(delta_q);
++	*acc_val = CC_ACC_TO_UAH(delta_q);
++
++	return 0;
++
++cc_read_failed:
++	dev_err(&info->pdev->dev, "cc acc read failed:%d\n", ret);
++	return ret;
++}
++
++static void dc_ti_cc_init_data(struct dc_ti_cc_info *info)
++{
++	int ret, val;
++	unsigned int smpl_ctr;
++
++	/* Read coulomb counter accumulator */
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC0_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	val = ret;
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC1_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	val |= (ret << 8);
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC2_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	val |= (ret << 16);
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_ACC3_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	val |= (ret << 24);
++
++	/*convert the cc_val to uAs */
++	info->cc_val_prev = val;
++
++	/* Read sample counter */
++	ret = intel_soc_pmic_readb(DC_TI_SMPL_CTR0_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	smpl_ctr = ret;
++
++	ret = intel_soc_pmic_readb(DC_TI_SMPL_CTR1_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	smpl_ctr |= (ret << 8);
++
++	ret = intel_soc_pmic_readb(DC_TI_SMPL_CTR2_REG);
++	if (ret < 0)
++		goto cc_read_failed;
++	smpl_ctr |= (ret << 16);
++
++	/* scale the counter to seconds */
++	smpl_ctr /= 4;
++	info->smpl_ctr_prev = smpl_ctr;
++
++cc_read_failed:
++	if (ret < 0)
++		dev_err(&info->pdev->dev, "pmic read failed\n");
++	return;
++}
++
++static int dc_ti_get_ibatt_avg(struct dc_ti_cc_info *info, int *ibatt_avg)
++{
++	*ibatt_avg = info->ibatt_avg;
++	return 0;
++}
++
++static int dc_ti_fg_get_ibatt(struct dc_ti_cc_info *info, int *ibatt)
++{
++	int ret, val;
++	short int cc_intg_val;
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_INTG0_REG);
++	if (ret < 0)
++		goto ibatt_read_failed;
++	val = ret;
++
++	ret = intel_soc_pmic_readb(DC_TI_CC_INTG1_REG);
++	if (ret < 0)
++		goto ibatt_read_failed;
++	val |= (ret & DC_TI_CC_INTG1_MASK) << 8;
++
++	/* scale the readings to seconds */
++	cc_intg_val = (short int)(val << 2);
++
++	/* convert the cc integrator value to uA */
++	*ibatt = CC_INTG_TO_UA((int)cc_intg_val);
++
++	return 0;
++
++ibatt_read_failed:
++	dev_err(&info->pdev->dev, "cc intg reg read failed:%d\n", ret);
++	return ret;
++}
++
++static int dc_ti_fg_get_ibatt_bootup(struct dc_ti_cc_info *info,
++					int *ibatt_boot)
++{
++	int ret;
++
++	ret = intel_soc_pmic_setb(DC_TI_CC_CNTL_REG, CC_CNTL_CC_CTR_EN);
++	if (ret < 0) {
++		dev_err(&info->pdev->dev,
++			"Failed to set CC_CTR_EN bit:%d\n", ret);
++		return ret;
++	}
++	/* Coulomb Counter need 250ms to give the first IBAT sample */
++	msleep(250);
++	ret = dc_ti_fg_get_ibatt(info, ibatt_boot);
++	if (ret)
++		dev_err(&info->pdev->dev,
++			"Failed to read IBAT bootup:%d\n", ret);
++
++	ret |= intel_soc_pmic_clearb(DC_TI_CC_CNTL_REG, CC_CNTL_CC_CTR_EN);
++	if (ret < 0) {
++		dev_err(&info->pdev->dev,
++			"Failed to clr CC_CTR_EN bit:%d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++static void dc_ti_calibrate_cc(struct dc_ti_cc_info *info)
++{
++	int ret;
++
++	/* disable Coulomb Counter */
++	ret = intel_soc_pmic_clearb(DC_TI_CC_CNTL_REG, CC_CNTL_CC_CTR_EN);
++	if (ret < 0)
++		goto cc_cal_failed;
++
++	/* Calibrate coulomb counter */
++	ret = intel_soc_pmic_setb(DC_TI_CC_CNTL_REG, CC_CNTL_CC_CTR_EN |
++				CC_CNTL_CC_CAL_EN | CC_CNTL_CC_OFFSET_EN);
++	if (ret < 0)
++		goto cc_cal_failed;
++
++	mdelay(1);
++	dc_ti_cc_init_data(info);
++
++	return;
++
++cc_cal_failed:
++	dev_err(&info->pdev->dev, "CC Calibration failed:%d\n", ret);
++}
++
++static int dc_ti_read_ocv(struct dc_ti_cc_info *info, int *vbat_ocv)
++{
++	int ret, val;
++
++	ret = intel_soc_pmic_readb(DC_TI_ADC_VBAT_LO_REG);
++	if (ret < 0)
++		goto ocv_read_failed;
++	val = ret;
++
++	ret = intel_soc_pmic_readb(DC_TI_ADC_VBAT_HI_REG);
++	if (ret < 0)
++		goto ocv_read_failed;
++	val |= (ret & ADC_VBAT_HI_MASK) << 8;
++
++	/* convert adc code to uV */
++	*vbat_ocv = ADC_TO_OCV(val);
++	return 0;
++
++ocv_read_failed:
++	dev_err(&info->pdev->dev, "ocv read failed:%d\n", ret);
++	return ret;
++}
++
++static int dc_ti_cc_get_batt_params(int *vbat, int *ibat, int *btemp)
++{
++	int ret;
++
++	if (!info_ptr)
++		return -EAGAIN;
++
++	ret = dc_ti_fg_get_vbatt(info_ptr, vbat);
++	if (ret < 0)
++		goto get_params_fail;
++
++	ret = dc_ti_fg_get_ibatt(info_ptr, ibat);
++	if (ret < 0)
++		goto get_params_fail;
++
++	ret = dc_ti_fg_get_btemp(info_ptr, btemp);
++
++get_params_fail:
++	return ret;
++}
++
++static int dc_ti_cc_get_vocv(int *vocv)
++{
++	int ret, ibatt;
++
++	ret = dc_ti_fg_get_ibatt(info_ptr, &ibatt);
++	if (ret < 0)
++		goto get_vocv_fail;
++	ret = dc_ti_fg_get_vbatt(info_ptr, vocv);
++	if (ret < 0)
++		goto get_vocv_fail;
++	/*
++	 * TODO: Ibatt adjustments.
++	 */
++	*vocv = (*vocv - ((ibatt * RBATT_TYPICAL)/1000));
++
++get_vocv_fail:
++	return ret;
++}
++
++static int dc_ti_cc_get_vocv_bootup(int *vocv_bootup)
++{
++	*vocv_bootup = info_ptr->vbat_bocv;
++	return 0;
++}
++
++static int dc_ti_cc_get_ibat_bootup(int *ibat_bootup)
++{
++	*ibat_bootup = info_ptr->ibat_boot;
++	return 0;
++}
++
++static int dc_ti_cc_get_vavg(int *vavg)
++{
++	int ret;
++
++	ret = dc_ti_fg_get_vbatt(info_ptr, vavg);
++	return ret;
++}
++
++static int dc_ti_cc_get_iavg(int *iavg)
++{
++	int ret;
++
++	ret = dc_ti_get_ibatt_avg(info_ptr, iavg);
++	return ret;
++}
++
++static int dc_ti_cc_get_deltaq(int *deltaq)
++{
++	int ret;
++
++	ret = dc_ti_get_cc_delta(info_ptr, deltaq);
++	return ret;
++}
++
++static int dc_ti_cc_calibrate(void)
++{
++	dc_ti_calibrate_cc(info_ptr);
++	return 0;
++}
++
++static struct intel_fg_input fg_input = {
++	.get_batt_params = &dc_ti_cc_get_batt_params,
++	.get_v_ocv = &dc_ti_cc_get_vocv,
++	.get_v_ocv_bootup = &dc_ti_cc_get_vocv_bootup,
++	.get_i_bat_bootup = &dc_ti_cc_get_ibat_bootup,
++	.get_v_avg = &dc_ti_cc_get_vavg,
++	.get_i_avg = &dc_ti_cc_get_iavg,
++	.get_delta_q = &dc_ti_cc_get_deltaq,
++	.calibrate_cc = &dc_ti_cc_calibrate,
++};
++
++static void dc_ti_update_boot_ocv(struct dc_ti_cc_info *info)
++{
++	int ret;
++
++	ret = intel_soc_pmic_setb(DC_TI_CC_CNTL_REG, CC_CNTL_CC_CTR_EN);
++	if (ret < 0)
++		dev_err(&info->pdev->dev,
++			"Failed to set CC_CTR_EN bit:%d\n", ret);
++	/*
++	 * coulomb counter need 250ms
++	 * to give the first IBAT sample.
++	 */
++	msleep(250);
++
++	ret = dc_ti_cc_get_vocv(&info->vbat_bocv);
++	if (ret)
++		dev_err(&info->pdev->dev,
++			"Failed to read IBAT bootup:%d\n", ret);
++
++	ret = intel_soc_pmic_clearb(DC_TI_CC_CNTL_REG, CC_CNTL_CC_CTR_EN);
++	if (ret < 0)
++		dev_err(&info->pdev->dev,
++			"Failed to clr CC_CTR_EN bit:%d\n", ret);
++}
++
++static void dc_ti_cc_init_worker(struct work_struct *work)
++{
++	struct dc_ti_cc_info *info =
++	    container_of(work, struct dc_ti_cc_info, init_work);
++	int ret;
++
++	/* read bootup OCV */
++	dc_ti_update_boot_ocv(info);
++	dc_ti_cc_init_data(info);
++	info_ptr = info;
++
++	ret = intel_fg_register_input(&fg_input);
++	if (ret < 0)
++		dev_err(&info->pdev->dev, "intel FG registration failed\n");
++}
++
++static int dc_ti_cc_probe(struct platform_device *pdev)
++{
++	struct dc_ti_cc_info *info;
++
++	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
++	if (!info) {
++		dev_err(&pdev->dev, "mem alloc failed\n");
++		return -ENOMEM;
++	}
++
++	info->pdev = pdev;
++	platform_set_drvdata(pdev, info);
++	INIT_WORK(&info->init_work, dc_ti_cc_init_worker);
++
++	/*
++	 * scheduling the init worker
++	 * to reduce the boot time.
++	 */
++	schedule_work(&info->init_work);
++
++	return 0;
++}
++
++static int dc_ti_cc_remove(struct platform_device *pdev)
++{
++	intel_fg_unregister_input(&fg_input);
++	return 0;
++}
++
++#ifdef CONFIG_PM
++static int dc_ti_cc_suspend(struct device *dev)
++{
++	return 0;
++}
++
++static int dc_ti_cc_resume(struct device *dev)
++{
++	return 0;
++}
++#else
++#define dc_ti_cc_suspend		NULL
++#define dc_ti_cc_resume		NULL
++#endif
++
++static const struct dev_pm_ops dc_ti_cc_driver_pm_ops = {
++	.suspend	= dc_ti_cc_suspend,
++	.resume		= dc_ti_cc_resume,
++};
++
++static struct platform_driver dc_ti_cc_driver = {
++	.probe = dc_ti_cc_probe,
++	.remove = dc_ti_cc_remove,
++	.driver = {
++		.name = DRV_NAME,
++		.pm = &dc_ti_cc_driver_pm_ops,
++	},
++};
++
++static int __init dc_ti_cc_init(void)
++{
++	return platform_driver_register(&dc_ti_cc_driver);
++}
++late_initcall(dc_ti_cc_init);
++
++static void __exit dc_ti_cc_exit(void)
++{
++	platform_driver_unregister(&dc_ti_cc_driver);
++}
++module_exit(dc_ti_cc_exit);
++
++MODULE_AUTHOR("Ramakrishna Pallala <ramakrishna.pallala@intel.com>");
++MODULE_DESCRIPTION("DollarCove(TI) Power Source Detect Driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/power/Kconfig b/drivers/power/Kconfig
+index 13a261f..cd325c4 100644
+--- a/drivers/power/Kconfig
++++ b/drivers/power/Kconfig
+@@ -440,6 +440,22 @@ config CHARGER_BQ24192
+ 	  Say Y here if you know your platform has this chip for charging
+ 	  support.
+ 
++config INTEL_FUEL_GAUGE
++	bool "Intel Fuel Gauge driver"
++	help
++	  SW fuel gauge has a daemon running in user space to read
++	  Coulomb counnter and calculate battery capacity and level.
++
++	  Say Y here to enable support for Intel SW Fuel Gauge driver.
++
++config INTEL_FG_UIFACE
++	bool "Intel Fuel Gauge User Interface"
++	help
++	  This enables the sysfs interface for SW fuel gauge.
++
++	  Say Y here to enable support for Intel SW Fuel gauge Algo User
++	  Interface.
++
+ source "drivers/power/reset/Kconfig"
+ 
+ endif # POWER_SUPPLY
+diff --git a/drivers/power/Makefile b/drivers/power/Makefile
+index c61308c..90efbdd 100644
+--- a/drivers/power/Makefile
++++ b/drivers/power/Makefile
+@@ -64,3 +64,5 @@ obj-$(CONFIG_POWER_RESET)	+= reset/
+ obj-$(CONFIG_DC_XPWR_BATTERY)	+= dc_xpwr_battery.o
+ obj-$(CONFIG_DC_XPWR_CHARGER)	+= dc_xpwr_charger.o
+ obj-$(CONFIG_CHARGER_BQ24192)	+= bq24192_charger.o
++obj-$(CONFIG_INTEL_FUEL_GAUGE)	+= intel_fuel_gauge.o
++obj-$(CONFIG_INTEL_FG_UIFACE)	+= intel_fg_uiface.o
+diff --git a/drivers/power/intel_fg_uiface.c b/drivers/power/intel_fg_uiface.c
+new file mode 100644
+index 0000000..7f7ba34
+--- /dev/null
++++ b/drivers/power/intel_fg_uiface.c
+@@ -0,0 +1,514 @@
++/*
++ * intel_fg_usr_iface.c - Intel FG algo interface
++ *
++ * Copyright (C) 2014 Intel Corporation
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the GNU
++ * General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ * Author: Ramakrishna Pallala <ramakrishna.pallala@intel.com>
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/io.h>
++#include <linux/slab.h>
++#include <linux/pm_runtime.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/power/intel_fuel_gauge.h>
++#include <linux/kdev_t.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
++#include <linux/miscdevice.h>
++
++#define DRIVER_NAME		"intel_fg_iface"
++
++struct fg_iface_info {
++	struct platform_device *pdev;
++	struct mutex lock;
++
++	int vbatt_boot;
++	int ibat_boot;
++	int vbatt;
++	int vavg;
++	int vocv;
++	int ibatt;
++	int iavg;
++	int bat_temp;
++	int delta_q;
++
++	int soc;
++	int nac;
++	int fcc;
++	int cycle_count;
++	int calib_cc;
++	wait_queue_head_t wait;
++	bool uevent_ack;
++
++	struct miscdevice intel_fg_misc_device;
++};
++
++static struct fg_iface_info *info_ptr;
++
++
++static ssize_t fg_iface_get_volt_now(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->vbatt);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_get_volt_ocv(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->vocv);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_get_volt_boot(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->vbatt_boot);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_get_ibat_boot(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->ibat_boot);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_get_cur_now(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->ibatt);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_get_cur_avg(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->iavg);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_get_batt_temp(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->bat_temp);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_get_delta_q(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->delta_q);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_get_capacity(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->soc);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_set_capacity(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t count)
++{
++	long val;
++
++	if (kstrtol(buf, 10, &val) < 0)
++		return -EINVAL;
++
++	mutex_lock(&info_ptr->lock);
++	info_ptr->soc = val;
++	mutex_unlock(&info_ptr->lock);
++	return count;
++}
++
++static ssize_t fg_iface_get_nac(struct device *dev,
++			struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->nac);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_set_nac(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t count)
++{
++	long val;
++
++	if (kstrtol(buf, 10, &val) < 0)
++		return -EINVAL;
++
++	mutex_lock(&info_ptr->lock);
++	info_ptr->nac = val;
++	mutex_unlock(&info_ptr->lock);
++	return count;
++}
++
++static ssize_t fg_iface_get_fcc(struct device *dev,
++			struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->fcc);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_set_fcc(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t count)
++{
++	long val;
++
++	if (kstrtol(buf, 10, &val) < 0)
++		return -EINVAL;
++
++	mutex_lock(&info_ptr->lock);
++	info_ptr->fcc = val;
++	mutex_unlock(&info_ptr->lock);
++	return count;
++}
++
++static ssize_t fg_iface_get_cyc_cnt(struct device *dev,
++			struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->cycle_count);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_set_cyc_cnt(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	long val;
++
++	if (kstrtol(buf, 10, &val) < 0)
++		return -EINVAL;
++
++	mutex_lock(&info_ptr->lock);
++	info_ptr->cycle_count = val;
++	mutex_unlock(&info_ptr->lock);
++	return count;
++}
++
++
++static ssize_t fg_iface_get_cc_calib(struct device *dev,
++			struct device_attribute *attr, char *buf)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	ret = sprintf(buf, "%d\n", info_ptr->calib_cc);
++	mutex_unlock(&info_ptr->lock);
++	return ret;
++}
++
++static ssize_t fg_iface_set_cc_calib(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t count)
++{
++	long val;
++
++	if (kstrtol(buf, 10, &val) < 0)
++		return -EINVAL;
++
++	mutex_lock(&info_ptr->lock);
++	info_ptr->calib_cc = val;
++	info_ptr->uevent_ack = true;
++	wake_up(&info_ptr->wait);
++	mutex_unlock(&info_ptr->lock);
++	return count;
++}
++
++
++static DEVICE_ATTR(volt_now, S_IRUGO,
++			fg_iface_get_volt_now, NULL);
++static DEVICE_ATTR(volt_ocv, S_IRUGO,
++			fg_iface_get_volt_ocv, NULL);
++static DEVICE_ATTR(volt_boot, S_IRUGO,
++			fg_iface_get_volt_boot, NULL);
++static DEVICE_ATTR(ibat_boot, S_IRUGO,
++			fg_iface_get_ibat_boot, NULL);
++static DEVICE_ATTR(cur_now, S_IRUGO,
++			fg_iface_get_cur_now, NULL);
++static DEVICE_ATTR(cur_avg, S_IRUGO,
++			fg_iface_get_cur_avg, NULL);
++static DEVICE_ATTR(batt_temp, S_IRUGO,
++			fg_iface_get_batt_temp, NULL);
++static DEVICE_ATTR(delta_q, S_IRUGO,
++			fg_iface_get_delta_q, NULL);
++
++static DEVICE_ATTR(capacity, S_IWUSR | S_IRUGO,
++		fg_iface_get_capacity, fg_iface_set_capacity);
++static DEVICE_ATTR(nac, S_IWUSR | S_IRUGO,
++		fg_iface_get_nac, fg_iface_set_nac);
++static DEVICE_ATTR(fcc, S_IWUSR | S_IRUGO,
++		fg_iface_get_fcc, fg_iface_set_fcc);
++static DEVICE_ATTR(cyc_cnt, S_IWUSR | S_IRUGO,
++		fg_iface_get_cyc_cnt, fg_iface_set_cyc_cnt);
++static DEVICE_ATTR(cc_calib, S_IWUSR | S_IRUGO,
++		fg_iface_get_cc_calib, fg_iface_set_cc_calib);
++
++static struct attribute *fg_iface_sysfs_attributes[] = {
++	&dev_attr_volt_now.attr,
++	&dev_attr_volt_ocv.attr,
++	&dev_attr_volt_boot.attr,
++	&dev_attr_ibat_boot.attr,
++	&dev_attr_cur_now.attr,
++	&dev_attr_cur_avg.attr,
++	&dev_attr_batt_temp.attr,
++	&dev_attr_delta_q.attr,
++	&dev_attr_capacity.attr,
++	&dev_attr_nac.attr,
++	&dev_attr_fcc.attr,
++	&dev_attr_cyc_cnt.attr,
++	&dev_attr_cc_calib.attr,
++	NULL,
++};
++
++static const struct attribute_group fg_iface_sysfs_attr_group = {
++	.attrs = fg_iface_sysfs_attributes,
++};
++
++static int fg_iface_sysfs_init(struct fg_iface_info *info)
++{
++	int ret;
++
++	info->intel_fg_misc_device.minor = MISC_DYNAMIC_MINOR;
++	info->intel_fg_misc_device.name = DRIVER_NAME;
++	info->intel_fg_misc_device.mode = (S_IWUSR | S_IRUGO);
++	ret = misc_register(&info->intel_fg_misc_device);
++	if (ret) {
++		dev_err(&info->pdev->dev,
++			"\nErr %d in registering misc class", ret);
++		return ret;
++	}
++	ret = sysfs_create_group(&info->intel_fg_misc_device.this_device->kobj,
++					&fg_iface_sysfs_attr_group);
++	if (ret) {
++		dev_err(&info->pdev->dev,
++			"\nError %d in creating sysfs group", ret);
++		misc_deregister(&info->intel_fg_misc_device);
++	}
++	return ret;
++}
++
++static void fg_iface_sysfs_exit(struct fg_iface_info *info)
++{
++	sysfs_remove_group(&info->pdev->dev.kobj,
++					&fg_iface_sysfs_attr_group);
++	if (info->intel_fg_misc_device.this_device)
++		misc_deregister(&info->intel_fg_misc_device);
++}
++
++static int intel_fg_iface_algo_process(struct fg_algo_ip_params *ip,
++						struct fg_algo_op_params *op)
++{
++	int ret;
++
++	mutex_lock(&info_ptr->lock);
++	info_ptr->vbatt = ip->vbatt;
++	info_ptr->vavg = ip->vavg;
++	info_ptr->vocv = ip->vocv;
++	info_ptr->ibatt = ip->ibatt;
++	info_ptr->iavg = ip->iavg;
++	info_ptr->bat_temp = ip->bat_temp;
++	info_ptr->delta_q = ip->delta_q;
++
++	/* TODO: Add user space event generation mechanism */
++	dev_dbg(&info_ptr->pdev->dev, "Sending uevent from intel_fg_uiface\n");
++
++	if (!IS_ERR_OR_NULL(info_ptr->intel_fg_misc_device.this_device))
++		sysfs_notify(&info_ptr->intel_fg_misc_device.this_device->kobj,
++				NULL, "uevent");
++
++	/*Wait for user space to write back*/
++	info_ptr->uevent_ack = false;
++	mutex_unlock(&info_ptr->lock);
++	/*
++	 * Since we need to wait for user space event and since the user space
++	 * scheduling depends on the system load and other high priority tasks,
++	 * hence, the safe margin to wait for timeout would be 12secs
++	 */
++	ret = wait_event_timeout(info_ptr->wait,
++			info_ptr->uevent_ack == true, 12 * HZ);
++	if (0 == ret) {
++		dev_err(&info_ptr->pdev->dev,
++				"\n Error TIMEOUT waiting for user space write back");
++		return -ETIMEDOUT;
++	}
++
++	mutex_lock(&info_ptr->lock);
++	op->soc = info_ptr->soc;
++	op->nac = info_ptr->nac;
++	op->fcc = info_ptr->fcc;
++	op->cycle_count = info_ptr->cycle_count;
++	op->calib_cc = info_ptr->calib_cc;
++	mutex_unlock(&info_ptr->lock);
++
++	return 0;
++}
++
++static int intel_fg_iface_algo_init(struct fg_batt_params *bat_params)
++{
++	mutex_lock(&info_ptr->lock);
++	info_ptr->vbatt_boot = bat_params->v_ocv_bootup;
++	info_ptr->ibat_boot = bat_params->i_bat_bootup;
++	info_ptr->vbatt = bat_params->vbatt_now;
++	info_ptr->vocv = bat_params->v_ocv_now;
++	info_ptr->ibatt = bat_params->i_batt_now;
++	info_ptr->iavg = bat_params->i_batt_avg;
++	info_ptr->bat_temp = bat_params->batt_temp_now;
++	mutex_unlock(&info_ptr->lock);
++
++	fg_iface_sysfs_init(info_ptr);
++
++	return 0;
++}
++
++struct intel_fg_algo algo = {
++	.type = INTEL_FG_ALGO_PRIMARY,
++	.fg_algo_init = intel_fg_iface_algo_init,
++	.fg_algo_process = intel_fg_iface_algo_process,
++};
++
++static int intel_fg_iface_probe(struct platform_device *pdev)
++{
++	int ret;
++	struct fg_iface_info *info;
++
++	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
++	if (!info) {
++		dev_err(&pdev->dev, "mem alloc failed\n");
++		return -ENOMEM;
++	}
++
++	info->pdev = pdev;
++	mutex_init(&info->lock);
++	info_ptr = info;
++
++	init_waitqueue_head(&info->wait);
++
++	ret = intel_fg_register_algo(&algo);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "FG algo registration error\n");
++		mutex_destroy(&info->lock);
++	}
++
++	return ret;
++}
++
++static int intel_fg_iface_remove(struct platform_device *pdev)
++{
++	intel_fg_unregister_algo(&algo);
++	fg_iface_sysfs_exit(info_ptr);
++	return 0;
++}
++
++#ifdef CONFIG_PM
++static int intel_fg_iface_suspend(struct device *dev)
++{
++	return 0;
++}
++
++static int intel_fg_iface_resume(struct device *dev)
++{
++	return 0;
++}
++#else
++#define intel_fg_iface_suspend		NULL
++#define intel_fg_iface_resume		NULL
++#endif
++
++static const struct dev_pm_ops intel_fg_iface_driver_pm_ops = {
++	.suspend	= intel_fg_iface_suspend,
++	.resume		= intel_fg_iface_resume,
++};
++
++static struct platform_driver intel_fg_iface_driver = {
++	.probe = intel_fg_iface_probe,
++	.remove = intel_fg_iface_remove,
++	.driver = {
++		.name = DRIVER_NAME,
++		.pm = &intel_fg_iface_driver_pm_ops,
++	},
++};
++
++static int __init intel_fg_iface_init(void)
++{
++	return platform_driver_register(&intel_fg_iface_driver);
++}
++late_initcall(intel_fg_iface_init);
++
++static void __exit intel_fg_iface_exit(void)
++{
++	platform_driver_unregister(&intel_fg_iface_driver);
++}
++module_exit(intel_fg_iface_exit);
++
++MODULE_AUTHOR("Ramakrishna Pallala <ramakrishna.pallala@intel.com>");
++MODULE_DESCRIPTION("Intel Fuel Gauge interface driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/power/intel_fuel_gauge.c b/drivers/power/intel_fuel_gauge.c
+new file mode 100644
+index 0000000..144d56d
+--- /dev/null
++++ b/drivers/power/intel_fuel_gauge.c
+@@ -0,0 +1,718 @@
++/*
++ * intel_fuel_gauge.c - Intel MID Fuel Gauge Driver
++ *
++ * Copyright (C) 2014 Intel Corporation
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ * Author: Ramakrishna Pallala <ramakrishna.pallala@intel.com>
++ *         Srinidhi Rao <srinidhi.rao@intel.com>
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/err.h>
++#include <linux/workqueue.h>
++#include <linux/jiffies.h>
++#include <linux/seq_file.h>
++#include <linux/debugfs.h>
++#include <linux/slab.h>
++#include <linux/param.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/wakelock.h>
++#include <linux/version.h>
++#include <linux/suspend.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/sched.h>
++#include <linux/pm_runtime.h>
++#include <linux/async.h>
++#include <linux/reboot.h>
++#include <linux/notifier.h>
++#include <linux/power/intel_fuel_gauge.h>
++#include <asm/intel_em_config.h>
++
++#define DRIVER_NAME	"intel_fuel_gauge"
++
++#define INTEL_FG_WAKELOCK_TIMEOUT	(1 * HZ)
++#define INTEL_FG_DISP_LOWBATT_TIMEOUT   (3 * HZ)
++#define SOC_WARN_LVL1			14
++#define SOC_WARN_LVL2			4
++#define SOC_WARN_LVL3			0
++
++#define BATT_OVP_OFFSET			50000 /* 50mV */
++
++#define FG_ADC_VBATT_OFF_ADJ		5000 /* 5mV */
++#define FG_ADC_IBATT_OFF_ADJ		30000 /* 30mA */
++
++#define FG_OCV_SMOOTH_DIV_NOR		20
++#define FG_OCV_SMOOTH_DIV_FULL		100
++#define FG_OCV_SMOOTH_CAP_LIM		97
++
++#define BOUND(min_val, x, max_val) min(max(x, min_val), max_val)
++
++struct intel_fg_wakeup_event {
++	int soc_bfr_sleep;
++	bool wake_enable;
++	struct wake_lock wakelock;
++};
++struct intel_fg_info {
++	struct device *dev;
++	struct intel_fg_batt_spec *batt_spec;
++	struct intel_fg_input *input;
++	struct intel_fg_algo *algo;
++	struct intel_fg_algo *algo_sec;
++	struct delayed_work fg_worker;
++	struct power_supply psy;
++	struct mutex lock;
++
++	struct intel_fg_wakeup_event wake_ui;
++	struct fg_batt_params batt_params;
++};
++
++static struct intel_fg_info *info_ptr;
++
++/* default battery spec data */
++static struct intel_fg_batt_spec bspec = {
++	.volt_min_design = 3400000,
++	.volt_max_design = 4350000,
++	.temp_min = 0,
++	.temp_max = 450,
++	.charge_full_design = 4980000,
++};
++
++static enum power_supply_property fg_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_OCV,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_CURRENT_AVG,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CHARGE_NOW,
++	POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_CHARGE_COUNTER,
++	POWER_SUPPLY_PROP_MODEL_NAME,
++};
++
++/**
++ * intel_fg_check_low_batt_event - Checks low batt condition
++ * @info : Pointer to the intel_fg_info structure instance
++ *
++ * Returns 0 if success
++ */
++static int intel_fg_check_low_batt_event(struct intel_fg_info *info)
++{
++	int ret = 0;
++
++	/*
++	 * Compare the previously stored capacity before going to suspend mode,
++	 * with the current capacity during resume, along with the SOC_WARN_LVLs
++	 * and if the new SOC during resume has fell below any of the low batt
++	 * warning levels, hold the wake lock for 1 sec so that Android user
++	 * space will have sufficient time to display the warning message.
++	 */
++	if (BOUND(info->batt_params.capacity, SOC_WARN_LVL1,
++				info->wake_ui.soc_bfr_sleep) == SOC_WARN_LVL1)
++		info->wake_ui.wake_enable = true;
++	else if (BOUND(info->batt_params.capacity, SOC_WARN_LVL2,
++				info->wake_ui.soc_bfr_sleep) == SOC_WARN_LVL2)
++		info->wake_ui.wake_enable = true;
++	else if (info->batt_params.capacity == SOC_WARN_LVL3)
++		info->wake_ui.wake_enable = true;
++	else {
++		if (wake_lock_active(&info_ptr->wake_ui.wakelock))
++			wake_unlock(&info_ptr->wake_ui.wakelock);
++		info->wake_ui.wake_enable = false;
++	}
++
++	if (info->wake_ui.wake_enable) {
++		wake_lock_timeout(&info_ptr->wake_ui.wakelock,
++			INTEL_FG_DISP_LOWBATT_TIMEOUT);
++		info->wake_ui.wake_enable = false;
++	}
++	return ret;
++}
++static int intel_fg_vbatt_soc_calc(struct intel_fg_info *info, int vbatt)
++{
++	int soc;
++
++	soc = (vbatt - info->batt_spec->volt_min_design) * 100;
++	soc /= (info->batt_spec->volt_max_design -
++			info->batt_spec->volt_min_design);
++
++	/* limit the capacity to 0 to 100 */
++	soc = clamp(soc, 0, 100);
++
++	return soc;
++}
++
++static int intel_fg_apply_volt_smooth(int vocv, int vbatt, int ibatt, int cap)
++{
++	static int vsocv = -1;
++	int vdiff;
++
++	if (vsocv == -1) {
++		vsocv = vocv;
++		return vsocv;
++	}
++
++	/*
++	 * for fully charged battery vbatt
++	 * and ocv should be same.
++	 */
++	if (cap >= FG_OCV_SMOOTH_CAP_LIM &&
++			ibatt >= FG_ADC_IBATT_OFF_ADJ)
++		vocv = vbatt;
++
++	vdiff = vocv - vsocv;
++	/*
++	 * handle leakage current or CC errors
++	 * scenarios for OCV calculation.
++	 */
++	if ((ibatt > -FG_ADC_IBATT_OFF_ADJ &&
++		ibatt < FG_ADC_IBATT_OFF_ADJ) && (cap < 100)) {
++		vsocv += vdiff / FG_OCV_SMOOTH_DIV_FULL;
++		return vsocv;
++	}
++
++	/* round off to +/- 5000uV */
++	if (vdiff <= FG_ADC_VBATT_OFF_ADJ &&
++			vdiff >= -FG_ADC_VBATT_OFF_ADJ)
++		vsocv = vocv;
++	else
++		vsocv += vdiff / FG_OCV_SMOOTH_DIV_NOR;
++
++	return vsocv;
++}
++
++static void intel_fg_worker(struct work_struct *work)
++{
++	struct intel_fg_info *fg_info = container_of(work,
++				struct intel_fg_info, fg_worker);
++	struct fg_algo_ip_params ip;
++	struct fg_algo_op_params op;
++	int ret;
++
++	memset(&op, 0, sizeof(struct fg_algo_op_params));
++
++	mutex_lock(&fg_info->lock);
++
++	ret = fg_info->input->get_delta_q(&ip.delta_q);
++	if (ret)
++		dev_err(fg_info->dev, "Error while getting delta Q\n");
++
++	ret = fg_info->input->get_batt_params(&ip.vbatt,
++					&ip.ibatt, &ip.bat_temp);
++	if (ret)
++		dev_err(fg_info->dev, "Error while getting battery props\n");
++
++	ret = fg_info->input->get_v_avg(&ip.vavg);
++	if (ret)
++		dev_err(fg_info->dev, "Error while getting V-AVG\n");
++
++	ret = fg_info->input->get_v_ocv(&ip.vocv);
++	if (ret)
++		dev_err(fg_info->dev, "Error while getting OCV\n");
++
++	ret = fg_info->input->get_i_avg(&ip.iavg);
++	if (ret)
++		dev_err(fg_info->dev, "Error while getting Current Average\n");
++
++	mutex_unlock(&fg_info->lock);
++	if (fg_info->algo) {
++		ret = fg_info->algo->fg_algo_process(&ip, &op);
++		mutex_lock(&fg_info->lock);
++		if (ret) {
++			dev_err(fg_info->dev,
++				"Err processing FG Algo primary\n");
++			fg_info->batt_params.capacity =
++				intel_fg_vbatt_soc_calc(fg_info, ip.vocv);
++		} else {
++			/* update battery parameters */
++			fg_info->batt_params.capacity = op.soc;
++			fg_info->batt_params.charge_now = op.nac;
++			fg_info->batt_params.charge_full = op.fcc;
++		}
++
++	} else if (fg_info->algo_sec) {
++		ret = fg_info->algo_sec->fg_algo_process(&ip, &op);
++		mutex_lock(&fg_info->lock);
++		if (ret)
++			dev_err(fg_info->dev,
++				"Err processing FG Algo Secondary\n");
++		/* update battery parameters from secondary Algo*/
++		fg_info->batt_params.capacity = op.soc;
++		fg_info->batt_params.charge_now = op.nac;
++		fg_info->batt_params.charge_full = op.fcc;
++	}
++	fg_info->batt_params.vbatt_now = ip.vbatt;
++	fg_info->batt_params.v_ocv_now =
++		intel_fg_apply_volt_smooth(ip.vocv, ip.vbatt, ip.ibatt, op.soc);
++	fg_info->batt_params.i_batt_now = ip.ibatt;
++	fg_info->batt_params.i_batt_avg = ip.iavg;
++	fg_info->batt_params.batt_temp_now = ip.bat_temp;
++	fg_info->batt_params.charge_counter += ip.delta_q;
++	if (op.calib_cc) {
++		ret = fg_info->input->calibrate_cc();
++		if (ret)
++			dev_err(fg_info->dev,
++				"error while calibrating CC\n");
++	}
++
++	mutex_unlock(&fg_info->lock);
++	power_supply_changed(&fg_info->psy);
++	if (fg_info->wake_ui.wake_enable)
++		intel_fg_check_low_batt_event(fg_info);
++	schedule_delayed_work(&fg_info->fg_worker, 30 * HZ);
++}
++
++static int intel_fg_battery_health(struct intel_fg_info *info)
++{
++	struct fg_batt_params *bat = &info->batt_params;
++	int health;
++
++
++	if (!info->batt_params.is_valid_battery)
++		health = POWER_SUPPLY_HEALTH_UNKNOWN;
++	else if (bat->vbatt_now > info->batt_spec->volt_max_design
++			+ BATT_OVP_OFFSET)
++		health = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
++	else if (bat->batt_temp_now > info->batt_spec->temp_max ||
++			bat->batt_temp_now < info->batt_spec->temp_min)
++		health = POWER_SUPPLY_HEALTH_OVERHEAT;
++	else if (bat->v_ocv_now < info->batt_spec->volt_min_design)
++		health = POWER_SUPPLY_HEALTH_DEAD;
++	else
++		health = POWER_SUPPLY_HEALTH_GOOD;
++
++	return health;
++}
++
++static int intel_fuel_gauge_get_property(struct power_supply *psup,
++					enum power_supply_property prop,
++					union power_supply_propval *val)
++{
++	struct intel_fg_info *fg_info = container_of(psup,
++					struct intel_fg_info, psy);
++
++	mutex_lock(&fg_info->lock);
++
++	switch (prop) {
++	case POWER_SUPPLY_PROP_STATUS:
++		val->intval = fg_info->batt_params.status;
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 0x1;
++		break;
++	case POWER_SUPPLY_PROP_HEALTH:
++		val->intval = intel_fg_battery_health(fg_info);
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		val->intval = fg_info->batt_params.vbatt_now;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
++		val->intval = fg_info->batt_params.v_ocv_now;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
++		val->intval = fg_info->batt_spec->volt_min_design;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		val->intval = fg_info->batt_spec->volt_max_design;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		val->intval = fg_info->batt_params.i_batt_now;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_AVG:
++		val->intval = fg_info->batt_params.i_batt_avg;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		if (fg_info->algo || fg_info->algo_sec)
++			val->intval = fg_info->batt_params.capacity;
++		else
++			val->intval = intel_fg_vbatt_soc_calc(fg_info,
++				fg_info->batt_params.v_ocv_now);
++		break;
++	case POWER_SUPPLY_PROP_TEMP:
++		val->intval = fg_info->batt_params.batt_temp_now;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_NOW:
++		val->intval = fg_info->batt_params.charge_now;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++		val->intval = fg_info->batt_params.charge_full;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		val->intval = fg_info->batt_spec->charge_full_design;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
++		val->intval = fg_info->batt_params.charge_counter;
++		break;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		break;
++	case POWER_SUPPLY_PROP_MODEL_NAME:
++		val->strval = "INTN0001";
++		break;
++	default:
++		mutex_unlock(&fg_info->lock);
++		return -EINVAL;
++	}
++
++	mutex_unlock(&fg_info->lock);
++	return 0;
++}
++
++static int intel_fuel_gauge_set_property(struct power_supply *psup,
++				enum power_supply_property prop,
++				const union power_supply_propval *val)
++{
++	struct intel_fg_info *fg_info = container_of(psup,
++						struct intel_fg_info, psy);
++
++	mutex_lock(&fg_info->lock);
++	switch (prop) {
++	case POWER_SUPPLY_PROP_STATUS:
++		fg_info->batt_params.status = val->intval;
++		break;
++	default:
++		dev_warn(fg_info->dev, "invalid psy prop\b");
++		mutex_unlock(&fg_info->lock);
++		return -EINVAL;
++	}
++	mutex_unlock(&fg_info->lock);
++	return 0;
++}
++
++static void intel_fg_ext_psy_changed(struct power_supply *psy)
++{
++	struct intel_fg_info *fg_info = container_of(psy,
++					struct intel_fg_info, psy);
++
++	dev_info(fg_info->dev, "%s\n", __func__);
++	power_supply_changed(&fg_info->psy);
++}
++
++static void intel_fg_init_batt_props(struct intel_fg_info *fg_info)
++{
++	struct fg_algo_ip_params ip;
++	int ret;
++
++	ret = fg_info->input->get_batt_params(&ip.vbatt,
++					&ip.ibatt, &ip.bat_temp);
++	if (ret)
++		dev_err(fg_info->dev, "Error while getting battery props\n");
++
++	ret = fg_info->input->get_v_ocv(&ip.vocv);
++	if (ret)
++		dev_err(fg_info->dev, "\nError while getting OCV");
++
++	ret = fg_info->input->get_i_avg(&ip.iavg);
++	if (ret)
++		dev_err(fg_info->dev, "\nError while getting Current Average");
++
++	fg_info->batt_params.capacity = intel_fg_vbatt_soc_calc(fg_info,
++								ip.vocv);
++	fg_info->batt_params.vbatt_now = ip.vbatt;
++	fg_info->batt_params.v_ocv_now = ip.vocv;
++	fg_info->batt_params.i_batt_now = ip.ibatt;
++	fg_info->batt_params.i_batt_avg = ip.iavg;
++	fg_info->batt_params.batt_temp_now = ip.bat_temp;
++}
++
++static void intel_fuel_gauge_algo_init(struct intel_fg_info *fg_info)
++{
++	int ret;
++
++	ret = fg_info->input->get_v_ocv_bootup(
++			&fg_info->batt_params.v_ocv_bootup);
++	if (ret)
++		dev_err(fg_info->dev, "error in getting bootup voltage\n");
++	else
++		dev_info(fg_info->dev, "boot up voltage:%d\n",
++					fg_info->batt_params.v_ocv_bootup);
++
++	ret = fg_info->input->get_i_bat_bootup(
++			&fg_info->batt_params.i_bat_bootup);
++	if (ret)
++		dev_err(fg_info->dev, "error in getting bootup ibat\n");
++	else
++		dev_info(fg_info->dev, "boot up ibat:%d\n",
++					fg_info->batt_params.i_bat_bootup);
++
++	/* update battery adc params */
++	intel_fg_init_batt_props(info_ptr);
++
++	fg_info->batt_params.boot_flag = true;
++	if (fg_info->algo && !fg_info->algo->init_done) {
++		fg_info->algo->fg_algo_init(&fg_info->batt_params);
++		fg_info->algo->init_done = true;
++	} else if (fg_info->algo_sec && !fg_info->algo_sec->init_done) {
++		fg_info->algo_sec->fg_algo_init(&fg_info->batt_params);
++		fg_info->algo_sec->init_done = true;
++	}
++		fg_info->batt_params.boot_flag = false;
++
++	schedule_delayed_work(&fg_info->fg_worker, 20 * HZ);
++}
++
++int intel_fg_register_input(struct intel_fg_input *input)
++{
++	int ret;
++
++	if (!info_ptr)
++		return -EAGAIN;
++
++	mutex_lock(&info_ptr->lock);
++
++	info_ptr->input = input;
++	/* init fuel gauge lib's or algo's */
++	if (info_ptr->algo || info_ptr->algo_sec)
++		intel_fuel_gauge_algo_init(info_ptr);
++	else
++		intel_fg_init_batt_props(info_ptr);
++
++	mutex_unlock(&info_ptr->lock);
++
++	info_ptr->psy.name = "intel_fuel_gauge";
++	info_ptr->psy.type = POWER_SUPPLY_TYPE_BATTERY;
++	info_ptr->psy.get_property = &intel_fuel_gauge_get_property;
++	info_ptr->psy.set_property = &intel_fuel_gauge_set_property;
++	info_ptr->psy.external_power_changed = &intel_fg_ext_psy_changed;
++	info_ptr->psy.properties = &fg_props;
++	info_ptr->psy.num_properties = ARRAY_SIZE(fg_props);
++
++	ret = power_supply_register(info_ptr->dev, &info_ptr->psy);
++	if (ret) {
++		dev_err(info_ptr->dev, "power supply class reg failed\n");
++		return ret;
++	}
++	/*Start Coulomb Counter Calibration*/
++	ret = info_ptr->input->calibrate_cc();
++	if (ret)
++		dev_err(info_ptr->dev, "error in calibrating CC\n");
++	/*If No FG Algo has been registered, schedule the worker thread
++		upon input driver registration*/
++	if (!info_ptr->algo && !info_ptr->algo_sec)
++		schedule_delayed_work(&info_ptr->fg_worker, 40 * HZ);
++	return 0;
++}
++EXPORT_SYMBOL(intel_fg_register_input);
++
++int intel_fg_unregister_input(struct intel_fg_input *input)
++{
++	if (!info_ptr || !info_ptr->input)
++		return -ENODEV;
++
++	flush_scheduled_work();
++	power_supply_unregister(&info_ptr->psy);
++
++	mutex_lock(&info_ptr->lock);
++	info_ptr->input = NULL;
++	mutex_unlock(&info_ptr->lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_fg_unregister_input);
++
++int intel_fg_register_algo(struct intel_fg_algo *algo)
++{
++	if (!info_ptr)
++		return -EAGAIN;
++
++	mutex_lock(&info_ptr->lock);
++	if (algo->type == INTEL_FG_ALGO_PRIMARY) {
++		if (!info_ptr->algo)
++			info_ptr->algo = algo;
++		else
++			goto register_algo;
++	} else {
++		if (!info_ptr->algo_sec)
++			info_ptr->algo_sec = algo;
++		else
++			goto register_algo;
++	}
++
++	/* init fuel gauge lib's or algo's */
++	if (info_ptr->input)
++		intel_fuel_gauge_algo_init(info_ptr);
++
++	mutex_unlock(&info_ptr->lock);
++	return 0;
++
++register_algo:
++	mutex_unlock(&info_ptr->lock);
++	return -EBUSY;
++}
++EXPORT_SYMBOL(intel_fg_register_algo);
++
++int intel_fg_unregister_algo(struct intel_fg_algo *algo)
++{
++	if (!info_ptr)
++		return -ENODEV;
++
++	mutex_lock(&info_ptr->lock);
++	if (algo->type == INTEL_FG_ALGO_PRIMARY) {
++		if (info_ptr->algo)
++			info_ptr->algo = NULL;
++		else
++			goto unregister_algo;
++	} else {
++		if (!info_ptr->algo_sec)
++			info_ptr->algo_sec = NULL;
++		else
++			goto unregister_algo;
++	}
++
++	mutex_unlock(&info_ptr->lock);
++	return 0;
++
++unregister_algo:
++	mutex_unlock(&info_ptr->lock);
++	return -ENODEV;
++}
++EXPORT_SYMBOL(intel_fg_unregister_algo);
++
++static int intel_fuel_gauge_probe(struct platform_device *pdev)
++{
++	struct intel_fg_info *fg_info;
++	struct em_config_oem0_data oem0_data;
++
++	fg_info = devm_kzalloc(&pdev->dev, sizeof(*fg_info), GFP_KERNEL);
++	if (!fg_info) {
++		dev_err(&pdev->dev, "mem alloc failed\n");
++		return -ENOMEM;
++	}
++
++	fg_info->dev = &pdev->dev;
++	fg_info->batt_spec = &bspec;
++	platform_set_drvdata(pdev, fg_info);
++
++	mutex_init(&fg_info->lock);
++	INIT_DELAYED_WORK(&fg_info->fg_worker, &intel_fg_worker);
++	fg_info->batt_params.status = POWER_SUPPLY_STATUS_DISCHARGING;
++
++	if (em_config_get_oem0_data(&oem0_data))
++		fg_info->batt_params.is_valid_battery = true;
++	else
++		fg_info->batt_params.is_valid_battery = false;
++
++	wake_lock_init(&fg_info->wake_ui.wakelock, WAKE_LOCK_SUSPEND,
++				"intel_fg_wakelock");
++
++	info_ptr = fg_info;
++
++	return 0;
++}
++
++static int intel_fuel_gauge_remove(struct platform_device *pdev)
++{
++	struct intel_fg_info *fg_info = platform_get_drvdata(pdev);
++	wake_lock_destroy(&fg_info->wake_ui.wakelock);
++
++	return 0;
++}
++
++static int intel_fuel_gauge_suspend(struct device *dev)
++{
++	/*
++	 * Store the current SOC value before going to suspend as
++	 * this value will be used by the worker function in resume to
++	 * check whether the low battery threshold has been crossed.
++	 */
++	info_ptr->wake_ui.soc_bfr_sleep = info_ptr->batt_params.capacity;
++	cancel_delayed_work_sync(&info_ptr->fg_worker);
++	return 0;
++}
++
++static int intel_fuel_gauge_resume(struct device *dev)
++{
++	/*
++	 * Set the wake_enable flag as true and schedule the
++	 * work queue at 0 secs so that the worker function is
++	 * scheduled immediately at the next available tick.
++	 * Once the intel_fg_worker function starts executing
++	 * It can check and clear the wake_enable flag and hold
++	 * the wakelock if low batt warning notification has to
++	 * be sent
++	 */
++	wake_lock_timeout(&info_ptr->wake_ui.wakelock,
++			  INTEL_FG_WAKELOCK_TIMEOUT);
++	info_ptr->wake_ui.wake_enable = true;
++	schedule_delayed_work(&info_ptr->fg_worker, 0);
++	return 0;
++}
++
++static int intel_fuel_gauge_runtime_suspend(struct device *dev)
++{
++	return 0;
++}
++static int intel_fuel_gauge_runtime_resume(struct device *dev)
++{
++	return 0;
++}
++static int intel_fuel_gauge_runtime_idle(struct device *dev)
++{
++	return 0;
++}
++
++static const struct dev_pm_ops intel_fuel_gauge_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(intel_fuel_gauge_suspend,
++			intel_fuel_gauge_resume)
++	SET_RUNTIME_PM_OPS(intel_fuel_gauge_runtime_suspend,
++			intel_fuel_gauge_runtime_resume,
++			intel_fuel_gauge_runtime_idle)
++};
++
++static const struct platform_device_id intel_fuel_gauge_id[] = {
++	{DRIVER_NAME, },
++	{ },
++};
++MODULE_DEVICE_TABLE(platform, intel_fuel_gauge_id);
++
++static struct platform_driver intel_fuel_gauge_driver = {
++	.driver = {
++		.name = DRIVER_NAME,
++		.owner = THIS_MODULE,
++		.pm = &intel_fuel_gauge_pm_ops,
++	},
++	.probe = intel_fuel_gauge_probe,
++	.remove = intel_fuel_gauge_remove,
++	.id_table = intel_fuel_gauge_id,
++};
++
++static int __init intel_fuel_gauge_init(void)
++{
++	return platform_driver_register(&intel_fuel_gauge_driver);
++}
++module_init(intel_fuel_gauge_init);
++
++static void __exit intel_fuel_gauge_exit(void)
++{
++	platform_driver_unregister(&intel_fuel_gauge_driver);
++}
++module_exit(intel_fuel_gauge_exit);
++
++MODULE_AUTHOR("Ramakrishna Pallala <ramakrishna.pallala@intel.com>");
++MODULE_AUTHOR("Srinidhi Rao <srinidhi.rao@intel.com>");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Intel MID Fuel Gauge Driver");
+diff --git a/include/linux/power/intel_fuel_gauge.h b/include/linux/power/intel_fuel_gauge.h
+new file mode 100644
+index 0000000..5d50f69
+--- /dev/null
++++ b/include/linux/power/intel_fuel_gauge.h
+@@ -0,0 +1,125 @@
++/*
++ * intel_fuel_gauge.h - Intel MID PMIC Fuel Gauge Driver header
++ *
++ * Copyright (C) 2011 Intel Corporation
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ * Author: Srinidhi Rao <srinidhi.rao@intel.com>
++ *	   Ramakrishna Pallala <ramakrishna.pallala@intel.com>
++ */
++
++#ifndef __INTEL_FUEL_GAUGE__
++#define __INTEL_FUEL_GAUGE__
++
++#include <linux/workqueue.h>
++#include <linux/power_supply.h>
++#include <linux/mutex.h>
++
++struct fg_algo_ip_params {
++	int vbatt;
++	int vavg;
++	int vocv;
++	int ibatt;
++	int iavg;
++	int bat_temp;
++	int delta_q;
++};
++
++struct fg_algo_op_params {
++	int soc;
++	int nac;
++	int fcc;
++	int cycle_count;
++	bool calib_cc;
++};
++
++struct fg_batt_params {
++	int v_ocv_bootup;
++	int v_ocv_now;
++	int vbatt_now;
++	int i_bat_bootup;
++	int i_batt_avg;
++	int i_batt_now;
++	int batt_temp_now;
++	int capacity;
++	int charge_now;
++	int charge_full;
++	int charge_counter;
++	int status;
++	bool boot_flag;
++	bool is_valid_battery;
++};
++
++struct fg_algo_params {
++	struct fg_algo_ip_params fg_ip;
++	struct fg_algo_op_params fg_op;
++};
++
++struct intel_fg_batt_spec {
++	int volt_min_design;
++	int volt_max_design;
++	int temp_min;
++	int temp_max;
++	int charge_full_design;
++};
++
++struct intel_fg_input {
++	int (*get_batt_params)(int *vbat, int *ibat, int *bat_temp);
++	int (*get_v_ocv)(int *v_ocv);
++	int (*get_v_ocv_bootup)(int *v_ocv_bootup);
++	int (*get_i_bat_bootup)(int *i_bat_bootup);
++	int (*get_v_avg)(int *v_avg);
++	int (*get_i_avg)(int *i_avg);
++	int (*get_delta_q)(int *delta_q);
++	int (*calibrate_cc)(void);
++};
++
++enum intel_fg_algo_type {
++	INTEL_FG_ALGO_PRIMARY,
++	INTEL_FG_ALGO_SECONDARY,
++};
++
++struct intel_fg_algo {
++	enum intel_fg_algo_type type;
++	bool init_done;
++	int (*fg_algo_init)(struct fg_batt_params *bat_params);
++	int (*fg_algo_process)(struct fg_algo_ip_params *ip,
++					struct fg_algo_op_params *op);
++};
++
++#ifdef CONFIG_INTEL_FUEL_GAUGE
++int intel_fg_register_input(struct intel_fg_input *input);
++int intel_fg_unregister_input(struct intel_fg_input *input);
++int intel_fg_register_algo(struct intel_fg_algo *algo);
++int intel_fg_unregister_algo(struct intel_fg_algo *algo);
++#else
++static int intel_fg_register_input(struct intel_fg_input *input)
++{
++	return 0;
++}
++static int intel_fg_unregister_input(struct intel_fg_input *input)
++{
++	return 0;
++}
++static int intel_fg_register_algo(struct intel_fg_algo *algo)
++{
++	return 0;
++}
++static int intel_fg_unregister_algo(struct intel_fg_algo *algo)
++{
++	return 0;
++}
++#endif
++
++#endif
+-- 
+2.0.4
+

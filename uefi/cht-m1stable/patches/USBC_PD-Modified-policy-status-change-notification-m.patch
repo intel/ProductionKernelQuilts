@@ -1,0 +1,410 @@
+From a698c0dc17f70a1849f37ca952a32e8f2d25ac18 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Tue, 1 Sep 2015 12:58:50 +0530
+Subject: [PATCH] USBC_PD: Modified policy status change notification
+ mechanism.
+
+Currently status change notification to policy engine is used by
+source pe for PD negotiation status. This status change mechanism
+can be used by all policies for PD success/fail, DP success/fail,
+power role change and data role change.
+This patch will enhance the status change notification for these
+cases and corresponding handling in policy engine.
+
+Change-Id: I3da60cc82197bc022471057807b7285f1c672b6b
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-17661
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+---
+ drivers/usb/typec/pd/policy_engine.c | 95 +++++++++++++++++++++---------------
+ drivers/usb/typec/pd/policy_engine.h | 26 +++++-----
+ drivers/usb/typec/pd/sink_port_pe.c  | 16 ++++--
+ drivers/usb/typec/pd/src_port_pe.c   | 19 ++++----
+ 4 files changed, 91 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 255f906..40c145e 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -59,8 +59,7 @@ struct policy *pe_get_running_policy(struct list_head *head)
+ 	struct policy *p = NULL;
+ 
+ 	list_for_each_entry(p, head, list) {
+-		if (p && (p->state == POLICY_STATE_ONLINE)
+-			&& (p->status == POLICY_STATUS_RUNNING))
++		if (p && p->state == POLICY_STATE_ONLINE)
+ 				return p;
+ 	}
+ 
+@@ -209,17 +208,13 @@ static int pe_fwdcmd_to_policy(struct policy_engine *pe, enum pe_event evt)
+ 	int ret = 0;
+ 
+ 	p = pe_get_active_src_or_snk_policy(&pe->policy_list);
+-	if (!p) {
+-		pr_err("PE: No Active policy!\n");
+-		return -EINVAL;
+-	}
+ 
+-	if (p && p->rcv_cmd) {
++	if (p && p->rcv_cmd)
++		p->rcv_cmd(p, evt);
++
++	p = pe_get_policy(pe, POLICY_TYPE_DISPLAY);
++	if (p && p->rcv_cmd)
+ 		p->rcv_cmd(p, evt);
+-	} else {
+-		pr_err("PE: Unable to find send cmd\n");
+-		ret = -ENODEV;
+-	}
+ 
+ 	return ret;
+ }
+@@ -420,10 +415,8 @@ static int pe_start_policy(struct policy_engine *pe, enum policy_type type)
+ 
+ 	if (p->state != POLICY_STATE_ONLINE)
+ 		p->start(p);
+-	else {
++	else
+ 		pr_warn("PE: policy %d is already active!!!\n", type);
+-		return -EINVAL;
+-	}
+ 
+ 	return 0;
+ }
+@@ -530,43 +523,40 @@ static struct policy *__pe_find_policy(struct list_head *list,
+ 	return ERR_PTR(-ENODEV);
+ }
+ 
+-static void pe_policy_status_changed(struct policy_engine *pe, int policy_type,
+-				int status)
++static void pe_policy_status_changed(struct policy_engine *pe,
++				enum policy_type ptype,
++				enum pe_status_change_evt status)
+ {
+ 	struct policy *p;
++	enum pwr_role prole;
+ 	int ret;
+ 
+ 	if (!pe)
+ 		return;
+-	switch (policy_type) {
+-	case POLICY_TYPE_SOURCE:
+-		/* Handle the source policy status change */
+-		if (status == POLICY_STATUS_SUCCESS
+-			|| status == POLICY_STATUS_FAIL) {
+-			p = pe_get_policy(pe, POLICY_TYPE_DISPLAY);
+-			/* Start the display policy */
+-			if (!p) {
+-				pr_err("PE: %s No Display policy found\n",
+-						__func__);
+-				break;
+-			}
+-			if (p->start) {
+-				pr_info("PE: %s Stating disp policy\n",
+-						__func__);
+-				p->start(p);
+-			}
+-		}
++	switch (status) {
++	case PE_STATUS_CHANGE_PD_FAIL:
++	case PE_STATUS_CHANGE_PD_SUCCESS:
++		/* Start display pe after PD */
++		ret = pe_start_policy(pe, POLICY_TYPE_DISPLAY);
++		if (ret)
++			pr_warn("PE:%s: Failed to start disp policy\n",
++					__func__);
+ 		break;
+-	case POLICY_TYPE_DISPLAY:
++
++	case PE_STATUS_CHANGE_DP_FAIL:
++	case PE_STATUS_CHANGE_DP_SUCCESS:
+ 		/* Handle the display policy status change */
++		prole = pe_get_power_role(pe);
++		if (prole != POWER_ROLE_SOURCE)
++			break;
++
+ 		p = pe_get_policy(pe, POLICY_TYPE_SOURCE);
+ 		if (!p) {
+ 			pr_err("PE: %s No Source policy found\n", __func__);
+ 			break;
+ 		}
+ 
+-		if (p->status != POLICY_STATUS_SUCCESS
+-			&& p->status != POLICY_STATUS_RUNNING) {
++		if (p->status != POLICY_STATUS_SUCCESS) {
+ 			pr_warn("PE:%s: Source PE not success!!\n", __func__);
+ 			break;
+ 		}
+@@ -582,8 +572,36 @@ static void pe_policy_status_changed(struct policy_engine *pe, int policy_type,
+ 		if (pe->pp_caps.pp_is_ext_pwrd && p->rcv_request)
+ 			p->rcv_request(p, PE_EVT_SEND_PR_SWAP);
+ 		break;
++	case PE_STATUS_CHANGE_DR_CHANGED:
++		/* Restart Display PE on data role change */
++		ret = pe_stop_policy(pe, POLICY_TYPE_DISPLAY);
++		if (ret < 0) {
++			pr_err("PE:%s: Failed to stop disp policy\n",
++					__func__);
++			break;
++		}
++		ret = pe_start_policy(pe, POLICY_TYPE_DISPLAY);
++		if (ret < 0) {
++			pr_err("PE:%s: Failed to start disp policy\n",
++					__func__);
++			break;
++		}
++		pr_info("PE:%s: Restarted disp policy\n", __func__);
++		break;
++
++	case PE_STATUS_CHANGE_PR_CHANGED:
++		if (ptype == POLICY_TYPE_SINK)
++			pe_switch_policy(pe, POLICY_TYPE_SOURCE);
++		else if (ptype == POLICY_TYPE_SOURCE)
++			pe_switch_policy(pe, POLICY_TYPE_SINK);
++		else
++			pr_err("PE:%s:PR_CHANGE from invalid policy=%d\n",
++					__func__, ptype);
++		break;
++
+ 	default:
+-		pr_debug("PE:%s: Not processing state change\n", __func__);
++		pr_debug("PE:%s: Not processing state change evt=%d\n",
++					__func__, status);
+ 	}
+ }
+ 
+@@ -783,7 +801,6 @@ static struct pe_operations ops = {
+ 	.get_cable_state = pe_get_cable_state,
+ 	.get_pd_state = pe_get_pd_state,
+ 	.set_pd_state = pe_set_pd_state,
+-	.switch_policy = pe_switch_policy,
+ 	.process_data_msg = policy_engine_process_data_msg,
+ 	.process_ctrl_msg = policy_engine_process_ctrl_msg,
+ 	.process_cmd = policy_engine_process_cmd,
+diff --git a/drivers/usb/typec/pd/policy_engine.h b/drivers/usb/typec/pd/policy_engine.h
+index 914ff24..4d9b7a0 100644
+--- a/drivers/usb/typec/pd/policy_engine.h
++++ b/drivers/usb/typec/pd/policy_engine.h
+@@ -293,6 +293,16 @@ enum policy_status {
+ 	POLICY_STATUS_SUCCESS,
+ };
+ 
++/* These events will be generated by policies to policy engine*/
++enum pe_status_change_evt {
++	PE_STATUS_CHANGE_PD_FAIL,
++	PE_STATUS_CHANGE_PD_SUCCESS,
++	PE_STATUS_CHANGE_DP_FAIL,
++	PE_STATUS_CHANGE_DP_SUCCESS,
++	PE_STATUS_CHANGE_DR_CHANGED,
++	PE_STATUS_CHANGE_PR_CHANGED,
++};
++
+ struct pe_port_partner_caps {
+ 	unsigned pp_is_dual_drole:1;
+ 	unsigned pp_is_dual_prole:1;
+@@ -361,14 +371,14 @@ struct pe_operations {
+ 						enum cable_type type);
+ 	int (*set_pd_state)(struct policy_engine *pe, bool state);
+ 	bool (*get_pd_state)(struct policy_engine *pe);
+-	int (*switch_policy)(struct policy_engine *pe,  enum policy_type type);
+ 	int (*process_data_msg)(struct policy_engine *pe, enum pe_event evt,
+ 				struct pd_packet *data);
+ 	int (*process_ctrl_msg)(struct policy_engine *pe, enum pe_event evt,
+ 				struct pd_packet *data);
+ 	int (*process_cmd)(struct policy_engine *pe, enum pe_event cmd);
+-	void (*policy_status_changed)(struct policy_engine *pe, int policy_type,
+-					int state);
++	void (*policy_status_changed)(struct policy_engine *pe,
++					enum policy_type ptype,
++					enum pe_status_change_evt state);
+ 	int (*notify_dpm_evt)(struct policy_engine *pe,
+ 					enum devpolicy_mgr_events evt);
+ };
+@@ -503,7 +513,7 @@ static inline int policy_send_packet(struct policy *p, void *data, int len,
+ }
+ 
+ static inline void pe_notify_policy_status_changed(struct policy *p,
+-			int type, int status)
++		enum policy_type type, enum pe_status_change_evt status)
+ {
+ 	if (p && p->pe && p->pe->ops && p->pe->ops->policy_status_changed)
+ 		p->pe->ops->policy_status_changed(p->pe, type, status);
+@@ -534,14 +544,6 @@ static inline int policy_get_pd_state(struct policy *p)
+ 	return -ENOTSUPP;
+ }
+ 
+-static inline int policy_switch_policy(struct policy *p, enum policy_type type)
+-{
+-	if (p && p->pe && p->pe->ops && p->pe->ops->switch_policy)
+-		return p->pe->ops->switch_policy(p->pe, type);
+-
+-	return -ENOTSUPP;
+-}
+-
+ static inline int policy_set_dp_state(struct policy *p,
+ 					enum cable_state state,
+ 					enum typec_dp_cable_type type)
+diff --git a/drivers/usb/typec/pd/sink_port_pe.c b/drivers/usb/typec/pd/sink_port_pe.c
+index 09e2529..698abf2 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.c
++++ b/drivers/usb/typec/pd/sink_port_pe.c
+@@ -297,6 +297,8 @@ static void snkpe_handle_dr_swap_transition(struct sink_port_pe *sink,
+ 		schedule_work(&sink->timer_work);
+ 		return;
+ 	}
++	pe_notify_policy_status_changed(&sink->p,
++			POLICY_TYPE_SINK, PE_STATUS_CHANGE_DR_CHANGED);
+ 	pr_debug("SNKPE:%s:Data role changed to %d", __func__, to_role);
+ 	snkpe_update_state(sink, PE_SNK_READY);
+ }
+@@ -435,15 +437,17 @@ static void snkpe_received_msg_good_crc(struct sink_port_pe *sink)
+ 		snkpe_handle_pss_transition_to_off(sink);
+ 		break;
+ 	case PE_PRS_SNK_SRC_SOURCE_ON:
+-		pr_debug("SNKPE:%s: Calling swith policy\n", __func__);
+-		policy_switch_policy(&sink->p, POLICY_TYPE_SOURCE);
++		pr_debug("SNKPE:%s: Notifying power role chnage\n", __func__);
++		pe_notify_policy_status_changed(&sink->p,
++			POLICY_TYPE_SINK, PE_STATUS_CHANGE_PR_CHANGED);
+ 		break;
+ 	case PE_DRS_DFP_UFP_ACCEPT_DR_SWAP:
+ 	case PE_DRS_UFP_DFP_ACCEPT_DR_SWAP:
+ 		complete(&sink->srt_complete);
+ 		break;
+ 	default:
+-		pr_warn("SNKPE: Recved GOODCRC in %d state\n", sink->cur_state);
++		pr_debug("SNKPE: Recved GOODCRC in %d state\n",
++							sink->cur_state);
+ 		break;
+ 	}
+ }
+@@ -757,7 +761,10 @@ static void sink_handle_ready(struct sink_port_pe *sink)
+ 		snkpe_setup_charging(sink);
+ 
+ ready_end:
++	sink->p.status = POLICY_STATUS_SUCCESS;
+ 	snkpe_update_state(sink, PE_SNK_READY);
++	pe_notify_policy_status_changed(&sink->p,
++			POLICY_TYPE_SINK, PE_STATUS_CHANGE_PD_SUCCESS);
+ }
+ 
+ static void sink_handle_transition_sink(struct sink_port_pe *sink)
+@@ -834,6 +841,8 @@ static void sinkpe_handle_error_recovery(struct sink_port_pe *sink)
+ 				PE_EVT_SEND_PROTOCOL_RESET);
+ 	sink->no_response_timer_expired = false;
+ 	pr_err("SNKPE: No Response timer expired, going to error recovery\n");
++	pe_notify_policy_status_changed(&sink->p,
++			POLICY_TYPE_SINK, PE_STATUS_CHANGE_PD_FAIL);
+ }
+ 
+ /* This is the main task worker for sink pe */
+@@ -1096,7 +1105,6 @@ static inline int sink_port_policy_start(struct policy *p)
+ 
+ 	pr_debug("SNKPE: %s\n", __func__);
+ 	mutex_lock(&sink->snkpe_state_lock);
+-	p->status = POLICY_STATUS_RUNNING;
+ 	p->state = POLICY_STATE_ONLINE;
+ 	sink->cur_state = PE_SNK_STARTUP;
+ 	mutex_unlock(&sink->snkpe_state_lock);
+diff --git a/drivers/usb/typec/pd/src_port_pe.c b/drivers/usb/typec/pd/src_port_pe.c
+index 1b94118..762978f 100644
+--- a/drivers/usb/typec/pd/src_port_pe.c
++++ b/drivers/usb/typec/pd/src_port_pe.c
+@@ -95,6 +95,7 @@ static void src_pe_reset_policy_engine(struct src_port_pe *src_pe)
+ 	/* By default dual power role is enabled*/
+ 	src_pe->pp_is_dual_prole = 1;
+ 	src_pe->pp_is_ext_pwrd = 0;
++	src_pe->got_snk_caps = 0;
+ 	src_pe->is_pd_configured = 0;
+ }
+ 
+@@ -250,6 +251,8 @@ static void src_pe_handle_dr_swap_transition(struct src_port_pe *src_pe,
+ 		return;
+ 	}
+ 	log_dbg("Data role changed to %d", to_role);
++	pe_notify_policy_status_changed(&src_pe->p,
++			POLICY_TYPE_SOURCE, PE_STATUS_CHANGE_DR_CHANGED);
+ 	mutex_lock(&src_pe->pe_lock);
+ 	src_pe->state = SRC_PE_STATE_PD_CONFIGURED;
+ 	mutex_unlock(&src_pe->pe_lock);
+@@ -313,7 +316,6 @@ static int src_pe_handle_trigger_dr_swap(struct src_port_pe *src_pe)
+ 		src_pe->state = PE_DRS_DFP_UFP_SEND_DR_SWAP;
+ 	else
+ 		src_pe->state = PE_DRS_UFP_DFP_SEND_DR_SWAP;
+-	src_pe->p.status = POLICY_STATUS_RUNNING;
+ 	mutex_unlock(&src_pe->pe_lock);
+ 	schedule_work(&src_pe->msg_work);
+ 
+@@ -377,7 +379,6 @@ static void src_pe_handle_rcv_dr_swap(struct src_port_pe *src_pe)
+ 		src_pe->state = PE_DRS_DFP_UFP_ACCEPT_DR_SWAP;
+ 	else
+ 		src_pe->state = PE_DRS_UFP_DFP_ACCEPT_DR_SWAP;
+-	src_pe->p.status = POLICY_STATUS_RUNNING;
+ 	mutex_unlock(&src_pe->pe_lock);
+ 	schedule_work(&src_pe->msg_work);
+ 
+@@ -438,7 +439,7 @@ src_pe_handle_gcrc(struct src_port_pe *src_pe, struct pd_packet *pkt)
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+-		log_info("GCRC received in wrong state=%d\n", src_pe->state);
++		log_dbg("GCRC received in wrong state=%d\n", src_pe->state);
+ 		break;
+ 	}
+ 
+@@ -489,7 +490,6 @@ static int src_pe_handle_pr_swap(struct src_port_pe *src_pe)
+ 		 */
+ 		mutex_lock(&src_pe->pe_lock);
+ 		src_pe->state = PE_PRS_SRC_SNK_EVALUATE_PR_SWAP;
+-		src_pe->p.status = POLICY_STATUS_RUNNING;
+ 		mutex_unlock(&src_pe->pe_lock);
+ 		ret = src_pe_pr_swap_ok(src_pe);
+ 	} else {
+@@ -520,7 +520,6 @@ static int src_pe_rcv_request(struct policy *srcp, enum pe_event evt)
+ 		}
+ 		mutex_lock(&src_pe->pe_lock);
+ 		src_pe->state = PE_PRS_SRC_SNK_SEND_PR_SWAP;
+-		src_pe->p.status = POLICY_STATUS_RUNNING;
+ 		mutex_unlock(&src_pe->pe_lock);
+ 		policy_send_packet(&src_pe->p, NULL, 0,
+ 					PD_CTRL_MSG_PR_SWAP, evt);
+@@ -688,8 +687,9 @@ static int src_pe_snk_source_off_waitfor_psrdy(struct src_port_pe *src_pe)
+ 
+ 	/* RR Swap success, set role as sink and switch policy */
+ 	policy_set_power_role(&src_pe->p, POWER_ROLE_SINK);
+-	log_dbg("Calling swith policy\n");
+-	policy_switch_policy(&src_pe->p, POLICY_TYPE_SINK);
++	log_dbg("Notifying power role change\n");
++	pe_notify_policy_status_changed(&src_pe->p,
++			POLICY_TYPE_SOURCE, PE_STATUS_CHANGE_PR_CHANGED);
+ error:
+ 	reinit_completion(&src_pe->psso_complete);
+ 	return ret;
+@@ -734,7 +734,7 @@ get_sink_cap_error:
+ 	 * policy engine as success as PD negotiation is success.
+ 	 */
+ 	pe_notify_policy_status_changed(&src_pe->p,
+-				POLICY_TYPE_SOURCE, POLICY_STATUS_SUCCESS);
++			POLICY_TYPE_SOURCE, PE_STATUS_CHANGE_PD_SUCCESS);
+ get_snk_cap_timeout:
+ 	reinit_completion(&src_pe->srt_complete);
+ }
+@@ -817,7 +817,7 @@ static void src_pe_start_comm(struct work_struct *work)
+ 		mutex_unlock(&src_pe->pe_lock);
+ 		log_dbg("Not sending srccap as max re-try reached\n");
+ 		pe_notify_policy_status_changed(&src_pe->p,
+-				POLICY_TYPE_SOURCE, src_pe->p.status);
++			POLICY_TYPE_SOURCE, PE_STATUS_CHANGE_PD_FAIL);
+ 	}
+ }
+ 
+@@ -829,7 +829,6 @@ static int src_pe_start_policy_engine(struct policy *p)
+ 	log_info("IN");
+ 	mutex_lock(&src_pe->pe_lock);
+ 	p->state = POLICY_STATE_ONLINE;
+-	p->status = POLICY_STATUS_RUNNING;
+ 	policy_set_pd_state(p, true);
+ 	src_pe_reset_policy_engine(src_pe);
+ 	schedule_delayed_work(&src_pe->start_comm, 0);
+-- 
+1.9.1
+

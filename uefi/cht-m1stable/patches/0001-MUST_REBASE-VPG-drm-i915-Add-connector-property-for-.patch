@@ -1,0 +1,327 @@
+From 3880e50c6ad2eb1be8b932c734e0ae36721c59ca Mon Sep 17 00:00:00 2001
+Message-Id: <3880e50c6ad2eb1be8b932c734e0ae36721c59ca.1434017134.git.chang-joon.lee@intel.com>
+From: Gajanan Bhat <gajanan.bhat@intel.com>
+Date: Tue, 26 May 2015 15:40:42 +0200
+Subject: [PATCH] MUST_REBASE [VPG]: drm/i915: Add connector property for
+ forcing low ddr frequency
+
+Vnn can be lowered to 0.95V from 1.05V for most of the camera related use cases.
+Due to some hw issue in CHV, Vnn cannot be lowered unless the DDR freq is
+lowered to 1066 MHz from 1600 MHz.
+This patch adds ddr_freq connector property which will be used by userspace
+to force ddr frequency to lower the Vnn. This contributes to power savings of
+~200 to 400 mW in SoC.
+
+MUST_REBASE: This patch can't be upstreamed because there is no open source use
+case for it. In Android Camera HAL and HWC communicates through binder
+interface and force the DDR freq to 1066MHz whenever a camera app is active.
+
+Issue: IMINAN-35228
+Change-Id: I45fba036a4e5aec8805cf2e4dfa26a4665b9e548
+Signed-off-by: Vijay Purushothaman <vijay.a.purushothaman@intel.com>
+Signed-off-by: Gajanan Bhat <gajanan.bhat@intel.com>
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h    |  4 ++
+ drivers/gpu/drm/i915/intel_dp.c    |  7 +++
+ drivers/gpu/drm/i915/intel_drv.h   |  1 +
+ drivers/gpu/drm/i915/intel_dsi.c   |  7 +++
+ drivers/gpu/drm/i915/intel_hdmi.c  |  7 +++
+ drivers/gpu/drm/i915/intel_modes.c | 33 +++++++++++++
+ drivers/gpu/drm/i915/intel_pm.c    | 95 +++++++++++++++++++++++++++++---------
+ 7 files changed, 133 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index f059bdb..8b18c25 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1803,6 +1803,7 @@ struct drm_i915_private {
+ 	bool csc_enabled[I915_MAX_PIPES];
+ 	bool is_resuming;
+ 	bool is_video_playing;  /* Indicates enabling only in videomode */
++	bool force_low_ddr_freq;
+ 
+ 	/* Track the media promotion timer update */
+ 	bool last_media_active_state;
+@@ -1936,6 +1937,7 @@ struct drm_i915_private {
+ 	struct drm_property *force_audio_property;
+ 	struct drm_property *force_pfit_property;
+ 	struct drm_property *scaling_src_size_property;
++	struct drm_property *force_ddr_low_freq_property;
+ 
+ 	uint32_t hw_context_size;
+ 	struct list_head context_list;
+@@ -3233,6 +3235,8 @@ extern void intel_detect_pch(struct drm_device *dev);
+ extern int intel_trans_dp_port_sel(struct drm_crtc *crtc);
+ extern int intel_enable_rc6(const struct drm_device *dev);
+ extern void valleyview_update_wm_pm5(struct intel_crtc *crtc);
++void vlv_force_ddr_low_frequency(struct drm_i915_private *dev_priv,
++				 bool enabled);
+ extern void vlv_update_dsparb(struct intel_crtc *crtc);
+ void vlv_update_watermarks(struct drm_i915_private *dev_priv);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index a4461f0..ddc74fb 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -4775,6 +4775,12 @@ intel_dp_set_property(struct drm_connector *connector,
+ 			intel_crtc->scaling_src_size);
+ 		return 0;
+ 	}
++
++	if (property == dev_priv->force_ddr_low_freq_property) {
++		vlv_force_ddr_low_frequency(dev_priv, val);
++		return 0;
++	}
++
+ 	return -EINVAL;
+ 
+ done:
+@@ -4903,6 +4909,7 @@ intel_dp_add_properties(struct intel_dp *intel_dp, struct drm_connector *connect
+ 	intel_attach_broadcast_rgb_property(connector);
+ 	intel_attach_force_pfit_property(connector);
+ 	intel_attach_scaling_src_size_property(connector);
++	intel_attach_force_ddr_low_freq_property(connector);
+ 	intel_dp->color_range_auto = true;
+ 
+ 	if (is_edp(intel_dp) && !IS_VALLEYVIEW(dev)) {
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 710d56d..fc266da 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1078,6 +1078,7 @@ void intel_attach_broadcast_rgb_property(struct drm_connector *connector);
+ void intel_attach_force_pfit_property(struct drm_connector *connector);
+ extern void
+ 	intel_attach_scaling_src_size_property(struct drm_connector *connector);
++void intel_attach_force_ddr_low_freq_property(struct drm_connector *connector);
+ 
+ 
+ /* intel_overlay.c */
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 5caba02..3340bc8 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -1199,6 +1199,12 @@ static int intel_dsi_set_property(struct drm_connector *connector,
+ 		DRM_DEBUG_DRIVER("src size = %u", intel_crtc->scaling_src_size);
+ 		return 0;
+ 	}
++
++	if (property == dev_priv->force_ddr_low_freq_property) {
++		vlv_force_ddr_low_frequency(dev_priv, val);
++		return 0;
++	}
++
+ done:
+ 	if (intel_dsi->base.base.crtc)
+ 		intel_crtc_restore_mode(intel_dsi->base.base.crtc);
+@@ -1272,6 +1278,7 @@ intel_dsi_add_properties(struct intel_dsi *intel_dsi,
+ {
+ 	intel_attach_force_pfit_property(connector);
+ 	intel_attach_scaling_src_size_property(connector);
++	intel_attach_force_ddr_low_freq_property(connector);
+ }
+ 
+ bool intel_dsi_init(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index 42a1cc6..f7953ab 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1470,6 +1470,12 @@ intel_hdmi_set_property(struct drm_connector *connector,
+ 			intel_crtc->scaling_src_size);
+ 		return 0;
+ 	}
++
++	if (property == dev_priv->force_ddr_low_freq_property) {
++		vlv_force_ddr_low_frequency(dev_priv, val);
++		return 0;
++	}
++
+ 	return -EINVAL;
+ 
+ done:
+@@ -1870,6 +1876,7 @@ intel_hdmi_add_properties(struct intel_hdmi *intel_hdmi, struct drm_connector *c
+ 	intel_attach_broadcast_rgb_property(connector);
+ 	intel_attach_force_pfit_property(connector);
+ 	intel_attach_scaling_src_size_property(connector);
++	intel_attach_force_ddr_low_freq_property(connector);
+ 	intel_hdmi->color_range_auto = true;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_modes.c b/drivers/gpu/drm/i915/intel_modes.c
+index f005f25..9bed8ed 100644
+--- a/drivers/gpu/drm/i915/intel_modes.c
++++ b/drivers/gpu/drm/i915/intel_modes.c
+@@ -192,3 +192,36 @@ intel_attach_scaling_src_size_property(struct drm_connector *connector)
+ 
+ 	drm_object_attach_property(obj, prop, 0);
+ }
++
++/*
++ * Userspace can force low DDR frequency using connector property for power
++ * optimization in certain cases or delegate the control to kernel for default
++ * DVFS policy.
++ */
++static const struct drm_prop_enum_list ddr_freq_names[] = {
++	{0, "default"},
++	{1, "low"},
++};
++
++void
++intel_attach_force_ddr_low_freq_property(struct drm_connector *connector)
++{
++	struct drm_device *dev = connector->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_property *prop;
++	struct drm_mode_object *obj = &connector->base;
++
++	prop = dev_priv->force_ddr_low_freq_property;
++	if (prop == NULL) {
++		prop = drm_property_create_enum(dev, 0,
++						"ddr_freq",
++						ddr_freq_names,
++						ARRAY_SIZE(ddr_freq_names));
++		if (prop == NULL)
++			return;
++
++		dev_priv->force_ddr_low_freq_property = prop;
++	}
++
++	drm_object_attach_property(obj, prop, 0);
++}
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 98e73d2..f6c9de8 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -1592,29 +1592,78 @@ void vlv_update_dsparb(struct intel_crtc *intel_crtc)
+ 	}
+ }
+ 
++void vlv_set_ddr_dvfs(struct drm_i915_private *dev_priv,
++		bool enable_ddr_dvfs)
++{
++	unsigned int val = 0x0;
++	unsigned int freq_mask = CHV_FORCE_DDR_LOW_FREQ |
++						CHV_FORCE_DDR_HIGH_FREQ;
++	int pipe_stat = VLV_PIPE_STATS(dev_priv->pipe_plane_stat);
++	struct drm_crtc *crtc;
++	struct intel_crtc_config *config;
++	unsigned int cur_dvfs_mode;
++
++	/* Set higher DDR frequency if DDR DVFS is being disabled */
++	if (!enable_ddr_dvfs)
++		val = CHV_FORCE_DDR_HIGH_FREQ;
++
++	/* Force DDR freq to low if userspace is requesting for it */
++	if (dev_priv->force_low_ddr_freq)
++		val = CHV_FORCE_DDR_LOW_FREQ;
++
++	/* DDR freq should be high if more than one pipe is active */
++	if (!single_pipe_enabled(pipe_stat))
++		val = CHV_FORCE_DDR_HIGH_FREQ;
++	else {
++		crtc = single_enabled_crtc(dev_priv->dev);
++		config = &((to_intel_crtc(crtc))->config);
++
++		/* DDR freq should be high for resolution greater than 19x12 */
++		if ((config->pipe_src_w * config->pipe_src_h) > (1920 * 1200))
++			val = CHV_FORCE_DDR_HIGH_FREQ;
++	}
++
++	mutex_lock(&dev_priv->rps.hw_lock);
++
++	/* Return if required mode is already set */
++	cur_dvfs_mode = vlv_punit_read(dev_priv, CHV_DDR_DVFS);
++	if ((cur_dvfs_mode & freq_mask) == val)
++		goto out;
++
++	/* First set the DDR DVFS frequency to auto */
++	vlv_punit_write(dev_priv, CHV_DDR_DVFS, CHV_DDR_DVFS_DOORBELL);
++	if (wait_for((vlv_punit_read(dev_priv, CHV_DDR_DVFS) &
++				CHV_DDR_DVFS_DOORBELL) == 0, 3))
++		DRM_ERROR("timed out for punit change req\n");
++
++	if (val) {
++		vlv_punit_write(dev_priv, CHV_DDR_DVFS, val);
++		if (wait_for((vlv_punit_read(dev_priv, CHV_DDR_DVFS) &
++					CHV_DDR_DVFS_DOORBELL) == 0, 3))
++			DRM_ERROR("timed out for punit change req\n");
++	}
++
++out:
++	mutex_unlock(&dev_priv->rps.hw_lock);
++}
++
+ void intel_update_maxfifo(struct drm_i915_private *dev_priv,
+ 				struct drm_crtc *crtc, bool enable)
+ {
+ 	unsigned int val = 0;
+-	struct intel_crtc_config *config =
+-				&((to_intel_crtc(crtc))->config);
+ 
+ 	if (!IS_VALLEYVIEW(dev_priv->dev))
+ 		return;
+ 
+ 	if (enable) {
+ 		if (IS_CHERRYVIEW(dev_priv->dev)) {
+-			val = 0x0;
++
+ 			/*
+-			 * cannot enable ddr dvfs if
+-			 * resolution greater than 19x12
++			 * When display is in single plane maxfifo mode,
++			 * DDR DVFS can be enabled for better power saving.
+ 			 */
+-			if ((config->pipe_src_w * config->pipe_src_h)
+-					<= (1920 * 1200)) {
+-				mutex_lock(&dev_priv->rps.hw_lock);
+-				vlv_punit_write(dev_priv, CHV_DDR_DVFS, val);
+-				mutex_unlock(&dev_priv->rps.hw_lock);
+-			}
++			vlv_set_ddr_dvfs(dev_priv, true);
++
+ 			I915_WRITE(FW_BLC_SELF_VLV, FW_CSPWRDWNEN);
+ 			mutex_lock(&dev_priv->rps.hw_lock);
+ 			val = vlv_punit_read(dev_priv, CHV_DPASSC);
+@@ -1626,18 +1675,13 @@ void intel_update_maxfifo(struct drm_i915_private *dev_priv,
+ 		dev_priv->maxfifo_enabled = true;
+ 	} else {
+ 		if (IS_CHERRYVIEW(dev_priv->dev)) {
++
+ 			/*
+-			 * cannot enable ddr dvfs if
+-			 * resolution is greater than 19x12
++			 * If display is in multiplane/multidisplay mode,
++			 * disable DDR DVFS and set higher frequency.
+ 			 */
+-			if ((config->pipe_src_w * config->pipe_src_h)
+-					<= (1920 * 1200)) {
+-				val = CHV_FORCE_DDR_HIGH_FREQ |
+-						CHV_DDR_DVFS_DOORBELL;
+-				mutex_lock(&dev_priv->rps.hw_lock);
+-				vlv_punit_write(dev_priv, CHV_DDR_DVFS, val);
+-				mutex_unlock(&dev_priv->rps.hw_lock);
+-			}
++			vlv_set_ddr_dvfs(dev_priv, false);
++
+ 			mutex_lock(&dev_priv->rps.hw_lock);
+ 			val = vlv_punit_read(dev_priv, CHV_DPASSC);
+ 			I915_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+@@ -1654,6 +1698,15 @@ void intel_update_maxfifo(struct drm_i915_private *dev_priv,
+ 	}
+ }
+ 
++void
++vlv_force_ddr_low_frequency(struct drm_i915_private *dev_priv, bool mode)
++{
++	if (mode != dev_priv->force_low_ddr_freq) {
++		dev_priv->force_low_ddr_freq = mode;
++		vlv_set_ddr_dvfs(dev_priv, mode);
++	}
++}
++
+ void valleyview_update_wm_pm5(struct intel_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->base.dev;
+-- 
+1.9.1
+

@@ -1,0 +1,99 @@
+From 91a0c3961f5eedbed406962aa855199068bd5998 Mon Sep 17 00:00:00 2001
+Message-Id: <91a0c3961f5eedbed406962aa855199068bd5998.1417780177.git.chang-joon.lee@intel.com>
+In-Reply-To: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+References: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+From: Akashdeep Sharma <akashdeep.sharma@intel.com>
+Date: Fri, 27 Dec 2013 00:31:28 +0530
+Subject: [PATCH 05/30] FOR_UPSTREAM [VPG]: drm/i915: Dedicated work queue for
+ HPD works.
+
+These changes are to enable dedicated work queue for HPD works.
+Currently hot plug works and unpin works are getting queued on
+same work queue dev_priv->wq with max_active=1. Hence, to make
+sure that unpin works (and other GEM works) are served without
+waiting for hot plug works, and to avoid chain of starvation for
+mutexes, we are enabling separate dedicated work queue for HPD
+works.
+
+Change-Id: Ib761642391f6e91f3f2a0948af57ff78215cf0ae
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-3423
+Signed-off-by: Akashdeep Sharma <akashdeep.sharma@intel.com>
+Signed-off-by: Nabendu Maiti <nabendu.bikash.maiti@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c |   12 ++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h |    1 +
+ drivers/gpu/drm/i915/i915_irq.c |    2 +-
+ 3 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 9b15613..e078c0f 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1788,6 +1788,15 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 		goto out_mtrrfree;
+ 	}
+ 
++	/* Create separate work queue for HPD works */
++	dev_priv->hpdwq = alloc_ordered_workqueue("i915_hpd", 0);
++	if (dev_priv->hpdwq == NULL) {
++		DRM_ERROR("Failed to create hpd workqueue.\n");
++		ret = -ENOMEM;
++		destroy_workqueue(dev_priv->wq);
++		goto out_mtrrfree;
++	}
++
+ 	intel_irq_init(dev);
+ 	intel_uncore_sanitize(dev);
+ 
+@@ -1876,6 +1885,7 @@ out_gem_unload:
+ 	intel_teardown_mchbar(dev);
+ 	pm_qos_remove_request(&dev_priv->pm_qos);
+ 	destroy_workqueue(dev_priv->wq);
++	destroy_workqueue(dev_priv->hpdwq);
+ out_mtrrfree:
+ 	arch_phys_wc_del(dev_priv->gtt.mtrr);
+ 	io_mapping_free(dev_priv->gtt.mappable);
+@@ -1958,6 +1968,7 @@ int i915_driver_unload(struct drm_device *dev)
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
+ 		/* Flush any outstanding unpin_work. */
+ 		flush_workqueue(dev_priv->wq);
++		flush_workqueue(dev_priv->hpdwq);
+ 
+ 		mutex_lock(&dev->struct_mutex);
+ 		i915_gem_cleanup_ringbuffer(dev);
+@@ -1975,6 +1986,7 @@ int i915_driver_unload(struct drm_device *dev)
+ 	intel_teardown_mchbar(dev);
+ 
+ 	destroy_workqueue(dev_priv->wq);
++	destroy_workqueue(dev_priv->hpdwq);
+ 	pm_qos_remove_request(&dev_priv->pm_qos);
+ 
+ 	i915_global_gtt_cleanup(dev);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 20e820b..cf4cf01 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1605,6 +1605,7 @@ struct drm_i915_private {
+ 	 * result in deadlocks.
+ 	 */
+ 	struct workqueue_struct *wq;
++	struct workqueue_struct *hpdwq;
+ 	struct workqueue_struct *flipwq;
+ 
+ 	/* Display functions */
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index f008875..4f8ee9b 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1850,7 +1850,7 @@ static inline void intel_hpd_irq_handler(struct drm_device *dev,
+ 	 * queue for otherwise the flush_work in the pageflip code will
+ 	 * deadlock.
+ 	 */
+-	schedule_work(&dev_priv->hotplug_work);
++	queue_work(dev_priv->hpdwq, &dev_priv->hotplug_work);
+ }
+ 
+ static void gmbus_irq_handler(struct drm_device *dev)
+-- 
+1.7.9.5
+

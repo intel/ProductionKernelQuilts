@@ -1,0 +1,428 @@
+From 891049bb2e4a41a4b99430446d8cd74fa27af80d Mon Sep 17 00:00:00 2001
+Message-Id: <891049bb2e4a41a4b99430446d8cd74fa27af80d.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Adam Rutkowski <adam.j.rutkowski@intel.com>
+Date: Tue, 21 Jan 2014 14:20:12 +0100
+Subject: [PATCH 059/312] FOR_UPSTREAM [VPG]: drm/i915: Perfmon buffer
+ interrupt
+
+Adding IOCTLs to enable, disable and wait for perfmon buffer
+half full interrupt.
+
+Issue: APDEV-770 VIZ-3346
+Change-Id: Ie207e31d685625c1bc9cd6c7b2668eb5c9d0fd8c
+Signed-off-by: Adam Rutkowski <adam.j.rutkowski@intel.com>
+Reviewed-on: https://android.intel.com/162915
+Tested-by: sys_abtbuild <sys_abtbuild@intel.com>
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Reviewed-by: Madajczak, Tomasz <Tomasz.Madajczak@intel.com>
+Reviewed-by: Nordell, Joakim <joakim.nordell@intel.com>
+---
+ drivers/gpu/drm/i915/Makefile           |    1 +
+ drivers/gpu/drm/i915/i915_dma.c         |    1 +
+ drivers/gpu/drm/i915/i915_drv.h         |    7 ++
+ drivers/gpu/drm/i915/i915_gem.c         |    3 +
+ drivers/gpu/drm/i915/i915_irq.c         |    8 ++
+ drivers/gpu/drm/i915/i915_perfmon.c     |  125 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_reg.h         |    1 +
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   25 ++++---
+ include/uapi/drm/i915_drm.h             |    4 +
+ include/uapi/drm/i915_perfmon.h         |   63 ++++++++++++++++
+ 10 files changed, 229 insertions(+), 9 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/i915_perfmon.c
+ create mode 100644 include/uapi/drm/i915_perfmon.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index abccfc4..af2326d 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -30,6 +30,7 @@ i915-y += i915_cmd_parser.o \
+ 	  i915_gem_userptr.o \
+ 	  i915_gpu_error.o \
+ 	  i915_irq.o \
++	  i915_perfmon.o \
+ 	  i915_trace_points.o \
+ 	  intel_ringbuffer.o \
+ 	  intel_uncore.o
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 6d856bf..3b6c562 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -2031,6 +2031,7 @@ const struct drm_ioctl_desc i915_ioctls[] = {
+ 	DRM_IOCTL_DEF_DRV(I915_DPST_CONTEXT, i915_dpst_context, DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF_DRV(I915_GEM_ACCESS_USERDATA, i915_gem_access_userdata,
+ 							DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(I915_PERFMON, i915_perfmon_ioctl, DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF_DRV(I915_SET_CSC, intel_configure_csc, DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(I915_SET_PLANE_ALPHA, i915_set_plane_alpha, \
+ 							DRM_AUTH|DRM_UNLOCKED),
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index ce58e30..0eea1bb 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1514,6 +1514,10 @@ struct drm_i915_private {
+ 	struct intel_ddi_plls ddi_plls;
+ 	int dpio_phy_iosf_port[I915_NUM_PHYS_VLV];
+ 
++	/* perfmon interrupt support */
++	wait_queue_head_t perfmon_buffer_queue;
++	atomic_t perfmon_buffer_interrupts;
++
+ 	/* Reclocking support */
+ 	bool render_reclock_avail;
+ 	bool lvds_downclock_avail;
+@@ -2738,6 +2742,9 @@ int vlv_freq_opcode(struct drm_i915_private *dev_priv, int val);
+ #define FORCEWAKE_MEDIA		(1 << 1)
+ #define FORCEWAKE_ALL		(FORCEWAKE_RENDER | FORCEWAKE_MEDIA)
+ 
++/* i195_perfmon.c */
++int i915_perfmon_ioctl(struct drm_device *dev, void *data,
++	struct drm_file *file);
+ 
+ #define I915_READ8(reg)		dev_priv->uncore.funcs.mmio_readb(dev_priv, (reg), true)
+ #define I915_WRITE8(reg, val)	dev_priv->uncore.funcs.mmio_writeb(dev_priv, (reg), (val), true)
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index a923eca..6a64cc8 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4913,6 +4913,9 @@ i915_gem_load(struct drm_device *dev)
+ 	i915_gem_detect_bit_6_swizzle(dev);
+ 	init_waitqueue_head(&dev_priv->pending_flip_queue);
+ 
++	atomic_set(&dev_priv->perfmon_buffer_interrupts, 0);
++	init_waitqueue_head(&dev_priv->perfmon_buffer_queue);
++
+ 	dev_priv->mm.interruptible = true;
+ 
+ 	dev_priv->mm.shrinker.scan_objects = i915_gem_shrinker_scan;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 8880a2c..de97e39 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1440,6 +1440,11 @@ static void snb_gt_irq_handler(struct drm_device *dev,
+ 
+ 	if (gt_iir & GT_PARITY_ERROR(dev))
+ 		ivybridge_parity_error_irq_handler(dev, gt_iir);
++
++	if (gt_iir & GT_RENDER_PERFMON_BUFFER_INTERRUPT) {
++		atomic_inc(&dev_priv->perfmon_buffer_interrupts);
++		wake_up_all(&dev_priv->perfmon_buffer_queue);
++	}
+ }
+ 
+ static void gen8_rps_irq_handler(struct drm_i915_private *dev_priv, u32 pm_iir)
+@@ -3276,6 +3281,9 @@ static void gen5_gt_irq_postinstall(struct drm_device *dev)
+ 		gt_irqs |= GT_PARITY_ERROR(dev);
+ 	}
+ 
++	if (IS_GEN7(dev))
++		gt_irqs |= GT_RENDER_PERFMON_BUFFER_INTERRUPT;
++
+ 	gt_irqs |= GT_RENDER_USER_INTERRUPT;
+ 	if (IS_GEN5(dev)) {
+ 		gt_irqs |= GT_RENDER_PIPECTL_NOTIFY_INTERRUPT |
+diff --git a/drivers/gpu/drm/i915/i915_perfmon.c b/drivers/gpu/drm/i915/i915_perfmon.c
+new file mode 100644
+index 0000000..807d431
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_perfmon.c
+@@ -0,0 +1,125 @@
++/*
++ * Copyright  2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++#include <drm/i915_drm.h>
++#include "i915_drv.h"
++#include "i915_trace.h"
++#include "intel_drv.h"
++#include "linux/wait.h"
++
++
++/**
++ * intel_enable_perfmon_interrupt - enable perfmon interrupt
++ *
++ */
++static int intel_enable_perfmon_interrupt(struct drm_device *dev,
++						int enable)
++{
++	struct drm_i915_private *dev_priv = (struct drm_i915_private *) dev->dev_private;
++	unsigned long irqflags;
++
++	if (!(IS_GEN7(dev)))
++		return -EINVAL;
++
++	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
++
++	if (enable)
++		ilk_enable_gt_irq(dev_priv,
++				  GT_RENDER_PERFMON_BUFFER_INTERRUPT);
++	else
++		ilk_disable_gt_irq(dev_priv,
++				   GT_RENDER_PERFMON_BUFFER_INTERRUPT);
++
++	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
++
++	return 0;
++}
++
++/**
++ * intel_wait_perfmon_interrupt - wait for perfmon buffer interrupt
++ *
++ * Blocks until perfmon buffer half full interrupt occurs or the wait
++ * times out.
++ */
++static int intel_wait_perfmon_interrupt(struct drm_device *dev,
++						int timeout_ms)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int counter = atomic_read(&dev_priv->perfmon_buffer_interrupts);
++	int retcode = I915_PERFMON_IRQ_WAIT_OK;
++	int time_left = 0;
++
++	if (!(IS_GEN7(dev)))
++		return -EINVAL;
++
++	time_left = wait_event_interruptible_timeout(
++		dev_priv->perfmon_buffer_queue,
++		atomic_read(&dev_priv->perfmon_buffer_interrupts) != counter,
++		timeout_ms * HZ / 1000);
++
++	if (time_left == 0)
++		retcode = I915_PERFMON_IRQ_WAIT_TIMEOUT;
++	else if (time_left == -ERESTARTSYS)
++		retcode = I915_PERFMON_IRQ_WAIT_INTERRUPTED;
++	else if (time_left < 0)
++		retcode = I915_PERFMON_IRQ_WAIT_FAILED;
++
++	return retcode;
++}
++
++/**
++ * i915_perfmon_ioctl - performance monitoring support
++ *
++ * Main entry point to performance monitoring support
++ * IOCTLs.
++ */
++int i915_perfmon_ioctl(struct drm_device *dev, void *data,
++	struct drm_file *file)
++{
++	struct drm_i915_perfmon *perfmon = data;
++	int retcode = 0;
++
++	switch (perfmon->op) {
++	case I915_PERFMON_SET_BUFFER_IRQS:
++		retcode = intel_enable_perfmon_interrupt(
++				dev,
++				perfmon->data.set_irqs.enable);
++		break;
++	case I915_PERFMON_WAIT_BUFFER_IRQS:
++		if (perfmon->data.wait_irqs.timeout >
++				I915_PERFMON_WAIT_IRQ_MAX_TIMEOUT_MS)
++			retcode =  -EINVAL;
++		else
++			perfmon->data.wait_irqs.ret_code =
++				intel_wait_perfmon_interrupt(
++					dev,
++					perfmon->data.wait_irqs.timeout);
++		break;
++	default:
++		/* unknown operation */
++		retcode = -EINVAL;
++		break;
++	}
++
++	return retcode;
++}
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 1c3aac5..2bf6a84 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -1326,6 +1326,7 @@ enum punit_power_well {
+ #define GT_BSD_CS_ERROR_INTERRUPT		(1 << 15)
+ #define GT_BSD_USER_INTERRUPT			(1 << 12)
+ #define GT_RENDER_L3_PARITY_ERROR_INTERRUPT_S1	(1 << 11) /* hsw+; rsvd on snb, ivb, vlv */
++#define GT_RENDER_PERFMON_BUFFER_INTERRUPT      (1 <<  9) /* !snb */
+ #define GT_RENDER_L3_PARITY_ERROR_INTERRUPT	(1 <<  5) /* !snb */
+ #define GT_RENDER_PIPECTL_NOTIFY_INTERRUPT	(1 <<  4)
+ #define GT_RENDER_CS_MASTER_ERROR_INTERRUPT	(1 <<  3)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 279488a..6bd6f29 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -604,6 +604,7 @@ static int init_render_ring(struct intel_engine_cs *ring)
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int ret = init_ring_common(ring);
++	u32 imr;
+ 
+ 	/* WaTimedSingleVertexDispatch:cl,bw,ctg,elk,ilk,snb */
+ 	if (INTEL_INFO(dev)->gen >= 4 && INTEL_INFO(dev)->gen < 7)
+@@ -649,8 +650,12 @@ static int init_render_ring(struct intel_engine_cs *ring)
+ 	if (INTEL_INFO(dev)->gen >= 6)
+ 		I915_WRITE(INSTPM, _MASKED_BIT_ENABLE(INSTPM_FORCE_ORDERING));
+ 
++	imr = ~0;
+ 	if (HAS_L3_DPF(dev))
+-		I915_WRITE_IMR(ring, ~GT_PARITY_ERROR(dev));
++		imr &= ~GT_PARITY_ERROR(dev);
++	if (IS_GEN7(dev))
++		imr &= ~GT_RENDER_PERFMON_BUFFER_INTERRUPT;
++	I915_WRITE_IMR(ring, imr);
+ 
+ 	return ret;
+ }
+@@ -1103,12 +1108,12 @@ gen6_ring_get_irq(struct intel_engine_cs *ring)
+ 
+ 	spin_lock_irqsave(&dev_priv->irq_lock, flags);
+ 	if (ring->irq_refcount++ == 0) {
++		u32 mask = ~ring->irq_enable_mask;
+ 		if (HAS_L3_DPF(dev) && ring->id == RCS)
+-			I915_WRITE_IMR(ring,
+-				       ~(ring->irq_enable_mask |
+-					 GT_PARITY_ERROR(dev)));
+-		else
+-			I915_WRITE_IMR(ring, ~ring->irq_enable_mask);
++			mask &= ~GT_PARITY_ERROR(dev);
++		if (IS_GEN7(dev))
++			mask &= ~GT_RENDER_PERFMON_BUFFER_INTERRUPT;
++		I915_WRITE_IMR(ring, mask);
+ 		ilk_enable_gt_irq(dev_priv, ring->irq_enable_mask);
+ 	}
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, flags);
+@@ -1125,10 +1130,12 @@ gen6_ring_put_irq(struct intel_engine_cs *ring)
+ 
+ 	spin_lock_irqsave(&dev_priv->irq_lock, flags);
+ 	if (--ring->irq_refcount == 0) {
++		u32 mask = ~0;
+ 		if (HAS_L3_DPF(dev) && ring->id == RCS)
+-			I915_WRITE_IMR(ring, ~GT_PARITY_ERROR(dev));
+-		else
+-			I915_WRITE_IMR(ring, ~0);
++			mask &= ~GT_PARITY_ERROR(dev);
++		if (IS_GEN7(dev))
++			mask &= ~GT_RENDER_PERFMON_BUFFER_INTERRUPT;
++		I915_WRITE_IMR(ring, mask);
+ 		ilk_disable_gt_irq(dev_priv, ring->irq_enable_mask);
+ 	}
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, flags);
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 70f1aa3..63d350b 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -28,6 +28,7 @@
+ #define _UAPI_I915_DRM_H_
+ 
+ #include <drm/drm.h>
++#include <drm/i915_perfmon.h>
+ 
+ /* Please note that modifications to all structs defined here are
+  * subject to backwards-compatibility constraints.
+@@ -280,6 +281,7 @@ struct csc_coeff {
+ #define DRM_I915_DPST_CONTEXT   0x3b
+ #define DRM_I915_GEM_ACCESS_USERDATA	0x3c
+ #define DRM_I915_SET_PLANE_ALPHA	0x3d
++#define DRM_I915_PERFMON		0x3e
+ 
+ #define DRM_IOCTL_I915_INIT		DRM_IOW( DRM_COMMAND_BASE + DRM_I915_INIT, drm_i915_init_t)
+ #define DRM_IOCTL_I915_FLUSH		DRM_IO ( DRM_COMMAND_BASE + DRM_I915_FLUSH)
+@@ -348,6 +350,8 @@ struct csc_coeff {
+ #define DRM_IOCTL_I915_GEM_ACCESS_USERDATA	\
+ 		DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_GEM_ACCESS_USERDATA, \
+ 		struct drm_i915_gem_access_userdata)
++#define DRM_IOCTL_I915_PERFMON DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_PERFMON, \
++					struct drm_i915_perfmon)
+ #define DRM_IOCTL_I915_SET_CSC DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_SET_CSC, \
+ 		struct csc_coeff)
+ 
+diff --git a/include/uapi/drm/i915_perfmon.h b/include/uapi/drm/i915_perfmon.h
+new file mode 100644
+index 0000000..323059e
+--- /dev/null
++++ b/include/uapi/drm/i915_perfmon.h
+@@ -0,0 +1,63 @@
++/*
++ * Copyright  2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#ifndef _I915_PERFMON_H_
++#define _I915_PERFMON_H_
++
++#include "drm.h"
++
++#define I915_PERFMON_IOCTL_VERSION           2
++
++#define I915_PERFMON_WAIT_IRQ_MAX_TIMEOUT_MS 10000
++
++struct drm_i915_perfmon_set_buffer_irqs {
++	__u32 enable;
++};
++
++enum I915_PERFMON_WAIT_IRQ_RET_CODE {
++	I915_PERFMON_IRQ_WAIT_OK,
++	I915_PERFMON_IRQ_WAIT_FAILED,
++	I915_PERFMON_IRQ_WAIT_TIMEOUT,
++	I915_PERFMON_IRQ_WAIT_INTERRUPTED,
++};
++
++struct drm_i915_perfmon_wait_irqs {
++	__u32 timeout;		/* in ms */
++	__u32 ret_code;
++};
++
++enum I915_PERFMON_IOCTL_OP {
++	I915_PERFMON_SET_BUFFER_IRQS = 5,
++	I915_PERFMON_WAIT_BUFFER_IRQS,
++};
++
++struct drm_i915_perfmon {
++	enum I915_PERFMON_IOCTL_OP op;
++	union {
++		struct drm_i915_perfmon_wait_irqs	wait_irqs;
++		struct drm_i915_perfmon_set_buffer_irqs set_irqs;
++		__u32 reserved[64];
++	} data;
++};
++
++#endif	/* _I915_PERFMON_H_ */
+-- 
+1.7.9.5
+

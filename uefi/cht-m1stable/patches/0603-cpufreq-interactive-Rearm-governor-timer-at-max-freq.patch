@@ -1,0 +1,192 @@
+From 57ea2ca21f43e922f79ddd6246dfdd3d601c2b35 Mon Sep 17 00:00:00 2001
+From: Rohit Gupta <rohgup@codeaurora.org>
+Date: Fri, 6 Mar 2015 18:46:04 -0800
+Subject: [PATCH 603/634] cpufreq: interactive: Rearm governor timer at max
+ freq
+
+Interactive governor doesn't rearm per-cpu timer if target_freq is
+equal to policy->max. However, this does not have clear performance
+benefits. Profiling doesn't show any difference in benchmarks, games
+or other workloads, if timers are always rearmed.
+
+At same time, there are a few issues caused by not rearming timer
+at policy->max.
+
+1) min_sample_time enforcement is inconsistent
+
+For target frequency that is lower than policy->max, it will not
+drop until min_sample_time has passed since last frequency evaluation
+selected current frequency. However, for policy->max, it will
+always drop immediately as long as CPU has been run for longer than
+min_sample_time. This is because timer is not running and thus
+floor_freq and floor_validate_time is not updated.
+
+Example: assume min_sample_time is 59ms and timer_rate is 20ms.
+Frequency X < Y. Let's say CPU would pick the following frequencies
+before accounting for min_sample_time in each 20ms sampling window.
+Y, Y, Y, Y, X, X, X, X, X
+If Y is not policy->max, the final target_freq after considering
+min_sample_time will be Y, Y, Y, Y, *Y, *Y, X, X, X
+* marks the windows where frequency is prevented from dropping.
+If Y is policy->max, the final target_freq will be
+Y, Y, Y, Y, X, X, X, X, X
+
+2) Rearm timer in IDLE_START does not work as intended
+
+IDLE_START/END is sent in arch_cpu_idle_enter/exit(). However, next
+wake up is decided in tick_nohz_idle_enter(), which traverses the
+timer list before idle notification is sent out. Therefore, rearming
+timer in idle notification won't take effect until CPU wakes up at
+least once. In rare scenarios when a CPU goes to idle and sleeps for a
+long time immediately after a heavy load stops, it may not wake up
+to drop its frequency vote for a long time, defeating the purpose of
+having a slack_timer.
+
+3) Need to rearm timer for policy->max change
+
+commit 535a553fc1c4b4c3627c73214ade6326615a7463
+(cpufreq: interactive: restructure CPUFREQ_GOV_LIMITS) mentions the
+problem of timer getting indefinitely pushed back due to frequency
+changes in policy->min/max. However, it still cancels and rearms timer
+if policy->max is increased, and same problem could still happen if
+policy->max is frequently changing after the fix. The best solution is
+to always rearm timer for each CPU even if it's running at
+policy->max.
+
+Rearming timers even if target_freq is policy->max solves these
+problems cleanly. It also simplifies the design and code of interactive
+governor.
+
+Change-Id: I973853d2375ea6f697fa4cee04a89efe6b8bf735
+Reviewed-by: Saravana Kannan <skannan@codeaurora.org>
+Signed-off-by: Junjie Wu <junjiew@codeaurora.org>
+Signed-off-by: Rohit Gupta <rohgup@codeaurora.org>
+---
+ drivers/cpufreq/cpufreq_interactive.c | 68 ++---------------------------------
+ 1 file changed, 2 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/cpufreq/cpufreq_interactive.c b/drivers/cpufreq/cpufreq_interactive.c
+index 8ddb6fc..39e6218 100644
+--- a/drivers/cpufreq/cpufreq_interactive.c
++++ b/drivers/cpufreq/cpufreq_interactive.c
+@@ -47,7 +47,6 @@ struct cpufreq_interactive_cpuinfo {
+ 	spinlock_t target_freq_lock; /*protects target freq */
+ 	unsigned int target_freq;
+ 	unsigned int floor_freq;
+-	unsigned int max_freq;
+ 	u64 pol_floor_val_time; /* policy floor_validate_time */
+ 	u64 loc_floor_val_time; /* per-cpu floor_validate_time */
+ 	u64 pol_hispeed_val_time; /* policy hispeed_validate_time */
+@@ -444,7 +443,7 @@ static void cpufreq_interactive_timer(unsigned long data)
+ 			data, cpu_load, pcpu->target_freq,
+ 			pcpu->policy->cur, new_freq);
+ 		spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
+-		goto rearm_if_notmax;
++		goto rearm;
+ 	}
+ 
+ 	trace_cpufreq_interactive_target(data, cpu_load, pcpu->target_freq,
+@@ -457,14 +456,6 @@ static void cpufreq_interactive_timer(unsigned long data)
+ 	spin_unlock_irqrestore(&speedchange_cpumask_lock, flags);
+ 	wake_up_process(speedchange_task);
+ 
+-rearm_if_notmax:
+-	/*
+-	 * Already set max speed and don't see a need to change that,
+-	 * wait until next idle to re-evaluate, don't need timer.
+-	 */
+-	if (pcpu->target_freq == pcpu->policy->max)
+-		goto exit;
+-
+ rearm:
+ 	if (!timer_pending(&pcpu->cpu_timer))
+ 		cpufreq_interactive_timer_resched(pcpu);
+@@ -474,37 +465,6 @@ exit:
+ 	return;
+ }
+ 
+-static void cpufreq_interactive_idle_start(void)
+-{
+-	struct cpufreq_interactive_cpuinfo *pcpu =
+-		&per_cpu(cpuinfo, smp_processor_id());
+-	int pending;
+-
+-	if (!down_read_trylock(&pcpu->enable_sem))
+-		return;
+-	if (!pcpu->governor_enabled) {
+-		up_read(&pcpu->enable_sem);
+-		return;
+-	}
+-
+-	pending = timer_pending(&pcpu->cpu_timer);
+-
+-	if (pcpu->target_freq != pcpu->policy->min) {
+-		/*
+-		 * Entering idle while not at lowest speed.  On some
+-		 * platforms this can hold the other CPU(s) at that speed
+-		 * even though the CPU is idle. Set a timer to re-evaluate
+-		 * speed so this idle CPU doesn't hold the other CPUs above
+-		 * min indefinitely.  This should probably be a quirk of
+-		 * the CPUFreq driver.
+-		 */
+-		if (!pending)
+-			cpufreq_interactive_timer_resched(pcpu);
+-	}
+-
+-	up_read(&pcpu->enable_sem);
+-}
+-
+ static void cpufreq_interactive_idle_end(void)
+ {
+ 	struct cpufreq_interactive_cpuinfo *pcpu =
+@@ -1129,14 +1089,8 @@ static int cpufreq_interactive_idle_notifier(struct notifier_block *nb,
+ 					     unsigned long val,
+ 					     void *data)
+ {
+-	switch (val) {
+-	case IDLE_START:
+-		cpufreq_interactive_idle_start();
+-		break;
+-	case IDLE_END:
++	if (val == IDLE_END)
+ 		cpufreq_interactive_idle_end();
+-		break;
+-	}
+ 
+ 	return 0;
+ }
+@@ -1258,7 +1212,6 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
+ 			pcpu->loc_floor_val_time = pcpu->pol_floor_val_time;
+ 			pcpu->pol_hispeed_val_time = pcpu->pol_floor_val_time;
+ 			pcpu->loc_hispeed_val_time = pcpu->pol_floor_val_time;
+-			pcpu->max_freq = policy->max;
+ 			down_write(&pcpu->enable_sem);
+ 			del_timer_sync(&pcpu->cpu_timer);
+ 			del_timer_sync(&pcpu->cpu_slack_timer);
+@@ -1308,23 +1261,6 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
+ 
+ 			spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
+ 			up_read(&pcpu->enable_sem);
+-
+-			/* Reschedule timer only if policy->max is raised.
+-			 * Delete the timers, else the timer callback may
+-			 * return without re-arm the timer when failed
+-			 * acquire the semaphore. This race may cause timer
+-			 * stopped unexpectedly.
+-			 */
+-
+-			if (policy->max > pcpu->max_freq) {
+-				down_write(&pcpu->enable_sem);
+-				del_timer_sync(&pcpu->cpu_timer);
+-				del_timer_sync(&pcpu->cpu_slack_timer);
+-				cpufreq_interactive_timer_start(tunables, j);
+-				up_write(&pcpu->enable_sem);
+-			}
+-
+-			pcpu->max_freq = policy->max;
+ 		}
+ 		break;
+ 	}
+-- 
+1.9.1
+

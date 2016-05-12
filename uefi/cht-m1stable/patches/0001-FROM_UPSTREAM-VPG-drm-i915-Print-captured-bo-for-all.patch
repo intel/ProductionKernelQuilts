@@ -1,0 +1,209 @@
+From cb098d33cdac3271103834fbce08218248d7bddb Mon Sep 17 00:00:00 2001
+Message-Id: <cb098d33cdac3271103834fbce08218248d7bddb.1417780878.git.chang-joon.lee@intel.com>
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 12 Aug 2014 20:05:47 +0100
+Subject: [PATCH 01/34] FROM_UPSTREAM [VPG]: drm/i915: Print captured bo for
+ all VM in error state
+
+The current error state harks back to the era of just a single VM. For
+full-ppgtt, we capture every bo on every VM. It behoves us to then print
+every bo for every VM, which we currently fail to do and so miss vital
+information in the error state.
+
+v2: Use the vma address rather than -1!
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Signed-off-by: Tomas Elf <tomas.elf@intel.com>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 3a448734902359113b0c7c3454ce4cd56dc1e61f
+Upstream-as-of-tag: linux-3.17
+Issue: GMIN-3575
+Tracked-On: https://jira01.devtools.intel.com/browse/GMIN-3576
+Change-Id: I3f9b8e96eb74dfe048fdf0b529f6aaf7f93c73de
+---
+ drivers/gpu/drm/i915/i915_drv.h       |    2 +
+ drivers/gpu/drm/i915/i915_gpu_error.c |   80 +++++++++++++++++++++++----------
+ 2 files changed, 58 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 5c39ab7..735d30d 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -414,6 +414,7 @@ struct drm_i915_error_state {
+ 		pid_t pid;
+ 		char comm[TASK_COMM_LEN];
+ 	} ring[I915_NUM_RINGS];
++
+ 	struct drm_i915_error_buffer {
+ 		u32 size;
+ 		u32 name;
+@@ -432,6 +433,7 @@ struct drm_i915_error_state {
+ 	} **active_bo, **pinned_bo;
+ 
+ 	u32 *active_bo_count, *pinned_bo_count;
++	u32 vm_count;
+ };
+ 
+ struct intel_connector;
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index fe236d2..b277dfd 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -197,10 +197,10 @@ static void print_error_buffers(struct drm_i915_error_state_buf *m,
+ 				struct drm_i915_error_buffer *err,
+ 				int count)
+ {
+-	err_printf(m, "%s [%d]:\n", name, count);
++	err_printf(m, "  %s [%d]:\n", name, count);
+ 
+ 	while (count--) {
+-		err_printf(m, "  %08x %8u %02x %02x %x %x",
++		err_printf(m, "    %08x %8u %02x %02x %x %x",
+ 			   err->gtt_offset,
+ 			   err->size,
+ 			   err->read_domains,
+@@ -377,15 +377,17 @@ int i915_error_state_to_str(struct drm_i915_error_state_buf *m,
+ 		i915_ring_error_state(m, dev, &error->ring[i]);
+ 	}
+ 
+-	if (error->active_bo)
++	for (i = 0; i < error->vm_count; i++) {
++		err_printf(m, "vm[%d]\n", i);
++
+ 		print_error_buffers(m, "Active",
+-				    error->active_bo[0],
+-				    error->active_bo_count[0]);
++				    error->active_bo[i],
++				    error->active_bo_count[i]);
+ 
+-	if (error->pinned_bo)
+ 		print_error_buffers(m, "Pinned",
+-				    error->pinned_bo[0],
+-				    error->pinned_bo_count[0]);
++				    error->pinned_bo[i],
++				    error->pinned_bo_count[i]);
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(error->ring); i++) {
+ 		struct drm_i915_error_object *obj;
+@@ -631,13 +633,15 @@ unwind:
+ 				       (src)->base.size>>PAGE_SHIFT)
+ 
+ static void capture_bo(struct drm_i915_error_buffer *err,
+-		       struct drm_i915_gem_object *obj)
++		       struct i915_vma *vma)
+ {
++	struct drm_i915_gem_object *obj = vma->obj;
++
+ 	err->size = obj->base.size;
+ 	err->name = obj->base.name;
+ 	err->rseqno = obj->last_read_seqno;
+ 	err->wseqno = obj->last_write_seqno;
+-	err->gtt_offset = i915_gem_obj_ggtt_offset(obj);
++	err->gtt_offset = vma->node.start;
+ 	err->read_domains = obj->base.read_domains;
+ 	err->write_domain = obj->base.write_domain;
+ 	err->fence_reg = obj->fence_reg;
+@@ -661,7 +665,7 @@ static u32 capture_active_bo(struct drm_i915_error_buffer *err,
+ 	int i = 0;
+ 
+ 	list_for_each_entry(vma, head, mm_list) {
+-		capture_bo(err++, vma->obj);
++		capture_bo(err++, vma);
+ 		if (++i == count)
+ 			break;
+ 	}
+@@ -670,21 +674,27 @@ static u32 capture_active_bo(struct drm_i915_error_buffer *err,
+ }
+ 
+ static u32 capture_pinned_bo(struct drm_i915_error_buffer *err,
+-			     int count, struct list_head *head)
++			     int count, struct list_head *head,
++			     struct i915_address_space *vm)
+ {
+ 	struct drm_i915_gem_object *obj;
+-	int i = 0;
++	struct drm_i915_error_buffer * const first = err;
++	struct drm_i915_error_buffer * const last = err + count;
+ 
+ 	list_for_each_entry(obj, head, global_list) {
+-		if (!i915_gem_obj_is_pinned(obj))
+-			continue;
++		struct i915_vma *vma;
+ 
+-		capture_bo(err++, obj);
+-		if (++i == count)
++		if (err == last)
+ 			break;
++
++		list_for_each_entry(vma, &obj->vma_list, vma_link)
++			if (vma->vm == vm && vma->pin_count > 0) {
++				capture_bo(err++, vma);
++				break;
++			}
+ 	}
+ 
+-	return i;
++	return err - first;
+ }
+ 
+ /* Generate a semi-unique error code. The code is not meant to have meaning, The
+@@ -1010,9 +1020,14 @@ static void i915_gem_capture_vm(struct drm_i915_private *dev_priv,
+ 	list_for_each_entry(vma, &vm->active_list, mm_list)
+ 		i++;
+ 	error->active_bo_count[ndx] = i;
+-	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_list)
+-		if (i915_gem_obj_is_pinned(obj))
+-			i++;
++
++	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_list) {
++		list_for_each_entry(vma, &obj->vma_list, vma_link)
++			if (vma->vm == vm && vma->pin_count > 0) {
++				i++;
++				break;
++			}
++	}
+ 	error->pinned_bo_count[ndx] = i - error->active_bo_count[ndx];
+ 
+ 	if (i) {
+@@ -1031,7 +1046,7 @@ static void i915_gem_capture_vm(struct drm_i915_private *dev_priv,
+ 		error->pinned_bo_count[ndx] =
+ 			capture_pinned_bo(pinned_bo,
+ 					  error->pinned_bo_count[ndx],
+-					  &dev_priv->mm.bound_list);
++					  &dev_priv->mm.bound_list, vm);
+ 	if (error->active_bo)
+ 		error->active_bo[ndx] = active_bo;
+ 	if (error->pinned_bo)
+@@ -1054,8 +1069,25 @@ static void i915_gem_capture_buffers(struct drm_i915_private *dev_priv,
+ 	error->pinned_bo_count = kcalloc(cnt, sizeof(*error->pinned_bo_count),
+ 					 GFP_ATOMIC);
+ 
+-	list_for_each_entry(vm, &dev_priv->vm_list, global_link)
+-		i915_gem_capture_vm(dev_priv, error, vm, i++);
++	if (error->active_bo == NULL ||
++	    error->pinned_bo == NULL ||
++	    error->active_bo_count == NULL ||
++	    error->pinned_bo_count == NULL) {
++		kfree(error->active_bo);
++		kfree(error->active_bo_count);
++		kfree(error->pinned_bo);
++		kfree(error->pinned_bo_count);
++
++		error->active_bo = NULL;
++		error->active_bo_count = NULL;
++		error->pinned_bo = NULL;
++		error->pinned_bo_count = NULL;
++	} else {
++		list_for_each_entry(vm, &dev_priv->vm_list, global_link)
++			i915_gem_capture_vm(dev_priv, error, vm, i++);
++
++		error->vm_count = cnt;
++	}
+ }
+ 
+ /* Capture all registers which don't fit into another category. */
+-- 
+1.7.9.5
+

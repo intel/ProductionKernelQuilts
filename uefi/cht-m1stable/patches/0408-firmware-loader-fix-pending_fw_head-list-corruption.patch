@@ -1,0 +1,64 @@
+From 529eb4b7c18fd3cef1301f8bb1a75a2cbfa151d7 Mon Sep 17 00:00:00 2001
+From: Maxime Bizon <mbizon@freebox.fr>
+Date: Thu, 29 Aug 2013 20:28:13 +0200
+Subject: [PATCH 408/634] firmware loader: fix pending_fw_head list corruption
+
+Got the following oops just before reboot:
+
+Unable to handle kernel NULL pointer dereference at virtual address 00000000
+[<8028d300>] (__list_del_entry+0x44/0xac)
+[<802e3320>] (__fw_load_abort.part.13+0x1c/0x50)
+[<802e337c>] (fw_shutdown_notify+0x28/0x50)
+[<80034f80>] (notifier_call_chain.isra.1+0x5c/0x9c)
+[<800350ec>] (__blocking_notifier_call_chain+0x44/0x58)
+[<80035114>] (blocking_notifier_call_chain+0x14/0x18)
+[<80035d64>] (kernel_restart_prepare+0x14/0x38)
+[<80035d94>] (kernel_restart+0xc/0x50)
+
+The following race condition triggers here:
+
+  _request_firmware_load()
+  device_create_file(...)
+  kobject_uevent(...)
+  (schedule)
+                                       (resume)
+                                       firmware_loading_store(1)
+                                       firmware_loading_store(0)
+                                       list_del_init(&buf->pending_list)
+                                       (schedule)
+  (resume)
+  list_add(&buf->pending_list, &pending_fw_head);
+  wait_for_completion(&buf->completion);
+
+causing an oops later when walking pending_list after the firmware has
+been released.
+
+The proposed fix is to move the list_add() before sysfs attribute
+creation.
+
+Signed-off-by: Maxime Bizon <mbizon@freebox.fr>
+Acked-by: Ming Lei <ming.lei@canonical.com>
+Cc: stable <stable@vger.kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/base/firmware_class.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/drivers/base/firmware_class.c b/drivers/base/firmware_class.c
+index f77a796..f0c15f9 100644
+--- a/drivers/base/firmware_class.c
++++ b/drivers/base/firmware_class.c
+@@ -915,10 +915,6 @@ static int _request_firmware_load(struct firmware_priv *fw_priv,
+ 		kobject_uevent(&fw_priv->dev.kobj, KOBJ_ADD);
+ 	}
+ 
+-	mutex_lock(&fw_lock);
+-	list_add(&buf->pending_list, &pending_fw_head);
+-	mutex_unlock(&fw_lock);
+-
+ 	wait_for_completion(&buf->completion);
+ 
+ 	cancel_delayed_work_sync(&fw_priv->timeout_work);
+-- 
+1.9.1
+

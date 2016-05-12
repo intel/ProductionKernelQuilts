@@ -1,0 +1,394 @@
+From 49c873b4ee41d4fa198320697b8f561d0ce77e51 Mon Sep 17 00:00:00 2001
+Message-Id: <49c873b4ee41d4fa198320697b8f561d0ce77e51.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: rtshiva <sivakumar.thulasimani@intel.com>
+Date: Wed, 4 Feb 2015 16:54:40 +0530
+Subject: [PATCH 87/95] MUST_REBASE [VPG]: video/adf/intel: Sleep resume fix
+ for eDP/DP
+
+This patch fixes write protect issue of saving and restoring the
+mode clock that will allow eDP/DP to sleep and resume. This also
+fixes the disable sequence for eDP/DP panels by first disabling
+pipe and then port.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5501
+Change-Id: I1415132681d57389ea343fd23082fa4b043bbc3c
+Signed-off-by: Thulasimani, Sivakumar <sivakumar.thulasimani@intel.com>
+---
+ .../video/adf/intel/core/common/dp/gen_dp_pipe.c   |   20 ++++--
+ drivers/video/adf/intel/core/vlv/vlv_dp_port.c     |   54 ++++++++++++++--
+ drivers/video/adf/intel/core/vlv/vlv_pipeline.c    |   65 +++++++++++++++++---
+ drivers/video/adf/intel/core/vlv/vlv_pll.c         |   10 +++
+ .../adf/intel/include/core/intel_platform_config.h |    1 +
+ .../adf/intel/include/core/vlv/vlv_dc_config.h     |    1 +
+ .../video/adf/intel/include/core/vlv/vlv_dp_port.h |    2 +-
+ drivers/video/adf/intel/include/core/vlv/vlv_pll.h |    1 +
+ 8 files changed, 134 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c b/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c
+index 9e3d808..c9014bd 100644
+--- a/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c
++++ b/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c
+@@ -159,7 +159,7 @@ static int dp_pipe_modeset(struct intel_pipe *pipe,
+ 	struct link_params *params;
+ 	bool ret = false, err = 0;
+ 	u8 dpcdval = 1;
+-	u32 dotclock = mode->clock;
++	u32 dotclock;
+ 	u32 bpp = 0;
+ 
+ 	params = &dp_pipe->link_params;
+@@ -173,8 +173,13 @@ static int dp_pipe_modeset(struct intel_pipe *pipe,
+ 	pr_err("%s:FIXME: get bpp from edid\n", __func__);
+ 	bpp = 24;
+ 
+-	/* Avoiding i915 enter into DPMS */
+-	intel_adf_display_rpm_get();
++	/* if NULL the current call is from dpms so use saved mode */
++	if (mode == NULL)
++		mode = &dp_pipe->current_mode;
++	else
++		intel_adf_display_rpm_get();
++
++	dotclock = mode->clock;
+ 	dp_pipe_dump_modes(mode, 1);
+ 	vlv_dp_backlight_seq(pipeline, false);
+ 
+@@ -236,7 +241,7 @@ static int dp_pipe_dpms(struct intel_pipe *pipe, u8 state)
+ {
+ 	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
+ 	struct intel_pipeline *pipeline = dp_pipe->pipeline;
+-	struct drm_mode_modeinfo mode;
++	u8 dpcdval = 0;
+ 	u32 err = 0;
+ 
+ 	pr_err("ADF: %s current_state = %d, requested_state = %d\n",
+@@ -248,15 +253,18 @@ static int dp_pipe_dpms(struct intel_pipe *pipe, u8 state)
+ 	switch (state) {
+ 	case DRM_MODE_DPMS_ON:
+ 		intel_adf_display_rpm_get();
+-		dp_pipe_get_current_mode(pipe, &mode);
+-		err = dp_pipe_modeset(pipe, &mode);
++		vlv_dpms(pipeline, state);
++		err = dp_pipe_modeset(pipe, NULL);
+ 		if (err != 0)
+ 			goto dpms_exit;
+ 		break;
+ 	case DRM_MODE_DPMS_OFF:
+ 		vlv_dp_backlight_seq(pipeline, false);
+ 		vlv_dp_panel_power_seq(pipeline, false);
++		dp_panel_set_dpcd(&dp_pipe->panel, DP_SET_POWER,
++			&dpcdval, 1);
+ 		err = vlv_pipeline_off(pipeline);
++		vlv_dpms(pipeline, state);
+ 		intel_adf_display_rpm_put();
+ 		if (err != 0)
+ 			goto dpms_exit;
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dp_port.c b/drivers/video/adf/intel/core/vlv/vlv_dp_port.c
+index c2a01e9..377a875 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dp_port.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dp_port.c
+@@ -41,6 +41,8 @@
+ #define PWM_DUTY_CYCLE		0x1e841e84
+ #define PLATFORM_MAX_BRIGHTNESS	0x1FFF
+ #define PWM_ENABLE		(1 << 31)
++#define EDP_WRITE_PROTECT	0xabcd0000
++#define EDP_WRITE_PROTECT_MASK	0xffff0000
+ 
+ static u32 wait_panel_status(struct vlv_dp_port *port, u32 mask, u32 value)
+ {
+@@ -95,6 +97,18 @@ void vlv_dp_port_get_max_vswing_preemp(struct vlv_dp_port *port,
+ 		*max_p = e9_5dB;
+ }
+ 
++void vlv_dp_port_write_protect_off(struct vlv_dp_port *port, bool enable)
++{
++	u32 val = 0;
++
++	val = REG_READ(port->pp_ctl_offset);
++	val &= ~(EDP_WRITE_PROTECT_MASK);
++	if (enable)
++		val |= EDP_WRITE_PROTECT;
++
++	REG_WRITE(port->pp_ctl_offset, val);
++}
++
+ u32 vlv_dp_port_panel_power_seq(struct vlv_dp_port *port, bool enable)
+ {
+ 	u32 pp = 0;
+@@ -154,7 +168,6 @@ u32 vlv_dp_port_backlight_seq(struct vlv_dp_port *port, bool enable)
+ {
+ 	u32 pp = 0;
+ 
+-	/* FIXME: implement register locking */
+ 	if (enable) {
+ 		vlv_dp_port_pwm_seq(port, enable);
+ 
+@@ -162,7 +175,26 @@ u32 vlv_dp_port_backlight_seq(struct vlv_dp_port *port, bool enable)
+ 		pp = REG_READ(port->pp_ctl_offset);
+ 		pp |= EDP_BLC_ENABLE;
+ 		REG_WRITE(port->pp_ctl_offset, pp);
++
++		/*
++		 * backlight is turned on, so modeset is complete
++		 * lock pps registers , only access for these
++		 * should come through brightness calls where
++		 * we should explictly enable and disable this
++		 */
++		vlv_dp_port_write_protect_off(port, false);
+ 	} else {
++		/*
++		 * exact opposite of above scenario
++		 * since backlight is turned off
++		 * this can be part of modeset where
++		 * pps and pipe timing registers can be acessed
++		 * so turn off write protection
++		 * This will handle dpms as well since
++		 * edp modeset always performs backlight off
++		 * before begining enable sequence
++		 */
++		vlv_dp_port_write_protect_off(port, true);
+ 		pp = REG_READ(port->pp_ctl_offset);
+ 		pp &= ~EDP_BLC_ENABLE;
+ 		REG_WRITE(port->pp_ctl_offset, pp);
+@@ -234,7 +266,6 @@ u32 vlv_dp_port_disable(struct vlv_dp_port *port)
+ 	reg_val &= ~(1 << 31);
+ 	REG_WRITE(port->hist_ctl_offset, reg_val);
+ 
+-	/* perform lane reset frm chv_post_disable_dp */
+ 	return 0;
+ }
+ 
+@@ -517,7 +548,6 @@ u32 vlv_dp_port_aux_transfer(struct vlv_dp_port *port,
+ aux_tx_exit:
+ 	mutex_unlock(&port->hw_mutex);
+ 	return ret;
+-
+ }
+ 
+ u32 vlv_dp_port_set_signal_levels(struct vlv_dp_port *port,
+@@ -836,8 +866,8 @@ u32 vlv_dp_port_load_panel_delays(struct vlv_dp_port *port)
+ 		port->pps_delays.t11_t12 = (510 + 100) * 10;
+ 
+ 	} else {
+-		pr_err("PPS delays: %d %d %d %d %d\n", *ptr, *(ptr+1), *(ptr+2),
+-				*(ptr+3), *(ptr+4));
++		pr_info("PPS delays: %d %d %d %d %d\n", *ptr, *(ptr+1),
++				*(ptr+2), *(ptr+3), *(ptr+4));
+ 
+ 		port->pps_delays.t1_t3 = *ptr;
+ 		port->pps_delays.t8 = *(ptr+1);
+@@ -867,6 +897,17 @@ void vlv_dp_port_destroy(struct vlv_dp_port *port)
+ 	i2c_del_adapter(&port->ddc);
+ }
+ 
++u32 vlv_dp_port_dpms(struct vlv_dp_port *port, u8 dpms_state)
++{
++	if (dpms_state == DRM_MODE_DPMS_ON) {
++		vlv_dp_port_write_protect_off(port, true);
++		vlv_dp_port_load_panel_delays(port);
++		vlv_dp_port_write_protect_off(port, false);
++	}
++
++	return 0;
++}
++
+ bool vlv_dp_port_init(struct vlv_dp_port *port, enum port port_id,
+ 		enum pipe pipe_id, enum intel_pipe_type type,
+ 		struct device *dev)
+@@ -939,12 +980,15 @@ u32 vlv_dp_port_set_brightness(struct vlv_dp_port *port, int level)
+ 
+ 	if (!port->is_edp)
+ 		return 0;
++	vlv_dp_port_write_protect_off(port, true);
+ 
+ 	val = REG_READ(port->pwm_duty_cycle_offset);
+ 	level = (level * PLATFORM_MAX_BRIGHTNESS) / MAXIMUM_BRIGHTNESS;
+ 	val = val & ~BACKLIGHT_DUTY_CYCLE_MASK;
+ 	REG_WRITE(port->pwm_duty_cycle_offset, val | level);
+ 
++	vlv_dp_port_write_protect_off(port, false);
++
+ 	return 1;
+ }
+ 
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+index e7f4913..2ddfd61 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+@@ -271,6 +271,7 @@ u32 vlv_pipeline_on(struct intel_pipeline *pipeline,
+ 	struct intel_clock clock;
+ 	bool ret = 0;
+ 	u32 err = 0, dotclock = 0, multiplier = 1;
++	u32 saved_clock = 0;
+ 	u8 bpp = 0;
+ 
+ 	if (!mode) {
+@@ -286,6 +287,7 @@ u32 vlv_pipeline_on(struct intel_pipeline *pipeline,
+ 		if ((disp->type == INTEL_PIPE_DP) ||
+ 			(disp->type == INTEL_PIPE_EDP)) {
+ 			dotclock = pipeline->params.dp.link_bw;
++			saved_clock = mode->clock;
+ 			mode->clock = dotclock;
+ 			multiplier = vlv_calc_multiplier(pipeline, dotclock);
+ 
+@@ -337,6 +339,7 @@ u32 vlv_pipeline_on(struct intel_pipeline *pipeline,
+ 
+ 	case INTEL_PIPE_DP:
+ 	case INTEL_PIPE_EDP:
++		mode->clock = saved_clock;
+ 		vlv_pipe_program_m_n(pipe, disp->base.params.dp.m_n);
+ 		bpp = disp->base.params.dp.bpp;
+ 		break;
+@@ -592,16 +595,28 @@ u32 chv_pipeline_off(struct intel_pipeline *pipeline)
+ 	/* Also check for pending flip and the vblank off  */
+ 	vlv_pipe_vblank_off(pipe);
+ 
+-	/* port disable */
+-	err = vlv_port_disable(pipeline);
+-	if (err)
+-		pr_err("ADF: %s: port disable failed\n", __func__);
++	if ((disp->type == INTEL_PIPE_EDP) ||
++		(disp->type == INTEL_PIPE_DP)) {
++		/* pipe disable first for dp/edp */
++		err = vlv_pipe_disable(pipe);
++		if (err)
++			pr_err("ADF: %s: pipe disable failed\n", __func__);
+ 
+-	/* pipe disable */
+-	err = vlv_pipe_disable(pipe);
+-	if (err)
+-		pr_err("ADF: %s: pipe disable failed\n", __func__);
++		/* port disable */
++		err = vlv_port_disable(pipeline);
++		if (err)
++			pr_err("ADF: %s: port disable failed\n", __func__);
++	} else {
++		/* port disable */
++		err = vlv_port_disable(pipeline);
++		if (err)
++			pr_err("ADF: %s: port disable failed\n", __func__);
+ 
++		/* pipe disable */
++		err = vlv_pipe_disable(pipe);
++		if (err)
++			pr_err("ADF: %s: pipe disable failed\n", __func__);
++	}
+ 	if (disp->type == INTEL_PIPE_DSI)
+ 		goto out;
+ 
+@@ -984,3 +999,37 @@ u32 vlv_dp_get_brightness(struct intel_pipeline *pipeline)
+ 	return level;
+ 
+ }
++
++u32 vlv_dpms(struct intel_pipeline *pipeline, u8 dpms_state)
++{
++	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
++	struct vlv_dp_port *dp_port = &disp->port.dp_port;
++	struct vlv_pll *pll = &disp->pll;
++
++	if (dpms_state == DRM_MODE_DPMS_ON) {
++		vlv_pll_dpms(pll, dpms_state);
++		switch (disp->type) {
++		case INTEL_PIPE_DP:
++		case INTEL_PIPE_EDP:
++			vlv_dp_port_dpms(dp_port, dpms_state);
++			break;
++		default:
++			/* add on required basis */
++			break;
++		}
++
++	} else if (dpms_state == DRM_MODE_DPMS_OFF) {
++		switch (disp->type) {
++		case INTEL_PIPE_DP:
++		case INTEL_PIPE_EDP:
++			vlv_dp_port_dpms(dp_port, dpms_state);
++			break;
++		default:
++			/* add on required basis */
++			break;
++		}
++		vlv_pll_dpms(pll, dpms_state);
++	}
++	disp->dpms_state = dpms_state;
++	return 0;
++}
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pll.c b/drivers/video/adf/intel/core/vlv/vlv_pll.c
+index 00f4cbb..ae2c1f3 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pll.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pll.c
+@@ -258,6 +258,16 @@ u32 vlv_pll_disable(struct vlv_pll *pll)
+ 	return 0;
+ }
+ 
++u32 vlv_pll_dpms(struct vlv_pll *pll, u8 dpms_state)
++{
++	if (dpms_state == DRM_MODE_DPMS_ON)
++		REG_WRITE(DISP_PHY_CTL, DPIO_INIT_VAL);
++
++	pr_info("pll %d state changed to %d\n", pll->pll_id, dpms_state);
++
++	return 0;
++}
++
+ bool vlv_pll_init(struct vlv_pll *pll, enum intel_pipe_type type,
+ 		enum pipe pipe_id, enum port port_id)
+ {
+diff --git a/drivers/video/adf/intel/include/core/intel_platform_config.h b/drivers/video/adf/intel/include/core/intel_platform_config.h
+index dba1403..45a639e 100644
+--- a/drivers/video/adf/intel/include/core/intel_platform_config.h
++++ b/drivers/video/adf/intel/include/core/intel_platform_config.h
+@@ -97,6 +97,7 @@ u32 vlv_get_event(struct intel_pipeline *pipeline, u32 *event);
+  * intel_adf_get_dc_config
+  */
+ 
++u32 vlv_dpms(struct intel_pipeline *pipeline, u8 dpms_state);
+ 
+ extern struct intel_dc_config *vlv_get_dc_config(struct pci_dev *pdev, u32 id);
+ extern void vlv_dc_config_destroy(struct intel_dc_config *config);
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+index 8fde104..ec9e55b 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+@@ -166,6 +166,7 @@ struct vlv_pipeline {
+ 	struct vlv_sp_plane splane[2];
+ 	u32 dpio_id;
+ 	u32 disp_no;
++	u8 dpms_state;
+ 	enum intel_pipe_type type;
+ 	u16 dc_stepping;
+ 	union {
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dp_port.h b/drivers/video/adf/intel/include/core/vlv/vlv_dp_port.h
+index 474fd85..b37e4e1 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dp_port.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dp_port.h
+@@ -55,7 +55,7 @@ struct vlv_dp_port {
+ bool vlv_dp_port_init(struct vlv_dp_port *port, enum port port_id,
+ 	enum pipe pipe_id, enum intel_pipe_type type, struct device *dev);
+ void vlv_dp_port_destroy(struct vlv_dp_port *port);
+-
++u32 vlv_dp_port_dpms(struct vlv_dp_port *port, u8 dpms_state);
+ u32 vlv_dp_port_set_link_pattern(struct vlv_dp_port *port,
+ 		u8 train_pattern);
+ void vlv_dp_port_get_adjust_train(struct vlv_dp_port *port,
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pll.h b/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
+index 7aede9d..46158a7 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pll.h
+@@ -69,5 +69,6 @@ bool vlv_dsi_pll_init(struct vlv_pll *pll, enum pipe epipe, enum port port);
+ bool vlv_pll_init(struct vlv_pll *pll, enum intel_pipe_type type,
+ 		enum pipe epipe, enum port eport);
+ bool vlv_pll_destroy(struct vlv_pll *pll);
++u32 vlv_pll_dpms(struct vlv_pll *pll, u8 dpms_state);
+ 
+ #endif /*_VLV_PLL_H_*/
+-- 
+1.7.9.5
+

@@ -1,0 +1,235 @@
+From c494325f23ba897d93789dc5444c130ef7628d03 Mon Sep 17 00:00:00 2001
+From: Praveen Diwakar <praveen.diwakar@intel.com>
+Date: Thu, 27 Nov 2014 10:10:25 +0530
+Subject: [PATCH 02/24] ASoC: Intel: Change the base addresses of modules as
+ per firmware changes
+
+For supporting IPC message greater than 1k(max 4k),
+ddr based mailbox will be implemented in firmware.
+Added support for the same in sst driver.
+However for timestamp and LPE debug points, we will
+still use SRAM mailbox.
+
+Issue: GMINL-3680
+
+Change-Id: I8c5d629bb617e9ce43208ae8ba90a28d536843f9
+Signed-off-by: Praveen Diwakar <praveen.diwakar@intel.com>
+---
+ sound/soc/intel/platform_ipc_v2.h       |  3 +++
+ sound/soc/intel/sst/sst.c               | 14 ++++++++++----
+ sound/soc/intel/sst/sst.h               |  3 ++-
+ sound/soc/intel/sst/sst_acpi.c          |  9 ++++++++-
+ sound/soc/intel/sst/sst_app_interface.c |  2 +-
+ sound/soc/intel/sst/sst_drv_interface.c |  2 +-
+ sound/soc/intel/sst/sst_ipc.c           |  8 ++++----
+ sound/soc/intel/sst/sst_pvt.c           |  3 ++-
+ 8 files changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/sound/soc/intel/platform_ipc_v2.h b/sound/soc/intel/platform_ipc_v2.h
+index 09f5c5b..dfc94af 100644
+--- a/sound/soc/intel/platform_ipc_v2.h
++++ b/sound/soc/intel/platform_ipc_v2.h
+@@ -31,9 +31,12 @@
+ #define MAX_LOOP_BACK_DWORDS 8
+ /* IPC base address and mailbox, timestamp offsets */
+ #define SST_MAILBOX_SIZE 0x0400
++#define SST_MAILBOX_SIZE_CHT 0x1000
++#define SST_DDR_MAILBOX_BASE     0x1000 /* Mailbox offset from IMR base */
+ #define SST_MAILBOX_SEND 0x0000
+ #define SST_TIME_STAMP 0x1800
+ #define SST_TIME_STAMP_MRFLD 0x680
++#define SST_TIME_STAMP_CHT 0x0000
+ #define SST_TIME_STAMP_BYT 0x800
+ #define SST_RESERVED_OFFSET 0x1A00
+ #define SST_SCU_LPE_MAILBOX 0x1000
+diff --git a/sound/soc/intel/sst/sst.c b/sound/soc/intel/sst/sst.c
+index 82029b6..c8f893e 100644
+--- a/sound/soc/intel/sst/sst.c
++++ b/sound/soc/intel/sst/sst.c
+@@ -117,7 +117,8 @@ static inline void set_imr_interrupts(struct intel_sst_drv *ctx, bool enable)
+ }
+ 
+ #define SST_IS_PROCESS_REPLY(header) ((header & PROCESS_MSG) ? true : false)
+-#define SST_VALIDATE_MAILBOX_SIZE(size) ((size <= SST_MAILBOX_SIZE) ? true : false)
++#define SST_VALIDATE_MAILBOX_SIZE(size) \
++		((size <= sst_drv_ctx->mailbox_size) ? true : false)
+ 
+ static irqreturn_t intel_sst_interrupt_mrfld(int irq, void *context)
+ {
+@@ -164,7 +165,8 @@ static irqreturn_t intel_sst_interrupt_mrfld(int irq, void *context)
+ 			size = header.p.header_low_payload;
+ 			if (SST_VALIDATE_MAILBOX_SIZE(size)) {
+ 				memcpy_fromio(msg->mailbox_data,
+-					drv->mailbox + drv->mailbox_recv_offset, size);
++				drv->ipc_mailbox + drv->mailbox_recv_offset,
++				size);
+ 			} else {
+ 				pr_err("Mailbox not copied, payload siz is: %u\n", size);
+ 				header.p.header_low_payload = 0;
+@@ -267,7 +269,8 @@ static irqreturn_t intel_sst_intr_mfld(int irq, void *context)
+ 			size = header.part.data;
+ 			if (SST_VALIDATE_MAILBOX_SIZE(size)) {
+ 				memcpy_fromio(msg->mailbox_data,
+-					drv->mailbox + drv->mailbox_recv_offset + 4, size);
++				drv->ipc_mailbox + drv->mailbox_recv_offset + 4,
++				size);
+ 			} else {
+ 				pr_err("Mailbox not copied, payload siz is: %u\n", size);
+ 				header.part.data = 0;
+@@ -433,7 +436,7 @@ int sst_driver_ops(struct intel_sst_drv *sst)
+ 		return 0;
+ #endif
+ 	case SST_CHT_PCI_ID:
+-		sst->tstamp = SST_TIME_STAMP_MRFLD;
++		sst->tstamp = SST_TIME_STAMP_CHT;
+ 		sst->ops = &mrfld_ops;
+ 		/* Override the recovery ops for CHT platforms */
+ 		sst->ops->do_recovery = sst_do_recovery;
+@@ -834,6 +837,9 @@ static int intel_sst_probe(struct pci_dev *pci,
+ 	}
+ 	pr_debug("SRAM Ptr %p\n", sst_drv_ctx->mailbox);
+ 
++	sst_drv_ctx->ipc_mailbox = sst_drv_ctx->mailbox;
++	sst_drv_ctx->mailbox_size = SST_MAILBOX_SIZE;
++
+ 	/* IRAM */
+ 	sst_drv_ctx->iram_end = pci_resource_end(pci, 3);
+ 	sst_drv_ctx->iram_base = pci_resource_start(pci, 3);
+diff --git a/sound/soc/intel/sst/sst.h b/sound/soc/intel/sst/sst.h
+index c0bdd15..d97c549 100644
+--- a/sound/soc/intel/sst/sst.h
++++ b/sound/soc/intel/sst/sst.h
+@@ -306,7 +306,6 @@ struct fw_block_info {
+ struct sst_ipc_msg_wq {
+ 	union ipc_header_mrfld mrfld_header;
+ 	struct ipc_dsp_hdr dsp_hdr;
+-	char mailbox[SST_MAILBOX_SIZE];
+ 	struct work_struct	wq;
+ 	union ipc_header header;
+ };
+@@ -492,6 +491,7 @@ struct intel_sst_drv {
+ 	void __iomem		*mailbox;
+ 	void __iomem		*iram;
+ 	void __iomem		*dram;
++	void __iomem            *ipc_mailbox;
+ 	void __iomem		*ssp0;
+ #if 0
+ 	void __iomem		*dma0;
+@@ -506,6 +506,7 @@ struct intel_sst_drv {
+ 	unsigned int		ddr_end;
+ 	unsigned int		ddr_base;
+ 	unsigned int		mailbox_recv_offset;
++	unsigned int		mailbox_size;
+ 	atomic_t		pm_usage_count;
+ 	struct sst_shim_regs64	*shim_regs64;
+ 	struct list_head        block_list;
+diff --git a/sound/soc/intel/sst/sst_acpi.c b/sound/soc/intel/sst/sst_acpi.c
+index e601511..0f23ef17 100644
+--- a/sound/soc/intel/sst/sst_acpi.c
++++ b/sound/soc/intel/sst/sst_acpi.c
+@@ -206,7 +206,7 @@ static const struct sst_lib_dnld_info  byt_lib_dnld_info = {
+ static const struct sst_ipc_info cht_ipc_info = {
+ 	.use_32bit_ops = false,
+ 	.ipc_offset = 0,
+-	.mbox_recv_off = 0x400,
++	.mbox_recv_off = 0x1000,
+ };
+ 
+ struct sst_platform_info cht_platform_data = {
+@@ -611,6 +611,13 @@ int sst_acpi_probe(struct platform_device *pdev)
+ 
+ 	ctx->use_32bit_ops = ctx->pdata->ipc_info->use_32bit_ops;
+ 	ctx->mailbox_recv_offset = ctx->pdata->ipc_info->mbox_recv_off;
++	if (ctx->pci_id == SST_CHT_PCI_ID) {
++		ctx->mailbox_size = SST_MAILBOX_SIZE_CHT;
++		ctx->ipc_mailbox = ctx->ddr + SST_DDR_MAILBOX_BASE;
++	} else {
++		ctx->mailbox_size = SST_MAILBOX_SIZE;
++		ctx->ipc_mailbox = ctx->mailbox;
++	}
+ 
+ 	memcpy(&ctx->info, ctx->pdata->probe_data, sizeof(ctx->info));
+ 
+diff --git a/sound/soc/intel/sst/sst_app_interface.c b/sound/soc/intel/sst/sst_app_interface.c
+index c24b6cd..4ca935a 100644
+--- a/sound/soc/intel/sst/sst_app_interface.c
++++ b/sound/soc/intel/sst/sst_app_interface.c
+@@ -110,7 +110,7 @@ static int sst_create_algo_ipc(struct snd_ppp_params *algo_params,
+ 			 - sizeof(algo_params->params) + algo_params->size;
+ 	u32 offset = 0;
+ 
+-	if (ipc_msg_size > SST_MAILBOX_SIZE)
++	if (ipc_msg_size > sst_drv_ctx->mailbox_size)
+ 		return -ENOMEM;
+ 	if (sst_create_ipc_msg(msg, true))
+ 		return -ENOMEM;
+diff --git a/sound/soc/intel/sst/sst_drv_interface.c b/sound/soc/intel/sst/sst_drv_interface.c
+index 2c2dd19..f3c83a7 100644
+--- a/sound/soc/intel/sst/sst_drv_interface.c
++++ b/sound/soc/intel/sst/sst_drv_interface.c
+@@ -139,7 +139,7 @@ static int sst_send_algo_param(struct snd_ppp_params *algo_params)
+ 			 - sizeof(algo_params->params) + algo_params->size;
+ 	u32 offset = 0;
+ 
+-	if (ipc_msg_size > SST_MAILBOX_SIZE)
++	if (ipc_msg_size > sst_drv_ctx->mailbox_size)
+ 		return -ENOMEM;
+ 	if (sst_create_ipc_msg(&msg, true))
+ 		return -ENOMEM;
+diff --git a/sound/soc/intel/sst/sst_ipc.c b/sound/soc/intel/sst/sst_ipc.c
+index 885260e..17103c1 100644
+--- a/sound/soc/intel/sst/sst_ipc.c
++++ b/sound/soc/intel/sst/sst_ipc.c
+@@ -186,7 +186,7 @@ void sst_post_message_mrfld(struct work_struct *work)
+ 	list_del(&msg->node);
+ 	pr_debug("sst: size: = %x\n", msg->mrfld_header.p.header_low_payload);
+ 	if (msg->mrfld_header.p.header_high.part.large)
+-		memcpy_toio(sst_drv_ctx->mailbox + SST_MAILBOX_SEND,
++		memcpy_toio(sst_drv_ctx->ipc_mailbox + SST_MAILBOX_SEND,
+ 			    msg->mailbox_data, msg->mrfld_header.p.header_low_payload);
+ 
+ 	trace_sst_ipc("POST  ->", msg->mrfld_header.p.header_high.full,
+@@ -241,7 +241,7 @@ void sst_post_message_mfld(struct work_struct *work)
+ 	list_del(&msg->node);
+ 	pr_debug("size: = %x\n", msg->header.part.data);
+ 	if (msg->header.part.large)
+-		memcpy_toio(sst_drv_ctx->mailbox + SST_MAILBOX_SEND,
++		memcpy_toio(sst_drv_ctx->ipc_mailbox + SST_MAILBOX_SEND,
+ 			msg->mailbox_data, msg->header.part.data);
+ 
+ 	sst_shim_write(sst_drv_ctx->shim, sst_drv_ctx->ipc_reg.ipcx, msg->header.full);
+@@ -279,7 +279,7 @@ int sst_sync_post_message_mrfld(struct ipc_post *msg)
+ 					msg->mrfld_header.p.header_high.full);
+ 	pr_debug("sst: size = 0x%x\n", msg->mrfld_header.p.header_low_payload);
+ 	if (msg->mrfld_header.p.header_high.part.large)
+-		memcpy_toio(sst_drv_ctx->mailbox + SST_MAILBOX_SEND,
++		memcpy_toio(sst_drv_ctx->ipc_mailbox + SST_MAILBOX_SEND,
+ 			msg->mailbox_data, msg->mrfld_header.p.header_low_payload);
+ 
+ 	trace_sst_ipc("POST  ->", msg->mrfld_header.p.header_high.full,
+@@ -321,7 +321,7 @@ int sst_sync_post_message_mfld(struct ipc_post *msg)
+ 	}
+ 	pr_debug("sst: Post message: header = %x\n", msg->header.full);
+ 	if (msg->header.part.large)
+-		memcpy_toio(sst_drv_ctx->mailbox + SST_MAILBOX_SEND,
++		memcpy_toio(sst_drv_ctx->ipc_mailbox + SST_MAILBOX_SEND,
+ 			msg->mailbox_data, msg->header.part.data);
+ 	sst_shim_write(sst_drv_ctx->shim, sst_drv_ctx->ipc_reg.ipcx, msg->header.full);
+ 
+diff --git a/sound/soc/intel/sst/sst_pvt.c b/sound/soc/intel/sst/sst_pvt.c
+index 3db9bad..fcad977 100644
+--- a/sound/soc/intel/sst/sst_pvt.c
++++ b/sound/soc/intel/sst/sst_pvt.c
+@@ -528,7 +528,8 @@ int sst_create_ipc_msg(struct ipc_post **arg, bool large)
+ 		return -ENOMEM;
+ 	}
+ 	if (large) {
+-		msg->mailbox_data = kzalloc(SST_MAILBOX_SIZE, GFP_ATOMIC);
++		msg->mailbox_data = kzalloc(sst_drv_ctx->mailbox_size,
++						GFP_ATOMIC);
+ 		if (!msg->mailbox_data) {
+ 			kfree(msg);
+ 			pr_err("kzalloc mailbox_data failed");
+-- 
+1.9.1
+

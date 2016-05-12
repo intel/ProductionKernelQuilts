@@ -1,0 +1,260 @@
+From 6832d6a525f35eada670b73e6337ef78a191adfb Mon Sep 17 00:00:00 2001
+Message-Id: <6832d6a525f35eada670b73e6337ef78a191adfb.1414143271.git.chang-joon.lee@intel.com>
+In-Reply-To: <f393e797ccaaf66a25ee3d7c4e6136083a6effeb.1414143271.git.chang-joon.lee@intel.com>
+References: <f393e797ccaaf66a25ee3d7c4e6136083a6effeb.1414143271.git.chang-joon.lee@intel.com>
+From: Deepak M <m.deepak@intel.com>
+Date: Mon, 13 Oct 2014 13:21:11 +0530
+Subject: [PATCH 22/26] FOR_UPSTREAM [VPG]: drm/i915: Save color manager
+ status.
+
+Save color manager component status (Gamma, CSC, Hue, Contrast)
+while going to suspend, re-apply while resuming.
+Added the crtc_inited flag because intel_modeset_init which
+calls the crtc_init is called after intel_power_domains_init_hw
+while loading driver. Hence to avoid the crash this flag is used.
+
+Issue: GMIN-2568
+Change-Id: I7d53f93bc2e921ca5f9b183eec4d9807c6d1be63
+Signed-off-by: Shashank Sharma <shashank.sharma@intel.com>
+Reviewed-on: http://android.intel.com:8080/132722
+Reviewed-by: Yang, Fei <fei.yang@intel.com>
+Reviewed-by: Kumar, Shobhit <shobhit.kumar@intel.com>
+Tested-by: Sun, Hang L <hang.l.sun@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Reviewed-on: http://android.intel.com:8080/139713
+Reviewed-by: Sun, Hang L <hang.l.sun@intel.com>
+Signed-off-by: Mahesh Kumar <mahesh1.kumar@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+Signed-off-by: Deepak M <m.deepak@intel.com>
+---
+ drivers/gpu/drm/i915/i915_suspend.c  |    8 +++
+ drivers/gpu/drm/i915/intel_clrmgr.c  |  126 ++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_clrmgr.h  |    3 +-
+ drivers/gpu/drm/i915/intel_display.c |   11 ++-
+ 4 files changed, 146 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_suspend.c b/drivers/gpu/drm/i915/i915_suspend.c
+index 72f57c4..7b8783b 100644
+--- a/drivers/gpu/drm/i915/i915_suspend.c
++++ b/drivers/gpu/drm/i915/i915_suspend.c
+@@ -28,6 +28,7 @@
+ #include <drm/i915_drm.h>
+ #include "intel_drv.h"
+ #include "i915_reg.h"
++#include "intel_clrmgr.h"
+ 
+ static u8 i915_read_indexed(struct drm_device *dev, u16 index_port, u16 data_port, u8 reg)
+ {
+@@ -218,6 +219,9 @@ static void i915_save_display(struct drm_device *dev)
+ 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
+ 		i915_save_display_reg(dev);
+ 
++	/* Save Hue/Saturation/Brightness/Contrast status */
++	intel_save_clr_mgr_status(dev);
++
+ 	/* LVDS state */
+ 	if (HAS_PCH_SPLIT(dev)) {
+ 		dev_priv->regfile.savePP_CONTROL = I915_READ(PCH_PP_CONTROL);
+@@ -325,6 +329,10 @@ static void i915_restore_display(struct drm_device *dev)
+ 		i915_restore_vga(dev);
+ 	else
+ 		i915_redisable_vga(dev);
++
++	/* Restore Gamma/Csc/Hue/Saturation/Brightness/Contrast */
++	if (!intel_restore_clr_mgr_status(dev))
++		DRM_ERROR("Restore Color manager status failed");
+ }
+ 
+ int i915_save_state(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/i915/intel_clrmgr.c b/drivers/gpu/drm/i915/intel_clrmgr.c
+index ad656c0..10269f1 100644
+--- a/drivers/gpu/drm/i915/intel_clrmgr.c
++++ b/drivers/gpu/drm/i915/intel_clrmgr.c
+@@ -78,6 +78,22 @@ u32 gcmax_softlut[GC_MAX_COUNT] =  {
+ 	0xFF00, 0xFF00, 0xFF00
+ };
+ 
++/* Hue Saturation defaults */
++struct hue_saturationlut savedhsvalues[NO_SPRITE_REG] = {
++	{SPRITEA, 0x1000000},
++	{SPRITEB, 0x1000000},
++	{SPRITEC, 0x1000000},
++	{SPRITED, 0x1000000}
++};
++
++/* Contrast brightness defaults */
++struct cont_brightlut savedcbvalues[NO_SPRITE_REG] = {
++	{SPRITEA, 0x80},
++	{SPRITEB, 0x80},
++	{SPRITEC, 0x80},
++	{SPRITED, 0x80}
++};
++
+ /* Color space conversion coff's */
+ u32 csc_softlut[CSC_MAX_COEFF_COUNT] = {
+ 	1024,	 0, 67108864, 0, 0, 1024
+@@ -614,3 +630,113 @@ int intel_sprite_hs_adjust(struct drm_i915_private *dev_priv,
+ 	}
+ 	return 0;
+ }
++
++static bool intel_restore_cb(struct drm_device *dev)
++{
++	int count = 0;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	while (count < NO_SPRITE_REG) {
++		if (intel_sprite_cb_adjust(dev_priv, &savedcbvalues[count++])) {
++			DRM_ERROR("Color Restore: Error restoring CB\n");
++			return false;
++		}
++	}
++
++	return true;
++}
++
++static bool intel_restore_hs(struct drm_device *dev)
++{
++	int count = 0;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	while (count < NO_SPRITE_REG) {
++		if (intel_sprite_hs_adjust(dev_priv, &savedhsvalues[count++])) {
++			DRM_ERROR("Color Restore: Error restoring HS\n");
++			return false;
++		}
++	}
++
++	return true;
++}
++
++bool intel_restore_clr_mgr_status(struct drm_device *dev)
++{
++	struct drm_crtc *crtc = NULL;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* Validate input */
++	if (!dev_priv) {
++		DRM_ERROR("Color Restore: Invalid input\n");
++		return false;
++	}
++
++	/* Search for a CRTC */
++	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
++		if (intel_pipe_has_type(crtc, dev_priv->vbt.has_mipi ?
++					INTEL_OUTPUT_DSI : INTEL_OUTPUT_EDP))
++			break;
++	}
++
++	if (!crtc) {
++		DRM_ERROR("Color Restore: No local panel found\n");
++		return false;
++	}
++
++	/* If gamma enabled, restore gamma */
++	if (dev_priv->gamma_enabled) {
++		if (intel_crtc_enable_gamma(crtc, PIPEA)) {
++			DRM_ERROR("Color Restore: gamma failed\n");
++			return false;
++		}
++	}
++
++	/* If csc enabled, restore csc */
++	if (dev_priv->csc_enabled) {
++		if (do_intel_enable_csc(dev, (void *) csc_softlut, crtc)) {
++			DRM_ERROR("Color Restore: CSC failed\n");
++			return false;
++		}
++	}
++
++	if (!intel_restore_hs(dev)) {
++		DRM_ERROR("Color Restore: Restore hue/sat failed\n");
++		return false;
++	}
++
++	if (!intel_restore_cb(dev)) {
++		DRM_ERROR("Color Restore: Restore CB failed\n");
++		return false;
++	}
++
++	DRM_DEBUG("Color Restore: Restore success\n");
++	return true;
++}
++EXPORT_SYMBOL(intel_restore_clr_mgr_status);
++
++void intel_save_cb_status(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	savedcbvalues[0].val = I915_READ(SPRITEA_CB_REG);
++	savedcbvalues[1].val = I915_READ(SPRITEB_CB_REG);
++	savedcbvalues[2].val = I915_READ(SPRITEC_CB_REG);
++	savedcbvalues[3].val = I915_READ(SPRITED_CB_REG);
++}
++
++void intel_save_hs_status(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	savedhsvalues[0].val = I915_READ(SPRITEA_HS_REG);
++	savedhsvalues[1].val = I915_READ(SPRITEB_HS_REG);
++	savedhsvalues[2].val = I915_READ(SPRITEC_HS_REG);
++	savedhsvalues[3].val = I915_READ(SPRITED_HS_REG);
++}
++
++void intel_save_clr_mgr_status(struct drm_device *dev)
++{
++	intel_save_hs_status(dev);
++	intel_save_cb_status(dev);
++}
++EXPORT_SYMBOL(intel_save_clr_mgr_status);
+diff --git a/drivers/gpu/drm/i915/intel_clrmgr.h b/drivers/gpu/drm/i915/intel_clrmgr.h
+index 4efc296..c1c5483 100644
+--- a/drivers/gpu/drm/i915/intel_clrmgr.h
++++ b/drivers/gpu/drm/i915/intel_clrmgr.h
+@@ -101,5 +101,6 @@ int intel_sprite_cb_adjust(struct drm_i915_private *dev_priv,
+ 		struct cont_brightlut *cb_ptr);
+ int intel_sprite_hs_adjust(struct drm_i915_private *dev_priv,
+ 		struct hue_saturationlut *hs_ptr);
+-
++void intel_save_clr_mgr_status(struct drm_device *dev);
++bool intel_restore_clr_mgr_status(struct drm_device *dev);
+ #endif
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 0598ae8..8363e01 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -44,6 +44,8 @@
+ #define DIV_ROUND_CLOSEST_ULL(ll, d)	\
+ 	({ unsigned long long _tmp = (ll)+(d)/2; do_div(_tmp, d); _tmp; })
+ 
++void intel_save_clr_mgr_status(struct drm_device *dev);
++bool intel_restore_clr_mgr_status(struct drm_device *dev);
+ static void intel_increase_pllclock(struct drm_crtc *crtc);
+ static void intel_crtc_update_cursor(struct drm_crtc *crtc, bool on);
+ static void i9xx_update_primary_plane(struct drm_crtc *crtc, struct drm_framebuffer *fb,
+@@ -5568,13 +5570,20 @@ void intel_encoder_destroy(struct drm_encoder *encoder)
+  * state of the entire output pipe. */
+ static void intel_encoder_dpms(struct intel_encoder *encoder, int mode)
+ {
++	struct drm_device *dev = encoder->base.dev;
+ 	if (mode == DRM_MODE_DPMS_ON) {
+ 		encoder->connectors_active = true;
+-
+ 		intel_crtc_update_dpms(encoder->base.crtc);
++
++		/* Restore Gamma/Csc/Hue/Saturation/Brightness/Contrast */
++		if (!intel_restore_clr_mgr_status(dev))
++			DRM_ERROR("Restore Color manager status failed");
+ 	} else {
+ 		encoder->connectors_active = false;
+ 
++		/* Save Hue/Saturation/Brightness/Contrast status */
++		intel_save_clr_mgr_status(dev);
++
+ 		intel_crtc_update_dpms(encoder->base.crtc);
+ 	}
+ }
+-- 
+1.7.9.5
+

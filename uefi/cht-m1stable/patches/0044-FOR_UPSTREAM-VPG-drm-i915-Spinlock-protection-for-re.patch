@@ -1,0 +1,72 @@
+From bb37a52e215ff19f6a71cfd0b9a983c09154af26 Mon Sep 17 00:00:00 2001
+Message-Id: <bb37a52e215ff19f6a71cfd0b9a983c09154af26.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 22 Oct 2014 13:23:57 +0100
+Subject: [PATCH 44/63] FOR_UPSTREAM [VPG]: drm/i915: Spinlock protection for
+ request list
+
+The completion status for all entries in the request list is updated on demand.
+This occurs whenever the code queries the completion status of a given request
+and a new seqno value has popped out of the hardware. Unfortuntately, not all
+such queries are done with the driver mutex lock held. Therefore there is a race
+condition between the query processing and the retired request removal code
+which can result in a dodgy pointer dereference.
+
+The solution is to spinlock around those two points - the actual list entry
+removal and the potentially asynchronous query. This ensures that the query will
+never see a node that is in the process of being destroyed.
+
+Change-Id: Ibd3c218b427507cf73152ea57775113296d2cba5
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c |    8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index dc55567..2fea3be 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2624,7 +2624,12 @@ void i915_set_reset_status(struct drm_i915_private *dev_priv,
+ 
+ static void i915_gem_free_request(struct drm_i915_gem_request *request)
+ {
++	unsigned long flags;
++
++	spin_lock_irqsave(&request->ring->reqlist_lock, flags);
+ 	list_del(&request->list);
++	spin_unlock_irqrestore(&request->ring->reqlist_lock, flags);
++
+ 	i915_gem_request_remove_from_client(request);
+ 
+ 	i915_gem_request_unreference(request);
+@@ -2796,6 +2801,7 @@ void i915_gem_complete_requests_ring(struct intel_engine_cs *ring,
+ 				     bool lazy_coherency)
+ {
+ 	struct drm_i915_gem_request *req;
++	unsigned long flags;
+ 	u32 seqno;
+ 
+ 	seqno = ring->get_seqno(ring, lazy_coherency);
+@@ -2805,6 +2811,7 @@ void i915_gem_complete_requests_ring(struct intel_engine_cs *ring,
+ 	if (seqno == ring->last_read_seqno)
+ 		return;
+ 
++	spin_lock_irqsave(&ring->reqlist_lock, flags);
+ 	list_for_each_entry(req, &ring->request_list, list) {
+ 		if (req->complete)
+ 			continue;
+@@ -2814,6 +2821,7 @@ void i915_gem_complete_requests_ring(struct intel_engine_cs *ring,
+ 			trace_i915_gem_request_complete(req);
+ 		}
+ 	}
++	spin_unlock_irqrestore(&ring->reqlist_lock, flags);
+ 
+ 	ring->last_read_seqno = seqno;
+ }
+-- 
+1.7.9.5
+

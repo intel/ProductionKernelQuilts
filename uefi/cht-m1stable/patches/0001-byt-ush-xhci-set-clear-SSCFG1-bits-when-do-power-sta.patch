@@ -1,0 +1,127 @@
+From 43875d028f555f76c83805dc37ee6fed8e198ae6 Mon Sep 17 00:00:00 2001
+From: Lu Baolu <baolu.lu@linux.intel.com>
+Date: Thu, 7 Aug 2014 11:10:04 +0800
+Subject: [PATCH 1/4]     byt ush xhci: set/clear SSCFG1 bits when do power
+ states transition
+
+    BZ: 142762
+
+    This patch implements below requirment from PMC (version 309+).
+    - set SSCFG1[28] before enters D3hot, as PMC will check this bit
+    otherwise PMC will do nothing.
+    - PMC will check SSCFG1[30] on S0ix entry to power off SS PHY and
+    SUS well. so driver set it when USH enters D3hot
+
+    Change-Id: I2bfc7fe5bf83cdff5a2648cd9c28ae221abec642
+    Signed-off-by: Wu, Hao <hao.wu@intel.com>
+    Reviewed-on: http://android.intel.com:8080/137561
+    Reviewed-by: Tang, Richard <richard.tang@intel.com>
+    Reviewed-by: Griffiths, Richard A <richard.a.griffiths@intel.com>
+    Tested-by: Wang, Ran <ran.wang@intel.com>
+    Reviewed-by: cactus <cactus@intel.com>
+    Tested-by: cactus <cactus@intel.com>
+---
+ drivers/pci/quirks.c    |   77 ++++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/pci_ids.h |    1 
+ 2 files changed, 78 insertions(+)
+
+--- linux.orig/drivers/pci/quirks.c
++++ linux/drivers/pci/quirks.c
+@@ -27,6 +27,8 @@
+ #include <linux/mm.h>
+ #include <asm/dma.h>	/* isa_dma_bridge_buggy */
+ #include "pci.h"
++#include <linux/usb.h>
++#include <linux/usb/hcd.h>
+ 
+ /*
+  * Decoding should be disabled for a PCI device during BAR sizing to avoid
+@@ -3482,3 +3484,78 @@ int pci_dev_specific_acs_enabled(struct
+ 
+ 	return -ENOTTY;
+ }
++
++#define PCI_USH_SSCFG1		0xb0
++#define PCI_USH_SSCFG1_D3	BIT(28)
++#define PCI_USH_SSCFG1_SUS	BIT(30)
++
++#define PCI_USH_OP_OFFSET	0x80
++#define PCI_USH_OP_PORTSC_OFFSET	0x400
++#define PCI_USH_OP_PORTSC_CCS	BIT(0)
++#define PCI_USH_MAX_PORTS	4
++
++static void quirk_byt_ush_suspend(struct pci_dev *dev)
++{
++	struct usb_hcd	*hcd;
++	u32	portsc;
++	u32	value;
++	int	port_index = 0;
++	int	usb_attached = 0;
++
++	dev_dbg(&dev->dev, "USH suspend quirk\n");
++
++	hcd = pci_get_drvdata(dev);
++	if (!hcd)
++		return;
++
++	/*
++	 * Check if anything attached on USB ports,
++	 * FIXME: may need to check HSIC ports.
++	 */
++	while (port_index < PCI_USH_MAX_PORTS) {
++		portsc = readl(hcd->regs + PCI_USH_OP_OFFSET +
++				PCI_USH_OP_PORTSC_OFFSET +
++				port_index * 0x10);
++		if (portsc & PCI_USH_OP_PORTSC_CCS) {
++			pr_info("XHCI: port %d, portsc 0x%x\n",
++				port_index, portsc);
++			usb_attached = 1;
++			break;
++		}
++		port_index++;
++	}
++
++	pci_read_config_dword(dev, PCI_USH_SSCFG1, &value);
++
++	/*
++	 * set SSCFG1 BIT 28 and 30 before enter D3hot
++	 * if USB attached, then we can not turn off SUS
++	 */
++	if (usb_attached)
++		value |= PCI_USH_SSCFG1_D3;
++	else
++		value |= (PCI_USH_SSCFG1_D3 | PCI_USH_SSCFG1_SUS);
++	pci_write_config_dword(dev, PCI_USH_SSCFG1, value);
++
++	pci_read_config_dword(dev, PCI_USH_SSCFG1, &value);
++	dev_dbg(&dev->dev, "PCI B0 reg (SSCFG1) = 0x%x\n", value);
++}
++DECLARE_PCI_FIXUP_SUSPEND(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_BYT_USH,
++			quirk_byt_ush_suspend);
++
++static void quirk_byt_ush_resume(struct pci_dev *dev)
++{
++	u32	value;
++
++	dev_dbg(&dev->dev, "USH resume quirk\n");
++	pci_read_config_dword(dev, PCI_USH_SSCFG1, &value);
++
++	/* clear SSCFG1 BIT 28 and 30 after back to D0 */
++	value &= (~(PCI_USH_SSCFG1_D3 | PCI_USH_SSCFG1_SUS));
++	pci_write_config_dword(dev, PCI_USH_SSCFG1, value);
++
++	pci_read_config_dword(dev, PCI_USH_SSCFG1, &value);
++	dev_dbg(&dev->dev, "PCI B0 reg (SSCFG1) = 0x%x\n", value);
++}
++DECLARE_PCI_FIXUP_RESUME(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_BYT_USH,
++			quirk_byt_ush_resume);
+--- linux.orig/include/linux/pci_ids.h
++++ linux/include/linux/pci_ids.h
+@@ -2864,6 +2864,7 @@
+ #define PCI_DEVICE_ID_INTEL_IXP4XX	0x8500
+ #define PCI_DEVICE_ID_INTEL_IXP2800	0x9004
+ #define PCI_DEVICE_ID_INTEL_S21152BB	0xb152
++#define PCI_DEVICE_ID_INTEL_BYT_USH	0x0f35
+ 
+ #define PCI_VENDOR_ID_SCALEMP		0x8686
+ #define PCI_DEVICE_ID_SCALEMP_VSMP_CTL	0x1010

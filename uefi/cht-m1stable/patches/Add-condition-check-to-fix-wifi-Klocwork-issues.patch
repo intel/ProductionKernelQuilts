@@ -1,0 +1,221 @@
+From cc509010651ce8babad45c316ceb2f95d0fd15b2 Mon Sep 17 00:00:00 2001
+From: liguan1x <guangliangx.li@intel.com>
+Date: Fri, 23 Oct 2015 15:32:59 +0800
+Subject: [PATCH] Add condition check to fix wifi Klocwork issues.
+
+CWS #118005: Array 'rdev->wiphy.bands' of size 3
+may use index value(s) 0..3.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c: nl80211_join_ibss()
+
+CWS #118020: Array 'ssid' of size 32 may use
+index value(s) 32..USHRT_MAX-5.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c: nl80211_trigger_scan()
+
+CWS #118022: Pointer 'request->ssids' checked for NULL
+may be dereferenced.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c: nl80211_trigger_scan()
+
+CWS #118028: Array 'rdev->wiphy.bands' of size 3
+may use index value(s) 0..3.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c: nl80211_parse_chandef()
+
+CWS #118036: Array 'settings->ciphers_pairwise' of
+size 20 may use index value(s) -5..USHRT_MAX-8.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c: nl80211_crypto_settings()
+
+CWS #118041: Array 'settings->akm_suites' of
+size 8 may use index value(s) -5..USHRT_MAX-8.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c: nl80211_crypto_settings()
+
+CWS #118043: Array 'wdev->ssid' of
+size 32 may use index value(s) -5..USHRT_MAX-5.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c nl80211_connect()
+
+CWS #118047: Array 'ssid' of size 32
+may use index value(s) 32..USHRT_MAX-5.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c nl80211_start_sched_scan()
+
+CWS #118054: Pointer 'request->ssids'
+checked for NULL may be dereferenced.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c nl80211_start_sched_scan()
+
+CWS #118056: Pointer 'request->ie'
+checked for NULL may be passed to function
+and may be dereferenced there
+by passing argument 1 to function 'memcpy'.
+File: /SourceCode/linux/kernel/net/wireless/nl80211.c nl80211_start_sched_scan()
+
+Change-Id: I2d3262399f890d6d960c2d84ac60491472839f59
+Category: device enablement
+Origin: internal
+Upstream-Candidate: no
+Signed-off-by: chuangx <chengcaix.huang@intel.com>
+Signed-off-by: liguan1x <guangliangx.li@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-6304
+---
+ net/wireless/ibss.c    |  5 ++++-
+ net/wireless/nl80211.c | 53 ++++++++++++++++++++++++++++++++------------------
+ net/wireless/sme.c     |  6 ++++--
+ 3 files changed, 42 insertions(+), 22 deletions(-)
+
+diff --git a/net/wireless/ibss.c b/net/wireless/ibss.c
+index f911c5f..d9de34d 100644
+--- a/net/wireless/ibss.c
++++ b/net/wireless/ibss.c
+@@ -101,7 +101,10 @@ int __cfg80211_join_ibss(struct cfg80211_registered_device *rdev,
+ 		struct ieee80211_supported_band *sband =
+ 			rdev->wiphy.bands[params->chandef.chan->band];
+ 		int j;
+-		u32 flag = params->chandef.chan->band == IEEE80211_BAND_5GHZ ?
++		u32 flag = 0;
++		if (params->chandef.chan->band >= IEEE80211_NUM_BANDS)
++			return -EINVAL;
++		flag = params->chandef.chan->band == IEEE80211_BAND_5GHZ ?
+ 			IEEE80211_RATE_MANDATORY_A :
+ 			IEEE80211_RATE_MANDATORY_B;
+ 
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index c260243..22bef15 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -1868,6 +1868,9 @@ static int nl80211_parse_chandef(struct cfg80211_registered_device *rdev,
+ 	if (!cfg80211_chandef_valid(chandef))
+ 		return -EINVAL;
+ 
++	if (chandef->chan->band >= IEEE80211_NUM_BANDS)
++		return -EINVAL;
++
+ 	if (!cfg80211_chandef_usable(&rdev->wiphy, chandef,
+ 				     IEEE80211_CHAN_DISABLED))
+ 		return -EINVAL;
+@@ -5357,15 +5360,16 @@ static int nl80211_trigger_scan(struct sk_buff *skb, struct genl_info *info)
+ 	request->n_channels = i;
+ 
+ 	i = 0;
+-	if (info->attrs[NL80211_ATTR_SCAN_SSIDS]) {
++	if (request->ssids && info->attrs[NL80211_ATTR_SCAN_SSIDS]) {
+ 		nla_for_each_nested(attr, info->attrs[NL80211_ATTR_SCAN_SSIDS], tmp) {
+-			if (nla_len(attr) > IEEE80211_MAX_SSID_LEN) {
++			if (nla_len(attr) <= IEEE80211_MAX_SSID_LEN) {
++				request->ssids[i].ssid_len = nla_len(attr);
++				memcpy(request->ssids[i].ssid, nla_data(attr), nla_len(attr));
++				i++;
++			} else {
+ 				err = -EINVAL;
+ 				goto out_free;
+ 			}
+-			request->ssids[i].ssid_len = nla_len(attr);
+-			memcpy(request->ssids[i].ssid, nla_data(attr), nla_len(attr));
+-			i++;
+ 		}
+ 	}
+ 
+@@ -5589,17 +5593,20 @@ static int nl80211_start_sched_scan(struct sk_buff *skb,
+ 	request->n_channels = i;
+ 
+ 	i = 0;
+-	if (info->attrs[NL80211_ATTR_SCAN_SSIDS]) {
++	if (request->ssids && info->attrs[NL80211_ATTR_SCAN_SSIDS]) {
+ 		nla_for_each_nested(attr, info->attrs[NL80211_ATTR_SCAN_SSIDS],
+ 				    tmp) {
+-			if (nla_len(attr) > IEEE80211_MAX_SSID_LEN) {
++			if (nla_len(attr) <= IEEE80211_MAX_SSID_LEN) {
++				request->ssids[i].ssid_len = nla_len(attr);
++				memcpy(request->ssids[i].ssid, nla_data(attr),
++				       nla_len(attr));
++				i++;
++
++			} else {
+ 				err = -EINVAL;
+ 				goto out_free;
+ 			}
+-			request->ssids[i].ssid_len = nla_len(attr);
+-			memcpy(request->ssids[i].ssid, nla_data(attr),
+-			       nla_len(attr));
+-			i++;
++
+ 		}
+ 	}
+ 
+@@ -5615,14 +5622,15 @@ static int nl80211_start_sched_scan(struct sk_buff *skb,
+ 				  nl80211_match_policy);
+ 			ssid = tb[NL80211_SCHED_SCAN_MATCH_ATTR_SSID];
+ 			if (ssid) {
+-				if (nla_len(ssid) > IEEE80211_MAX_SSID_LEN) {
++				if (nla_len(ssid) <= IEEE80211_MAX_SSID_LEN) {
++					memcpy(request->match_sets[i].ssid.ssid,
++					       nla_data(ssid), nla_len(ssid));
++					request->match_sets[i].ssid.ssid_len =
++						nla_len(ssid);
++				} else {
+ 					err = -EINVAL;
+ 					goto out_free;
+ 				}
+-				memcpy(request->match_sets[i].ssid.ssid,
+-				       nla_data(ssid), nla_len(ssid));
+-				request->match_sets[i].ssid.ssid_len =
+-					nla_len(ssid);
+ 			}
+ 			rssi = tb[NL80211_SCHED_SCAN_MATCH_ATTR_RSSI];
+ 			if (rssi)
+@@ -5636,9 +5644,10 @@ static int nl80211_start_sched_scan(struct sk_buff *skb,
+ 
+ 	if (info->attrs[NL80211_ATTR_IE]) {
+ 		request->ie_len = nla_len(info->attrs[NL80211_ATTR_IE]);
+-		memcpy((void *)request->ie,
+-		       nla_data(info->attrs[NL80211_ATTR_IE]),
+-		       request->ie_len);
++		if (request->ie)
++			memcpy((void *)request->ie,
++			       nla_data(info->attrs[NL80211_ATTR_IE]),
++			       request->ie_len);
+ 	}
+ 
+ 	if (info->attrs[NL80211_ATTR_SCAN_FLAGS]) {
+@@ -6285,6 +6294,9 @@ static int nl80211_crypto_settings(struct cfg80211_registered_device *rdev,
+ 		if (settings->n_ciphers_pairwise > cipher_limit)
+ 			return -EINVAL;
+ 
++		if (len <= 0 || len > 20)
++			return -EINVAL;
++
+ 		memcpy(settings->ciphers_pairwise, data, len);
+ 
+ 		for (i = 0; i < settings->n_ciphers_pairwise; i++)
+@@ -6323,6 +6335,9 @@ static int nl80211_crypto_settings(struct cfg80211_registered_device *rdev,
+ 		if (settings->n_akm_suites > NL80211_MAX_NR_AKM_SUITES)
+ 			return -EINVAL;
+ 
++		if (len <= 0 || len > 8)
++			return -EINVAL;
++
+ 		memcpy(settings->akm_suites, data, len);
+ 	}
+ 
+diff --git a/net/wireless/sme.c b/net/wireless/sme.c
+index 760722f..18ab4f0 100644
+--- a/net/wireless/sme.c
++++ b/net/wireless/sme.c
+@@ -19,7 +19,6 @@
+ #include "nl80211.h"
+ #include "reg.h"
+ #include "rdev-ops.h"
+-
+ /*
+  * Software SME in cfg80211, using auth/assoc/deauth calls to the
+  * driver. This is is for implementing nl80211's connect/disconnect
+@@ -952,7 +951,10 @@ int cfg80211_connect(struct cfg80211_registered_device *rdev,
+ 	}
+ 
+ 	wdev->connect_keys = connkeys;
+-	memcpy(wdev->ssid, connect->ssid, connect->ssid_len);
++	if (connect->ssid_len <= IEEE80211_MAX_SSID_LEN)
++		memcpy(wdev->ssid, connect->ssid, connect->ssid_len);
++	else
++		return -EINVAL;
+ 	wdev->ssid_len = connect->ssid_len;
+ 
+ 	if (!rdev->ops->connect)
+-- 
+1.9.1
+

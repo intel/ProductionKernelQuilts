@@ -1,0 +1,275 @@
+From ab9350f521cf9df907211e12cad70b94098a7928 Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Thu, 17 Jul 2014 15:46:37 -0700
+Subject: [PATCH 081/117] i2c camera drivers: Clean up initialization
+
+The gminification idiom applied to the gc0339, gc2235, mt9m114 and
+ov5693 drivers would call atomisp_register_i2c_module() every time the
+stream configuration changed.  Move this to the probe function where
+it belongs, and clean up the logic around the platform_data pointers.
+
+Issue: GMIN-2253
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ .../camera/drivers/media/i2c/gc0339.c              | 45 ++++++++------------
+ .../camera/drivers/media/i2c/gc2235.c              | 48 ++++++++--------------
+ .../camera/drivers/media/i2c/mt9m114.c             | 29 +++++++------
+ .../camera/drivers/media/i2c/ov5693.c              | 27 ++++++------
+ 4 files changed, 62 insertions(+), 87 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/gc0339.c b/drivers/external_drivers/camera/drivers/media/i2c/gc0339.c
+index 0229375..a33db2b 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/gc0339.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/gc0339.c
+@@ -1260,19 +1260,6 @@ static int gc0339_s_config(struct v4l2_subdev *sd,
+ 		goto fail_csi_cfg;
+ 	}
+ 
+-	/* Register the atomisp platform data prior to the ISP module
+-	 * load.  Ideally this would be stored as data on the
+-	 * subdevices, but this API matches upstream better. */
+-	ret = atomisp_register_i2c_module(sd, client, platform_data,
+-					  gmin_get_var_int(&client->dev, "CamType",
+-						     RAW_CAMERA),
+-					  gmin_get_var_int(&client->dev, "CsiPort",
+-						     ATOMISP_CAMERA_PORT_PRIMARY));
+-	if (ret) {
+-		dev_err(&client->dev,
+-			"gc2235 atomisp_register_i2c_module failed.\n");
+-		goto fail_csi_cfg;
+-	}
+ 	mutex_unlock(&dev->input_lock);
+ 
+ 	pr_info("%s E\n", __func__);
+@@ -1497,7 +1484,8 @@ static int gc0339_probe(struct i2c_client *client,
+ 			const struct i2c_device_id *id)
+ {
+ 	struct gc0339_device *dev;
+-	int ret;
++	int ret = -1;
++	void *pdata = client->dev.platform_data;
+ 
+ 	pr_info("%s S\n", __func__);
+ 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+@@ -1511,21 +1499,20 @@ static int gc0339_probe(struct i2c_client *client,
+ 	dev->fmt_idx = 0;
+ 	v4l2_i2c_subdev_init(&(dev->sd), client, &gc0339_ops);
+ 
+-	if (client->dev.platform_data) {
+-		ret = gc0339_s_config(&dev->sd, client->irq,
+-				       client->dev.platform_data);
+-		if (ret)
+-			goto out_free;
+-	} else if (ACPI_COMPANION(&client->dev)) {
+-		/*
+-		 * If no SFI firmware, grab the platform struct
+-		 * directly and configure via ACPI/EFIvars instead
+-		 */
+-		ret = gc0339_s_config(&dev->sd, client->irq,
+-				      gmin_camera_platform_data());
+-		if (ret)
+-			goto out_free;
+-	}
++	if (ACPI_COMPANION(&client->dev))
++		pdata = gmin_camera_platform_data();
++	if (!pdata)
++		goto out_free;
++
++	ret = gc0339_s_config(&dev->sd, client->irq, pdata);
++	if (ret)
++		goto out_free;
++
++	ret = atomisp_register_i2c_module(&dev->sd, client, pdata, RAW_CAMERA,
++					  gmin_get_var_int(&client->dev, "CsiPort",
++							   ATOMISP_CAMERA_PORT_PRIMARY));
++	if (ret)
++		goto out_free;
+ 
+ 	dev->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+ 	dev->pad.flags = MEDIA_PAD_FL_SOURCE;
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/gc2235.c b/drivers/external_drivers/camera/drivers/media/i2c/gc2235.c
+index 479da98..93fc8bd 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/gc2235.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/gc2235.c
+@@ -1309,21 +1309,6 @@ static int gc2235_s_config(struct v4l2_subdev *sd,
+ 
+ 	dev->sensor_id = sensor_id;
+ 
+-	/* Register the atomisp platform data prior to the ISP module
+-	 * load.  Ideally this would be stored as data on the
+-	 * subdevices, but this API matches upstream better. */
+-	ret = atomisp_register_i2c_module(sd, client, dev->platform_data,
+-					  gmin_get_var_int(&client->dev, "CamType",
+-						     RAW_CAMERA),
+-					  gmin_get_var_int(&client->dev, "CsiPort",
+-						     ATOMISP_CAMERA_PORT_PRIMARY));
+-
+-	if (ret) {
+-		dev_err(&client->dev,
+-			"gc2235 atomisp_register_i2c_module failed.\n");
+-		goto fail_csi_cfg;
+-	}
+-
+ 	/* power off sensor */
+ 	ret = __gc2235_s_power(sd, 0);
+ 	mutex_unlock(&dev->input_lock);
+@@ -1563,7 +1548,8 @@ static int gc2235_probe(struct i2c_client *client,
+ {
+ 	struct gc2235_device *dev;
+ 	struct camera_mipi_info *gc2235_info = NULL;
+-	int ret;
++	int ret = -1;
++	void *pdata = client->dev.platform_data;
+ 
+ 	/* allocate sensor device & init sub device */
+ 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+@@ -1579,21 +1565,21 @@ static int gc2235_probe(struct i2c_client *client,
+ 
+ 	dev->once_launched = 0;
+ 
+-	if (client->dev.platform_data) {
+-		ret = gc2235_s_config(&dev->sd, client->irq,
+-				       client->dev.platform_data);
+-		if (ret)
+-			goto out_free;
+-	} else if (ACPI_COMPANION(&client->dev)) {
+-		/*
+-		 * If no SFI firmware, grab the platform struct
+-		 * directly and configure via ACPI/EFIvars instead
+-		 */
+-		ret = gc2235_s_config(&dev->sd, client->irq,
+-				      gmin_camera_platform_data());
+-		if (ret)
+-			goto out_free;
+-	}
++	if (ACPI_COMPANION(&client->dev))
++		pdata = gmin_camera_platform_data();
++	if (!pdata)
++		goto out_free;
++
++	ret = gc2235_s_config(&dev->sd, client->irq, pdata);
++	if (ret)
++		goto out_free;
++
++	ret = atomisp_register_i2c_module(&dev->sd, client, pdata, RAW_CAMERA,
++					  gmin_get_var_int(&client->dev, "CsiPort",
++							   ATOMISP_CAMERA_PORT_PRIMARY));
++	if (ret)
++		goto out_free;
++
+ 	gc2235_info = v4l2_get_subdev_hostdata(&dev->sd);
+ 
+ 	/*
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+index 811bd02..98e15c2 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+@@ -1455,12 +1455,6 @@ mt9m114_s_config(struct v4l2_subdev *sd, int irq, void *platform_data)
+ 		return ret;
+ 	}
+ 
+-	ret = atomisp_register_i2c_module(sd, client, platform_data,
+-					  gmin_get_var_int(&client->dev, "CamType",
+-							   RAW_CAMERA),
+-					  gmin_get_var_int(&client->dev, "CsiPort",
+-							   ATOMISP_CAMERA_PORT_PRIMARY));
+-
+ 	return ret;
+ 
+ fail_csi_cfg:
+@@ -1837,6 +1831,7 @@ static int mt9m114_probe(struct i2c_client *client,
+ {
+ 	struct mt9m114_device *dev;
+ 	int ret = 0;
++	void *pdata;
+ 
+ 	/* Setup sensor configuration structure */
+ 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+@@ -1846,17 +1841,25 @@ static int mt9m114_probe(struct i2c_client *client,
+ 	}
+ 
+ 	v4l2_i2c_subdev_init(&dev->sd, client, &mt9m114_ops);
+-	if (client->dev.platform_data) {
+-		ret = mt9m114_s_config(&dev->sd, client->irq,
+-				       client->dev.platform_data);
+-	} else if (ACPI_COMPANION(&client->dev)) {
+-		ret = mt9m114_s_config(&dev->sd, client->irq,
+-				       gmin_camera_platform_data());
++
++	pdata = client->dev.platform_data;
++	if (ACPI_COMPANION(&client->dev))
++		pdata = gmin_camera_platform_data();
++
++	if (pdata)
++		ret = mt9m114_s_config(&dev->sd, client->irq, pdata);
++	if (!pdata || ret) {
++		v4l2_device_unregister_subdev(&dev->sd);
++		kfree(dev);
++		return ret;
+ 	}
++
++	ret = atomisp_register_i2c_module(&dev->sd, client, pdata, RAW_CAMERA,
++					  gmin_get_var_int(&client->dev, "CsiPort",
++							   ATOMISP_CAMERA_PORT_PRIMARY));
+ 	if (ret) {
+ 		v4l2_device_unregister_subdev(&dev->sd);
+ 		kfree(dev);
+-		return ret;
+ 	}
+ 
+ 	/*TODO add format code here*/
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c b/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c
+index 8082da4..4712532 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c
+@@ -1409,13 +1409,6 @@ static int ov5693_s_config(struct v4l2_subdev *sd,
+ 	}
+ 	mutex_unlock(&dev->input_lock);
+ 
+-
+-	ret = atomisp_register_i2c_module(sd, client, platform_data,
+-					  gmin_get_var_int(&client->dev, "CamType",
+-							   RAW_CAMERA),
+-					  gmin_get_var_int(&client->dev, "CsiPort",
+-							   ATOMISP_CAMERA_PORT_PRIMARY));
+-
+ 	return ret;
+ 
+ fail_csi_cfg:
+@@ -1623,6 +1616,7 @@ static int ov5693_probe(struct i2c_client *client,
+ 	struct ov5693_device *dev;
+ 	int i2c;
+ 	int ret = 0;
++	void *pdata = client->dev.platform_data;
+ 
+ 	/* Firmware workaround: Some modules use a "secondary default"
+ 	 * address of 0x10 which doesn't appear on schematics, and
+@@ -1646,13 +1640,18 @@ static int ov5693_probe(struct i2c_client *client,
+ 	dev->fmt_idx = 0;
+ 	v4l2_i2c_subdev_init(&(dev->sd), client, &ov5693_ops);
+ 
+-	if (client->dev.platform_data) {
+-		ret = ov5693_s_config(&dev->sd, client->irq,
+-				       client->dev.platform_data);
+-	} else if (ACPI_COMPANION(&client->dev)) {
+-		ret = ov5693_s_config(&dev->sd, client->irq,
+-				      gmin_camera_platform_data());
+-	}
++	if (ACPI_COMPANION(&client->dev))
++		pdata = gmin_camera_platform_data();
++	if (!pdata)
++		goto out_free;
++
++	ret = ov5693_s_config(&dev->sd, client->irq, pdata);
++	if (ret)
++		goto out_free;
++
++	ret = atomisp_register_i2c_module(&dev->sd, client, pdata, RAW_CAMERA,
++					  gmin_get_var_int(&client->dev, "CsiPort",
++							   ATOMISP_CAMERA_PORT_PRIMARY));
+ 	if (ret)
+ 		goto out_free;
+ 
+-- 
+1.9.3
+

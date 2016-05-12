@@ -1,0 +1,174 @@
+From 7f3107eaf38b05179a7e779ec090b3c791320860 Mon Sep 17 00:00:00 2001
+From: Jon Bloomfield <jon.bloomfield@intel.com>
+Date: Thu, 13 Nov 2014 19:34:38 +0000
+Subject: [PATCH 3/4] SQUASHME! [VPG]: drm/i915: Corrections to pid handling
+ in memtracker
+
+SQUASHME! - This patch should be squashed into the following existing patch:
+
+Author: Sourab Gupta <sourab.gupta@intel.com>
+Date:   Mon Aug 11 13:12:04 2014 +0530
+Change-Id: I02552d54a753fcfb94b5bdd9bc9c82702bbf514d
+	MUST_REBASE [VPG]: drm/i915: Sysfs interface to get GFX shmem usage stats per process
+
+The memtracker code does not take a reference to the tgid when recording
+the pid struct in the priv_file.
+
+This could cause a kernel panic if we attempt to use the pid from a process
+which has died.
+
+The potential for this is subtle:
+
+Usually, if a process dies all open file descriptors are closed, so the
+the driver will be closed also, file_priv will be destroyed and there's
+no issue.
+
+However, if the original process forks prior to dying, then the child
+process(es) will inherit the file_priv, along with parents pid struct ptr.
+Since no reference was declared with get_pid(), the parents pid struct ptr
+will be freed off by the kernel, but the ptr will still be held in the
+(now childs) file_priv. A subsequent memtracker event will attempt to deref
+the now invalid ptr, causing a panic.
+
+Correct the issue by taking a reference to the pid with get_pid() and
+releasing again with put_pid() in i915_gem_release().
+
+v2: When i915_gem_get_all_obj_info() is calling idr_for_each(), the list may be
+    modified concurrently by parallel path executing in drm_gem_handle_delete()
+    and drm_gem_handle_create_tail(). We need to apply the file_priv->table_lock
+    spinlock protection to protect the idr_for_each() access in
+    i915_gem_get_all_obj_info(). Applying this fix in v2 of this patch.
+
+Issue: GMINL-3913
+Change-Id: I1c48514b1d0abcea1a9f3e18dca582ec9c5087e6
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c       |    9 +++++++-
+ drivers/gpu/drm/i915/i915_gem_debug.c |   38 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index e57a443..07692cc 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5207,6 +5207,8 @@ void i915_gem_release(struct drm_device *dev, struct drm_file *file)
+ {
+ 	struct drm_i915_file_private *file_priv = file->driver_priv;
+ 
++	put_pid(file_priv->tgid);
++
+ 	cancel_delayed_work_sync(&file_priv->mm.idle_work);
+ 
+ 	/* Clean up our request list when the client is going away, so that
+@@ -5248,7 +5250,11 @@ int i915_gem_open(struct drm_device *dev, struct drm_file *file)
+ 	file->driver_priv = file_priv;
+ 	file_priv->dev_priv = dev->dev_private;
+ 	file_priv->file = file;
+-	file_priv->tgid = find_vpid(task_tgid_nr(current));
++
++	rcu_read_lock();
++	file_priv->tgid = get_pid(find_vpid(task_tgid_nr(current)));
++	rcu_read_unlock();
++
+ 	file_priv->process_name =  kzalloc(PAGE_SIZE, GFP_ATOMIC);
+ 	if (!file_priv->process_name) {
+ 		ret = -ENOMEM;
+@@ -5273,6 +5279,7 @@ int i915_gem_open(struct drm_device *dev, struct drm_file *file)
+ out_free_name:
+ 	kfree(file_priv->process_name);
+ out_free_file:
++	put_pid(file_priv->tgid);
+ 	kfree(file_priv);
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/i915/i915_gem_debug.c b/drivers/gpu/drm/i915/i915_gem_debug.c
+index 3f551eb..db4ebd5 100644
+--- a/drivers/gpu/drm/i915/i915_gem_debug.c
++++ b/drivers/gpu/drm/i915/i915_gem_debug.c
+@@ -472,6 +472,17 @@ static void i915_obj_pidarray_validate(struct drm_gem_object *gem_obj)
+ 	 * be subset of the the drm filelist pid entries.
+ 	 */
+ 	list_for_each_entry_safe(pid_entry, pid_next, &obj->pid_info, head) {
++		if (pid_next == NULL) {
++			DRM_ERROR(
++				  "Invalid pid info. obj:%p, size:%zdK, pin flag:%s, tiling:%s, userptr=%s, stolen:%s, name:%d, handle_count=%d\n",
++				  &obj->base, obj->base.size/1024,
++				  get_pin_flag(obj), get_tiling_flag(obj),
++				  (obj->userptr.mm != 0) ? "Y" : "N",
++				  obj->stolen ? "Y" : "N", obj->base.name,
++				  obj->base.handle_count);
++			break;
++		}
++
+ 		present = 0;
+ 		list_for_each_entry(file, &dev->filelist, lhead) {
+ 			file_priv = file->driver_priv;
+@@ -586,6 +597,16 @@ i915_drm_gem_obj_info(int id, void *ptr, void *data)
+ 	struct drm_i915_error_state_buf *m = data;
+ 	int ret;
+ 
++	if (obj->pid_info.next == NULL) {
++		DRM_ERROR(
++			"Invalid pid info. obj:%p, size:%zdK, pin flag:%s, tiling:%s, userptr=%s, stolen:%s, name:%d, handle_count=%d\n",
++			&obj->base, obj->base.size/1024,
++			get_pin_flag(obj), get_tiling_flag(obj),
++			(obj->userptr.mm != 0) ? "Y" : "N",
++			obj->stolen ? "Y" : "N", obj->base.name,
++			obj->base.handle_count);
++		return 0;
++	}
+ 	i915_obj_pidarray_validate(&obj->base);
+ 	ret = i915_describe_obj(m, obj);
+ 
+@@ -602,6 +623,17 @@ i915_drm_gem_object_per_file_summary(int id, void *ptr, void *data)
+ 	struct drm_hash_item *hash_item;
+ 	int obj_shared_count = 0;
+ 
++	if (obj->pid_info.next == NULL) {
++		DRM_ERROR(
++			"Invalid pid info. obj:%p, size:%zdK, pin flag:%s, tiling:%s, userptr=%s, stolen:%s, name:%d, handle_count=%d\n",
++			&obj->base, obj->base.size/1024,
++			get_pin_flag(obj), get_tiling_flag(obj),
++			(obj->userptr.mm != 0) ? "Y" : "N",
++			obj->stolen ? "Y" : "N", obj->base.name,
++			obj->base.handle_count);
++		return 0;
++	}
++
+ 	i915_obj_pidarray_validate(&obj->base);
+ 
+ 	stats->num_obj++;
+@@ -611,7 +643,7 @@ i915_drm_gem_object_per_file_summary(int id, void *ptr, void *data)
+ 		if (drm_ht_find_item(&pid_entry->namelist,
+ 				(unsigned long)obj->base.name, &hash_item)) {
+ 			struct name_entry *entry =
+-				kzalloc(sizeof(*entry), GFP_KERNEL);
++				kzalloc(sizeof(*entry), GFP_NOWAIT);
+ 			if (entry == NULL) {
+ 				DRM_ERROR("alloc failed\n");
+ 				return -ENOMEM;
+@@ -741,8 +773,10 @@ __i915_get_drm_clients_info(struct drm_i915_error_state_buf *m,
+ 			pid_entry = new_entry;
+ 		}
+ 
++		spin_lock(&file->table_lock);
+ 		ret = idr_for_each(&file->object_idr,
+ 			&i915_drm_gem_object_per_file_summary, pid_entry);
++		spin_unlock(&file->table_lock);
+ 		if (ret)
+ 			break;
+ 	}
+@@ -859,8 +893,10 @@ __i915_gem_get_all_obj_info(struct drm_i915_error_state_buf *m,
+ 
+ 		err_puts(m,
+ 			"\n Obj Identifier       Size Pin Tiling Dirty Shared Vmap Stolen Mappable  AllocState Global/PP  GttOffset (PID: handle count: user virt addrs)\n");
++		spin_lock(&file->table_lock);
+ 		ret = idr_for_each(&file->object_idr,
+ 				&i915_drm_gem_obj_info, m);
++		spin_unlock(&file->table_lock);
+ 		if (ret)
+ 			break;
+ 	}
+-- 
+1.7.9.5
+

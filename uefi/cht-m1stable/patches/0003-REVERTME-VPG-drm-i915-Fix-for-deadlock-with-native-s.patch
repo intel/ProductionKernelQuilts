@@ -1,0 +1,89 @@
+From 854c5158d0b872203e0805449694327fb741a1e8 Mon Sep 17 00:00:00 2001
+Message-Id: <854c5158d0b872203e0805449694327fb741a1e8.1432852048.git.chang-joon.lee@intel.com>
+In-Reply-To: <c5e9fa1af945ac4e7bd37c3035c0e756494f0273.1432852048.git.chang-joon.lee@intel.com>
+References: <c5e9fa1af945ac4e7bd37c3035c0e756494f0273.1432852048.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 5 May 2015 12:32:53 +0100
+Subject: [PATCH 3/4] REVERTME [VPG]: drm/i915: Fix for deadlock with native
+ syncs vs SurfaceFlinger
+
+There is a mechanism for stalling the execution of a batch buffer
+until a specified native sync point has been signaled. The intention
+is that this is handled asynchronously in the driver. However doing so
+can lead to a deadlock with Surface Flinger as follows:
+  App renders frame N
+  App passes frame N to Surface Flinger
+  Surface Flinger takes note and returns a sync point
+  App renders frame N+1 with SF sync point for frame N
+  VBlank interrupt fires
+  Surface Flinger presents frame N to the driver for display
+  Driver stalls because the frame N buffer object has outstanding rendering
+  But the outstanding rendering is for frame N+1 and is blocked waiting
+  on display completion for frame N
+
+The basic issue is that Surface Flinger manages its dependencies
+internally and only presents the frame to the driver when it already
+believes it is safe to display. However, the driver will only display
+a buffer when _all_ rendering to it has completed. It has no knowledge
+of frame numbers and merely sees the rendering being present first and
+therefore believes it must complete first.
+
+The simplest solution is to stop the driver from attempting to
+synchronise the rendering with the display. That is, trust that
+Surface Flinger has done its job properly and that any incoming page
+flip request should be executed immediately without a stall
+irrespective of any rendering. The cleanest way to do this would be to
+set a property on the plane to say that its synchronisation is being
+managed externally. However, such properties don't exist until the new
+display APIs land in the next fork lift driver.
+
+Hence this patch simply disables the display <- rendering
+synchronisation unilaterally.
+
+Until the new property API arrives, this patch is a REVERTME. Once
+that API does arrive, the patch will need to be updated to make use of
+it. At that point, it could become a FOR_UPSTREAM, assuming the
+property API is also upstreamed.
+
+Change-Id: Id3f6e9d4bd88dca051a34a34f835f77bc5541108
+For: VIZ-1587
+For: VIZ-4741
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 7dab777..cf9ee70 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3262,6 +3262,26 @@ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 	if (from == NULL || to == from)
+ 		return 0;
+ 
++	if (!to_batch) {
++		/*
++		 * The request is coming from a display path. For Android,
++		 * that means SurfaceFlinger. Our SF/HardwareComposer already
++		 * guarantees that all outstanding rendering has completed
++		 * for the frame being presented. It does not guarantee to
++		 * actually present that frame before any further rendering
++		 * has been queued. With native syncs, that can even include
++		 * rendering that writes to the object.
++		 *
++		 * The driver must therefore trust that SF knows what it is
++		 * doing and simply ignore the apparent synchronisation
++		 * requirement. Otherwise a deadlock can occur where the
++		 * display is waiting for rendering to complete to present
++		 * frame N but in reality the rendering is for frame N+1 and
++		 * is itself stalled waiting for frame N to finish displaying.
++		 */
++		return 0;
++	}
++
+ 	if (to == NULL)
+ 		goto wait;
+ 
+-- 
+1.9.1
+

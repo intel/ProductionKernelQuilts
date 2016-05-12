@@ -1,0 +1,1485 @@
+From 3ea9fbbdb95c1b4679f6c4d75b219ed417557c6e Mon Sep 17 00:00:00 2001
+From: Jeff Vander Stoep <jeffv@google.com>
+Date: Fri, 10 Jul 2015 17:19:56 -0400
+Subject: [PATCH 641/645] selinux: extended permissions for ioctls
+
+(cherry picked from commit fa1aa143ac4a682c7f5fd52a3cf05f5a6fe44a0a)
+
+Add extended permissions logic to selinux. Extended permissions
+provides additional permissions in 256 bit increments. Extend the
+generic ioctl permission check to use the extended permissions for
+per-command filtering. Source/target/class sets including the ioctl
+permission may additionally include a set of commands. Example:
+
+allowxperm <source> <target>:<class> ioctl unpriv_app_socket_cmds
+auditallowxperm <source> <target>:<class> ioctl priv_gpu_cmds
+
+Where unpriv_app_socket_cmds and priv_gpu_cmds are macros
+representing commonly granted sets of ioctl commands.
+
+When ioctl commands are omitted only the permissions are checked.
+This feature is intended to provide finer granularity for the ioctl
+permission that may be too imprecise. For example, the same driver
+may use ioctls to provide important and benign functionality such as
+driver version or socket type as well as dangerous capabilities such
+as debugging features, read/write/execute to physical memory or
+access to sensitive data. Per-command filtering provides a mechanism
+to reduce the attack surface of the kernel, and limit applications
+to the subset of commands required.
+
+The format of the policy binary has been modified to include ioctl
+commands, and the policy version number has been incremented to
+POLICYDB_VERSION_XPERMS_IOCTL=30 to account for the format
+change.
+
+The extended permissions logic is deliberately generic to allow
+components to be reused e.g. netlink filters
+
+Signed-off-by: Jeff Vander Stoep <jeffv@google.com>
+Acked-by: Nick Kralevich <nnk@google.com>
+Signed-off-by: Paul Moore <pmoore@redhat.com>
+Bug: 22846070
+Change-Id: I74ce041142b545288ededfac7ca9446975dcf2f5
+---
+ security/selinux/avc.c              | 415 ++++++++++++++++++++++++++++++++++--
+ security/selinux/hooks.c            |  42 +++-
+ security/selinux/include/avc.h      |   5 +
+ security/selinux/include/security.h |  32 ++-
+ security/selinux/ss/avtab.c         | 104 +++++++--
+ security/selinux/ss/avtab.h         |  34 ++-
+ security/selinux/ss/conditional.c   |  32 ++-
+ security/selinux/ss/conditional.h   |   6 +-
+ security/selinux/ss/policydb.c      |   5 +
+ security/selinux/ss/services.c      | 213 ++++++++++++++++--
+ security/selinux/ss/services.h      |   6 +
+ 11 files changed, 834 insertions(+), 60 deletions(-)
+
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index e6caf9a..fd33dbc 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -22,6 +22,7 @@
+ #include <linux/init.h>
+ #include <linux/skbuff.h>
+ #include <linux/percpu.h>
++#include <linux/list.h>
+ #include <net/sock.h>
+ #include <linux/un.h>
+ #include <net/af_unix.h>
+@@ -48,6 +49,7 @@ struct avc_entry {
+ 	u32			tsid;
+ 	u16			tclass;
+ 	struct av_decision	avd;
++	struct avc_xperms_node	*xp_node;
+ };
+ 
+ struct avc_node {
+@@ -56,6 +58,16 @@ struct avc_node {
+ 	struct rcu_head		rhead;
+ };
+ 
++struct avc_xperms_decision_node {
++	struct extended_perms_decision xpd;
++	struct list_head xpd_list; /* list of extended_perms_decision */
++};
++
++struct avc_xperms_node {
++	struct extended_perms xp;
++	struct list_head xpd_head; /* list head of extended_perms_decision */
++};
++
+ struct avc_cache {
+ 	struct hlist_head	slots[AVC_CACHE_SLOTS]; /* head for avc_node->list */
+ 	spinlock_t		slots_lock[AVC_CACHE_SLOTS]; /* lock for writes */
+@@ -80,6 +92,9 @@ DEFINE_PER_CPU(struct avc_cache_stats, avc_cache_stats) = { 0 };
+ static struct avc_cache avc_cache;
+ static struct avc_callback_node *avc_callbacks;
+ static struct kmem_cache *avc_node_cachep;
++static struct kmem_cache *avc_xperms_data_cachep;
++static struct kmem_cache *avc_xperms_decision_cachep;
++static struct kmem_cache *avc_xperms_cachep;
+ 
+ static inline int avc_hash(u32 ssid, u32 tsid, u16 tclass)
+ {
+@@ -170,7 +185,17 @@ void __init avc_init(void)
+ 	atomic_set(&avc_cache.lru_hint, 0);
+ 
+ 	avc_node_cachep = kmem_cache_create("avc_node", sizeof(struct avc_node),
+-					     0, SLAB_PANIC, NULL);
++					0, SLAB_PANIC, NULL);
++	avc_xperms_cachep = kmem_cache_create("avc_xperms_node",
++					sizeof(struct avc_xperms_node),
++					0, SLAB_PANIC, NULL);
++	avc_xperms_decision_cachep = kmem_cache_create(
++					"avc_xperms_decision_node",
++					sizeof(struct avc_xperms_decision_node),
++					0, SLAB_PANIC, NULL);
++	avc_xperms_data_cachep = kmem_cache_create("avc_xperms_data",
++					sizeof(struct extended_perms_data),
++					0, SLAB_PANIC, NULL);
+ 
+ 	audit_log(current->audit_context, GFP_KERNEL, AUDIT_KERNEL, "AVC INITIALIZED\n");
+ }
+@@ -205,9 +230,261 @@ int avc_get_hash_stats(char *page)
+ 			 slots_used, AVC_CACHE_SLOTS, max_chain_len);
+ }
+ 
++/*
++ * using a linked list for extended_perms_decision lookup because the list is
++ * always small. i.e. less than 5, typically 1
++ */
++static struct extended_perms_decision *avc_xperms_decision_lookup(u8 driver,
++					struct avc_xperms_node *xp_node)
++{
++	struct avc_xperms_decision_node *xpd_node;
++
++	list_for_each_entry(xpd_node, &xp_node->xpd_head, xpd_list) {
++		if (xpd_node->xpd.driver == driver)
++			return &xpd_node->xpd;
++	}
++	return NULL;
++}
++
++static inline unsigned int
++avc_xperms_has_perm(struct extended_perms_decision *xpd,
++					u8 perm, u8 which)
++{
++	unsigned int rc = 0;
++
++	if ((which == XPERMS_ALLOWED) &&
++			(xpd->used & XPERMS_ALLOWED))
++		rc = security_xperm_test(xpd->allowed->p, perm);
++	else if ((which == XPERMS_AUDITALLOW) &&
++			(xpd->used & XPERMS_AUDITALLOW))
++		rc = security_xperm_test(xpd->auditallow->p, perm);
++	else if ((which == XPERMS_DONTAUDIT) &&
++			(xpd->used & XPERMS_DONTAUDIT))
++		rc = security_xperm_test(xpd->dontaudit->p, perm);
++	return rc;
++}
++
++static void avc_xperms_allow_perm(struct avc_xperms_node *xp_node,
++				u8 driver, u8 perm)
++{
++	struct extended_perms_decision *xpd;
++	security_xperm_set(xp_node->xp.drivers.p, driver);
++	xpd = avc_xperms_decision_lookup(driver, xp_node);
++	if (xpd && xpd->allowed)
++		security_xperm_set(xpd->allowed->p, perm);
++}
++
++static void avc_xperms_decision_free(struct avc_xperms_decision_node *xpd_node)
++{
++	struct extended_perms_decision *xpd;
++
++	xpd = &xpd_node->xpd;
++	if (xpd->allowed)
++		kmem_cache_free(avc_xperms_data_cachep, xpd->allowed);
++	if (xpd->auditallow)
++		kmem_cache_free(avc_xperms_data_cachep, xpd->auditallow);
++	if (xpd->dontaudit)
++		kmem_cache_free(avc_xperms_data_cachep, xpd->dontaudit);
++	kmem_cache_free(avc_xperms_decision_cachep, xpd_node);
++}
++
++static void avc_xperms_free(struct avc_xperms_node *xp_node)
++{
++	struct avc_xperms_decision_node *xpd_node, *tmp;
++
++	if (!xp_node)
++		return;
++
++	list_for_each_entry_safe(xpd_node, tmp, &xp_node->xpd_head, xpd_list) {
++		list_del(&xpd_node->xpd_list);
++		avc_xperms_decision_free(xpd_node);
++	}
++	kmem_cache_free(avc_xperms_cachep, xp_node);
++}
++
++static void avc_copy_xperms_decision(struct extended_perms_decision *dest,
++					struct extended_perms_decision *src)
++{
++	dest->driver = src->driver;
++	dest->used = src->used;
++	if (dest->used & XPERMS_ALLOWED)
++		memcpy(dest->allowed->p, src->allowed->p,
++				sizeof(src->allowed->p));
++	if (dest->used & XPERMS_AUDITALLOW)
++		memcpy(dest->auditallow->p, src->auditallow->p,
++				sizeof(src->auditallow->p));
++	if (dest->used & XPERMS_DONTAUDIT)
++		memcpy(dest->dontaudit->p, src->dontaudit->p,
++				sizeof(src->dontaudit->p));
++}
++
++/*
++ * similar to avc_copy_xperms_decision, but only copy decision
++ * information relevant to this perm
++ */
++static inline void avc_quick_copy_xperms_decision(u8 perm,
++			struct extended_perms_decision *dest,
++			struct extended_perms_decision *src)
++{
++	/*
++	 * compute index of the u32 of the 256 bits (8 u32s) that contain this
++	 * command permission
++	 */
++	u8 i = perm >> 5;
++
++	dest->used = src->used;
++	if (dest->used & XPERMS_ALLOWED)
++		dest->allowed->p[i] = src->allowed->p[i];
++	if (dest->used & XPERMS_AUDITALLOW)
++		dest->auditallow->p[i] = src->auditallow->p[i];
++	if (dest->used & XPERMS_DONTAUDIT)
++		dest->dontaudit->p[i] = src->dontaudit->p[i];
++}
++
++static struct avc_xperms_decision_node
++		*avc_xperms_decision_alloc(u8 which)
++{
++	struct avc_xperms_decision_node *xpd_node;
++	struct extended_perms_decision *xpd;
++
++	xpd_node = kmem_cache_zalloc(avc_xperms_decision_cachep,
++				GFP_ATOMIC | __GFP_NOMEMALLOC);
++	if (!xpd_node)
++		return NULL;
++
++	xpd = &xpd_node->xpd;
++	if (which & XPERMS_ALLOWED) {
++		xpd->allowed = kmem_cache_zalloc(avc_xperms_data_cachep,
++						GFP_ATOMIC | __GFP_NOMEMALLOC);
++		if (!xpd->allowed)
++			goto error;
++	}
++	if (which & XPERMS_AUDITALLOW) {
++		xpd->auditallow = kmem_cache_zalloc(avc_xperms_data_cachep,
++						GFP_ATOMIC | __GFP_NOMEMALLOC);
++		if (!xpd->auditallow)
++			goto error;
++	}
++	if (which & XPERMS_DONTAUDIT) {
++		xpd->dontaudit = kmem_cache_zalloc(avc_xperms_data_cachep,
++						GFP_ATOMIC | __GFP_NOMEMALLOC);
++		if (!xpd->dontaudit)
++			goto error;
++	}
++	return xpd_node;
++error:
++	avc_xperms_decision_free(xpd_node);
++	return NULL;
++}
++
++static int avc_add_xperms_decision(struct avc_node *node,
++			struct extended_perms_decision *src)
++{
++	struct avc_xperms_decision_node *dest_xpd;
++
++	node->ae.xp_node->xp.len++;
++	dest_xpd = avc_xperms_decision_alloc(src->used);
++	if (!dest_xpd)
++		return -ENOMEM;
++	avc_copy_xperms_decision(&dest_xpd->xpd, src);
++	list_add(&dest_xpd->xpd_list, &node->ae.xp_node->xpd_head);
++	return 0;
++}
++
++static struct avc_xperms_node *avc_xperms_alloc(void)
++{
++	struct avc_xperms_node *xp_node;
++
++	xp_node = kmem_cache_zalloc(avc_xperms_cachep,
++				GFP_ATOMIC|__GFP_NOMEMALLOC);
++	if (!xp_node)
++		return xp_node;
++	INIT_LIST_HEAD(&xp_node->xpd_head);
++	return xp_node;
++}
++
++static int avc_xperms_populate(struct avc_node *node,
++				struct avc_xperms_node *src)
++{
++	struct avc_xperms_node *dest;
++	struct avc_xperms_decision_node *dest_xpd;
++	struct avc_xperms_decision_node *src_xpd;
++
++	if (src->xp.len == 0)
++		return 0;
++	dest = avc_xperms_alloc();
++	if (!dest)
++		return -ENOMEM;
++
++	memcpy(dest->xp.drivers.p, src->xp.drivers.p, sizeof(dest->xp.drivers.p));
++	dest->xp.len = src->xp.len;
++
++	/* for each source xpd allocate a destination xpd and copy */
++	list_for_each_entry(src_xpd, &src->xpd_head, xpd_list) {
++		dest_xpd = avc_xperms_decision_alloc(src_xpd->xpd.used);
++		if (!dest_xpd)
++			goto error;
++		avc_copy_xperms_decision(&dest_xpd->xpd, &src_xpd->xpd);
++		list_add(&dest_xpd->xpd_list, &dest->xpd_head);
++	}
++	node->ae.xp_node = dest;
++	return 0;
++error:
++	avc_xperms_free(dest);
++	return -ENOMEM;
++
++}
++
++static inline u32 avc_xperms_audit_required(u32 requested,
++					struct av_decision *avd,
++					struct extended_perms_decision *xpd,
++					u8 perm,
++					int result,
++					u32 *deniedp)
++{
++	u32 denied, audited;
++
++	denied = requested & ~avd->allowed;
++	if (unlikely(denied)) {
++		audited = denied & avd->auditdeny;
++		if (audited && xpd) {
++			if (avc_xperms_has_perm(xpd, perm, XPERMS_DONTAUDIT))
++				audited &= ~requested;
++		}
++	} else if (result) {
++		audited = denied = requested;
++	} else {
++		audited = requested & avd->auditallow;
++		if (audited && xpd) {
++			if (!avc_xperms_has_perm(xpd, perm, XPERMS_AUDITALLOW))
++				audited &= ~requested;
++		}
++	}
++
++	*deniedp = denied;
++	return audited;
++}
++
++static inline int avc_xperms_audit(u32 ssid, u32 tsid, u16 tclass,
++				u32 requested, struct av_decision *avd,
++				struct extended_perms_decision *xpd,
++				u8 perm, int result,
++				struct common_audit_data *ad)
++{
++	u32 audited, denied;
++
++	audited = avc_xperms_audit_required(
++			requested, avd, xpd, perm, result, &denied);
++	if (likely(!audited))
++		return 0;
++	return slow_avc_audit(ssid, tsid, tclass, requested,
++			audited, denied, result, ad, 0);
++}
++
+ static void avc_node_free(struct rcu_head *rhead)
+ {
+ 	struct avc_node *node = container_of(rhead, struct avc_node, rhead);
++	avc_xperms_free(node->ae.xp_node);
+ 	kmem_cache_free(avc_node_cachep, node);
+ 	avc_cache_stats_incr(frees);
+ }
+@@ -221,6 +498,7 @@ static void avc_node_delete(struct avc_node *node)
+ 
+ static void avc_node_kill(struct avc_node *node)
+ {
++	avc_xperms_free(node->ae.xp_node);
+ 	kmem_cache_free(avc_node_cachep, node);
+ 	avc_cache_stats_incr(frees);
+ 	atomic_dec(&avc_cache.active_nodes);
+@@ -367,6 +645,7 @@ static int avc_latest_notif_update(int seqno, int is_insert)
+  * @tsid: target security identifier
+  * @tclass: target security class
+  * @avd: resulting av decision
++ * @xp_node: resulting extended permissions
+  *
+  * Insert an AVC entry for the SID pair
+  * (@ssid, @tsid) and class @tclass.
+@@ -378,7 +657,9 @@ static int avc_latest_notif_update(int seqno, int is_insert)
+  * the access vectors into a cache entry, returns
+  * avc_node inserted. Otherwise, this function returns NULL.
+  */
+-static struct avc_node *avc_insert(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd)
++static struct avc_node *avc_insert(u32 ssid, u32 tsid, u16 tclass,
++				struct av_decision *avd,
++				struct avc_xperms_node *xp_node)
+ {
+ 	struct avc_node *pos, *node = NULL;
+ 	int hvalue;
+@@ -391,10 +672,15 @@ static struct avc_node *avc_insert(u32 ssid, u32 tsid, u16 tclass, struct av_dec
+ 	if (node) {
+ 		struct hlist_head *head;
+ 		spinlock_t *lock;
++		int rc = 0;
+ 
+ 		hvalue = avc_hash(ssid, tsid, tclass);
+ 		avc_node_populate(node, ssid, tsid, tclass, avd);
+-
++		rc = avc_xperms_populate(node, xp_node);
++		if (rc) {
++			kmem_cache_free(avc_node_cachep, node);
++			return NULL;
++		}
+ 		head = &avc_cache.slots[hvalue];
+ 		lock = &avc_cache.slots_lock[hvalue];
+ 
+@@ -528,14 +814,17 @@ static inline int avc_sidcmp(u32 x, u32 y)
+  * @perms : Permission mask bits
+  * @ssid,@tsid,@tclass : identifier of an AVC entry
+  * @seqno : sequence number when decision was made
++ * @xpd: extended_perms_decision to be added to the node
+  *
+  * if a valid AVC entry doesn't exist,this function returns -ENOENT.
+  * if kmalloc() called internal returns NULL, this function returns -ENOMEM.
+  * otherwise, this function updates the AVC entry. The original AVC-entry object
+  * will release later by RCU.
+  */
+-static int avc_update_node(u32 event, u32 perms, u32 ssid, u32 tsid, u16 tclass,
+-			   u32 seqno)
++static int avc_update_node(u32 event, u32 perms, u8 driver, u8 xperm, u32 ssid,
++			u32 tsid, u16 tclass, u32 seqno,
++			struct extended_perms_decision *xpd,
++			u32 flags)
+ {
+ 	int hvalue, rc = 0;
+ 	unsigned long flag;
+@@ -579,9 +868,19 @@ static int avc_update_node(u32 event, u32 perms, u32 ssid, u32 tsid, u16 tclass,
+ 
+ 	avc_node_populate(node, ssid, tsid, tclass, &orig->ae.avd);
+ 
++	if (orig->ae.xp_node) {
++		rc = avc_xperms_populate(node, orig->ae.xp_node);
++		if (rc) {
++			kmem_cache_free(avc_node_cachep, node);
++			goto out_unlock;
++		}
++	}
++
+ 	switch (event) {
+ 	case AVC_CALLBACK_GRANT:
+ 		node->ae.avd.allowed |= perms;
++		if (node->ae.xp_node && (flags & AVC_EXTENDED_PERMS))
++			avc_xperms_allow_perm(node->ae.xp_node, driver, xperm);
+ 		break;
+ 	case AVC_CALLBACK_TRY_REVOKE:
+ 	case AVC_CALLBACK_REVOKE:
+@@ -599,6 +898,9 @@ static int avc_update_node(u32 event, u32 perms, u32 ssid, u32 tsid, u16 tclass,
+ 	case AVC_CALLBACK_AUDITDENY_DISABLE:
+ 		node->ae.avd.auditdeny &= ~perms;
+ 		break;
++	case AVC_CALLBACK_ADD_XPERMS:
++		avc_add_xperms_decision(node, xpd);
++		break;
+ 	}
+ 	avc_node_replace(node, orig);
+ out_unlock:
+@@ -670,18 +972,20 @@ int avc_ss_reset(u32 seqno)
+  * results in a bigger stack frame.
+  */
+ static noinline struct avc_node *avc_compute_av(u32 ssid, u32 tsid,
+-			 u16 tclass, struct av_decision *avd)
++			 u16 tclass, struct av_decision *avd,
++			 struct avc_xperms_node *xp_node)
+ {
+ 	rcu_read_unlock();
+-	security_compute_av(ssid, tsid, tclass, avd);
++	INIT_LIST_HEAD(&xp_node->xpd_head);
++	security_compute_av(ssid, tsid, tclass, avd, &xp_node->xp);
+ 	rcu_read_lock();
+-	return avc_insert(ssid, tsid, tclass, avd);
++	return avc_insert(ssid, tsid, tclass, avd, xp_node);
+ }
+ 
+ static noinline int avc_denied(u32 ssid, u32 tsid,
+-			 u16 tclass, u32 requested,
+-			 unsigned flags,
+-			 struct av_decision *avd)
++				u16 tclass, u32 requested,
++				u8 driver, u8 xperm, unsigned flags,
++				struct av_decision *avd)
+ {
+ 	if (flags & AVC_STRICT)
+ 		return -EACCES;
+@@ -689,11 +993,91 @@ static noinline int avc_denied(u32 ssid, u32 tsid,
+ 	if (selinux_enforcing && !(avd->flags & AVD_FLAGS_PERMISSIVE))
+ 		return -EACCES;
+ 
+-	avc_update_node(AVC_CALLBACK_GRANT, requested, ssid,
+-				tsid, tclass, avd->seqno);
++	avc_update_node(AVC_CALLBACK_GRANT, requested, driver, xperm, ssid,
++				tsid, tclass, avd->seqno, NULL, flags);
+ 	return 0;
+ }
+ 
++/*
++ * The avc extended permissions logic adds an additional 256 bits of
++ * permissions to an avc node when extended permissions for that node are
++ * specified in the avtab. If the additional 256 permissions is not adequate,
++ * as-is the case with ioctls, then multiple may be chained together and the
++ * driver field is used to specify which set contains the permission.
++ */
++int avc_has_extended_perms(u32 ssid, u32 tsid, u16 tclass, u32 requested,
++			u8 driver, u8 xperm, struct common_audit_data *ad)
++{
++	struct avc_node *node;
++	struct av_decision avd;
++	u32 denied;
++	struct extended_perms_decision local_xpd;
++	struct extended_perms_decision *xpd = NULL;
++	struct extended_perms_data allowed;
++	struct extended_perms_data auditallow;
++	struct extended_perms_data dontaudit;
++	struct avc_xperms_node local_xp_node;
++	struct avc_xperms_node *xp_node;
++	int rc = 0, rc2;
++
++	xp_node = &local_xp_node;
++	BUG_ON(!requested);
++
++	rcu_read_lock();
++
++	node = avc_lookup(ssid, tsid, tclass);
++	if (unlikely(!node)) {
++		node = avc_compute_av(ssid, tsid, tclass, &avd, xp_node);
++	} else {
++		memcpy(&avd, &node->ae.avd, sizeof(avd));
++		xp_node = node->ae.xp_node;
++	}
++	/* if extended permissions are not defined, only consider av_decision */
++	if (!xp_node || !xp_node->xp.len)
++		goto decision;
++
++	local_xpd.allowed = &allowed;
++	local_xpd.auditallow = &auditallow;
++	local_xpd.dontaudit = &dontaudit;
++
++	xpd = avc_xperms_decision_lookup(driver, xp_node);
++	if (unlikely(!xpd)) {
++		/*
++		 * Compute the extended_perms_decision only if the driver
++		 * is flagged
++		 */
++		if (!security_xperm_test(xp_node->xp.drivers.p, driver)) {
++			avd.allowed &= ~requested;
++			goto decision;
++		}
++		rcu_read_unlock();
++		security_compute_xperms_decision(ssid, tsid, tclass, driver,
++						&local_xpd);
++		rcu_read_lock();
++		avc_update_node(AVC_CALLBACK_ADD_XPERMS, requested, driver, xperm,
++				ssid, tsid, tclass, avd.seqno, &local_xpd, 0);
++	} else {
++		avc_quick_copy_xperms_decision(xperm, &local_xpd, xpd);
++	}
++	xpd = &local_xpd;
++
++	if (!avc_xperms_has_perm(xpd, xperm, XPERMS_ALLOWED))
++		avd.allowed &= ~requested;
++
++decision:
++	denied = requested & ~(avd.allowed);
++	if (unlikely(denied))
++		rc = avc_denied(ssid, tsid, tclass, requested, driver, xperm,
++				AVC_EXTENDED_PERMS, &avd);
++
++	rcu_read_unlock();
++
++	rc2 = avc_xperms_audit(ssid, tsid, tclass, requested,
++			&avd, xpd, xperm, rc, ad);
++	if (rc2)
++		return rc2;
++	return rc;
++}
+ 
+ /**
+  * avc_has_perm_noaudit - Check permissions but perform no auditing.
+@@ -721,6 +1105,7 @@ inline int avc_has_perm_noaudit(u32 ssid, u32 tsid,
+ 			 struct av_decision *avd)
+ {
+ 	struct avc_node *node;
++	struct avc_xperms_node xp_node;
+ 	int rc = 0;
+ 	u32 denied;
+ 
+@@ -730,13 +1115,13 @@ inline int avc_has_perm_noaudit(u32 ssid, u32 tsid,
+ 
+ 	node = avc_lookup(ssid, tsid, tclass);
+ 	if (unlikely(!node))
+-		node = avc_compute_av(ssid, tsid, tclass, avd);
++		node = avc_compute_av(ssid, tsid, tclass, avd, &xp_node);
+ 	else
+ 		memcpy(avd, &node->ae.avd, sizeof(*avd));
+ 
+ 	denied = requested & ~(avd->allowed);
+ 	if (unlikely(denied))
+-		rc = avc_denied(ssid, tsid, tclass, requested, flags, avd);
++		rc = avc_denied(ssid, tsid, tclass, requested, 0, 0, flags, avd);
+ 
+ 	rcu_read_unlock();
+ 	return rc;
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index bd7c9ff..e45ef57 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -3201,6 +3201,46 @@ static void selinux_file_free_security(struct file *file)
+ 	file_free_security(file);
+ }
+ 
++/*
++ * Check whether a task has the ioctl permission and cmd
++ * operation to an inode.
++ */
++int ioctl_has_perm(const struct cred *cred, struct file *file,
++		u32 requested, u16 cmd)
++{
++	struct common_audit_data ad;
++	struct file_security_struct *fsec = file->f_security;
++	struct inode *inode = file_inode(file);
++	struct inode_security_struct *isec = inode->i_security;
++	struct lsm_ioctlop_audit ioctl;
++	u32 ssid = cred_sid(cred);
++	int rc;
++	u8 driver = cmd >> 8;
++	u8 xperm = cmd & 0xff;
++
++	ad.type = LSM_AUDIT_DATA_IOCTL_OP;
++	ad.u.op = &ioctl;
++	ad.u.op->cmd = cmd;
++	ad.u.op->path = file->f_path;
++
++	if (ssid != fsec->sid) {
++		rc = avc_has_perm(ssid, fsec->sid,
++				SECCLASS_FD,
++				FD__USE,
++				&ad);
++		if (rc)
++			goto out;
++	}
++
++	if (unlikely(IS_PRIVATE(inode)))
++		return 0;
++
++	rc = avc_has_extended_perms(ssid, isec->sid, isec->sclass,
++			requested, driver, xperm, &ad);
++out:
++	return rc;
++}
++
+ static int selinux_file_ioctl(struct file *file, unsigned int cmd,
+ 			      unsigned long arg)
+ {
+@@ -3243,7 +3283,7 @@ static int selinux_file_ioctl(struct file *file, unsigned int cmd,
+ 	 * to the file's ioctl() function.
+ 	 */
+ 	default:
+-		error = file_has_perm(cred, file, FILE__IOCTL);
++		error = ioctl_has_perm(cred, file, FILE__IOCTL, (u16) cmd);
+ 	}
+ 	return error;
+ }
+diff --git a/security/selinux/include/avc.h b/security/selinux/include/avc.h
+index ddf8eec..03a9f08 100644
+--- a/security/selinux/include/avc.h
++++ b/security/selinux/include/avc.h
+@@ -142,6 +142,7 @@ static inline int avc_audit(u32 ssid, u32 tsid,
+ }
+ 
+ #define AVC_STRICT 1 /* Ignore permissive mode. */
++#define AVC_EXTENDED_PERMS 2	/* update extended permissions */
+ int avc_has_perm_noaudit(u32 ssid, u32 tsid,
+ 			 u16 tclass, u32 requested,
+ 			 unsigned flags,
+@@ -151,6 +152,9 @@ int avc_has_perm(u32 ssid, u32 tsid,
+ 		 u16 tclass, u32 requested,
+ 		 struct common_audit_data *auditdata);
+ 
++int avc_has_extended_perms(u32 ssid, u32 tsid, u16 tclass, u32 requested,
++		u8 driver, u8 perm, struct common_audit_data *ad);
++
+ u32 avc_policy_seqno(void);
+ 
+ #define AVC_CALLBACK_GRANT		1
+@@ -161,6 +165,7 @@ u32 avc_policy_seqno(void);
+ #define AVC_CALLBACK_AUDITALLOW_DISABLE	32
+ #define AVC_CALLBACK_AUDITDENY_ENABLE	64
+ #define AVC_CALLBACK_AUDITDENY_DISABLE	128
++#define AVC_CALLBACK_ADD_XPERMS		256
+ 
+ int avc_add_callback(int (*callback)(u32 event), u32 events);
+ 
+diff --git a/security/selinux/include/security.h b/security/selinux/include/security.h
+index c9a0d93..c9acb6e 100644
+--- a/security/selinux/include/security.h
++++ b/security/selinux/include/security.h
+@@ -34,13 +34,14 @@
+ #define POLICYDB_VERSION_NEW_OBJECT_DEFAULTS	27
+ #define POLICYDB_VERSION_DEFAULT_TYPE	28
+ #define POLICYDB_VERSION_CONSTRAINT_NAMES	29
++#define POLICYDB_VERSION_XPERMS_IOCTL	30
+ 
+ /* Range of policy versions we understand*/
+ #define POLICYDB_VERSION_MIN   POLICYDB_VERSION_BASE
+ #ifdef CONFIG_SECURITY_SELINUX_POLICYDB_VERSION_MAX
+ #define POLICYDB_VERSION_MAX	CONFIG_SECURITY_SELINUX_POLICYDB_VERSION_MAX_VALUE
+ #else
+-#define POLICYDB_VERSION_MAX	POLICYDB_VERSION_CONSTRAINT_NAMES
++#define POLICYDB_VERSION_MAX	POLICYDB_VERSION_XPERMS_IOCTL
+ #endif
+ 
+ /* Mask for just the mount related flags */
+@@ -108,11 +109,38 @@ struct av_decision {
+ 	u32 flags;
+ };
+ 
++#define XPERMS_ALLOWED 1
++#define XPERMS_AUDITALLOW 2
++#define XPERMS_DONTAUDIT 4
++
++#define security_xperm_set(perms, x) (perms[x >> 5] |= 1 << (x & 0x1f))
++#define security_xperm_test(perms, x) (1 & (perms[x >> 5] >> (x & 0x1f)))
++struct extended_perms_data {
++	u32 p[8];
++};
++
++struct extended_perms_decision {
++	u8 used;
++	u8 driver;
++	struct extended_perms_data *allowed;
++	struct extended_perms_data *auditallow;
++	struct extended_perms_data *dontaudit;
++};
++
++struct extended_perms {
++	u16 len;	/* length associated decision chain */
++	struct extended_perms_data drivers; /* flag drivers that are used */
++};
++
+ /* definitions of av_decision.flags */
+ #define AVD_FLAGS_PERMISSIVE	0x0001
+ 
+ void security_compute_av(u32 ssid, u32 tsid,
+-			 u16 tclass, struct av_decision *avd);
++			 u16 tclass, struct av_decision *avd,
++			 struct extended_perms *xperms);
++
++void security_compute_xperms_decision(u32 ssid, u32 tsid, u16 tclass,
++			 u8 driver, struct extended_perms_decision *xpermd);
+ 
+ void security_compute_av_user(u32 ssid, u32 tsid,
+ 			     u16 tclass, struct av_decision *avd);
+diff --git a/security/selinux/ss/avtab.c b/security/selinux/ss/avtab.c
+index a3dd9fa..a6bef63 100644
+--- a/security/selinux/ss/avtab.c
++++ b/security/selinux/ss/avtab.c
+@@ -24,6 +24,7 @@
+ #include "policydb.h"
+ 
+ static struct kmem_cache *avtab_node_cachep;
++static struct kmem_cache *avtab_xperms_cachep;
+ 
+ static inline int avtab_hash(struct avtab_key *keyp, u16 mask)
+ {
+@@ -37,11 +38,24 @@ avtab_insert_node(struct avtab *h, int hvalue,
+ 		  struct avtab_key *key, struct avtab_datum *datum)
+ {
+ 	struct avtab_node *newnode;
++	struct avtab_extended_perms *xperms;
+ 	newnode = kmem_cache_zalloc(avtab_node_cachep, GFP_KERNEL);
+ 	if (newnode == NULL)
+ 		return NULL;
+ 	newnode->key = *key;
+-	newnode->datum = *datum;
++
++	if (key->specified & AVTAB_XPERMS) {
++		xperms = kmem_cache_zalloc(avtab_xperms_cachep, GFP_KERNEL);
++		if (xperms == NULL) {
++			kmem_cache_free(avtab_node_cachep, newnode);
++			return NULL;
++		}
++		*xperms = *(datum->u.xperms);
++		newnode->datum.u.xperms = xperms;
++	} else {
++		newnode->datum.u.data = datum->u.data;
++	}
++
+ 	if (prev) {
+ 		newnode->next = prev->next;
+ 		prev->next = newnode;
+@@ -70,8 +84,12 @@ static int avtab_insert(struct avtab *h, struct avtab_key *key, struct avtab_dat
+ 		if (key->source_type == cur->key.source_type &&
+ 		    key->target_type == cur->key.target_type &&
+ 		    key->target_class == cur->key.target_class &&
+-		    (specified & cur->key.specified))
++		    (specified & cur->key.specified)) {
++			/* extended perms may not be unique */
++			if (specified & AVTAB_XPERMS)
++				break;
+ 			return -EEXIST;
++		}
+ 		if (key->source_type < cur->key.source_type)
+ 			break;
+ 		if (key->source_type == cur->key.source_type &&
+@@ -232,6 +250,9 @@ void avtab_destroy(struct avtab *h)
+ 		while (cur) {
+ 			temp = cur;
+ 			cur = cur->next;
++			if (temp->key.specified & AVTAB_XPERMS)
++				kmem_cache_free(avtab_xperms_cachep,
++						temp->datum.u.xperms);
+ 			kmem_cache_free(avtab_node_cachep, temp);
+ 		}
+ 		h->htable[i] = NULL;
+@@ -320,7 +341,10 @@ static uint16_t spec_order[] = {
+ 	AVTAB_AUDITALLOW,
+ 	AVTAB_TRANSITION,
+ 	AVTAB_CHANGE,
+-	AVTAB_MEMBER
++	AVTAB_MEMBER,
++	AVTAB_XPERMS_ALLOWED,
++	AVTAB_XPERMS_AUDITALLOW,
++	AVTAB_XPERMS_DONTAUDIT
+ };
+ 
+ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
+@@ -330,10 +354,11 @@ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
+ {
+ 	__le16 buf16[4];
+ 	u16 enabled;
+-	__le32 buf32[7];
+ 	u32 items, items2, val, vers = pol->policyvers;
+ 	struct avtab_key key;
+ 	struct avtab_datum datum;
++	struct avtab_extended_perms xperms;
++	__le32 buf32[ARRAY_SIZE(xperms.perms.p)];
+ 	int i, rc;
+ 	unsigned set;
+ 
+@@ -390,11 +415,15 @@ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
+ 			printk(KERN_ERR "SELinux: avtab: entry has both access vectors and types\n");
+ 			return -EINVAL;
+ 		}
++		if (val & AVTAB_XPERMS) {
++			printk(KERN_ERR "SELinux: avtab: entry has extended permissions\n");
++			return -EINVAL;
++		}
+ 
+ 		for (i = 0; i < ARRAY_SIZE(spec_order); i++) {
+ 			if (val & spec_order[i]) {
+ 				key.specified = spec_order[i] | enabled;
+-				datum.data = le32_to_cpu(buf32[items++]);
++				datum.u.data = le32_to_cpu(buf32[items++]);
+ 				rc = insertf(a, &key, &datum, p);
+ 				if (rc)
+ 					return rc;
+@@ -437,14 +466,42 @@ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
+ 		return -EINVAL;
+ 	}
+ 
+-	rc = next_entry(buf32, fp, sizeof(u32));
+-	if (rc) {
+-		printk(KERN_ERR "SELinux: avtab: truncated entry\n");
+-		return rc;
++	if ((vers < POLICYDB_VERSION_XPERMS_IOCTL) &&
++			(key.specified & AVTAB_XPERMS)) {
++		printk(KERN_ERR "SELinux:  avtab:  policy version %u does not "
++				"support extended permissions rules and one "
++				"was specified\n", vers);
++		return -EINVAL;
++	} else if (key.specified & AVTAB_XPERMS) {
++		memset(&xperms, 0, sizeof(struct avtab_extended_perms));
++		rc = next_entry(&xperms.specified, fp, sizeof(u8));
++		if (rc) {
++			printk(KERN_ERR "SELinux: avtab: truncated entry\n");
++			return rc;
++		}
++		rc = next_entry(&xperms.driver, fp, sizeof(u8));
++		if (rc) {
++			printk(KERN_ERR "SELinux: avtab: truncated entry\n");
++			return rc;
++		}
++		rc = next_entry(buf32, fp, sizeof(u32)*ARRAY_SIZE(xperms.perms.p));
++		if (rc) {
++			printk(KERN_ERR "SELinux: avtab: truncated entry\n");
++			return rc;
++		}
++		for (i = 0; i < ARRAY_SIZE(xperms.perms.p); i++)
++			xperms.perms.p[i] = le32_to_cpu(buf32[i]);
++		datum.u.xperms = &xperms;
++	} else {
++		rc = next_entry(buf32, fp, sizeof(u32));
++		if (rc) {
++			printk(KERN_ERR "SELinux: avtab: truncated entry\n");
++			return rc;
++		}
++		datum.u.data = le32_to_cpu(*buf32);
+ 	}
+-	datum.data = le32_to_cpu(*buf32);
+ 	if ((key.specified & AVTAB_TYPE) &&
+-	    !policydb_type_isvalid(pol, datum.data)) {
++	    !policydb_type_isvalid(pol, datum.u.data)) {
+ 		printk(KERN_ERR "SELinux: avtab: invalid type\n");
+ 		return -EINVAL;
+ 	}
+@@ -504,8 +561,9 @@ bad:
+ int avtab_write_item(struct policydb *p, struct avtab_node *cur, void *fp)
+ {
+ 	__le16 buf16[4];
+-	__le32 buf32[1];
++	__le32 buf32[ARRAY_SIZE(cur->datum.u.xperms->perms.p)];
+ 	int rc;
++	unsigned int i;
+ 
+ 	buf16[0] = cpu_to_le16(cur->key.source_type);
+ 	buf16[1] = cpu_to_le16(cur->key.target_type);
+@@ -514,8 +572,22 @@ int avtab_write_item(struct policydb *p, struct avtab_node *cur, void *fp)
+ 	rc = put_entry(buf16, sizeof(u16), 4, fp);
+ 	if (rc)
+ 		return rc;
+-	buf32[0] = cpu_to_le32(cur->datum.data);
+-	rc = put_entry(buf32, sizeof(u32), 1, fp);
++
++	if (cur->key.specified & AVTAB_XPERMS) {
++		rc = put_entry(&cur->datum.u.xperms->specified, sizeof(u8), 1, fp);
++		if (rc)
++			return rc;
++		rc = put_entry(&cur->datum.u.xperms->driver, sizeof(u8), 1, fp);
++		if (rc)
++			return rc;
++		for (i = 0; i < ARRAY_SIZE(cur->datum.u.xperms->perms.p); i++)
++			buf32[i] = cpu_to_le32(cur->datum.u.xperms->perms.p[i]);
++		rc = put_entry(buf32, sizeof(u32),
++				ARRAY_SIZE(cur->datum.u.xperms->perms.p), fp);
++	} else {
++		buf32[0] = cpu_to_le32(cur->datum.u.data);
++		rc = put_entry(buf32, sizeof(u32), 1, fp);
++	}
+ 	if (rc)
+ 		return rc;
+ 	return 0;
+@@ -548,9 +620,13 @@ void avtab_cache_init(void)
+ 	avtab_node_cachep = kmem_cache_create("avtab_node",
+ 					      sizeof(struct avtab_node),
+ 					      0, SLAB_PANIC, NULL);
++	avtab_xperms_cachep = kmem_cache_create("avtab_extended_perms",
++						sizeof(struct avtab_extended_perms),
++						0, SLAB_PANIC, NULL);
+ }
+ 
+ void avtab_cache_destroy(void)
+ {
+ 	kmem_cache_destroy(avtab_node_cachep);
++	kmem_cache_destroy(avtab_xperms_cachep);
+ }
+diff --git a/security/selinux/ss/avtab.h b/security/selinux/ss/avtab.h
+index 63ce2f9..8133523 100644
+--- a/security/selinux/ss/avtab.h
++++ b/security/selinux/ss/avtab.h
+@@ -23,6 +23,8 @@
+ #ifndef _SS_AVTAB_H_
+ #define _SS_AVTAB_H_
+ 
++#include "security.h"
++
+ struct avtab_key {
+ 	u16 source_type;	/* source type */
+ 	u16 target_type;	/* target type */
+@@ -35,13 +37,43 @@ struct avtab_key {
+ #define AVTAB_MEMBER		0x0020
+ #define AVTAB_CHANGE		0x0040
+ #define AVTAB_TYPE		(AVTAB_TRANSITION | AVTAB_MEMBER | AVTAB_CHANGE)
++/* extended permissions */
++#define AVTAB_XPERMS_ALLOWED	0x0100
++#define AVTAB_XPERMS_AUDITALLOW	0x0200
++#define AVTAB_XPERMS_DONTAUDIT	0x0400
++#define AVTAB_XPERMS		(AVTAB_XPERMS_ALLOWED | \
++				AVTAB_XPERMS_AUDITALLOW | \
++				AVTAB_XPERMS_DONTAUDIT)
+ #define AVTAB_ENABLED_OLD   0x80000000 /* reserved for used in cond_avtab */
+ #define AVTAB_ENABLED		0x8000 /* reserved for used in cond_avtab */
+ 	u16 specified;	/* what field is specified */
+ };
+ 
++/*
++ * For operations that require more than the 32 permissions provided by the avc
++ * extended permissions may be used to provide 256 bits of permissions.
++ */
++struct avtab_extended_perms {
++/* These are not flags. All 256 values may be used */
++#define AVTAB_XPERMS_IOCTLFUNCTION	0x01
++#define AVTAB_XPERMS_IOCTLDRIVER	0x02
++	/* extension of the avtab_key specified */
++	u8 specified; /* ioctl, netfilter, ... */
++	/*
++	 * if 256 bits is not adequate as is often the case with ioctls, then
++	 * multiple extended perms may be used and the driver field
++	 * specifies which permissions are included.
++	 */
++	u8 driver;
++	/* 256 bits of permissions */
++	struct extended_perms_data perms;
++};
++
+ struct avtab_datum {
+-	u32 data; /* access vector or type value */
++	union {
++		u32 data; /* access vector or type value */
++		struct avtab_extended_perms *xperms;
++	} u;
+ };
+ 
+ struct avtab_node {
+diff --git a/security/selinux/ss/conditional.c b/security/selinux/ss/conditional.c
+index 377d148..6618fb4 100644
+--- a/security/selinux/ss/conditional.c
++++ b/security/selinux/ss/conditional.c
+@@ -15,6 +15,7 @@
+ 
+ #include "security.h"
+ #include "conditional.h"
++#include "services.h"
+ 
+ /*
+  * cond_evaluate_expr evaluates a conditional expr
+@@ -617,21 +618,39 @@ int cond_write_list(struct policydb *p, struct cond_node *list, void *fp)
+ 
+ 	return 0;
+ }
++
++void cond_compute_xperms(struct avtab *ctab, struct avtab_key *key,
++		struct extended_perms_decision *xpermd)
++{
++	struct avtab_node *node;
++
++	if (!ctab || !key || !xpermd)
++		return;
++
++	for (node = avtab_search_node(ctab, key); node;
++			node = avtab_search_node_next(node, key->specified)) {
++		if (node->key.specified & AVTAB_ENABLED)
++			services_compute_xperms_decision(xpermd, node);
++	}
++	return;
++
++}
+ /* Determine whether additional permissions are granted by the conditional
+  * av table, and if so, add them to the result
+  */
+-void cond_compute_av(struct avtab *ctab, struct avtab_key *key, struct av_decision *avd)
++void cond_compute_av(struct avtab *ctab, struct avtab_key *key,
++		struct av_decision *avd, struct extended_perms *xperms)
+ {
+ 	struct avtab_node *node;
+ 
+-	if (!ctab || !key || !avd)
++	if (!ctab || !key || !avd || !xperms)
+ 		return;
+ 
+ 	for (node = avtab_search_node(ctab, key); node;
+ 				node = avtab_search_node_next(node, key->specified)) {
+ 		if ((u16)(AVTAB_ALLOWED|AVTAB_ENABLED) ==
+ 		    (node->key.specified & (AVTAB_ALLOWED|AVTAB_ENABLED)))
+-			avd->allowed |= node->datum.data;
++			avd->allowed |= node->datum.u.data;
+ 		if ((u16)(AVTAB_AUDITDENY|AVTAB_ENABLED) ==
+ 		    (node->key.specified & (AVTAB_AUDITDENY|AVTAB_ENABLED)))
+ 			/* Since a '0' in an auditdeny mask represents a
+@@ -639,10 +658,13 @@ void cond_compute_av(struct avtab *ctab, struct avtab_key *key, struct av_decisi
+ 			 * the '&' operand to ensure that all '0's in the mask
+ 			 * are retained (much unlike the allow and auditallow cases).
+ 			 */
+-			avd->auditdeny &= node->datum.data;
++			avd->auditdeny &= node->datum.u.data;
+ 		if ((u16)(AVTAB_AUDITALLOW|AVTAB_ENABLED) ==
+ 		    (node->key.specified & (AVTAB_AUDITALLOW|AVTAB_ENABLED)))
+-			avd->auditallow |= node->datum.data;
++			avd->auditallow |= node->datum.u.data;
++		if ((node->key.specified & AVTAB_ENABLED) &&
++				(node->key.specified & AVTAB_XPERMS))
++			services_compute_xperms_drivers(xperms, node);
+ 	}
+ 	return;
+ }
+diff --git a/security/selinux/ss/conditional.h b/security/selinux/ss/conditional.h
+index 4d1f874..ddb43e7 100644
+--- a/security/selinux/ss/conditional.h
++++ b/security/selinux/ss/conditional.h
+@@ -73,8 +73,10 @@ int cond_read_list(struct policydb *p, void *fp);
+ int cond_write_bool(void *key, void *datum, void *ptr);
+ int cond_write_list(struct policydb *p, struct cond_node *list, void *fp);
+ 
+-void cond_compute_av(struct avtab *ctab, struct avtab_key *key, struct av_decision *avd);
+-
++void cond_compute_av(struct avtab *ctab, struct avtab_key *key,
++		struct av_decision *avd, struct extended_perms *xperms);
++void cond_compute_xperms(struct avtab *ctab, struct avtab_key *key,
++		struct extended_perms_decision *xpermd);
+ int evaluate_cond_node(struct policydb *p, struct cond_node *node);
+ 
+ #endif /* _CONDITIONAL_H_ */
+diff --git a/security/selinux/ss/policydb.c b/security/selinux/ss/policydb.c
+index 9c5cdc2..f34cdf1 100644
+--- a/security/selinux/ss/policydb.c
++++ b/security/selinux/ss/policydb.c
+@@ -148,6 +148,11 @@ static struct policydb_compat_info policydb_compat[] = {
+ 		.sym_num	= SYM_NUM,
+ 		.ocon_num	= OCON_NUM,
+ 	},
++	{
++		.version	= POLICYDB_VERSION_XPERMS_IOCTL,
++		.sym_num	= SYM_NUM,
++		.ocon_num	= OCON_NUM,
++	},
+ };
+ 
+ static struct policydb_compat_info *policydb_lookup_compat(int version)
+diff --git a/security/selinux/ss/services.c b/security/selinux/ss/services.c
+index 4bca494..e6c5d93 100644
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@ -93,9 +93,10 @@ static int context_struct_to_string(struct context *context, char **scontext,
+ 				    u32 *scontext_len);
+ 
+ static void context_struct_compute_av(struct context *scontext,
+-				      struct context *tcontext,
+-				      u16 tclass,
+-				      struct av_decision *avd);
++					struct context *tcontext,
++					u16 tclass,
++					struct av_decision *avd,
++					struct extended_perms *xperms);
+ 
+ struct selinux_mapping {
+ 	u16 value; /* policy value */
+@@ -565,7 +566,8 @@ static void type_attribute_bounds_av(struct context *scontext,
+ 		context_struct_compute_av(&lo_scontext,
+ 					  tcontext,
+ 					  tclass,
+-					  &lo_avd);
++					  &lo_avd,
++					  NULL);
+ 		if ((lo_avd.allowed & avd->allowed) == avd->allowed)
+ 			return;		/* no masked permission */
+ 		masked = ~lo_avd.allowed & avd->allowed;
+@@ -580,7 +582,8 @@ static void type_attribute_bounds_av(struct context *scontext,
+ 		context_struct_compute_av(scontext,
+ 					  &lo_tcontext,
+ 					  tclass,
+-					  &lo_avd);
++					  &lo_avd,
++					  NULL);
+ 		if ((lo_avd.allowed & avd->allowed) == avd->allowed)
+ 			return;		/* no masked permission */
+ 		masked = ~lo_avd.allowed & avd->allowed;
+@@ -596,7 +599,8 @@ static void type_attribute_bounds_av(struct context *scontext,
+ 		context_struct_compute_av(&lo_scontext,
+ 					  &lo_tcontext,
+ 					  tclass,
+-					  &lo_avd);
++					  &lo_avd,
++					  NULL);
+ 		if ((lo_avd.allowed & avd->allowed) == avd->allowed)
+ 			return;		/* no masked permission */
+ 		masked = ~lo_avd.allowed & avd->allowed;
+@@ -613,13 +617,39 @@ static void type_attribute_bounds_av(struct context *scontext,
+ }
+ 
+ /*
+- * Compute access vectors based on a context structure pair for
+- * the permissions in a particular class.
++ * flag which drivers have permissions
++ * only looking for ioctl based extended permssions
++ */
++void services_compute_xperms_drivers(
++		struct extended_perms *xperms,
++		struct avtab_node *node)
++{
++	unsigned int i;
++
++	if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLDRIVER) {
++		/* if one or more driver has all permissions allowed */
++		for (i = 0; i < ARRAY_SIZE(xperms->drivers.p); i++)
++			xperms->drivers.p[i] |= node->datum.u.xperms->perms.p[i];
++	} else if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLFUNCTION) {
++		/* if allowing permissions within a driver */
++		security_xperm_set(xperms->drivers.p,
++					node->datum.u.xperms->driver);
++	}
++
++	/* If no ioctl commands are allowed, ignore auditallow and auditdeny */
++	if (node->key.specified & AVTAB_XPERMS_ALLOWED)
++		xperms->len = 1;
++}
++
++/*
++ * Compute access vectors and extended permissions based on a context
++ * structure pair for the permissions in a particular class.
+  */
+ static void context_struct_compute_av(struct context *scontext,
+-				      struct context *tcontext,
+-				      u16 tclass,
+-				      struct av_decision *avd)
++					struct context *tcontext,
++					u16 tclass,
++					struct av_decision *avd,
++					struct extended_perms *xperms)
+ {
+ 	struct constraint_node *constraint;
+ 	struct role_allow *ra;
+@@ -633,6 +663,10 @@ static void context_struct_compute_av(struct context *scontext,
+ 	avd->allowed = 0;
+ 	avd->auditallow = 0;
+ 	avd->auditdeny = 0xffffffff;
++	if (xperms) {
++		memset(&xperms->drivers, 0, sizeof(xperms->drivers));
++		xperms->len = 0;
++	}
+ 
+ 	if (unlikely(!tclass || tclass > policydb.p_classes.nprim)) {
+ 		if (printk_ratelimit())
+@@ -647,7 +681,7 @@ static void context_struct_compute_av(struct context *scontext,
+ 	 * this permission check, then use it.
+ 	 */
+ 	avkey.target_class = tclass;
+-	avkey.specified = AVTAB_AV;
++	avkey.specified = AVTAB_AV | AVTAB_XPERMS;
+ 	sattr = flex_array_get(policydb.type_attr_map_array, scontext->type - 1);
+ 	BUG_ON(!sattr);
+ 	tattr = flex_array_get(policydb.type_attr_map_array, tcontext->type - 1);
+@@ -660,15 +694,18 @@ static void context_struct_compute_av(struct context *scontext,
+ 			     node;
+ 			     node = avtab_search_node_next(node, avkey.specified)) {
+ 				if (node->key.specified == AVTAB_ALLOWED)
+-					avd->allowed |= node->datum.data;
++					avd->allowed |= node->datum.u.data;
+ 				else if (node->key.specified == AVTAB_AUDITALLOW)
+-					avd->auditallow |= node->datum.data;
++					avd->auditallow |= node->datum.u.data;
+ 				else if (node->key.specified == AVTAB_AUDITDENY)
+-					avd->auditdeny &= node->datum.data;
++					avd->auditdeny &= node->datum.u.data;
++				else if (xperms && (node->key.specified & AVTAB_XPERMS))
++					services_compute_xperms_drivers(xperms, node);
+ 			}
+ 
+ 			/* Check conditional av table for additional permissions */
+-			cond_compute_av(&policydb.te_cond_avtab, &avkey, avd);
++			cond_compute_av(&policydb.te_cond_avtab, &avkey,
++					avd, xperms);
+ 
+ 		}
+ 	}
+@@ -899,6 +936,139 @@ static void avd_init(struct av_decision *avd)
+ 	avd->flags = 0;
+ }
+ 
++void services_compute_xperms_decision(struct extended_perms_decision *xpermd,
++					struct avtab_node *node)
++{
++	unsigned int i;
++
++	if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLFUNCTION) {
++		if (xpermd->driver != node->datum.u.xperms->driver)
++			return;
++	} else if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLDRIVER) {
++		if (!security_xperm_test(node->datum.u.xperms->perms.p,
++					xpermd->driver))
++			return;
++	} else {
++		BUG();
++	}
++
++	if (node->key.specified == AVTAB_XPERMS_ALLOWED) {
++		xpermd->used |= XPERMS_ALLOWED;
++		if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLDRIVER) {
++			memset(xpermd->allowed->p, 0xff,
++					sizeof(xpermd->allowed->p));
++		}
++		if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLFUNCTION) {
++			for (i = 0; i < ARRAY_SIZE(xpermd->allowed->p); i++)
++				xpermd->allowed->p[i] |=
++					node->datum.u.xperms->perms.p[i];
++		}
++	} else if (node->key.specified == AVTAB_XPERMS_AUDITALLOW) {
++		xpermd->used |= XPERMS_AUDITALLOW;
++		if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLDRIVER) {
++			memset(xpermd->auditallow->p, 0xff,
++					sizeof(xpermd->auditallow->p));
++		}
++		if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLFUNCTION) {
++			for (i = 0; i < ARRAY_SIZE(xpermd->auditallow->p); i++)
++				xpermd->auditallow->p[i] |=
++					node->datum.u.xperms->perms.p[i];
++		}
++	} else if (node->key.specified == AVTAB_XPERMS_DONTAUDIT) {
++		xpermd->used |= XPERMS_DONTAUDIT;
++		if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLDRIVER) {
++			memset(xpermd->dontaudit->p, 0xff,
++					sizeof(xpermd->dontaudit->p));
++		}
++		if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLFUNCTION) {
++			for (i = 0; i < ARRAY_SIZE(xpermd->dontaudit->p); i++)
++				xpermd->dontaudit->p[i] |=
++					node->datum.u.xperms->perms.p[i];
++		}
++	} else {
++		BUG();
++	}
++}
++
++void security_compute_xperms_decision(u32 ssid,
++				u32 tsid,
++				u16 orig_tclass,
++				u8 driver,
++				struct extended_perms_decision *xpermd)
++{
++	u16 tclass;
++	struct context *scontext, *tcontext;
++	struct avtab_key avkey;
++	struct avtab_node *node;
++	struct ebitmap *sattr, *tattr;
++	struct ebitmap_node *snode, *tnode;
++	unsigned int i, j;
++
++	xpermd->driver = driver;
++	xpermd->used = 0;
++	memset(xpermd->allowed->p, 0, sizeof(xpermd->allowed->p));
++	memset(xpermd->auditallow->p, 0, sizeof(xpermd->auditallow->p));
++	memset(xpermd->dontaudit->p, 0, sizeof(xpermd->dontaudit->p));
++
++	read_lock(&policy_rwlock);
++	if (!ss_initialized)
++		goto allow;
++
++	scontext = sidtab_search(&sidtab, ssid);
++	if (!scontext) {
++		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
++		       __func__, ssid);
++		goto out;
++	}
++
++	tcontext = sidtab_search(&sidtab, tsid);
++	if (!tcontext) {
++		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
++		       __func__, tsid);
++		goto out;
++	}
++
++	tclass = unmap_class(orig_tclass);
++	if (unlikely(orig_tclass && !tclass)) {
++		if (policydb.allow_unknown)
++			goto allow;
++		goto out;
++	}
++
++
++	if (unlikely(!tclass || tclass > policydb.p_classes.nprim)) {
++		pr_warn_ratelimited("SELinux:  Invalid class %hu\n", tclass);
++		goto out;
++	}
++
++	avkey.target_class = tclass;
++	avkey.specified = AVTAB_XPERMS;
++	sattr = flex_array_get(policydb.type_attr_map_array,
++				scontext->type - 1);
++	BUG_ON(!sattr);
++	tattr = flex_array_get(policydb.type_attr_map_array,
++				tcontext->type - 1);
++	BUG_ON(!tattr);
++	ebitmap_for_each_positive_bit(sattr, snode, i) {
++		ebitmap_for_each_positive_bit(tattr, tnode, j) {
++			avkey.source_type = i + 1;
++			avkey.target_type = j + 1;
++			for (node = avtab_search_node(&policydb.te_avtab, &avkey);
++			     node;
++			     node = avtab_search_node_next(node, avkey.specified))
++				services_compute_xperms_decision(xpermd, node);
++
++			cond_compute_xperms(&policydb.te_cond_avtab,
++						&avkey, xpermd);
++		}
++	}
++out:
++	read_unlock(&policy_rwlock);
++	return;
++allow:
++	memset(xpermd->allowed->p, 0xff, sizeof(xpermd->allowed->p));
++	goto out;
++}
+ 
+ /**
+  * security_compute_av - Compute access vector decisions.
+@@ -906,6 +1076,7 @@ static void avd_init(struct av_decision *avd)
+  * @tsid: target security identifier
+  * @tclass: target security class
+  * @avd: access vector decisions
++ * @xperms: extended permissions
+  *
+  * Compute a set of access vector decisions based on the
+  * SID pair (@ssid, @tsid) for the permissions in @tclass.
+@@ -913,13 +1084,15 @@ static void avd_init(struct av_decision *avd)
+ void security_compute_av(u32 ssid,
+ 			 u32 tsid,
+ 			 u16 orig_tclass,
+-			 struct av_decision *avd)
++			 struct av_decision *avd,
++			 struct extended_perms *xperms)
+ {
+ 	u16 tclass;
+ 	struct context *scontext = NULL, *tcontext = NULL;
+ 
+ 	read_lock(&policy_rwlock);
+ 	avd_init(avd);
++	xperms->len = 0;
+ 	if (!ss_initialized)
+ 		goto allow;
+ 
+@@ -947,7 +1120,7 @@ void security_compute_av(u32 ssid,
+ 			goto allow;
+ 		goto out;
+ 	}
+-	context_struct_compute_av(scontext, tcontext, tclass, avd);
++	context_struct_compute_av(scontext, tcontext, tclass, avd, xperms);
+ 	map_decision(orig_tclass, avd, policydb.allow_unknown);
+ out:
+ 	read_unlock(&policy_rwlock);
+@@ -993,7 +1166,7 @@ void security_compute_av_user(u32 ssid,
+ 		goto out;
+ 	}
+ 
+-	context_struct_compute_av(scontext, tcontext, tclass, avd);
++	context_struct_compute_av(scontext, tcontext, tclass, avd, NULL);
+  out:
+ 	read_unlock(&policy_rwlock);
+ 	return;
+@@ -1515,7 +1688,7 @@ static int security_compute_sid(u32 ssid,
+ 
+ 	if (avdatum) {
+ 		/* Use the type from the type transition/member/change rule. */
+-		newcontext.type = avdatum->data;
++		newcontext.type = avdatum->u.data;
+ 	}
+ 
+ 	/* if we have a objname this is a file trans check so check those rules */
+diff --git a/security/selinux/ss/services.h b/security/selinux/ss/services.h
+index e8d907e..6abcd87 100644
+--- a/security/selinux/ss/services.h
++++ b/security/selinux/ss/services.h
+@@ -11,5 +11,11 @@
+ 
+ extern struct policydb policydb;
+ 
++void services_compute_xperms_drivers(struct extended_perms *xperms,
++				struct avtab_node *node);
++
++void services_compute_xperms_decision(struct extended_perms_decision *xpermd,
++					struct avtab_node *node);
++
+ #endif	/* _SS_SERVICES_H_ */
+ 
+-- 
+1.9.1
+

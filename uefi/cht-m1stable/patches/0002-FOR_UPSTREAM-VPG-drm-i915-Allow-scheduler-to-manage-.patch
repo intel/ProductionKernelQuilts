@@ -1,0 +1,162 @@
+From a15666e9dd21335947c89519912c48ad1ea4257f Mon Sep 17 00:00:00 2001
+Message-Id: <a15666e9dd21335947c89519912c48ad1ea4257f.1432852048.git.chang-joon.lee@intel.com>
+In-Reply-To: <c5e9fa1af945ac4e7bd37c3035c0e756494f0273.1432852048.git.chang-joon.lee@intel.com>
+References: <c5e9fa1af945ac4e7bd37c3035c0e756494f0273.1432852048.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 28 Apr 2015 11:39:41 +0100
+Subject: [PATCH 2/4] FOR_UPSTREAM [VPG]: drm/i915: Allow scheduler to manage
+ inter-ring object synchronisation
+
+The scheduler has always tracked batch buffer dependencies based on
+DRM object usage. This means that it will not submit a batch on one
+ring that has outstanding dependencies still executing on other rings.
+This is exactly the same synchronisation performed by
+i915_gem_object_sync() using hardware semaphores where available and
+CPU stalls where not (e.g. in execlist mode and/or on Gen8 hardware).
+
+Unfortunately, when a batch buffer is submitted to the driver the
+_object_sync() call happens first. Thus in case where hardware
+semaphores are disabled, the driver has already stalled until the
+dependency has been resolved.
+
+This patch adds an optimisation to _object_sync() to ignore the
+synchronisation in the case where it will subsequently be handled by
+the scheduler. This removes the driver stall and (in the single
+application case) provides near hardware semaphore performance even
+when hardware semaphores are disabled. In a busy system where there is
+other work that can be executed on the stalling ring, it provides
+better than hardware semaphore performance as it removes the stall
+from both the driver and from the hardware. There is also a theory
+that this method should improve power usage as hardware semaphores are
+apparently not very power efficient - the stalled ring does not go
+into as low a power a state as when it is genuinely idle.
+
+The optimisation is to check whether both ends of the synchronisation
+are batch buffer requests. If they are, then the scheduler will have
+the inter-dependency tracked and managed. If one or other end is not a
+batch buffer request (e.g. a page flip) then the code falls back to
+the CPU stall or hardware semaphore as appropriate.
+
+To check whether the existing usage is a batch buffer, the code simply
+calls the 'are you tracking this request' function of the scheduler on
+the object's last_read_req member.
+
+To check whether the new usage is a batch buffer, a flag is passed in
+from the caller. The flag 'add_request' was previously present and
+was used to optimise out the add request call in the case of a batch
+buffer submission to prevent the semaphore emission being submitted in
+a separate request to the batch buffer itself. Although there was a
+bug where this flag was set incorrectly in LRC mode. This change
+replaces that flag with 'to_batch' to make it explicit that this is a
+batch buffer request rather than just assuming it as a side effect of
+the request optimisation. The reason for inverting the flag polarity
+is to avoid a messy double negative test: 'if(!not_a_batch)'.
+
+Change-Id: Idc16e19b5a4dc8b3782ce9db44dd3df445f396c1
+Issue: VIZ-5566
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    2 -
+ drivers/gpu/drm/i915/i915_gem.c            |   30 ++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    2 -
+ 3 files changed, 25 insertions(+), 9 deletions(-)
+
+Index: b/drivers/gpu/drm/i915/i915_drv.h
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_drv.h	2016-03-08 10:17:38.855552088 -0800
++++ b/drivers/gpu/drm/i915/i915_drv.h	2016-03-08 10:18:53.276502611 -0800
+@@ -2696,7 +2696,7 @@
+ 
+ int __must_check i915_mutex_lock_interruptible(struct drm_device *dev);
+ int i915_gem_object_sync(struct drm_i915_gem_object *obj,
+-			 struct intel_engine_cs *to, bool add_request);
++			 struct intel_engine_cs *to, bool to_batch);
+ void i915_vma_move_to_active(struct i915_vma *vma,
+ 			     struct intel_engine_cs *ring);
+ int i915_gem_dumb_create(struct drm_file *file_priv,
+Index: b/drivers/gpu/drm/i915/i915_gem.c
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_gem.c	2016-03-08 10:17:38.859552140 -0800
++++ b/drivers/gpu/drm/i915/i915_gem.c	2016-03-08 10:19:25.988919879 -0800
+@@ -3239,8 +3239,9 @@
+  *
+  * @obj: object which may be in use on another ring.
+  * @to: ring we wish to use the object on. May be NULL.
+- * @add_request: do we need to add a request to track operations
+- *    submitted on ring with sync_to function
++ * @to_batch: is the sync request on behalf of batch buffer submission?
++ * If so then the scheduler can (potentially) manage the synchronisation
++ * but if not then the flush is not required.
+  *
+  * This code is meant to abstract object synchronization with the GPU.
+  * Calling with NULL implies synchronizing the object with the CPU
+@@ -3250,7 +3251,7 @@
+  */
+ int
+ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+-		     struct intel_engine_cs *to, bool add_request)
++		     struct intel_engine_cs *to, bool to_batch)
+ {
+ 	struct intel_engine_cs *from;
+ 	u32 seqno;
+@@ -3261,8 +3262,20 @@
+ 	if (from == NULL || to == from)
+ 		return 0;
+ 
+-	if (to == NULL || !i915_semaphore_is_enabled(obj->base.dev))
+-		return i915_gem_object_wait_rendering(obj, false);
++	if (to == NULL)
++		goto wait;
++
++	/*
++	 * The scheduler will manage inter-ring object dependencies
++	 * as long as both to and from requests are scheduler managed
++	 * (i.e. batch buffers).
++	 */
++	if (to_batch &&
++	    i915_scheduler_is_request_tracked(obj->last_read_req, NULL, NULL))
++		return 0;
++
++	if (!i915_semaphore_is_enabled(obj->base.dev))
++		goto wait;
+ 
+ 	idx = intel_ring_sync_index(from, to);
+ 
+@@ -3283,11 +3296,14 @@
+ 		 */
+ 		from->semaphore.sync_seqno[idx] =
+ 				i915_gem_request_get_seqno(obj->last_read_req);
+-		if (add_request)
++		if (!to_batch)
+ 			i915_add_request_no_flush(to);
+ 	}
+ 
+ 	return ret;
++
++wait:
++	return i915_gem_object_wait_rendering(obj, false);
+ }
+ 
+ static void i915_gem_object_finish_gtt(struct drm_i915_gem_object *obj)
+@@ -4273,7 +4289,7 @@
+ 	struct drm_device *dev = obj->base.dev;
+ 
+ 	if (pipelined != i915_gem_request_get_ring(obj->last_read_req)) {
+-		ret = i915_gem_object_sync(obj, pipelined, true);
++		ret = i915_gem_object_sync(obj, pipelined, false);
+ 		if (ret)
+ 			return ret;
+ 	}
+Index: b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c	2016-03-08 10:17:38.859552140 -0800
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c	2016-03-08 10:18:53.280502661 -0800
+@@ -847,7 +847,7 @@
+ 
+ 	list_for_each_entry(vma, vmas, exec_list) {
+ 		struct drm_i915_gem_object *obj = vma->obj;
+-		ret = i915_gem_object_sync(obj, ring, false);
++		ret = i915_gem_object_sync(obj, ring, true);
+ 		if (ret)
+ 			return ret;
+ 

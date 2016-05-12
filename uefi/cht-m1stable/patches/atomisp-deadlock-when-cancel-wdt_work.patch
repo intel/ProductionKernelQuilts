@@ -1,0 +1,106 @@
+From 61c2031d7c5e030bffd279d4159d386579e8db60 Mon Sep 17 00:00:00 2001
+From: Saranya Gopal <saranya.gopal@intel.com>
+Date: Fri, 18 Dec 2015 11:53:10 +0530
+Subject: [PATCH 1/3] atomisp: deadlock when cancel wdt_work
+
+We hit deadlock in atomisp driver.
+
+v4l_streamoff	=> ...
+		=> atomisp_wdt_stop_pipe
+		=> cancel_work_sync(&pipe->asd->isp->wdt_work)
+
+ffffffff810a9f7d flush_work+0xed/0x170
+ffffffff810ab101 __cancel_work_timer+0x101/0x1c0
+ffffffff810ab1d0 cancel_work_sync+0x10/0x20
+ffffffffa02cf7df atomisp_wdt_stop_pipe+0x5f/0xa0
+atomisp_css2401a0_v21
+ffffffffa02cf85d atomisp_wdt_stop+0x3d/0x90
+atomisp_css2401a0_v21
+ffffffffa02d3b62 atomisp_css_flush+0x52/0x100
+atomisp_css2401a0_v21
+ffffffffa02cac22 __atomisp_streamoff+0x192/0x8c0
+atomisp_css2401a0_v21
+ffffffffa02cb3ab atomisp_streamoff+0x5b/0x80
+atomisp_css2401a0_v21
+ffffffff8175a25a v4l_streamoff+0x1a/0x20
+ffffffff8175cd9c __video_do_ioctl+0x26c/0x360
+ffffffff8175e730 video_usercopy+0x390/0x620
+ffffffff8175e9d5 video_ioctl2+0x15/0x20
+ffffffff81758ed4 v4l2_ioctl+0x154/0x190
+ffffffff817679e7 do_video_ioctl+0x457/0x16c0
+ffffffff81768cc2 v4l2_compat_ioctl32+0x72/0xb0
+ffffffff81208300 compat_sys_ioctl+0xc0/0x13e0
+ffffffff81a50b89 ia32_sysret+0x0/0x5
+
+However, wdt_work is running to apply for lock isp->mutex,
+which is held by above thread.
+
+The patch fixes it by resetting/checking wdt_work_queued.
+In addition, to make it safer, flush_work(isp->wdt_work) before
+atomisp_streamoff exits.
+
+Tracked-On: OAM-11082
+Signed-off-by: Xiao Jin <jin.xiao@intel.com>
+Signed-off-by: Zhang Yanmin <yanmin.zhang@intel.com>
+Reviewed-on: https://android.intel.com:443/430996
+(cherry picked from commit 12f0d428d8d7590b2db4ff5a6ded081e153ff916)
+Signed-off-by: Pradeep Sakhamoori <pradeep.sakhamoori@intel.com>
+
+Change-Id: I8385b047fbabae90acd94e9ed849e2fe50a645cb
+Original-Tracked-On: OAM-11082
+Signed-off-by: Binusha, B <b.binusha@intel.com>
+Signed-off-by: Saranya Gopal <saranya.gopal@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/90076
+Reviewed-by: Mikael Persson <mikael.persson@intel.com>
+Build: Dessert M CHT FFD (SC)
+Approver: Fan F Yang <fan.f.yang@intel.com>
+Reviewed-by: WeiX Meng <weix.meng@intel.com>
+Integrator: WeiX Meng <weix.meng@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-13813
+Signed-off-by: Yang Fan F <fan.f.yang@intel.com>
+Reviewed-on: https://android.intel.com:443/453191
+---
+ .../camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c | 7 ++++++-
+ .../drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c      | 1 +
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index 6338722..458682c 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -1507,6 +1507,11 @@ void atomisp_wdt_work(struct work_struct *work)
+ 	bool css_recover = true;
+ 
+ 	rt_mutex_lock(&isp->mutex);
++	if (!atomic_read(&isp->wdt_work_queued)) {
++		rt_mutex_unlock(&isp->mutex);
++		return;
++	}
++
+ 	if (!atomisp_streaming_count(isp)) {
+ 		atomic_set(&isp->wdt_work_queued, 0);
+ 		rt_mutex_unlock(&isp->mutex);
+@@ -1759,7 +1764,7 @@ void atomisp_wdt_stop_pipe(struct atomisp_video_pipe *pipe, bool sync)
+ 
+ 	if (sync) {
+ 		del_timer_sync(&pipe->wdt);
+-		cancel_work_sync(&pipe->asd->isp->wdt_work);
++		atomic_set(&pipe->asd->isp->wdt_work_queued, 0);
+ 	} else {
+ 		del_timer(&pipe->wdt);
+ 	}
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index 4e692e9..f0a4edb 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -2243,6 +2243,7 @@ static int atomisp_streamoff(struct file *file, void *fh,
+ 	rval = __atomisp_streamoff(file, fh, type);
+ 	rt_mutex_unlock(&isp->mutex);
+ 	mutex_unlock(&isp->streamoff_mutex);
++	flush_work(&isp->wdt_work);
+ 
+ 	return rval;
+ }
+-- 
+1.9.1
+

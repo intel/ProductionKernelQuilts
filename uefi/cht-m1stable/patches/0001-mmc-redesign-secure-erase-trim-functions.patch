@@ -1,0 +1,183 @@
+From 3abbfe42aed55b37515617f28d6c5ff901fd85a1 Mon Sep 17 00:00:00 2001
+From: Dong Chuanxiao <chuanxiao.dong@intel.com>
+Date: Wed, 17 Jul 2013 15:47:43 +0800
+Subject: [PATCH 1/3] mmc: redesign secure erase/trim functions
+
+BZ: 41411
+
+Since a lot of eMMC device has a much larger timeout request than
+MFLD host allowed, eMMC driver needs to have some changes to have
+a better using.
+
+report to block layer by using max_trim/max_discard size. So when
+secure erase/trim request coming, the request will at least need
+driver to erase max_trim/max_discard sectors.
+
+When processing secure erase/trim, not set R1B for CMD38 due to limited
+host timeout value. Driver will sending CMD13 to polling card status
+instead
+
+Change-Id: I93e9fd742045d7bc2234b16faef0a7cd739545e3
+Orig-Change-Id: I1794066a8735980d7f362c500d2f4c59d1cf1e83
+Signed-off-by: Ning Feiyi <feiyix.ning@intel.com>
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+
+Conflicts:
+
+	drivers/mmc/core/core.c
+	drivers/mmc/host/sdhci-pci.c
+	include/linux/mmc/host.h
+
+Signed-off-by: Eric Ernst <eric.ernst@intel.com>
+---
+ drivers/mmc/core/core.c       |   36 +++++++++++++++++++++++++++---------
+ drivers/mmc/host/sdhci-acpi.c |    2 +-
+ drivers/mmc/host/sdhci-pci.c  |    4 ++--
+ include/linux/mmc/host.h      |    1 +
+ 4 files changed, 31 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 098374b1ab2b..661ddd401058 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -1949,8 +1949,16 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
+ 	memset(&cmd, 0, sizeof(struct mmc_command));
+ 	cmd.opcode = MMC_ERASE;
+ 	cmd.arg = arg;
+-	cmd.flags = MMC_RSP_SPI_R1B | MMC_RSP_R1B | MMC_CMD_AC;
+-	cmd.cmd_timeout_ms = mmc_erase_timeout(card, arg, qty);
++	if (card->host->caps2 & MMC_CAP2_POLL_R1B_BUSY) {
++		cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 | MMC_CMD_AC;
++		if (card->host->max_discard_to)
++			cmd.cmd_timeout_ms = card->host->max_discard_to - 1;
++		else
++			cmd.cmd_timeout_ms = mmc_erase_timeout(card, arg, qty);
++	} else {
++		cmd.flags = MMC_RSP_SPI_R1B | MMC_RSP_R1B | MMC_CMD_AC;
++		cmd.cmd_timeout_ms = mmc_erase_timeout(card, arg, qty);
++	}
+ 	err = mmc_wait_for_cmd(card->host, &cmd, 0);
+ 	if (err) {
+ 		pr_err("mmc_erase: erase error %d, status %#x\n",
+@@ -1959,7 +1967,8 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
+ 		goto out;
+ 	}
+ 
+-	if (mmc_host_is_spi(card->host))
++	if (mmc_host_is_spi(card->host) &&
++			!(card->host->caps2 & MMC_CAP2_POLL_R1B_BUSY))
+ 		goto out;
+ 
+ 	timeout = jiffies + msecs_to_jiffies(MMC_CORE_TIMEOUT_MS);
+@@ -2123,7 +2132,7 @@ static unsigned int mmc_do_calc_max_discard(struct mmc_card *card,
+ {
+ 	struct mmc_host *host = card->host;
+ 	unsigned int max_discard, x, y, qty = 0, max_qty, timeout;
+-	unsigned int last_timeout = 0;
++	unsigned int last_timeout = 0, aligned_qty;
+ 
+ 	if (card->erase_shift)
+ 		max_qty = UINT_MAX >> card->erase_shift;
+@@ -2150,16 +2159,21 @@ static unsigned int mmc_do_calc_max_discard(struct mmc_card *card,
+ 	if (!qty)
+ 		return 0;
+ 
+-	if (qty == 1)
+-		return 1;
++	if (arg & MMC_TRIM_ARGS) {
++		if (qty == 1)
++			aligned_qty = 1;
++		else
++			aligned_qty = qty - 1;
++	} else
++		aligned_qty = qty;
+ 
+ 	/* Convert qty to sectors */
+ 	if (card->erase_shift)
+-		max_discard = --qty << card->erase_shift;
++		max_discard = aligned_qty << card->erase_shift;
+ 	else if (mmc_card_sd(card))
+ 		max_discard = qty;
+ 	else
+-		max_discard = --qty * card->erase_size;
++		max_discard = aligned_qty * card->erase_size;
+ 
+ 	return max_discard;
+ }
+@@ -2172,6 +2186,7 @@ unsigned int mmc_calc_max_discard(struct mmc_card *card)
+ 	if (!host->max_discard_to)
+ 		return UINT_MAX;
+ 
++
+ 	/*
+ 	 * Without erase_group_def set, MMC erase timeout depends on clock
+ 	 * frequence which can change.  In that case, the best choice is
+@@ -2180,6 +2195,9 @@ unsigned int mmc_calc_max_discard(struct mmc_card *card)
+ 	if (mmc_card_mmc(card) && !(card->ext_csd.erase_group_def & 1))
+ 		return card->pref_erase;
+ 
++	if (host->caps2 & MMC_CAP2_POLL_R1B_BUSY)
++		return UINT_MAX;
++
+ 	max_discard = mmc_do_calc_max_discard(card, MMC_ERASE_ARG);
+ 	if (mmc_can_trim(card)) {
+ 		max_trim = mmc_do_calc_max_discard(card, MMC_TRIM_ARG);
+@@ -2188,7 +2206,7 @@ unsigned int mmc_calc_max_discard(struct mmc_card *card)
+ 	} else if (max_discard < card->erase_size) {
+ 		max_discard = 0;
+ 	}
+-	pr_debug("%s: calculated max. discard sectors %u for timeout %u ms\n",
++	pr_info("%s: calculated max. discard sectors %u for timeout %u ms\n",
+ 		 mmc_hostname(host), max_discard, host->max_discard_to);
+ 	return max_discard;
+ }
+diff --git a/drivers/mmc/host/sdhci-acpi.c b/drivers/mmc/host/sdhci-acpi.c
+index 9ce17f6e4014..c04cdabfddec 100644
+--- a/drivers/mmc/host/sdhci-acpi.c
++++ b/drivers/mmc/host/sdhci-acpi.c
+@@ -116,7 +116,7 @@ static const struct sdhci_acpi_chip sdhci_acpi_chip_int = {
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_emmc = {
+ 	.chip    = &sdhci_acpi_chip_int,
+ 	.caps    = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE | MMC_CAP_HW_RESET,
+-	.caps2   = MMC_CAP2_HC_ERASE_SZ,
++	.caps2   = MMC_CAP2_HC_ERASE_SZ | MMC_CAP2_POLL_R1B_BUSY,
+ 	.flags   = SDHCI_ACPI_RUNTIME_PM,
+ };
+ 
+diff --git a/drivers/mmc/host/sdhci-pci.c b/drivers/mmc/host/sdhci-pci.c
+index 0955777b6c7e..00dd4c49b940 100644
+--- a/drivers/mmc/host/sdhci-pci.c
++++ b/drivers/mmc/host/sdhci-pci.c
+@@ -202,7 +202,7 @@ static int mfd_emmc_probe_slot(struct sdhci_pci_slot *slot)
+ {
+ 	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE;
+ 	slot->host->mmc->caps2 |= MMC_CAP2_BOOTPART_NOACC |
+-				  MMC_CAP2_HC_ERASE_SZ;
++				  MMC_CAP2_HC_ERASE_SZ | MMC_CAP2_POLL_R1B_BUSY;
+ 	return 0;
+ }
+ 
+@@ -265,7 +265,7 @@ static int byt_emmc_probe_slot(struct sdhci_pci_slot *slot)
+ {
+ 	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
+ 				 MMC_CAP_HW_RESET;
+-	slot->host->mmc->caps2 |= MMC_CAP2_HC_ERASE_SZ;
++	slot->host->mmc->caps2 |= MMC_CAP2_HC_ERASE_SZ | MMC_CAP2_POLL_R1B_BUSY;
+ 	slot->hw_reset = sdhci_pci_int_hw_reset;
+ 	return 0;
+ }
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 99f5709ac343..283e4aa238b7 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -282,6 +282,7 @@ struct mmc_host {
+ 				 MMC_CAP2_PACKED_WR)
+ #define MMC_CAP2_NO_PRESCAN_POWERUP (1 << 14)	/* Don't power up before scan */
+ #define MMC_CAP2_SANITIZE	(1 << 15)		/* Support Sanitize */
++#define MMC_CAP2_POLL_R1B_BUSY	(1 << 16)	/* host poll R1B busy*/
+ 
+ 	mmc_pm_flag_t		pm_caps;	/* supported pm features */
+ 
+-- 
+1.7.9.5
+

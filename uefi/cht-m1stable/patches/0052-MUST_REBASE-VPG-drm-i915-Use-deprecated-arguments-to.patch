@@ -1,0 +1,391 @@
+From e11d52ca85aa530232350788c3e5c4e091adada9 Mon Sep 17 00:00:00 2001
+Message-Id: <e11d52ca85aa530232350788c3e5c4e091adada9.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: arsharma <ankitprasad.r.sharma@intel.com>
+Date: Tue, 15 Jul 2014 20:57:59 +0530
+Subject: [PATCH 52/71] MUST_REBASE [VPG]: drm/i915: Use deprecated arguments
+ to pass command buffer private data
+
+Workaround:  Due to a HW limitation, the "Clear Batch Buffer" (CB2) command
+to clean up render artifacts following encrypted processing must be executed from the render ring.
+Applications submitting an execbuffer need the ability to inform the kernel if CB2 execution is required.
+There a two deprecated arguments available in the drm_intel_bo_mrb_exec() function
+(*clip_rects, and num_clip_rects) that are no longer used for Gen5 and later.
+These two arguments will be used to pass information about CB2 execution between app and kernel.
+This patch also includes the BYT-CR specific fix to prevent the
+artifacts seen during protected content playback over WiDi on BYT_CR.
+
+    (cherry picked from commit f8f86747a8bff3e9f8732d8fae99093a5ca4673c)
+
+Change-Id: Ided6ed23b93f1328ca8fe58737b2956c5f14e852
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c   |   76 +++++++++-----
+ drivers/gpu/drm/i915/i915_gem_render_state.c |    1 +
+ drivers/gpu/drm/i915/intel_ringbuffer.c      |  137 +++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_ringbuffer.h      |    1 +
+ 4 files changed, 184 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 8f6e122..21d3a1f 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1055,37 +1055,55 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 	u32 seqno;
+ 	int sync_err = 0;
+ 	void *handle = NULL;
++	void *priv_data = NULL;
++	u32 priv_length = 0;
+ 
+ 	if (args->num_cliprects != 0) {
+-		if (ring != &dev_priv->ring[RCS]) {
+-			DRM_DEBUG("clip rectangles are only valid with the render ring\n");
+-			return -EINVAL;
+-		}
++		if (INTEL_INFO(dev)->gen <= 4) {
++			/* Pre-Gen5 definition of cliprects */
++			if (ring != &dev_priv->ring[RCS]) {
++				DRM_DEBUG("clip rectangles are only valid with "
++					  "the render ring\n");
++				return -EINVAL;
++			}
+ 
+-		if (INTEL_INFO(dev)->gen >= 5) {
+-			DRM_DEBUG("clip rectangles are only valid on pre-gen5\n");
+-			return -EINVAL;
+-		}
++			if (args->num_cliprects > 
++					UINT_MAX / sizeof(*cliprects)) {
++				DRM_DEBUG("execbuf with %u cliprects\n",
++					  args->num_cliprects);
++				return -EINVAL;
++			}
+ 
+-		if (args->num_cliprects > UINT_MAX / sizeof(*cliprects)) {
+-			DRM_DEBUG("execbuf with %u cliprects\n",
+-				  args->num_cliprects);
+-			return -EINVAL;
+-		}
++			cliprects = kcalloc(args->num_cliprects,
++					    sizeof(*cliprects),
++					    GFP_KERNEL);
++			if (cliprects == NULL) {
++				ret = -ENOMEM;
++				goto error;
++			}
+ 
+-		cliprects = kcalloc(args->num_cliprects,
+-				    sizeof(*cliprects),
+-				    GFP_KERNEL);
+-		if (cliprects == NULL) {
+-			ret = -ENOMEM;
+-			goto error;
+-		}
++			if (copy_from_user(cliprects,
++				    to_user_ptr(args->cliprects_ptr),
++				    sizeof(*cliprects)*args->num_cliprects)) {
++				ret = -EFAULT;
++				goto error;
++			}
++		} else {
++			/* Gen5 and later definition of cliprects */
++			priv_data = kmalloc(args->num_cliprects, GFP_KERNEL);
++			if (priv_data == NULL) {
++				ret = -ENOMEM;
++				goto error;
++			}
+ 
+-		if (copy_from_user(cliprects,
+-				   to_user_ptr(args->cliprects_ptr),
+-				   sizeof(*cliprects)*args->num_cliprects)) {
+-			ret = -EFAULT;
+-			goto error;
++			priv_length = args->num_cliprects;
++			if (copy_from_user(
++					priv_data,
++					to_user_ptr(args->cliprects_ptr),
++					priv_length)) {
++				ret = -EFAULT;
++				goto error;
++			}
+ 		}
+ 	} else {
+ 		if (args->DR4 == 0xffffffff) {
+@@ -1179,6 +1197,7 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 
+ 	exec_len = args->batch_len;
+ 	if (cliprects) {
++		/* Non-NULL cliprects only possible for Gen <= 4 */
+ 		for (i = 0; i < args->num_cliprects; i++) {
+ 			ret = i915_emit_box(dev, &cliprects[i],
+ 					    args->DR1, args->DR4);
+@@ -1187,16 +1206,19 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 
+ 			ret = ring->dispatch_execbuffer(ring,
+ 							exec_start, exec_len,
++							NULL, 0,
+ 							flags);
+ 			if (ret)
+ 				goto error;
+ 		}
+ 	} else {
++		/* Execution path for all Gen >= 5 */
+ 		ret = ring->dispatch_execbuffer(ring,
+ 						exec_start, exec_len,
++						priv_data, priv_length,
+ 						flags);
+ 		if (ret)
+-			return ret;
++			goto error;
+ 	}
+ 
+ 	sync_err = i915_sync_finish_request(handle, args, ring);
+@@ -1226,6 +1248,7 @@ error:
+ 		i915_sync_cancel_request(handle, args, ring);
+ 
+ 	kfree(cliprects);
++	kfree(priv_data);
+ 	return ret;
+ }
+ 
+@@ -1291,6 +1314,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	struct intel_engine_cs *ring;
+ 	struct intel_context *ctx;
+ 	struct i915_address_space *vm;
++
+ 	const u32 ctx_id = i915_execbuffer2_get_context_id(*args);
+ 	u64 exec_start = args->batch_start_offset;
+ 	u32 flags;
+diff --git a/drivers/gpu/drm/i915/i915_gem_render_state.c b/drivers/gpu/drm/i915/i915_gem_render_state.c
+index a9a62d7..7e6a32c7 100644
+--- a/drivers/gpu/drm/i915/i915_gem_render_state.c
++++ b/drivers/gpu/drm/i915/i915_gem_render_state.c
+@@ -165,6 +165,7 @@ int i915_gem_render_state_init(struct intel_engine_cs *ring)
+ 	ret = ring->dispatch_execbuffer(ring,
+ 					so.ggtt_offset,
+ 					so.rodata->batch_items * 4,
++					NULL, 0,
+ 					I915_DISPATCH_SECURE);
+ 	if (ret)
+ 		goto out;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 9d56e97..b854048 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1397,6 +1397,7 @@ gen8_ring_put_irq(struct intel_engine_cs *ring)
+ static int
+ i965_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 			 u64 offset, u32 length,
++			 void *priv_data, u32 priv_length,
+ 			 unsigned flags)
+ {
+ 	int ret;
+@@ -1420,6 +1421,7 @@ i965_dispatch_execbuffer(struct intel_engine_cs *ring,
+ static int
+ i830_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 				u64 offset, u32 len,
++				void *priv_data, u32 priv_length,
+ 				unsigned flags)
+ {
+ 	int ret;
+@@ -1471,6 +1473,7 @@ i830_dispatch_execbuffer(struct intel_engine_cs *ring,
+ static int
+ i915_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 			 u64 offset, u32 len,
++			 void *priv_data, u32 priv_length,
+ 			 unsigned flags)
+ {
+ 	int ret;
+@@ -2030,8 +2033,33 @@ static int gen6_bsd_ring_flush(struct intel_engine_cs *ring,
+ }
+ 
+ static int
++gen8_pipe_control_disable_protected_mem(struct intel_engine_cs *ring)
++{
++	int ret;
++
++	ret = intel_ring_begin(ring, 8);
++	if (ret)
++		return ret;
++
++	/* Pipe Control */
++	intel_ring_emit(ring, GFX_OP_PIPE_CONTROL(5));	/* DW0 */
++	intel_ring_emit(ring, 0x81010a0);	/* DW1 - Disable
++							protect mem */
++	intel_ring_emit(ring, 0);		/* DW2 */
++	intel_ring_emit(ring, 0);		/* DW3 */
++	intel_ring_emit(ring, 0);		/* DW4 */
++	intel_ring_emit(ring, 0);		/* DW5 */
++	intel_ring_emit(ring, 0);		/* NOOP */
++	intel_ring_emit(ring, 0);		/* NOOP */
++	intel_ring_advance(ring);
++
++	return 0;
++}
++
++static int
+ gen8_ring_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 			      u64 offset, u32 len,
++			      void *priv_data, u32 priv_length,
+ 			      unsigned flags)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+@@ -2050,15 +2078,101 @@ gen8_ring_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 	intel_ring_emit(ring, MI_NOOP);
+ 	intel_ring_advance(ring);
+ 
+-	return 0;
++	/* Send pipe control with protected memory disable if requested */
++	if ((priv_length == sizeof(u32)) &&
++	    (*(u32 *)priv_data == 0xffffffff)) {
++		ret = gen8_pipe_control_disable_protected_mem(ring);
++		if (ret)
++			return ret;
++	}
++
++	return ret;
++}
++
++static int
++launch_cb2(struct intel_engine_cs *ring)
++{
++	int			i;
++	int			ret = 0;
++	uint32_t		hws_pga;
++	struct drm_i915_private	*dev_priv = ring->dev->dev_private;
++
++	/* Get HW Status Page address & point to its center */
++	hws_pga = 0x800 + (I915_READ(RENDER_HWS_PGA_GEN7) & 0xFFFFF000);
++
++	ret = intel_ring_begin(ring, 8);
++	if (ret)
++		return ret;
++
++	/* Pipe Control */
++	intel_ring_emit(ring, 0x7a000003);	/* PipeControl DW0 */
++	intel_ring_emit(ring, 0x01510bc);	/* DW1 */
++	intel_ring_emit(ring, 0);		/* DW2 */
++	intel_ring_emit(ring, 0);		/* DW3 */
++	intel_ring_emit(ring, 0);		/* DW4 */
++	intel_ring_emit(ring, 0);		/* NOOP */
++	intel_ring_emit(ring, 0);		/* NOOP */
++	intel_ring_emit(ring, 0);		/* NOOP */
++	intel_ring_advance(ring);
++
++	/* Insert 20 Store Data Immediate commands */
++	for (i = 0; i < 20; i++) {
++		ret = intel_ring_begin(ring, 4);
++		if (ret)
++			return ret;
++
++		intel_ring_emit(ring, 0x10400002); /* SDI - DW0 */
++		intel_ring_emit(ring, 0);	/* SDI - DW1 */
++		intel_ring_emit(ring, hws_pga);	/* SDI - Address */
++		intel_ring_emit(ring, 0);	/* SDI - Data */
++		intel_ring_advance(ring);
++	}
++
++	ret = intel_ring_begin(ring, 12);
++	if (ret)
++		return ret;
++
++	/* Start CB2 */
++	intel_ring_emit(ring, 0x18800800);	/* BB Start - CB2 */
++	intel_ring_emit(ring, 0);		/* Address */
++	intel_ring_emit(ring, 0);		/* NOOP */
++	intel_ring_emit(ring, 0);		/* NOOP */
++
++	/* Pipe Control */
++	intel_ring_emit(ring, 0x7a000003);	/* PipeControl DW0 */
++	intel_ring_emit(ring, 0x01510bc);	/* DW1 */
++	intel_ring_emit(ring, 0);		/* DW2 */
++	intel_ring_emit(ring, 0);		/* DW3 */
++	intel_ring_emit(ring, 0);		/* DW4 */
++	intel_ring_emit(ring, 0);		/* NOOP */
++	intel_ring_emit(ring, 0);		/* NOOP */
++	intel_ring_emit(ring, 0);		/* NOOP */
++
++	intel_ring_advance(ring);
++
++	/* Add another 20 Store Data Immediate commands */
++	for (i = 0; i < 20; i++) {
++		ret = intel_ring_begin(ring, 4);
++		if (ret)
++			return ret;
++
++		intel_ring_emit(ring, 0x10400002); /* SDI - DW0 */
++		intel_ring_emit(ring, 0);	/* SDI - DW1 */
++		intel_ring_emit(ring, hws_pga);	/* SDI - Address */
++		intel_ring_emit(ring, 0);	/* SDI - Data */
++		intel_ring_advance(ring);
++	}
++
++	return ret;
+ }
+ 
+ static int
+ hsw_ring_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 			      u64 offset, u32 len,
++			      void *priv_data, u32 priv_length,
+ 			      unsigned flags)
+ {
+-	int ret;
++	int ret = 0;
+ 
+ 	ret = intel_ring_begin(ring, 2);
+ 	if (ret)
+@@ -2071,15 +2185,21 @@ hsw_ring_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 	intel_ring_emit(ring, offset);
+ 	intel_ring_advance(ring);
+ 
+-	return 0;
++	/* Execute CB2 if requested */
++	if ((priv_length == sizeof(u32)) &&
++	    (*(u32 *)priv_data == 0xffffffff))
++		ret = launch_cb2(ring);
++
++	return ret;
+ }
+ 
+ static int
+ gen6_ring_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 			      u64 offset, u32 len,
++			      void *priv_data, u32 priv_length,
+ 			      unsigned flags)
+ {
+-	int ret;
++	int ret = 0;
+ 
+ 	ret = intel_ring_begin(ring, 2);
+ 	if (ret)
+@@ -2092,7 +2212,14 @@ gen6_ring_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 	intel_ring_emit(ring, offset);
+ 	intel_ring_advance(ring);
+ 
+-	return 0;
++	/* Execute CB2 if requested */
++	if ((priv_length == sizeof(u32)) &&
++	    (*(u32 *)priv_data == 0xffffffff)) {
++		if (IS_VALLEYVIEW(ring->dev))
++			ret = launch_cb2(ring);
++	}
++
++	return ret;
+ }
+ 
+ /* Blitter support (SandyBridge+) */
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 957147e..bb1dbb8 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -142,6 +142,7 @@ struct intel_engine_cs {
+ 				     u32 seqno);
+ 	int		(*dispatch_execbuffer)(struct intel_engine_cs *ring,
+ 					       u64 offset, u32 length,
++					       void *priv_data, u32 priv_length,
+ 					       unsigned flags);
+ #define I915_DISPATCH_SECURE 0x1
+ #define I915_DISPATCH_PINNED 0x2
+-- 
+1.7.9.5
+

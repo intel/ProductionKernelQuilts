@@ -1,0 +1,1173 @@
+From 5255c954e6a72de5cf211461b5cf6d66642ec91a Mon Sep 17 00:00:00 2001
+From: Hyunchang Choi <hyunchang.choi@intel.com>
+Date: Wed, 30 Sep 2015 15:45:37 -0700
+Subject: [PATCH] imx227: Add IMX227 driver for BTNS
+
+Port from R6_legacy for BTNS.
+
+Change-Id: I4c9f51bfd1696aef24e7ba7fc5d300cd0b5e077b
+Original-Tracked-On: #H1504074607
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-7449
+Signed-off-by: Hyunchang Choi <hyunchang.choi@intel.com>
+Signed-off-by: Zhang, Guoqing <guoqingx.zhang@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/80825
+Build: Dessert M BXT RVP (SC)
+Approver: Bin B Han <bin.b.han@intel.com>
+Reviewed-by: Bin B Han <bin.b.han@intel.com>
+Build: Dessert M CHT FFD (SC)
+Build: Dessert M COHO (SC)
+Integrator: WeiX Meng <weix.meng@intel.com>
+Validation-Android: Wei Tao <wei.tao@intel.com>
+Reviewed-by: WeiX Meng <weix.meng@intel.com>
+---
+ .../camera/drivers/media/i2c/imx/imx.c             |  92 ++-
+ .../camera/drivers/media/i2c/imx/imx.h             |  52 +-
+ .../camera/drivers/media/i2c/imx/imx227.h          | 716 +++++++++++++++++++++
+ .../camera/drivers/media/i2c/imx/otp_imx.c         |  46 ++
+ 4 files changed, 892 insertions(+), 14 deletions(-)
+ create mode 100644 drivers/external_drivers/camera/drivers/media/i2c/imx/imx227.h
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+index 37d743a..d22aa02 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+@@ -62,6 +62,10 @@ static enum atomisp_bayer_order imx_bayer_order_mapping[] = {
+ 	atomisp_bayer_order_bggr
+ };
+ 
++static const unsigned int
++IMX227_BRACKETING_LUT_FRAME_ENTRY[IMX_MAX_AE_LUT_LENGTH] = {
++	0x0E10, 0x0E1E, 0x0E2C, 0x0E3A, 0x0E48};
++
+ static int
+ imx_read_reg(struct i2c_client *client, u16 len, u16 reg, u16 *val)
+ {
+@@ -380,9 +384,11 @@ static int __imx_update_exposure_timing(struct i2c_client *client, u16 exposure,
+ 	struct imx_device *dev = to_imx_sensor(sd);
+ 	int ret = 0;
+ 
+-	/* Increase the VTS to match exposure + margin */
+-	if (exposure > fll - IMX_INTEGRATION_TIME_MARGIN)
+-		fll = exposure + IMX_INTEGRATION_TIME_MARGIN;
++	if (dev->sensor_id != IMX227_ID) {
++		/* Increase the VTS to match exposure + margin */
++		if (exposure > fll - IMX_INTEGRATION_TIME_MARGIN)
++			fll = exposure + IMX_INTEGRATION_TIME_MARGIN;
++	}
+ 
+ 	ret = imx_write_reg(client, IMX_16BIT,
+ 		dev->reg_addr->line_length_pixels, llp);
+@@ -431,6 +437,8 @@ static int __imx_update_digital_gain(struct i2c_client *client, u16 digitgain)
+ 
+ 	if (dev->sensor_id == IMX219_ID) {
+ 		return imx_i2c_write(client, IMX219_DGC_LEN, (u8 *)&digit_gain);
++	} else if (dev->sensor_id == IMX227_ID) {
++		return imx_i2c_write(client, IMX227_DGC_LEN, (u8 *)&digit_gain);
+ 	} else {
+ 		digit_gain.data[2] = (digitgain >> 8) & 0xFF;
+ 		digit_gain.data[3] = digitgain & 0xFF;
+@@ -460,6 +468,12 @@ static int imx_set_exposure_gain(struct v4l2_subdev *sd, u16 coarse_itg,
+ 
+ 	mutex_lock(&dev->input_lock);
+ 
++	if (dev->sensor_id == IMX227_ID) {
++		ret = imx_write_reg_array(client, imx_param_hold);
++		if (ret)
++			return ret;
++	}
++
+ 	/* For imx175, setting gain must be delayed by one */
+ 	if ((dev->sensor_id == IMX175_ID) && dev->digital_gain)
+ 		digitgain_scaled = dev->digital_gain;
+@@ -494,6 +508,8 @@ static int imx_set_exposure_gain(struct v4l2_subdev *sd, u16 coarse_itg,
+ 	dev->digital_gain = digitgain;
+ 
+ out:
++	if (dev->sensor_id == IMX227_ID)
++		ret = imx_write_reg_array(client, imx_param_update);
+ 	mutex_unlock(&dev->input_lock);
+ 	return ret;
+ }
+@@ -816,7 +832,11 @@ static int imx_get_intg_factor(struct i2c_client *client,
+ 		dev->sensor_id == IMX219_ID)
+ 		read_mode = 0;
+ 	else {
+-		ret = imx_read_reg(client, 1, IMX_READ_MODE, data);
++		if (dev->sensor_id == IMX227_ID)
++			ret = imx_read_reg(client, 1, IMX227_READ_MODE, data);
++		else
++			ret = imx_read_reg(client, 1, IMX_READ_MODE, data);
++
+ 		if (ret)
+ 			return ret;
+ 		read_mode = data[0] & IMX_MASK_2BIT;
+@@ -828,6 +848,12 @@ static int imx_get_intg_factor(struct i2c_client *client,
+ 
+ 	if (dev->sensor_id == IMX132_ID || dev->sensor_id == IMX208_ID)
+ 		vt_pix_clk_freq_mhz = ext_clk_freq_hz / div;
++	else if (dev->sensor_id == IMX227_ID)
++		/* according to IMX227 datasheet:
++		 * vt_pix_freq_mhz = * num_of_vt_lanes(4) * ivt_pix_clk_freq_mhz
++		 */
++		vt_pix_clk_freq_mhz =
++			(u64)4 * ext_clk_freq_hz * pll_multiplier / div;
+ 	else
+ 		vt_pix_clk_freq_mhz = 2 * ext_clk_freq_hz / div;
+ 
+@@ -854,12 +880,23 @@ static int imx_get_intg_factor(struct i2c_client *client,
+ 		buf->binning_factor_x = 1;
+ 		buf->binning_factor_y = 1;
+ 	} else {
+-		ret = imx_read_reg(client, 1, IMX_BINNING_ENABLE, data);
++		if (dev->sensor_id == IMX227_ID)
++			ret = imx_read_reg(client, 1, IMX227_BINNING_ENABLE,
++				data);
++		else
++			ret = imx_read_reg(client, 1, IMX_BINNING_ENABLE, data);
++
+ 		if (ret)
+ 			return ret;
+ 		/* 1:binning enabled, 0:disabled */
+ 		if (data[0] == 1) {
+-			ret = imx_read_reg(client, 1, IMX_BINNING_TYPE, data);
++			if (dev->sensor_id == IMX227_ID)
++				ret = imx_read_reg(client, 1,
++					IMX227_BINNING_TYPE, data);
++			else
++				ret = imx_read_reg(client, 1,
++					IMX_BINNING_TYPE, data);
++
+ 			if (ret)
+ 				return ret;
+ 			buf->binning_factor_x = data[0] >> 4 & 0x0f;
+@@ -868,6 +905,20 @@ static int imx_get_intg_factor(struct i2c_client *client,
+ 			buf->binning_factor_y = data[0] & 0xf;
+ 			if (!buf->binning_factor_y)
+ 				buf->binning_factor_y = 1;
++			/* WOWRKAROUND, NHD setting for IMX227 should have 4x4
++			 * binning but the register setting does not reflect
++			 * this, I am asking vendor why this happens. this is
++			 * workaround for INTEL BZ 216560.
++			 */
++			if (dev->sensor_id == IMX227_ID) {
++				if (dev->curr_res_table[dev->fmt_idx].width ==
++					376 &&
++				    dev->curr_res_table[dev->fmt_idx].height ==
++					656) {
++					buf->binning_factor_x = 4;
++					buf->binning_factor_y = 4;
++				}
++			}
+ 		} else {
+ 			buf->binning_factor_x = 1;
+ 			buf->binning_factor_y = 1;
+@@ -1774,6 +1825,25 @@ static int imx_s_mbus_fmt(struct v4l2_subdev *sd,
+ 				imx135_embedded_effective_size;
+ 
+ 		break;
++	case IMX227_ID:
++		ret = imx_read_reg(client, 2, IMX227_OUTPUT_DATA_FORMAT_REG,
++			&data);
++		if (ret)
++			goto out;
++		if (data == IMX227_OUTPUT_FORMAT_RAW10)
++			/* the data format is RAW10. */
++			imx_info->metadata_width = res->width * 10 / 8;
++		else
++			/* The data format is RAW6/8/12/14/ etc. */
++			imx_info->metadata_width = res->width;
++
++		imx_info->metadata_height = IMX227_EMBEDDED_DATA_LINE_NUM;
++
++		if (imx_info->metadata_effective_width == NULL)
++			imx_info->metadata_effective_width =
++				imx227_embedded_effective_size;
++
++		break;
+ 	default:
+ 		imx_info->metadata_width = 0;
+ 		imx_info->metadata_height = 0;
+@@ -1821,11 +1891,11 @@ static int imx_detect(struct i2c_client *client, u16 *id, u8 *revision)
+ 		*id == IMX208_ID || *id == IMX219_ID)
+ 		goto found;
+ 
+-	if (imx_read_reg(client, IMX_16BIT, IMX134_135_CHIP_ID, id)) {
++	if (imx_read_reg(client, IMX_16BIT, IMX134_135_227_CHIP_ID, id)) {
+ 		v4l2_err(client, "sensor_id = 0x%x\n", *id);
+ 		return -ENODEV;
+ 	}
+-	if (*id != IMX134_ID && *id != IMX135_ID) {
++	if (*id != IMX134_ID && *id != IMX135_ID && *id != IMX227_ID) {
+ 		v4l2_err(client, "no imx sensor found\n");
+ 		return -ENODEV;
+ 	}
+@@ -2025,6 +2095,11 @@ static int __update_imx_device_settings(struct imx_device *dev, u16 sensor_id)
+ 		dev->vcm_driver = &imx_vcms[IMX219_MFV0_PRH];
+ 		dev->otp_driver = &imx_otps[IMX219_MFV0_PRH];
+ 		break;
++	case IMX227_ID:
++		dev->mode_tables = &imx_sets[IMX227_SAND];
++		dev->vcm_driver = NULL;
++		dev->otp_driver = &imx_otps[IMX227_SAND];
++		return 0;
+ 	case IMX132_ID:
+ 		dev->mode_tables = &imx_sets[IMX132_SALTBAY];
+ 		dev->otp_driver = &imx_otps[IMX132_SALTBAY];
+@@ -2616,6 +2691,7 @@ static const struct i2c_device_id imx_ids[] = {
+ 	{IMX_NAME_132, IMX132_ID},
+ 	{IMX_NAME_208, IMX208_ID},
+ 	{IMX_NAME_219, IMX219_ID},
++	{IMX_NAME_227, IMX227_ID},
+ 	{}
+ };
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.h b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.h
+index fb78175..1e2c0c3 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.h
+@@ -43,6 +43,7 @@
+ #include "imx132.h"
+ #include "imx208.h"
+ #include "imx219.h"
++#include "imx227.h"
+ 
+ #define IMX_MCLK		192
+ 
+@@ -51,11 +52,13 @@
+ #define V4L2_IDENT_IMX	8245
+ #endif
+ 
++#define IMX_MAX_AE_LUT_LENGTH	5
+ /*
+  * imx System control registers
+  */
+ #define IMX_MASK_5BIT	0x1F
+ #define IMX_MASK_4BIT	0xF
++#define IMX_MASK_3BIT	0x7
+ #define IMX_MASK_2BIT	0x3
+ #define IMX_MASK_8BIT	0xFF
+ #define IMX_MASK_11BIT	0x7FF
+@@ -63,10 +66,16 @@
+ 
+ #define IMX_FINE_INTG_TIME		0x1E8
+ 
+-#define IMX_VT_PIX_CLK_DIV			0x0301
+-#define IMX_VT_SYS_CLK_DIV			0x0303
+-#define IMX_PRE_PLL_CLK_DIV			0x0305
+-#define IMX_PLL_MULTIPLIER			0x030C
++#define IMX_VT_PIX_CLK_DIV		0x0301
++#define IMX_VT_SYS_CLK_DIV		0x0303
++#define IMX_PRE_PLL_CLK_DIV		0x0305
++#define IMX227_IOP_PRE_PLL_CLK_DIV	0x030D
++#define IMX227_PLL_MULTIPLIER		0x0306
++#define IMX227_IOP_PLL_MULTIPLIER	0x030E
++#define IMX227_PLL_MULTI_DRIVE		0x0310
++#define IMX227_OP_PIX_CLK_DIV		0x0309
++#define IMX227_OP_SYS_CLK_DIV		0x030B
++#define IMX_PLL_MULTIPLIER		0x030C
+ #define IMX_OP_PIX_DIV			0x0309
+ #define IMX_OP_SYS_DIV			0x030B
+ #define IMX_FRAME_LENGTH_LINES		0x0340
+@@ -74,9 +83,11 @@
+ #define IMX_COARSE_INTG_TIME_MIN	0x1004
+ #define IMX_COARSE_INTG_TIME_MAX	0x1006
+ #define IMX_BINNING_ENABLE		0x0390
++#define IMX227_BINNING_ENABLE		0x0900
+ #define IMX_BINNING_TYPE		0x0391
+-
+-#define IMX_READ_MODE				0x0390
++#define IMX227_BINNING_TYPE		0x0901
++#define IMX_READ_MODE			0x0390
++#define IMX227_READ_MODE		0x0900
+ 
+ #define IMX_HORIZONTAL_START_H 0x0344
+ #define IMX_VERTICAL_START_H 0x0346
+@@ -104,6 +115,7 @@
+ #define IMX_SHORT_AGC_GAIN		0x0233
+ #define IMX_DGC_ADJ		0x020E
+ #define IMX_DGC_LEN		10
++#define IMX227_DGC_LEN		4
+ #define IMX_MAX_EXPOSURE_SUPPORTED 0xfffb
+ #define IMX_MAX_GLOBAL_GAIN_SUPPORTED 0x00ff
+ #define IMX_MAX_DIGITAL_GAIN_SUPPORTED 0x0fff
+@@ -121,12 +133,14 @@
+ #define IMX_NAME_132	"imx132"
+ #define IMX_NAME_208	"imx208"
+ #define IMX_NAME_219	"imx219"
++#define IMX_NAME_227	"imx227"
+ #define IMX175_ID	0x0175
+ #define IMX135_ID	0x0135
+ #define IMX134_ID	0x0134
+ #define IMX132_ID	0x0132
+ #define IMX208_ID	0x0208
+ #define IMX219_ID	0x0219
++#define IMX227_ID	0x0227
+ 
+ /* Sensor id based on i2c_device_id table
+  * (Fuji module can not be detected based on sensor registers) */
+@@ -142,6 +156,7 @@
+ #define IMX134_VALLEYVIEW 0x134
+ #define IMX208_MOFD_PD2 0x208
+ #define IMX219_MFV0_PRH 0x219
++#define IMX227_SAND 0x227
+ 
+ /* otp - specific settings */
+ #define E2PROM_ADDR 0xa0
+@@ -150,11 +165,13 @@
+ #define DEFAULT_OTP_SIZE 1280
+ #define IMX135_OTP_SIZE 1280
+ #define IMX219_OTP_SIZE 2048
++#define IMX227_OTP_SIZE 2560
+ #define E2PROM_LITEON_12P1BA869D_SIZE 544
+ 
+ #define IMX_ID_DEFAULT	0x0000
+ #define IMX132_175_208_219_CHIP_ID	0x0000
+ #define IMX134_135_CHIP_ID	0x0016
++#define IMX134_135_227_CHIP_ID	0x0016
+ 
+ #define IMX175_RES_WIDTH_MAX	3280
+ #define IMX175_RES_HEIGHT_MAX	2464
+@@ -168,6 +185,8 @@
+ #define IMX208_RES_HEIGHT_MAX	1096
+ #define IMX219_RES_WIDTH_MAX	3280
+ #define IMX219_RES_HEIGHT_MAX	2464
++#define IMX227_RES_WIDTH_MAX	2400
++#define IMX227_RES_HEIGHT_MAX	2720
+ 
+ /* Defines for lens/VCM */
+ #define IMX_FOCAL_LENGTH_NUM	369	/*3.69mm*/
+@@ -255,6 +274,10 @@ struct max_res imx_max_res[] = {
+ 		.res_max_width = IMX219_RES_WIDTH_MAX,
+ 		.res_max_height = IMX219_RES_HEIGHT_MAX,
+ 	},
++	[IMX227_ID] = {
++		.res_max_width = IMX227_RES_WIDTH_MAX,
++		.res_max_height = IMX227_RES_HEIGHT_MAX,
++	},
+ };
+ 
+ struct imx_settings {
+@@ -340,6 +363,15 @@ struct imx_settings imx_sets[] = {
+ 		.n_res_still = ARRAY_SIZE(imx219_res_still),
+ 		.n_res_video = ARRAY_SIZE(imx219_res_video),
+ 	},
++	[IMX227_SAND] = {
++		.init_settings = imx227_init_settings,
++		.res_preview = imx227_res_preview,
++		.res_still = imx227_res_still,
++		.res_video = imx227_res_video,
++		.n_res_preview = ARRAY_SIZE(imx227_res_preview),
++		.n_res_still = ARRAY_SIZE(imx227_res_still),
++		.n_res_video = ARRAY_SIZE(imx227_res_video),
++	},
+ };
+ 
+ struct imx_reg_addr {
+@@ -676,6 +708,10 @@ extern void *e2prom_otp_read(struct v4l2_subdev *sd, u8 dev_addr,
+ 	u32 start_addr, u32 size);
+ extern void *brcc064_otp_read(struct v4l2_subdev *sd, u8 dev_addr,
+ 	u32 start_addr, u32 size);
++extern void *imx227_otp_read(struct v4l2_subdev *sd, u8 dev_addr,
++	u32 start_addr, u32 size);
++extern void *e2prom_otp_read(struct v4l2_subdev *sd, u8 dev_addr,
++	u32 start_addr, u32 size);
+ struct imx_otp imx_otps[] = {
+ 	[IMX175_MERRFLD] = {
+ 		.otp_read = imx_otp_read,
+@@ -719,6 +755,10 @@ struct imx_otp imx_otps[] = {
+ 		.start_addr = 0,
+ 		.size = IMX219_OTP_SIZE,
+ 	},
++	[IMX227_SAND] = {
++		.otp_read = imx227_otp_read,
++		.size = IMX227_OTP_SIZE,
++	},
+ 	[IMX_ID_DEFAULT] = {
+ 		.otp_read = dummy_otp_read,
+ 		.size = DEFAULT_OTP_SIZE,
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx227.h b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx227.h
+new file mode 100644
+index 0000000..76d6198
+--- /dev/null
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx227.h
+@@ -0,0 +1,716 @@
++#ifndef __IMX227_H__
++#define __IMX227_H__
++
++#include "common.h"
++
++#define IMX227_EMBEDDED_DATA_LINE_NUM 2
++#define IMX227_OUTPUT_DATA_FORMAT_REG  0x0112
++#define IMX227_OUTPUT_FORMAT_RAW10  0x0a0a
++
++/* AE Bracketing Registers */
++#define IMX227_BRACKETING_LUT_MODE_BIT_CONTINUE_STREAMING	0x1
++#define IMX227_BRACKETING_LUT_MODE_BIT_LOOP_MODE	0x2
++
++#define IMX227_BRACKETING_LUT_CONTROL		0x0E00
++#define IMX227_BRACKETING_LUT_MODE		0x0E01
++#define IMX227_BRACKETING_LUT_ENTRY_CONTROL	0x0E02
++
++/*
++ * The imx135 embedded data info:
++ * embedded data line num: 2
++ * line 0 effective data size(byte): 76
++ * line 1 effective data size(byte): 113
++ */
++static const uint32_t
++imx227_embedded_effective_size[IMX227_EMBEDDED_DATA_LINE_NUM] = {160, 62};
++
++/************************** settings for imx *************************/
++/* Full Output Mode */
++static struct imx_reg const imx_STILL_6_5M_25fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x6259, 0x06},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xd0},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3f},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++/* 4:3 Output Mode */
++static struct imx_reg const imx_STILL_5_5M_3X4_30fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x0344, 0x00},
++	{IMX_8BIT, 0x0345, 0xb0},
++	{IMX_8BIT, 0x0346, 0x00},
++	{IMX_8BIT, 0x0347, 0x00},
++	{IMX_8BIT, 0x0348, 0x08},
++	{IMX_8BIT, 0x0349, 0xaf},
++	{IMX_8BIT, 0x034a, 0x0a},
++	{IMX_8BIT, 0x034b, 0x9f},
++	{IMX_8BIT, 0x034c, 0x08},
++	{IMX_8BIT, 0x034d, 0x00},
++	{IMX_8BIT, 0x034e, 0x0a},
++	{IMX_8BIT, 0x034f, 0xa0},
++
++	{IMX_8BIT, 0x6259, 0x05},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xd8},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3f},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++/* Square Output Mode */
++static struct imx_reg const imx_STILL_5_7M_1X1_30fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x0344, 0x00},
++	{IMX_8BIT, 0x0345, 0x00},
++	{IMX_8BIT, 0x0346, 0x00},
++	{IMX_8BIT, 0x0347, 0xa0},
++	{IMX_8BIT, 0x0348, 0x09},
++	{IMX_8BIT, 0x0349, 0x5f},
++	{IMX_8BIT, 0x034a, 0x09},
++	{IMX_8BIT, 0x034b, 0xff},
++	{IMX_8BIT, 0x034c, 0x09},
++	{IMX_8BIT, 0x034d, 0x60},
++	{IMX_8BIT, 0x034e, 0x09},
++	{IMX_8BIT, 0x034f, 0x60},
++
++	{IMX_8BIT, 0x6259, 0x06},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xd4},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3f},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++/* Full Frame 1080P Mode (use ISP scaler)*/
++static struct imx_reg const imx_VIDEO_4M_9X16_30fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x6259, 0x05},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xdc},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3f},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++/* Cropped 1080P Mode */
++static struct imx_reg const imx_VIDEO_2M_9X16_45fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x0112, 0x0a},
++	{IMX_8BIT, 0x0113, 0x0a},
++	{IMX_8BIT, 0x0344, 0x02},
++	{IMX_8BIT, 0x0345, 0x8e},
++	{IMX_8BIT, 0x0346, 0x01},
++	{IMX_8BIT, 0x0347, 0x88},
++	{IMX_8BIT, 0x0348, 0x06},
++	{IMX_8BIT, 0x0349, 0xd1},
++	{IMX_8BIT, 0x034a, 0x09},
++	{IMX_8BIT, 0x034b, 0x17},
++	{IMX_8BIT, 0x034c, 0x04},
++	{IMX_8BIT, 0x034d, 0x44},
++	{IMX_8BIT, 0x034e, 0x07},
++	{IMX_8BIT, 0x034f, 0x90},
++
++	{IMX_8BIT, 0x0380, 0x00},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0382, 0x00},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0384, 0x00},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0386, 0x00},
++	{IMX_8BIT, 0x0387, 0x01},
++
++	{IMX_8BIT, 0x0408, 0x00},
++	{IMX_8BIT, 0x0409, 0x00},
++	{IMX_8BIT, 0x040a, 0x00},
++	{IMX_8BIT, 0x040b, 0x00},
++	{IMX_8BIT, 0x040c, 0x04},
++	{IMX_8BIT, 0x040d, 0x44},
++	{IMX_8BIT, 0x040e, 0x07},
++	{IMX_8BIT, 0x040f, 0x90},
++
++	{IMX_8BIT, 0x0900, 0x00},
++	{IMX_8BIT, 0x0901, 0x00},
++
++	{IMX_8BIT, 0x6259, 0x05},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xdc},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3c},  /*	preset_en	*/
++
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++/* Moment mode */
++static struct imx_reg const imx_VIDEO_1_3M_3X4_60fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x6259, 0x05},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xd9},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3f},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++/* High Speed 3:4 mode */
++static struct imx_reg const imx_VIDEO_VGA_3X4_120fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x9004, 0xca},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3f},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++
++/* Binned 720P mode */
++static struct imx_reg const imx_VIDEO_1M_9X16_60fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x0112, 0x0a},
++	{IMX_8BIT, 0x0113, 0x0a},
++	{IMX_8BIT, 0x0344, 0x01},
++	{IMX_8BIT, 0x0345, 0xd0},
++	{IMX_8BIT, 0x0346, 0x00},
++	{IMX_8BIT, 0x0347, 0x40},
++	{IMX_8BIT, 0x0348, 0x07},
++	{IMX_8BIT, 0x0349, 0x8f},
++	{IMX_8BIT, 0x034a, 0x0a},
++	{IMX_8BIT, 0x034b, 0x5f},
++	{IMX_8BIT, 0x034c, 0x02},
++	{IMX_8BIT, 0x034d, 0xe0},
++	{IMX_8BIT, 0x034e, 0x05},
++	{IMX_8BIT, 0x034f, 0x10},
++
++	{IMX_8BIT, 0x0380, 0x00},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0382, 0x00},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0384, 0x00},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0386, 0x00},
++	{IMX_8BIT, 0x0387, 0x01},
++
++	{IMX_8BIT, 0x0408, 0x00},
++	{IMX_8BIT, 0x0409, 0x00},
++	{IMX_8BIT, 0x040a, 0x00},
++	{IMX_8BIT, 0x040b, 0x00},
++	{IMX_8BIT, 0x040c, 0x02},
++	{IMX_8BIT, 0x040d, 0xe0},
++	{IMX_8BIT, 0x040e, 0x05},
++	{IMX_8BIT, 0x040f, 0x10},
++
++	{IMX_8BIT, 0x0900, 0x01},
++	{IMX_8BIT, 0x0901, 0x22},
++
++	{IMX_8BIT, 0x6259, 0x05},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xdd},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3c},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++/* Binned 496x868 mode */
++static struct imx_reg const imx_VIDEO_496x868_30fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x0112, 0x0a},
++	{IMX_8BIT, 0x0113, 0x0a},
++	{IMX_8BIT, 0x0344, 0x02},
++	{IMX_8BIT, 0x0345, 0xc0},
++	{IMX_8BIT, 0x0346, 0x01},
++	{IMX_8BIT, 0x0347, 0xec},
++	{IMX_8BIT, 0x0348, 0x06},
++	{IMX_8BIT, 0x0349, 0x9f},
++	{IMX_8BIT, 0x034a, 0x08},
++	{IMX_8BIT, 0x034b, 0xb3},
++	{IMX_8BIT, 0x034c, 0x01},
++	{IMX_8BIT, 0x034d, 0xf0},
++	{IMX_8BIT, 0x034e, 0x03},
++	{IMX_8BIT, 0x034f, 0x64},
++
++	{IMX_8BIT, 0x0380, 0x00},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0382, 0x00},
++	{IMX_8BIT, 0x0383, 0x01},
++	{IMX_8BIT, 0x0384, 0x00},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0386, 0x00},
++	{IMX_8BIT, 0x0387, 0x01},
++
++	{IMX_8BIT, 0x0408, 0x00},
++	{IMX_8BIT, 0x0409, 0x00},
++	{IMX_8BIT, 0x040a, 0x00},
++	{IMX_8BIT, 0x040b, 0x00},
++	{IMX_8BIT, 0x040c, 0x01},
++	{IMX_8BIT, 0x040d, 0xf0},
++	{IMX_8BIT, 0x040e, 0x03},
++	{IMX_8BIT, 0x040f, 0x64},
++
++	{IMX_8BIT, 0x0900, 0x01},
++	{IMX_8BIT, 0x0901, 0x22},
++
++	{IMX_8BIT, 0x6259, 0x05},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xdd},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3c},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++
++/* Hangout mode */
++static struct imx_reg const imx_PREVIEW_374X652_30fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x0112, 0x0a},
++	{IMX_8BIT, 0x0113, 0x0a},
++	{IMX_8BIT, 0x0344, 0x01},
++	{IMX_8BIT, 0x0345, 0xc0},
++	{IMX_8BIT, 0x0346, 0x00},
++	{IMX_8BIT, 0x0347, 0x30},
++	{IMX_8BIT, 0x0348, 0x07},
++	{IMX_8BIT, 0x0349, 0x9f},
++	{IMX_8BIT, 0x034a, 0x0a},
++	{IMX_8BIT, 0x034b, 0x6f},
++	{IMX_8BIT, 0x034c, 0x01},
++	{IMX_8BIT, 0x034d, 0x78},
++	{IMX_8BIT, 0x034e, 0x02},
++	{IMX_8BIT, 0x034f, 0x90},
++
++	{IMX_8BIT, 0x0380, 0x00},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0382, 0x00},
++	{IMX_8BIT, 0x0383, 0x03},
++	{IMX_8BIT, 0x0384, 0x00},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0386, 0x00},
++	{IMX_8BIT, 0x0387, 0x03},
++
++	{IMX_8BIT, 0x0408, 0x00},
++	{IMX_8BIT, 0x0409, 0x00},
++	{IMX_8BIT, 0x040a, 0x00},
++	{IMX_8BIT, 0x040b, 0x02},
++	{IMX_8BIT, 0x040c, 0x01},
++	{IMX_8BIT, 0x040d, 0x76},
++	{IMX_8BIT, 0x040e, 0x02},
++	{IMX_8BIT, 0x040f, 0x8c},
++
++	{IMX_8BIT, 0x0900, 0x01},
++	{IMX_8BIT, 0x0901, 0x22},
++
++	{IMX_8BIT, 0x6259, 0x05},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xde},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3c},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++static struct imx_reg const imx_VIDEO_NHD_9X16_30fps[] = {
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x0112, 0x0a},
++	{IMX_8BIT, 0x0113, 0x0a},
++	{IMX_8BIT, 0x0344, 0x01},
++	{IMX_8BIT, 0x0345, 0xc0},
++	{IMX_8BIT, 0x0346, 0x00},
++	{IMX_8BIT, 0x0347, 0x30},
++	{IMX_8BIT, 0x0348, 0x07},
++	{IMX_8BIT, 0x0349, 0x9f},
++	{IMX_8BIT, 0x034a, 0x0a},
++	{IMX_8BIT, 0x034b, 0x6f},
++	{IMX_8BIT, 0x034c, 0x01},
++	{IMX_8BIT, 0x034d, 0x78},
++	{IMX_8BIT, 0x034e, 0x02},
++	{IMX_8BIT, 0x034f, 0x90},
++
++	{IMX_8BIT, 0x0380, 0x00},
++	{IMX_8BIT, 0x0381, 0x01},
++	{IMX_8BIT, 0x0382, 0x00},
++	{IMX_8BIT, 0x0383, 0x03},
++	{IMX_8BIT, 0x0384, 0x00},
++	{IMX_8BIT, 0x0385, 0x01},
++	{IMX_8BIT, 0x0386, 0x00},
++	{IMX_8BIT, 0x0387, 0x03},
++
++	{IMX_8BIT, 0x0408, 0x00},
++	{IMX_8BIT, 0x0409, 0x00},
++	{IMX_8BIT, 0x040a, 0x00},
++	{IMX_8BIT, 0x040b, 0x00},
++	{IMX_8BIT, 0x040c, 0x01},
++	{IMX_8BIT, 0x040d, 0x78},
++	{IMX_8BIT, 0x040e, 0x02},
++	{IMX_8BIT, 0x040f, 0x90},
++
++	{IMX_8BIT, 0x0900, 0x01},
++	{IMX_8BIT, 0x0901, 0x22},
++
++	{IMX_8BIT, 0x6259, 0x05},  /*	latency ctrl	*/
++	{IMX_8BIT, 0x9004, 0xde},  /*	preset_sel	*/
++	{IMX_8BIT, 0x9005, 0x3c},  /*	preset_en	*/
++	{IMX_8BIT, 0x0136, 0x13},
++	{IMX_8BIT, 0x0137, 0x33},
++	{IMX_TOK_TERM, 0, 0}
++};
++
++
++static struct imx_reg const imx227_init_settings[] = {
++	{IMX_8BIT, 0x0100, 0x00},  /*   mode_select     */
++	GROUPED_PARAMETER_HOLD_ENABLE,
++	{IMX_8BIT, 0x0306, 0x00},
++	{IMX_8BIT, 0x0307, 0xBB},
++	{IMX_8BIT, 0x030E, 0x03},
++	{IMX_8BIT, 0x030F, 0x0D},
++	{IMX_8BIT, 0x463b, 0x30},
++	{IMX_8BIT, 0x463e, 0x05},
++	{IMX_8BIT, 0x4612, 0x66},
++	{IMX_8BIT, 0x4815, 0x65},
++	{IMX_8BIT, 0x4991, 0x00},
++	{IMX_8BIT, 0x4992, 0x01},
++	{IMX_8BIT, 0x4993, 0xff},
++	{IMX_8BIT, 0x458b, 0x00},
++	{IMX_8BIT, 0x452a, 0x02},
++	{IMX_8BIT, 0x4a7c, 0x00},
++	{IMX_8BIT, 0x4a7d, 0x1c},
++	{IMX_8BIT, 0x4a7e, 0x00},
++	{IMX_8BIT, 0x4a7f, 0x17},
++	{IMX_8BIT, 0x462C, 0x2E},
++	{IMX_8BIT, 0x461B, 0x28},
++	{IMX_8BIT, 0x4663, 0x29},
++	{IMX_8BIT, 0x461A, 0x7C},
++	{IMX_8BIT, 0x4619, 0x28},
++	{IMX_8BIT, 0x4667, 0x22},
++	{IMX_8BIT, 0x466B, 0x23},
++	{IMX_8BIT, 0x40AD, 0xFF},
++	{IMX_8BIT, 0x40BE, 0x00},
++	{IMX_8BIT, 0x40BF, 0x6E},
++	{IMX_8BIT, 0x40CE, 0x00},
++	{IMX_8BIT, 0x40CF, 0x0A},
++	{IMX_8BIT, 0x40CA, 0x00},
++	{IMX_8BIT, 0x40CB, 0x1F},
++	{IMX_8BIT, 0x4D16, 0x00},
++	{IMX_8BIT, 0x6204, 0x01},
++	{IMX_8BIT, 0x6209, 0x00},
++	{IMX_8BIT, 0x621F, 0x01},
++	{IMX_8BIT, 0x621E, 0x10},
++	GROUPED_PARAMETER_HOLD_DISABLE,
++	{IMX_TOK_TERM, 0, 0}
++};
++
++/* TODO settings of preview/still/video will be updated with new use case */
++struct imx_resolution imx227_res_preview[] = {
++	{
++		.desc = "imx_PREVIEW_374X652_30fps",
++		.regs = imx_PREVIEW_374X652_30fps,
++		.width = 374,
++		.height = 652,
++		.bin_factor_x = 2,
++		.bin_factor_y = 2,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 30,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0C0A,
++			},
++			{
++			}
++		},
++	},
++	{
++		.desc = "imx_VIDEO_496x868_30fps",
++		.regs = imx_VIDEO_496x868_30fps,
++		.width = 496,
++		.height = 868,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 30,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0C08,
++			},
++			{
++			}
++		},
++	},
++	{
++		.desc = "imx_STILL_5_5M_3X4_30fps",
++		.regs = imx_STILL_5_5M_3X4_30fps,
++		.width = 2048,
++		.height = 2720,
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 30,
++				.pixels_per_line = 0x0ED8,
++				.lines_per_frame = 0x0BB8,
++			},
++			{
++			}
++		},
++
++	},
++	{
++		.desc = "imx_STILL_5_7M_1X1_30fps",
++		.regs = imx_STILL_5_7M_1X1_30fps,
++		.width = 2400,
++		.height = 2400,
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 30,
++				.pixels_per_line = 0x1130,
++				.lines_per_frame = 0x0A1E,
++			},
++			{
++			}
++		},
++
++	},
++	{
++		.desc = "imx_STILL_6_5M_25fps",
++		.regs = imx_STILL_6_5M_25fps,
++		.width = 2400,
++		.height = 2720,
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 25,
++				.pixels_per_line = 0x1130,
++				.lines_per_frame = 0x0C24,
++			},
++			{
++			}
++		},
++	}
++};
++
++struct imx_resolution imx227_res_still[] = {
++	{
++		.desc = "imx_STILL_5_5M_3X4_30fps",
++		.regs = imx_STILL_5_5M_3X4_30fps,
++		.width = 2048,
++		.height = 2720,
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 6,
++				.pixels_per_line = 0x2130,
++				.lines_per_frame = 0x1A22,
++			},
++			{
++				.fps = 30,
++				.pixels_per_line = 0x0ED8,
++				.lines_per_frame = 0x0BB8,
++			},
++			{
++			}
++		},
++
++	},
++	{
++		.desc = "imx_STILL_5_7M_1X1_30fps",
++		.regs = imx_STILL_5_7M_1X1_30fps,
++		.width = 2400,
++		.height = 2400,
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 6,
++				.pixels_per_line = 0x266E,
++				.lines_per_frame = 0x1704,
++			},
++			{
++				.fps = 30,
++				.pixels_per_line = 0x1130,
++				.lines_per_frame = 0x0A1E,
++			},
++			{
++			}
++		},
++
++	},
++	{
++		.desc = "imx_STILL_6_5M_25fps",
++		.regs = imx_STILL_6_5M_25fps,
++		.width = 2400,
++		.height = 2720,
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 25,
++				.pixels_per_line = 0x1130,
++				.lines_per_frame = 0x0C24,
++			},
++			{
++			}
++		},
++	},
++};
++
++struct imx_resolution imx227_res_video[] = {
++	{
++		.desc = "imx_VIDEO_4M_9X16_30fps",
++		.regs = imx_VIDEO_4M_9X16_30fps,
++		.width = 1536,
++		.height = 2720,
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 30,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0C08,
++			},
++			{
++			}
++		},
++
++	},
++	{
++		.desc = "imx_VIDEO_2M_9X16_45fps",
++		.regs = imx_VIDEO_2M_9X16_45fps,
++		.width = 1092,
++		.height = 1936,
++		.bin_factor_x = 0,
++		.bin_factor_y = 0,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 45,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0800,
++			},
++			{
++			}
++		},
++
++	},
++	{
++		.desc = "imx_VIDEO_1_3M_3X4_60fps",
++		.regs = imx_VIDEO_1_3M_3X4_60fps,
++		.width = 1024,
++		.height = 1360,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 60,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0604,
++			},
++			{
++			}
++		},
++	},
++	{
++		.desc = "imx_VIDEO_496x868_30fps",
++		.regs = imx_VIDEO_496x868_30fps,
++		.width = 496,
++		.height = 868,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 30,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0C08,
++			},
++			{
++			}
++		},
++	},
++	{
++		.desc = "imx_VIDEO_1M_9X16_60fps",
++		.regs = imx_VIDEO_1M_9X16_60fps,
++		.width = 736,
++		.height = 1296,
++		.bin_factor_x = 1,
++		.bin_factor_y = 1,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 60,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0604,
++			},
++			{
++				.fps = 30,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0C10,
++			},
++			{
++			}
++		},
++	},
++	{
++		.desc = "imx_VIDEO_VGA_3X4_120fps",
++		.regs = imx_VIDEO_VGA_3X4_120fps,
++		.width = 512,
++		.height = 680,
++		.bin_factor_x = 2,
++		.bin_factor_y = 2,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 120,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0302,
++			},
++			{
++			}
++		},
++	},
++	{
++		.desc = "imx_VIDEO_NHD_9X16_30fps",
++		.regs = imx_VIDEO_NHD_9X16_30fps,
++		.width = 376,
++		.height = 656,
++		.bin_factor_x = 2,
++		.bin_factor_y = 2,
++		.mipi_freq = 499000,
++		.used = 0,
++		.fps_options = {
++			{
++				.fps = 30,
++				.pixels_per_line = 0x0E70,
++				.lines_per_frame = 0x0C0A,
++			},
++			{
++			}
++		},
++	},
++};
++
++#endif /* __IMX227_H__ */
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/otp_imx.c b/drivers/external_drivers/camera/drivers/media/i2c/imx/otp_imx.c
+index 915f9b9..ae69eb1 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/otp_imx.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/otp_imx.c
+@@ -46,6 +46,12 @@
+ #define IMX_OTP_READY_REG_DONE		1
+ #define IMX_OTP_READ_ONETIME		32
+ #define IMX_OTP_MODE_READ		1
++#define IMX227_OTP_START_ADDR           0x0A04
++#define IMX227_OTP_ENABLE_REG           0x0A00
++#define IMX227_OTP_READY_REG            0x0A01
++#define IMX227_OTP_PAGE_REG             0x0A02
++#define IMX227_OTP_READY_REG_DONE       1
++#define IMX227_OTP_MODE_READ            1
+ 
+ static int
+ imx_read_otp_data(struct i2c_client *client, u16 len, u16 reg, void *val)
+@@ -146,3 +152,43 @@ fail:
+ 	return ERR_PTR(ret);
+ }
+ 
++void *imx227_otp_read(struct v4l2_subdev *sd, u8 dev_addr,
++	u32 start_addr, u32 size)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(sd);
++	u8 *buf;
++	int ret;
++	int i;
++
++	buf = devm_kzalloc(&client->dev, size, GFP_KERNEL);
++	if (!buf)
++		return ERR_PTR(-ENOMEM);
++
++	for (i = 0; i < IMX_OTP_PAGE_MAX; i++) {
++
++		/*set page NO.*/
++		ret = imx_write_reg(client, IMX_8BIT,
++			       IMX227_OTP_PAGE_REG, i & 0xff);
++		if (ret)
++			goto fail;
++
++		/*set read mode*/
++		ret = imx_write_reg(client, IMX_8BIT,
++			       IMX227_OTP_ENABLE_REG, IMX227_OTP_MODE_READ);
++		if (ret)
++			goto fail;
++
++		/* Reading the OTP data array */
++		ret = imx_read_otp_reg_array(client, IMX_OTP_PAGE_SIZE,
++			IMX227_OTP_START_ADDR, buf + i * IMX_OTP_PAGE_SIZE);
++		if (ret)
++			goto fail;
++	}
++
++	return buf;
++fail:
++	/* Driver has failed to find valid data */
++	dev_err(&client->dev, "sensor found no valid OTP data\n");
++	return ERR_PTR(ret);
++}
++
+-- 
+1.9.1
+

@@ -1,0 +1,149 @@
+From 841a48059c48d48ebc7ca217249d7a9f7b5684c8 Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Wed, 4 Jun 2014 14:32:51 -0700
+Subject: [PATCH 065/117] gc0339: Support unified gmin atomisp platform device
+
+When available, use the gmin-style unified platform instead of the
+sensor-specific one.  Requires moving a little bit of logic (timings,
+basically, which are uniform across platforms anyway) from the
+original platform driver.  Works on MRD7.
+
+Also includes correct _HID for the device and pseudo-EFI configuration
+for the MRD7 from Johan Mossberg.
+
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ .../x86/platform/intel-mid/atomisp_gmin_platform.c |  8 +++
+ .../camera/drivers/media/i2c/gc0339.c              | 57 ++++++++++++++++++++--
+ .../camera/drivers/media/i2c/gc0339.h              |  2 -
+ 3 files changed, 61 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+index 011954a..89f4905 100644
+--- a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
++++ b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+@@ -196,12 +196,20 @@ static const struct gmin_cfg_var ffrd8_vars[] = {
+ };
+ 
+ static const struct gmin_cfg_var mrd7_vars[] = {
++	/* GC2235 world-facing camera: */
+ 	{ "INT33F8:00_CamType",  "1" },
+ 	{ "INT33F8:00_CsiPort",  "1" },
+ 	{ "INT33F8:00_CsiLanes", "2" },
+ 	{ "INT33F8:00_CsiFmt",   "13" },
+ 	{ "INT33F8:00_CsiBayer", "0" },
+ 	{ "INT33F8:00_CamClk", "0" },
++	/* GC0339 user-facing camera: */
++	{ "INT33F9:00_CamType",  "1" },
++	{ "INT33F9:00_CsiPort",  "0" },
++	{ "INT33F9:00_CsiLanes", "1" },
++	{ "INT33F9:00_CsiFmt",   "13" },
++	{ "INT33F9:00_CsiBayer", "0" },
++	{ "INT33F9:00_CamClk", "1" },
+ 	{},
+ };
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/gc0339.c b/drivers/external_drivers/camera/drivers/media/i2c/gc0339.c
+index 030b63c..0d680bd 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/gc0339.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/gc0339.c
+@@ -762,14 +762,63 @@ static int gc0339_init(struct v4l2_subdev *sd)
+ 
+ static int power_ctrl(struct v4l2_subdev *sd, bool flag)
+ {
++	int ret = 0;
+ 	struct gc0339_device *dev = to_gc0339_sensor(sd);
+-	return dev->platform_data->power_ctrl(sd, flag);
++	if (!dev || !dev->platform_data)
++		return -ENODEV;
++
++	/* Non-gmin platforms use the legacy callback */
++	if (dev->platform_data->power_ctrl)
++		return dev->platform_data->power_ctrl(sd, flag);
++
++	if (flag) {
++		/* The upstream module driver (written to Crystal
++		 * Cove) had this logic to pulse the rails low first.
++		 * This appears to break things on the MRD7 with the
++		 * X-Powers PMIC...
++		 *
++		 *     ret = dev->platform_data->v1p8_ctrl(sd, 0);
++		 *     ret |= dev->platform_data->v2p8_ctrl(sd, 0);
++		 *     mdelay(50);
++		*/
++		ret |= dev->platform_data->v1p8_ctrl(sd, 1);
++		ret |= dev->platform_data->v2p8_ctrl(sd, 1);
++		msleep(10);
++	}
++
++	if (!flag || ret) {
++		ret |= dev->platform_data->v1p8_ctrl(sd, 0);
++		ret |= dev->platform_data->v2p8_ctrl(sd, 0);
++	}
++	return ret;
+ }
+ 
+ static int gpio_ctrl(struct v4l2_subdev *sd, bool flag)
+ {
++	int ret;
+ 	struct gc0339_device *dev = to_gc0339_sensor(sd);
+-	return dev->platform_data->gpio_ctrl(sd, flag);
++
++	if (!dev || !dev->platform_data)
++		return -ENODEV;
++
++	/* Non-gmin platforms use the legacy callback */
++	if (dev->platform_data->gpio_ctrl)
++		return dev->platform_data->gpio_ctrl(sd, flag);
++
++	/* GPIO0 == "reset" (active low), GPIO1 == "power down" */
++	if (flag) {
++		/* Pulse reset, then release power down */
++		ret = dev->platform_data->gpio0_ctrl(sd, 0);
++		msleep(5);
++		ret |= dev->platform_data->gpio0_ctrl(sd, 1);
++		msleep(10);
++		ret |= dev->platform_data->gpio1_ctrl(sd, 0);
++		msleep(10);
++	} else {
++		ret = dev->platform_data->gpio1_ctrl(sd, 1);
++		ret |= dev->platform_data->gpio0_ctrl(sd, 0);
++	}
++	return ret;
+ }
+ 
+ static int power_down(struct v4l2_subdev *sd);
+@@ -1473,7 +1522,7 @@ static int gc0339_probe(struct i2c_client *client,
+ 		 * directly and configure via ACPI/EFIvars instead
+ 		 */
+ 		ret = gc0339_s_config(&dev->sd, client->irq,
+-				      gc0339_platform_data(NULL));
++				      gmin_camera_platform_data());
+ 		if (ret)
+ 			goto out_free;
+ 	}
+@@ -1497,7 +1546,7 @@ out_free:
+ }
+ 
+ static struct acpi_device_id gc0339_acpi_match[] = {
+-	{""},
++	{"INT33F9"},
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(acpi, gc0339_acpi_match);
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/gc0339.h b/drivers/external_drivers/camera/drivers/media/i2c/gc0339.h
+index 6c5786a..b04ab99 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/gc0339.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/gc0339.h
+@@ -110,8 +110,6 @@
+ 
+ #define REG_VER1 0
+ 
+-void *gc0339_platform_data(void *info);
+-
+ struct regval_list {
+ 	u16 reg_num;
+ 	u8 value;
+-- 
+1.9.3
+

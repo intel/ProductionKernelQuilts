@@ -1,0 +1,247 @@
+From f9fbe7d6c2967953aac34afb3e628e33c490afc5 Mon Sep 17 00:00:00 2001
+From: "Suzuki K. Poulose" <suzuki.poulose@arm.com>
+Date: Wed, 21 Jan 2015 12:43:11 +0000
+Subject: [PATCH 562/634] arm64: Emulate SETEND for AArch32 tasks
+
+Emulate deprecated 'setend' instruction for AArch32 bit tasks.
+
+	setend [le/be] - Sets the endianness of EL0
+
+On systems with CPUs which support mixed endian at EL0, the hardware
+support for the instruction can be enabled by setting the SCTLR_EL1.SED
+bit. Like the other emulated instructions it is controlled by an entry in
+/proc/sys/abi/. For more information see :
+	Documentation/arm64/legacy_instructions.txt
+
+The instruction is emulated by setting/clearing the SPSR_EL1.E bit, which
+will be reflected in the PSTATE.E in AArch32 context.
+
+This patch also restores the native endianness for the execution of signal
+handlers, since the process could have changed the endianness.
+
+Note: All CPUs on the system must have mixed endian support at EL0. Once the
+handler is registered, hotplugging a CPU which doesn't support mixed endian,
+could lead to unexpected results/behavior in applications.
+
+Signed-off-by: Suzuki K. Poulose <suzuki.poulose@arm.com>
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: Punit Agrawal <punit.agrawal@arm.com>
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Change-Id: I5993237889a049a23f6c234daa130d3a740d5525
+---
+ Documentation/arm64/legacy_instructions.txt | 12 +++++
+ arch/arm64/Kconfig                          | 16 ++++++
+ arch/arm64/include/asm/cputype.h            |  1 +
+ arch/arm64/include/asm/ptrace.h             |  7 +++
+ arch/arm64/kernel/armv8_deprecated.c        | 80 +++++++++++++++++++++++++++++
+ arch/arm64/kernel/signal32.c                |  5 +-
+ 6 files changed, 120 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/arm64/legacy_instructions.txt b/Documentation/arm64/legacy_instructions.txt
+index a3b3da2..01bf3d9 100644
+--- a/Documentation/arm64/legacy_instructions.txt
++++ b/Documentation/arm64/legacy_instructions.txt
+@@ -32,6 +32,9 @@ The default mode depends on the status of the instruction in the
+ architecture. Deprecated instructions should default to emulation
+ while obsolete instructions must be undefined by default.
+ 
++Note: Instruction emulation may not be possible in all cases. See
++individual instruction notes for further information.
++
+ Supported legacy instructions
+ -----------------------------
+ * SWP{B}
+@@ -43,3 +46,12 @@ Default: Undef (0)
+ Node: /proc/sys/abi/cp15_barrier
+ Status: Deprecated
+ Default: Emulate (1)
++
++* SETEND
++Node: /proc/sys/abi/setend
++Status: Deprecated
++Default: Emulate (1)*
++Note: All the cpus on the system must have mixed endian support at EL0
++for this feature to be enabled. If a new CPU - which doesn't support mixed
++endian - is hotplugged in after this feature has been enabled, there could
++be unexpected results in the application.
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index c54b7a8..3d12f63 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -314,6 +314,22 @@ config SECCOMP
+ 	  and the task is only allowed to execute a few safe syscalls
+ 	  defined by each seccomp mode.
+ 
++config SETEND_EMULATION
++	bool "Emulate SETEND instruction"
++	help
++	  The SETEND instruction alters the data-endianness of the
++	  AArch32 EL0, and is deprecated in ARMv8.
++
++	  Say Y here to enable software emulation of the instruction
++	  for AArch32 userspace code.
++
++	  Note: All the cpus on the system must have mixed endian support at EL0
++	  for this feature to be enabled. If a new CPU - which doesn't support mixed
++	  endian - is hotplugged in after this feature has been enabled, there could
++	  be unexpected results in the applications.
++
++	  If unsure, say Y
++
+ endmenu
+ 
+ menu "Boot options"
+diff --git a/arch/arm64/include/asm/cputype.h b/arch/arm64/include/asm/cputype.h
+index 136a5d5..046a392 100644
+--- a/arch/arm64/include/asm/cputype.h
++++ b/arch/arm64/include/asm/cputype.h
+@@ -75,6 +75,7 @@
+ 	(((mmfr0) & ID_AA64MMFR0_BIGEND_MASK) >> ID_AA64MMFR0_BIGEND_SHIFT)
+ 
+ #define SCTLR_EL1_CP15BEN	(0x1 << 5)
++#define SCTLR_EL1_SED		(0x1 << 8)
+ 
+ #ifndef __ASSEMBLY__
+ 
+diff --git a/arch/arm64/include/asm/ptrace.h b/arch/arm64/include/asm/ptrace.h
+index 87d66d7..6f8aed0 100644
+--- a/arch/arm64/include/asm/ptrace.h
++++ b/arch/arm64/include/asm/ptrace.h
+@@ -54,6 +54,13 @@
+ #define COMPAT_PSR_Z_BIT	0x40000000
+ #define COMPAT_PSR_N_BIT	0x80000000
+ #define COMPAT_PSR_IT_MASK	0x0600fc00	/* If-Then execution state mask */
++
++#ifdef CONFIG_CPU_BIG_ENDIAN
++#define COMPAT_PSR_ENDSTATE	COMPAT_PSR_E_BIT
++#else
++#define COMPAT_PSR_ENDSTATE	0
++#endif
++
+ /*
+  * These are 'magic' values for PTRACE_PEEKUSR that return info about where a
+  * process is located in memory.
+diff --git a/arch/arm64/kernel/armv8_deprecated.c b/arch/arm64/kernel/armv8_deprecated.c
+index 68b955e..7922c2e 100644
+--- a/arch/arm64/kernel/armv8_deprecated.c
++++ b/arch/arm64/kernel/armv8_deprecated.c
+@@ -548,6 +548,79 @@ static struct insn_emulation_ops cp15_barrier_ops = {
+ 	.set_hw_mode = cp15_barrier_set_hw_mode,
+ };
+ 
++static int setend_set_hw_mode(bool enable)
++{
++	if (!cpu_supports_mixed_endian_el0())
++		return -EINVAL;
++
++	if (enable)
++		config_sctlr_el1(SCTLR_EL1_SED, 0);
++	else
++		config_sctlr_el1(0, SCTLR_EL1_SED);
++	return 0;
++}
++
++static int compat_setend_handler(struct pt_regs *regs, u32 big_endian)
++{
++	char *insn;
++
++	perf_sw_event(PERF_COUNT_SW_EMULATION_FAULTS, 1, regs, regs->pc);
++
++	if (big_endian) {
++		insn = "setend be";
++		regs->pstate |= COMPAT_PSR_E_BIT;
++	} else {
++		insn = "setend le";
++		regs->pstate &= ~COMPAT_PSR_E_BIT;
++	}
++
++	trace_instruction_emulation(insn, regs->pc);
++	pr_warn_ratelimited("\"%s\" (%ld) uses deprecated setend instruction at 0x%llx\n",
++			current->comm, (unsigned long)current->pid, regs->pc);
++
++	return 0;
++}
++
++static int a32_setend_handler(struct pt_regs *regs, u32 instr)
++{
++	int rc = compat_setend_handler(regs, (instr >> 9) & 1);
++	regs->pc += 4;
++	return rc;
++}
++
++static int t16_setend_handler(struct pt_regs *regs, u32 instr)
++{
++	int rc = compat_setend_handler(regs, (instr >> 3) & 1);
++	regs->pc += 2;
++	return rc;
++}
++
++static struct undef_hook setend_hooks[] = {
++	{
++		.instr_mask	= 0xfffffdff,
++		.instr_val	= 0xf1010000,
++		.pstate_mask	= COMPAT_PSR_MODE_MASK,
++		.pstate_val	= COMPAT_PSR_MODE_USR,
++		.fn		= a32_setend_handler,
++	},
++	{
++		/* Thumb mode */
++		.instr_mask	= 0x0000fff7,
++		.instr_val	= 0x0000b650,
++		.pstate_mask	= (COMPAT_PSR_T_BIT | COMPAT_PSR_MODE_MASK),
++		.pstate_val	= (COMPAT_PSR_T_BIT | COMPAT_PSR_MODE_USR),
++		.fn		= t16_setend_handler,
++	},
++	{}
++};
++
++static struct insn_emulation_ops setend_ops = {
++	.name = "setend",
++	.status = INSN_DEPRECATED,
++	.hooks = setend_hooks,
++	.set_hw_mode = setend_set_hw_mode,
++};
++
+ static int insn_cpu_hotplug_notify(struct notifier_block *b,
+ 			      unsigned long action, void *hcpu)
+ {
+@@ -573,6 +646,13 @@ static int __init armv8_deprecated_init(void)
+ 	if (IS_ENABLED(CONFIG_CP15_BARRIER_EMULATION))
+ 		register_insn_emulation(&cp15_barrier_ops);
+ 
++	if (IS_ENABLED(CONFIG_SETEND_EMULATION)) {
++		if(system_supports_mixed_endian_el0())
++			register_insn_emulation(&setend_ops);
++		else
++			pr_info("setend instruction emulation is not supported on the system");
++	}
++
+ 	register_cpu_notifier(&insn_cpu_hotplug_notifier);
+ 	register_insn_emulation_sysctl(ctl_abi);
+ 
+diff --git a/arch/arm64/kernel/signal32.c b/arch/arm64/kernel/signal32.c
+index 3d84ecb..dd475a6 100644
+--- a/arch/arm64/kernel/signal32.c
++++ b/arch/arm64/kernel/signal32.c
+@@ -468,7 +468,7 @@ static void compat_setup_return(struct pt_regs *regs, struct k_sigaction *ka,
+ {
+ 	compat_ulong_t handler = ptr_to_compat(ka->sa.sa_handler);
+ 	compat_ulong_t retcode;
+-	compat_ulong_t spsr = regs->pstate & ~PSR_f;
++	compat_ulong_t spsr = regs->pstate & ~(PSR_f | COMPAT_PSR_E_BIT);
+ 	int thumb;
+ 
+ 	/* Check if the handler is written for ARM or Thumb */
+@@ -482,6 +482,9 @@ static void compat_setup_return(struct pt_regs *regs, struct k_sigaction *ka,
+ 	/* The IT state must be cleared for both ARM and Thumb-2 */
+ 	spsr &= ~COMPAT_PSR_IT_MASK;
+ 
++	/* Restore the original endianness */
++	spsr |= COMPAT_PSR_ENDSTATE;
++
+ 	if (ka->sa.sa_flags & SA_RESTORER) {
+ 		retcode = ptr_to_compat(ka->sa.sa_restorer);
+ 	} else {
+-- 
+1.9.1
+

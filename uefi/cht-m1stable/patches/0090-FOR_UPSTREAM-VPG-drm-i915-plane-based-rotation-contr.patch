@@ -1,0 +1,348 @@
+From 76df8312d36a0b4d2a1e00d77f8c826513aa2331 Mon Sep 17 00:00:00 2001
+Message-Id: <76df8312d36a0b4d2a1e00d77f8c826513aa2331.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Vidya Srinivas <vidya.srinivas@intel.com>
+Date: Sat, 5 Jul 2014 00:49:41 +0530
+Subject: [PATCH 090/312] FOR_UPSTREAM [VPG]: drm/i915: plane based rotation
+ control
+
+The following changes have been ported:
+	[PORT FROM R42B-STABLE]drm/i915: plane based rotation control
+	(OriginalChangeID - I426de043f21d89fdfa0ebf8551ca1de9138a6312)
+	Description: Enabled plane based rotation support. HWC will control rotation
+	based on plane. Minor changes done for rotation state handling
+	after resume and modeset. Kernel was doing it earlier since
+	feature was not enabled in HWC. Now with HWComposer handling
+	rotation in user space, it will not be required in kernel.
+
+Issue: GMIN-1464
+Change-Id: I026c92d1823f0302a06cedbe9a495bd15c6ab856
+Signed-off-by: Uma Shankar <uma.shankar@intel.com>
+Signed-off-by: Peter Collins <peter.collins@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    1 +
+ drivers/gpu/drm/i915/intel_bios.c    |    7 --
+ drivers/gpu/drm/i915/intel_display.c |  118 ++++++++++++++--------------------
+ drivers/gpu/drm/i915/intel_drv.h     |    2 +
+ drivers/gpu/drm/i915/intel_sprite.c  |   24 +++----
+ include/uapi/drm/i915_drm.h          |    3 +-
+ 6 files changed, 64 insertions(+), 91 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index b3d380e..300445d 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1276,6 +1276,7 @@ struct intel_vbt_data {
+ 	union child_device_config *child_dev;
+ 
+ 	struct ddi_vbt_port_info ddi_port_info[I915_MAX_PORTS];
++	bool is_180_rotation_enabled;
+ };
+ 
+ enum intel_ddb_partitioning {
+diff --git a/drivers/gpu/drm/i915/intel_bios.c b/drivers/gpu/drm/i915/intel_bios.c
+index 827498e..05fce5b 100644
+--- a/drivers/gpu/drm/i915/intel_bios.c
++++ b/drivers/gpu/drm/i915/intel_bios.c
+@@ -415,13 +415,6 @@ parse_general_features(struct drm_i915_private *dev_priv,
+ 			intel_bios_ssc_frequency(dev, general->ssc_freq);
+ 		dev_priv->vbt.display_clock_mode = general->display_clock_mode;
+ 		dev_priv->vbt.fdi_rx_polarity_inverted = general->fdi_rx_polarity_inverted;
+-		DRM_DEBUG_KMS("BDB_GENERAL_FEATURES int_tv_support %d int_crt_support %d lvds_use_ssc %d lvds_ssc_freq %d display_clock_mode %d fdi_rx_polarity_inverted %d\n",
+-			      dev_priv->vbt.int_tv_support,
+-			      dev_priv->vbt.int_crt_support,
+-			      dev_priv->vbt.lvds_use_ssc,
+-			      dev_priv->vbt.lvds_ssc_freq,
+-			      dev_priv->vbt.display_clock_mode,
+-			      dev_priv->vbt.fdi_rx_polarity_inverted);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 02ce495..8021f8b 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2526,82 +2526,51 @@ static void intel_find_plane_obj(struct intel_crtc *intel_crtc,
+ int i915_set_plane_180_rotation(struct drm_device *dev, void *data,
+ 				struct drm_file *file)
+ {
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct drm_i915_plane_180_rotation *rotation = data;
+-
+-	bool rotate = (rotation->rotate & 0x1) ? true : false;
+-	int reg;
+-	u32 val;
+-	u32 sprctla;
+-	u32 sprctlb;
+-	int ret = 1;
++	struct drm_i915_plane_180_rotation *rotation;
+ 	struct drm_mode_object *obj;
+-	struct drm_crtc *crtc;
+ 	struct intel_crtc *intel_crtc;
+-	int pipe;
+-
+-	obj = drm_mode_object_find(dev, rotation->crtc_id,
+-			DRM_MODE_OBJECT_CRTC);
+-
+-	if (!obj) {
+-		DRM_DEBUG_DRIVER("Unknown CRTC ID %d\n", rotation->crtc_id);
+-		return -EINVAL;
+-	}
++	struct intel_plane *intel_plane;
++	int ret = -EINVAL;
++	struct drm_i915_private *dev_priv;
+ 
+-	crtc = obj_to_crtc(obj);
+-	DRM_DEBUG_DRIVER("[CRTC:%d]\n", crtc->base.id);
+-	if (!crtc->enabled) {
+-		DRM_ERROR("[CRTC:%d] not active\n", crtc->base.id);
++	if (!dev)
+ 		return -EINVAL;
+-	}
+-
+-	intel_crtc = to_intel_crtc(crtc);
+-	pipe = intel_crtc->pipe;
+-
+-	DRM_DEBUG_DRIVER("pipe = %d\n", pipe);
+-	memcpy(&rot_mode, &(crtc->hwmode), sizeof(struct drm_display_mode));
+-	reg = DSPCNTR(pipe);
+-	val = I915_READ(reg);
+-	sprctla = I915_READ(SPCNTR(pipe, 0));
+-	sprctlb = I915_READ(SPCNTR(pipe, 1));
+-
+-	/*Clear older rotation settings*/
+-	if (val & DISPLAY_PLANE_ENABLE) {
+-		val &= ~DISPPLANE_180_ROTATION_ENABLE;
+-		I915_WRITE(reg, val);
+-		ret = 0;
+-	}
+ 
+-	if (sprctla & DISPLAY_PLANE_ENABLE) {
+-		sprctla &= ~DISPPLANE_180_ROTATION_ENABLE;
+-		I915_WRITE(SPCNTR(pipe, 0), sprctla);
+-		ret = 0;
+-	}
++	dev_priv = dev->dev_private;
+ 
+-	if (sprctlb & DISPLAY_PLANE_ENABLE) {
+-		sprctlb &= ~DISPPLANE_180_ROTATION_ENABLE;
+-		I915_WRITE(SPCNTR(pipe, 1), sprctlb);
+-		ret = 0;
+-	}
++	if (!data)
++		return -EINVAL;
+ 
+-	if (rotate) {
+-		if (val & DISPLAY_PLANE_ENABLE) {
+-			val |= DISPPLANE_180_ROTATION_ENABLE;
+-			I915_WRITE(reg, val);
+-		}
++	rotation = data;
+ 
+-		if (sprctla & DISPLAY_PLANE_ENABLE) {
+-			sprctla |= DISPPLANE_180_ROTATION_ENABLE;
+-			I915_WRITE(SPCNTR(pipe, 0), sprctla);
++	if (rotation->obj_type == DRM_MODE_OBJECT_PLANE) {
++		obj = drm_mode_object_find(dev, rotation->obj_id,
++			DRM_MODE_OBJECT_PLANE);
++		if (obj) {
++			intel_plane = to_intel_plane(obj_to_plane(obj));
++			intel_plane->rotate180 = (rotation->rotate & 0x1) ?
++					true : false;
++			ret = 0;
++		} else {
++			DRM_ERROR("Unknown PLANE ID\n");
++			ret = -EINVAL;
+ 		}
+-
+-		if (sprctlb & DISPLAY_PLANE_ENABLE) {
+-			sprctlb |= DISPPLANE_180_ROTATION_ENABLE;
+-			I915_WRITE(SPCNTR(pipe, 1), sprctlb);
++	} else if (rotation->obj_type == DRM_MODE_OBJECT_CRTC) {
++		obj = drm_mode_object_find(dev, rotation->obj_id,
++			DRM_MODE_OBJECT_CRTC);
++		if (obj) {
++			intel_crtc = to_intel_crtc(obj_to_crtc(obj));
++			intel_crtc->rotate180 = (rotation->rotate & 0x1) ?
++					true : false;
++			ret = 0;
++		} else {
++			DRM_ERROR("Unknown CRTC\n");
++			ret = -EINVAL;
+ 		}
++	} else {
++		DRM_ERROR("Unknown IOCTL parameter\n");
++		ret = -EINVAL;
+ 	}
+-
+-	i9xx_update_primary_plane(crtc, crtc->primary->fb, 0, 0);
+ 	return ret;
+ }
+ 
+@@ -2615,6 +2584,7 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 	struct intel_framebuffer *intel_fb;
+ 	struct drm_i915_gem_object *obj;
+ 	int plane = intel_crtc->plane;
++	int pipe = intel_crtc->pipe;
+ 	unsigned long linear_offset;
+ 	bool rotate = false;
+ 	u32 dspcntr;
+@@ -2673,7 +2643,8 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 	default:
+ 		BUG();
+ 	}
+-	if (dspcntr & DISPPLANE_180_ROTATION_ENABLE)
++
++	if (intel_crtc->rotate180 && (pipe == 0))
+ 		rotate = true;
+ 
+ 	if (INTEL_INFO(dev)->gen >= 4) {
+@@ -2688,6 +2659,8 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 
+ 	if (rotate)
+ 		dspcntr |= DISPPLANE_180_ROTATION_ENABLE;
++	else
++		dspcntr &= ~DISPPLANE_180_ROTATION_ENABLE;
+ 
+ 	I915_WRITE(reg, dspcntr);
+ 
+@@ -2711,15 +2684,17 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 		I915_MODIFY_DISPBASE(DSPSURF(plane),
+ 			   i915_gem_obj_ggtt_offset(obj) + intel_crtc->dspaddr_offset);
+ 		if (rotate) {
+-			I915_WRITE(DSPTILEOFF(plane), ((intel_fb->base.height
+-				<< 16) | (intel_fb->base.width)));
+-			I915_WRITE(DSPLINOFF(plane), (intel_fb->base.width *
+-				intel_fb->base.height * pixel_size));
++			I915_WRITE(DSPTILEOFF(plane),
++				   (((y + fb->height - 1) << 16) |
++				    (x + fb->width - 1)));
++			I915_WRITE(DSPLINOFF(plane),
++				   linear_offset +
++				   (fb->height - 1) * fb->pitches[0] +
++				   fb->width * pixel_size);
+ 		} else {
+ 			I915_WRITE(DSPTILEOFF(plane), (y << 16) | x);
+ 			I915_WRITE(DSPLINOFF(plane), linear_offset);
+ 		}
+-
+ 	} else
+ 		I915_WRITE(DSPADDR(plane), i915_gem_obj_ggtt_offset(obj) + linear_offset);
+ 	POSTING_READ(reg);
+@@ -11998,6 +11973,7 @@ static void intel_crtc_init(struct drm_device *dev, int pipe)
+ 	intel_crtc->primary_alpha = false;
+ 	intel_crtc->sprite0_alpha = true;
+ 	intel_crtc->sprite1_alpha = true;
++	intel_crtc->rotate180 = false;
+ 
+ 	WARN_ON(drm_crtc_index(&intel_crtc->base) != intel_crtc->pipe);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index d99b160..161b132 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -368,6 +368,7 @@ struct intel_crtc {
+ 	struct drm_crtc base;
+ 	enum pipe pipe;
+ 	enum plane plane;
++	bool rotate180;
+ 	u8 lut_r[256], lut_g[256], lut_b[256];
+ 	/*
+ 	 * Whether the crtc and the connected output pipeline is active. Implies
+@@ -447,6 +448,7 @@ struct intel_plane {
+ 	struct drm_i915_gem_object *obj, *old_obj;
+ 	bool can_scale;
+ 	int max_downscale;
++	bool rotate180;
+ 	u32 lut_r[1024], lut_g[1024], lut_b[1024];
+ 	int crtc_x, crtc_y;
+ 	unsigned int crtc_w, crtc_h;
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index b179291..e4ec109 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -470,7 +470,8 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	intel_update_sprite_watermarks(dplane, crtc, src_w, pixel_size, true,
+ 				       src_w != crtc_w || src_h != crtc_h);
+ 
+-	if (sprctl & DISPPLANE_180_ROTATION_ENABLE)
++	if (intel_plane->rotate180 &&
++			(pipe == 0))
+ 		rotate = true;
+ 
+ 	/* Sizes are 0 based */
+@@ -479,6 +480,8 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	crtc_w--;
+ 	crtc_h--;
+ 
++	I915_WRITE(SPPOS(pipe, plane), (crtc_y << 16) | crtc_x);
++
+ 	linear_offset = y * fb->pitches[0] + x * pixel_size;
+ 	sprsurf_offset = intel_gen4_compute_page_offset(&x, &y,
+ 							obj->tiling_mode,
+@@ -492,24 +495,18 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 
+ 	I915_WRITE(SPSTRIDE(pipe, plane), fb->pitches[0]);
+ 
+-	if (rotate)
+-		I915_WRITE(SPPOS(pipe, plane), ((rot_mode.vdisplay -
+-			(crtc_y + crtc_h + 1)) << 16) |
+-				(rot_mode.hdisplay - (crtc_x + crtc_w + 1)));
+-	else
+-		I915_WRITE(SPPOS(pipe, plane), (crtc_y << 16) | crtc_x);
+-
+ 	if (obj->tiling_mode != I915_TILING_NONE) {
+ 		if (rotate) {
+ 			I915_WRITE(SPTILEOFF(pipe, plane),
+-				(((crtc_h + 1) << 16) | (crtc_w + 1)));
++				((y + crtc_h) << 16) | (x + crtc_w));
+ 		} else
+ 			I915_WRITE(SPTILEOFF(pipe, plane), (y << 16) | x);
+ 	} else {
+ 		if (rotate) {
+-			I915_WRITE(SPLINOFF(pipe, plane),
+-				(((crtc_h + 1) * (crtc_w + 1) *
+-				pixel_size)) - pixel_size);
++			int rot_linoff = linear_offset +
++					 crtc_h * fb->pitches[0] +
++					 (crtc_w + 1) * pixel_size;
++			I915_WRITE(SPLINOFF(pipe, plane), rot_linoff);
+ 		} else
+ 			I915_WRITE(SPLINOFF(pipe, plane), linear_offset);
+ 	}
+@@ -517,6 +514,8 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	I915_WRITE(SPSIZE(pipe, plane), (crtc_h << 16) | crtc_w);
+ 	if (rotate)
+ 		sprctl |= DISPPLANE_180_ROTATION_ENABLE;
++	else
++		sprctl &= ~DISPPLANE_180_ROTATION_ENABLE;
+ 
+ 	I915_WRITE(SPCNTR(pipe, plane), sprctl);
+ 	I915_MODIFY_DISPBASE(SPSURF(pipe, plane),
+@@ -1799,6 +1798,7 @@ intel_plane_init(struct drm_device *dev, enum pipe pipe, int plane)
+ 
+ 	intel_plane->pipe = pipe;
+ 	intel_plane->plane = plane;
++	intel_plane->rotate180 = false;
+ 	possible_crtcs = (1 << pipe);
+ 	ret = drm_plane_init(dev, &intel_plane->base, possible_crtcs,
+ 			     &intel_plane_funcs,
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 5d8e7c2..6ff0270 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -1168,7 +1168,8 @@ struct drm_i915_gem_userptr {
+ };
+ 
+ struct drm_i915_plane_180_rotation {
+-	__u32 crtc_id;
++	__u32 obj_id;
++	__u32 obj_type;
+ 	__u32 rotate;
+ };
+ 
+-- 
+1.7.9.5
+

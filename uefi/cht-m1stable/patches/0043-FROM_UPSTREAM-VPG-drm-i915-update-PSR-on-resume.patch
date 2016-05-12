@@ -1,0 +1,160 @@
+From 2fc8d44d155a73377302252a8a05db82ac6aadc8 Mon Sep 17 00:00:00 2001
+Message-Id: <2fc8d44d155a73377302252a8a05db82ac6aadc8.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Rodrigo Vivi <rodrigo.vivi@gmail.com>
+Date: Tue, 18 Feb 2014 15:51:52 +0530
+Subject: [PATCH 043/312] FROM_UPSTREAM [VPG]: drm/i915: update PSR on resume
+
+Redo the PSR setup on resume and introducing
+the mutex to protect psr state change.
+
+Issue: AIAF-1680
+Upstream-Repo: http://patchwork.freedesktop.org/patch/19539/
+Change-Id: I345ed0c38d8fdfd0a4ccadb523f55f5094acd44b
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@gmail.com>
+Signed-off-by: Ramalingam C <ramalingam.c@intel.com>
+Reviewed-on: https://android.intel.com/164992
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Tested-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h     |    2 ++
+ drivers/gpu/drm/i915/i915_suspend.c |    4 ++++
+ drivers/gpu/drm/i915/intel_dp.c     |   23 +++++++++++++++++------
+ drivers/gpu/drm/i915/intel_drv.h    |    1 -
+ 4 files changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 6142cd4..9471906 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -651,6 +651,8 @@ struct i915_drrs {
+ struct i915_psr {
+ 	bool sink_support;
+ 	bool source_ok;
++	bool setup_done;
++	struct mutex lock;
+ };
+ 
+ enum intel_pch {
+diff --git a/drivers/gpu/drm/i915/i915_suspend.c b/drivers/gpu/drm/i915/i915_suspend.c
+index 043123c..0c4f402 100644
+--- a/drivers/gpu/drm/i915/i915_suspend.c
++++ b/drivers/gpu/drm/i915/i915_suspend.c
+@@ -288,6 +288,10 @@ static void i915_restore_display(struct drm_device *dev)
+ 		I915_WRITE(PP_CONTROL, dev_priv->regfile.savePP_CONTROL);
+ 	}
+ 
++	/* Force a full PSR setup on resume */
++	dev_priv->psr.setup_done = false;
++	intel_edp_psr_update(dev);
++
+ 	/* only restore FBC info on the platform that supports FBC*/
+ 	intel_disable_fbc(dev);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 23fddcc..59cc3d0 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -1665,9 +1665,11 @@ static void intel_edp_psr_setup(struct intel_dp *intel_dp)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct edp_vsc_psr psr_vsc;
+ 
+-	if (intel_dp->psr_setup_done)
++	if (dev_priv->psr.setup_done)
+ 		return;
+ 
++	mutex_init(&dev_priv->psr.lock);
++
+ 	/* Prepare VSC packet as per EDP 1.3 spec, Table 3.10 */
+ 	memset(&psr_vsc, 0, sizeof(psr_vsc));
+ 	psr_vsc.sdp_header.HB0 = 0;
+@@ -1680,7 +1682,7 @@ static void intel_edp_psr_setup(struct intel_dp *intel_dp)
+ 	I915_WRITE(EDP_PSR_DEBUG_CTL(dev), EDP_PSR_DEBUG_MASK_MEMUP |
+ 		   EDP_PSR_DEBUG_MASK_HPD | EDP_PSR_DEBUG_MASK_LPSP);
+ 
+-	intel_dp->psr_setup_done = true;
++	dev_priv->psr.setup_done = true;
+ }
+ 
+ static void intel_edp_psr_enable_sink(struct intel_dp *intel_dp)
+@@ -1810,9 +1812,6 @@ static void intel_edp_psr_do_enable(struct intel_dp *intel_dp)
+ 	    intel_edp_is_psr_enabled(dev))
+ 		return;
+ 
+-	/* Setup PSR once */
+-	intel_edp_psr_setup(intel_dp);
+-
+ 	/* Enable PSR on the panel */
+ 	intel_edp_psr_enable_sink(intel_dp);
+ 
+@@ -1823,10 +1822,16 @@ static void intel_edp_psr_do_enable(struct intel_dp *intel_dp)
+ void intel_edp_psr_enable(struct intel_dp *intel_dp)
+ {
+ 	struct drm_device *dev = intel_dp_to_dev(intel_dp);
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
++	/* Setup PSR once */
++	intel_edp_psr_setup(intel_dp);
++
++	mutex_lock(&dev_priv->psr.lock);
+ 	if (intel_edp_psr_match_conditions(intel_dp) &&
+ 	    !intel_edp_is_psr_enabled(dev))
+ 		intel_edp_psr_do_enable(intel_dp);
++	mutex_unlock(&dev_priv->psr.lock);
+ }
+ 
+ void intel_edp_psr_disable(struct intel_dp *intel_dp)
+@@ -1848,9 +1853,13 @@ void intel_edp_psr_disable(struct intel_dp *intel_dp)
+ 
+ void intel_edp_psr_update(struct drm_device *dev)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_encoder *encoder;
+ 	struct intel_dp *intel_dp = NULL;
+ 
++	if (!dev_priv->psr.setup_done)
++		return;
++
+ 	list_for_each_entry(encoder, &dev->mode_config.encoder_list, base.head)
+ 		if (encoder->type == INTEL_OUTPUT_EDP) {
+ 			intel_dp = enc_to_intel_dp(&encoder->base);
+@@ -1858,11 +1867,13 @@ void intel_edp_psr_update(struct drm_device *dev)
+ 			if (!is_edp_psr(dev))
+ 				return;
+ 
++			mutex_lock(&dev_priv->psr.lock);
+ 			if (!intel_edp_psr_match_conditions(intel_dp))
+ 				intel_edp_psr_disable(intel_dp);
+ 			else
+ 				if (!intel_edp_is_psr_enabled(dev))
+ 					intel_edp_psr_do_enable(intel_dp);
++			mutex_unlock(&dev_priv->psr.lock);
+ 		}
+ }
+ 
+@@ -4342,7 +4353,7 @@ intel_dp_init_connector(struct intel_digital_port *intel_dig_port,
+ 
+ 	intel_dp_aux_init(intel_dp, intel_connector);
+ 
+-	intel_dp->psr_setup_done = false;
++	dev_priv->psr.setup_done = false;
+ 
+ 	if (!intel_edp_init_connector(intel_dp, intel_connector, &power_seq)) {
+ 		drm_dp_aux_unregister(&intel_dp->aux);
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index c454bef..b72d2db 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -562,7 +562,6 @@ struct intel_dp {
+ 	unsigned long last_power_cycle;
+ 	unsigned long last_power_on;
+ 	unsigned long last_backlight_off;
+-	bool psr_setup_done;
+ 	bool use_tps3;
+ 	struct intel_connector *attached_connector;
+ 
+-- 
+1.7.9.5
+

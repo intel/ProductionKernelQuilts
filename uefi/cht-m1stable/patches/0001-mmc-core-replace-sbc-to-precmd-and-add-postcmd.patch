@@ -1,0 +1,293 @@
+From feb576327d39efb5b7ee44008b8d19a4ab673d67 Mon Sep 17 00:00:00 2001
+From: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Date: Mon, 27 Oct 2014 19:03:18 +0800
+Subject: [PATCH 1/5] mmc: core: replace sbc to precmd and add postcmd
+
+right now we use sbc to present CMD23. If we want sbc to present
+other cmds, then it is not suitable. So change the name to precmd
+which means a cmd that needs to be sent before a cmd. So it can sent
+any command without misunderstanding
+
+Change-Id: I837be5dd88501e9c5e5ace0153af623b5ac6bf5c
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+---
+ drivers/mmc/card/block.c  | 27 ++++++++++++++-------------
+ drivers/mmc/card/queue.h  |  3 ++-
+ drivers/mmc/core/core.c   |  6 +++---
+ drivers/mmc/host/dw_mmc.c |  8 ++++----
+ drivers/mmc/host/mmci.c   | 12 ++++++------
+ drivers/mmc/host/sdhci.c  | 18 ++++++++++--------
+ include/linux/mmc/core.h  |  3 ++-
+ 7 files changed, 41 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index ab026cb..70fe023 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -894,8 +894,9 @@ static int mmc_blk_cmd_recovery(struct mmc_card *card, struct request *req,
+ 	}
+ 
+ 	/* Check for set block count errors */
+-	if (brq->sbc.error)
+-		return mmc_blk_cmd_error(req, "SET_BLOCK_COUNT", brq->sbc.error,
++	if (brq->precmd.error)
++		return mmc_blk_cmd_error(req, "SET_BLOCK_COUNT",
++				brq->precmd.error,
+ 				prev_cmd_status_valid, status);
+ 
+ 	/* Check for r/w command errors */
+@@ -1132,7 +1133,7 @@ static int mmc_blk_err_check(struct mmc_card *card,
+ 	int ecc_err = 0, gen_err = 0;
+ 
+ 	/*
+-	 * sbc.error indicates a problem with the set block count
++	 * precmd.error indicates a problem with the set block count
+ 	 * command.  No data will have been transferred.
+ 	 *
+ 	 * cmd.error indicates a problem with the r/w command.  No
+@@ -1141,7 +1142,7 @@ static int mmc_blk_err_check(struct mmc_card *card,
+ 	 * stop.error indicates a problem with the stop command.  Data
+ 	 * may have been transferred, or may still be transferring.
+ 	 */
+-	if (brq->sbc.error || brq->cmd.error || brq->stop.error ||
++	if (brq->precmd.error || brq->cmd.error || brq->stop.error ||
+ 	    brq->data.error) {
+ 		switch (mmc_blk_cmd_recovery(card, req, brq, &ecc_err, &gen_err)) {
+ 		case ERR_RETRY:
+@@ -1420,7 +1421,7 @@ static void mmc_blk_rw_rq_prep(struct mmc_queue_req *mqrq,
+ 	 * with Auto-CMD23 enhancements provided by some
+ 	 * hosts, means that the complexity of dealing
+ 	 * with this is best left to the host. If CMD23 is
+-	 * supported by card and host, we'll fill sbc in and let
++	 * supported by card and host, we'll fill precmd in and let
+ 	 * the host deal with handling it correctly. This means
+ 	 * that for hosts that don't expose MMC_CAP_CMD23, no
+ 	 * change of behavior will be observed.
+@@ -1432,12 +1433,12 @@ static void mmc_blk_rw_rq_prep(struct mmc_queue_req *mqrq,
+ 	if ((md->flags & MMC_BLK_CMD23) && mmc_op_multi(brq->cmd.opcode) &&
+ 	    (do_rel_wr || !(card->quirks & MMC_QUIRK_BLK_NO_CMD23) ||
+ 	     do_data_tag)) {
+-		brq->sbc.opcode = MMC_SET_BLOCK_COUNT;
+-		brq->sbc.arg = brq->data.blocks |
++		brq->precmd.opcode = MMC_SET_BLOCK_COUNT;
++		brq->precmd.arg = brq->data.blocks |
+ 			(do_rel_wr ? (1 << 31) : 0) |
+ 			(do_data_tag ? (1 << 29) : 0);
+-		brq->sbc.flags = MMC_RSP_R1 | MMC_CMD_AC;
+-		brq->mrq.sbc = &brq->sbc;
++		brq->precmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
++		brq->mrq.precmd = &brq->precmd;
+ 	}
+ 
+ 	mmc_set_data_timeout(&brq->data, card);
+@@ -1646,12 +1647,12 @@ static void mmc_blk_packed_hdr_wrq_prep(struct mmc_queue_req *mqrq,
+ 	memset(brq, 0, sizeof(struct mmc_blk_request));
+ 	brq->mrq.cmd = &brq->cmd;
+ 	brq->mrq.data = &brq->data;
+-	brq->mrq.sbc = &brq->sbc;
++	brq->mrq.precmd = &brq->precmd;
+ 	brq->mrq.stop = &brq->stop;
+ 
+-	brq->sbc.opcode = MMC_SET_BLOCK_COUNT;
+-	brq->sbc.arg = MMC_CMD23_ARG_PACKED | (packed->blocks + hdr_blocks);
+-	brq->sbc.flags = MMC_RSP_R1 | MMC_CMD_AC;
++	brq->precmd.opcode = MMC_SET_BLOCK_COUNT;
++	brq->precmd.arg = MMC_CMD23_ARG_PACKED | (packed->blocks + hdr_blocks);
++	brq->precmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
+ 
+ 	brq->cmd.opcode = MMC_WRITE_MULTIPLE_BLOCK;
+ 	brq->cmd.arg = blk_rq_pos(req);
+diff --git a/drivers/mmc/card/queue.h b/drivers/mmc/card/queue.h
+index 5752d50..b129ddc 100644
+--- a/drivers/mmc/card/queue.h
++++ b/drivers/mmc/card/queue.h
+@@ -8,8 +8,9 @@ struct task_struct;
+ 
+ struct mmc_blk_request {
+ 	struct mmc_request	mrq;
+-	struct mmc_command	sbc;
++	struct mmc_command	precmd;
+ 	struct mmc_command	cmd;
++	struct mmc_command	postcmd;
+ 	struct mmc_command	stop;
+ 	struct mmc_data		data;
+ };
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 36f991b..f467ff0 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -265,10 +265,10 @@ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
+ 	struct scatterlist *sg;
+ #endif
+ 
+-	if (mrq->sbc) {
++	if (mrq->precmd) {
+ 		pr_debug("<%s: starting CMD%u arg %08x flags %08x>\n",
+-			 mmc_hostname(host), mrq->sbc->opcode,
+-			 mrq->sbc->arg, mrq->sbc->flags);
++			 mmc_hostname(host), mrq->precmd->opcode,
++			 mrq->precmd->arg, mrq->precmd->flags);
+ 	}
+ 
+ 	pr_debug("%s: starting CMD%u arg %08x flags %08x\n",
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index 55cd110..cccb7c1 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -894,7 +894,7 @@ static void dw_mci_start_request(struct dw_mci *host,
+ 	struct mmc_request *mrq = slot->mrq;
+ 	struct mmc_command *cmd;
+ 
+-	cmd = mrq->sbc ? mrq->sbc : mrq->cmd;
++	cmd = mrq->precmd ? mrq->precmd : mrq->cmd;
+ 	__dw_mci_start_request(host, slot, cmd);
+ }
+ 
+@@ -1295,7 +1295,7 @@ static void dw_mci_tasklet_func(unsigned long priv)
+ 			host->cmd = NULL;
+ 			set_bit(EVENT_CMD_COMPLETE, &host->completed_events);
+ 			err = dw_mci_command_complete(host, cmd);
+-			if (cmd == mrq->sbc && !err) {
++			if (cmd == mrq->precmd && !err) {
+ 				prev_state = state = STATE_SENDING_CMD;
+ 				__dw_mci_start_request(host, host->cur_slot,
+ 						       mrq->cmd);
+@@ -1344,8 +1344,8 @@ static void dw_mci_tasklet_func(unsigned long priv)
+ 			err = dw_mci_data_complete(host, data);
+ 
+ 			if (!err) {
+-				if (!data->stop || mrq->sbc) {
+-					if (mrq->sbc)
++				if (!data->stop || mrq->precmd) {
++					if (mrq->precmd)
+ 						data->stop->error = 0;
+ 					dw_mci_request_end(host, mrq);
+ 					goto unlock;
+diff --git a/drivers/mmc/host/mmci.c b/drivers/mmc/host/mmci.c
+index b931226..1bd0bfe 100644
+--- a/drivers/mmc/host/mmci.c
++++ b/drivers/mmc/host/mmci.c
+@@ -907,7 +907,7 @@ mmci_data_irq(struct mmci_host *host, struct mmc_data *data,
+ 			/* The error clause is handled above, success! */
+ 			data->bytes_xfered = data->blksz * data->blocks;
+ 
+-		if (!data->stop || host->mrq->sbc) {
++		if (!data->stop || host->mrq->precmd) {
+ 			mmci_request_end(host, data->mrq);
+ 		} else {
+ 			mmci_start_command(host, data->stop, 0);
+@@ -920,7 +920,7 @@ mmci_cmd_irq(struct mmci_host *host, struct mmc_command *cmd,
+ 	     unsigned int status)
+ {
+ 	void __iomem *base = host->base;
+-	bool sbc = (cmd == host->mrq->sbc);
++	bool precmd = (cmd == host->mrq->precmd);
+ 
+ 	host->cmd = NULL;
+ 
+@@ -935,7 +935,7 @@ mmci_cmd_irq(struct mmci_host *host, struct mmc_command *cmd,
+ 		cmd->resp[3] = readl(base + MMCIRESPONSE3);
+ 	}
+ 
+-	if ((!sbc && !cmd->data) || cmd->error) {
++	if ((!precmd && !cmd->data) || cmd->error) {
+ 		if (host->data) {
+ 			/* Terminate the DMA transfer */
+ 			if (dma_inprogress(host)) {
+@@ -945,7 +945,7 @@ mmci_cmd_irq(struct mmci_host *host, struct mmc_command *cmd,
+ 			mmci_stop_data(host);
+ 		}
+ 		mmci_request_end(host, host->mrq);
+-	} else if (sbc) {
++	} else if (precmd) {
+ 		mmci_start_command(host, host->mrq->cmd, 0);
+ 	} else if (!(cmd->data->flags & MMC_DATA_READ)) {
+ 		mmci_start_data(host, cmd->data);
+@@ -1187,8 +1187,8 @@ static void mmci_request(struct mmc_host *mmc, struct mmc_request *mrq)
+ 	if (mrq->data && mrq->data->flags & MMC_DATA_READ)
+ 		mmci_start_data(host, mrq->data);
+ 
+-	if (mrq->sbc)
+-		mmci_start_command(host, mrq->sbc, 0);
++	if (mrq->precmd)
++		mmci_start_command(host, mrq->precmd, 0);
+ 	else
+ 		mmci_start_command(host, mrq->cmd, 0);
+ 
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index dd5ffea..5ad711c 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -916,11 +916,13 @@ static void sdhci_set_transfer_mode(struct sdhci_host *host,
+ 		 * If we are sending CMD23, CMD12 never gets sent
+ 		 * on successful completion (so no Auto-CMD12).
+ 		 */
+-		if (!host->mrq->sbc && (host->flags & SDHCI_AUTO_CMD12))
++		if (!host->mrq->precmd && (host->flags & SDHCI_AUTO_CMD12))
+ 			mode |= SDHCI_TRNS_AUTO_CMD12;
+-		else if (host->mrq->sbc && (host->flags & SDHCI_AUTO_CMD23)) {
++		else if (host->mrq->precmd && (host->flags &
++					SDHCI_AUTO_CMD23)) {
+ 			mode |= SDHCI_TRNS_AUTO_CMD23;
+-			sdhci_writel(host, host->mrq->sbc->arg, SDHCI_ARGUMENT2);
++			sdhci_writel(host, host->mrq->precmd->arg,
++					SDHCI_ARGUMENT2);
+ 		}
+ 	}
+ 
+@@ -970,7 +972,7 @@ static void sdhci_finish_data(struct sdhci_host *host)
+ 	 */
+ 	if (data->stop &&
+ 	    (data->error ||
+-	     !host->mrq->sbc)) {
++	     !host->mrq->precmd)) {
+ 
+ 		/*
+ 		 * The controller needs a reset of internal state machines
+@@ -1091,7 +1093,7 @@ static void sdhci_finish_command(struct sdhci_host *host)
+ 	host->cmd->error = 0;
+ 
+ 	/* Finished CMD23, now send actual command. */
+-	if (host->cmd == host->mrq->sbc) {
++	if (host->cmd == host->mrq->precmd) {
+ 		host->cmd = NULL;
+ 		sdhci_send_command(host, host->mrq->cmd);
+ 	} else {
+@@ -1360,7 +1362,7 @@ static void sdhci_request(struct mmc_host *mmc, struct mmc_request *mrq)
+ 	 * Ensure we don't send the STOP for non-SET_BLOCK_COUNTED
+ 	 * requests if Auto-CMD12 is enabled.
+ 	 */
+-	if (!mrq->sbc && (host->flags & SDHCI_AUTO_CMD12)) {
++	if (!mrq->precmd && (host->flags & SDHCI_AUTO_CMD12)) {
+ 		if (mrq->stop) {
+ 			mrq->data->stop = NULL;
+ 			mrq->stop = NULL;
+@@ -1450,8 +1452,8 @@ end_tuning:
+ 			goto out;
+ 		}
+ 
+-		if (mrq->sbc && !(host->flags & SDHCI_AUTO_CMD23))
+-			sdhci_send_command(host, mrq->sbc);
++		if (mrq->precmd && !(host->flags & SDHCI_AUTO_CMD23))
++			sdhci_send_command(host, mrq->precmd);
+ 		else
+ 			sdhci_send_command(host, mrq->cmd);
+ 	}
+diff --git a/include/linux/mmc/core.h b/include/linux/mmc/core.h
+index 94a7568..2de2906b 100644
+--- a/include/linux/mmc/core.h
++++ b/include/linux/mmc/core.h
+@@ -129,8 +129,9 @@ struct mmc_data {
+ 
+ struct mmc_host;
+ struct mmc_request {
+-	struct mmc_command	*sbc;		/* SET_BLOCK_COUNT for multiblock */
++	struct mmc_command	*precmd;
+ 	struct mmc_command	*cmd;
++	struct mmc_command	*postcmd;
+ 	struct mmc_data		*data;
+ 	struct mmc_command	*stop;
+ 
+-- 
+1.9.1
+

@@ -1,0 +1,132 @@
+From 55ee5de7beb2f98651c91f23e24dfdf2798563e5 Mon Sep 17 00:00:00 2001
+From: Yuan Juntao <juntao.yuan@intel.com>
+Date: Wed, 22 Apr 2015 11:17:22 +0800
+Subject: [PATCH] mmc: cmdq error handling improvement
+
+Improve cmdq error handling process.
+
+Change-Id: I7b30309b6f027070edd2a48e68c579da17d6cb99
+Signed-off-by: Yuan Juntao <juntao.yuan@intel.com>
+---
+ drivers/mmc/card/block.c | 39 ++++++++++++++++++---------------------
+ drivers/mmc/core/core.c  |  8 ++++++++
+ 2 files changed, 26 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index 8fcefb9c0b58..b15573b72381 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -2099,8 +2099,8 @@ static void mmc_blk_wait_cmdq_data(struct mmc_request *mrq)
+ 	struct mmc_host		*host = mrq->host;
+ 	struct mmc_queue_req	*mqrq;
+ 	struct request		*req;
+-	int error, bytes;
+-	bool partial;
++	int error;
++	unsigned int bytes;
+ 
+ 	BUG_ON(!mrq->data);
+ 	BUG_ON(!host->areq);
+@@ -2113,16 +2113,15 @@ static void mmc_blk_wait_cmdq_data(struct mmc_request *mrq)
+ 	mmc_queue_bounce_post(mqrq);
+ 	error = mrq->data->error;
+ 	bytes = mrq->data->bytes_xfered;
+-	partial = (blk_rq_bytes(req) != bytes) ? true : false;
++	if (blk_rq_bytes(req) == bytes)
++		mqrq->mmc_active.success = true;
+ 	host->context_info.is_done_rcv = true;
+ 	wake_up_interruptible(&mrq->host->context_info.wait);
+ 	if (error) {
+ 		pr_err("%s: data err %d for id %d\n",
+ 				__func__, error, mqrq->task_id);
+-	} else if (!partial) {
+-		mqrq->mmc_active.success = true;
++	} else if (mqrq->mmc_active.success)
+ 		blk_end_request(req, 0, bytes);
+-	}
+ }
+ 
+ static int mmc_blk_cmdq_check(struct mmc_card *card, unsigned long *status)
+@@ -2196,12 +2195,16 @@ static int mmc_blk_execute_cmdq(struct mmc_queue *mq,
+ 		case MMC_BLK_PARTIAL:
+ 			mmc_blk_reset_success(md, MMC_BLK_CMDQ);
+ 			/* re-queue */
+-			BUG_ON(!prev_mqrq);
+-			blk_end_request(prev_mqrq->req, 0,
++			if (prev_mqrq) {
++				blk_end_request(prev_mqrq->req, 0,
+ 					prev_mqrq->brq.data.bytes_xfered);
+-			err = mmc_blk_queue_cmdq_req(mq, prev_mqrq, NULL);
+-			if (err)
+-				return err;
++				err = mmc_blk_queue_cmdq_req(mq, prev_mqrq,
++						NULL);
++				if (err)
++					return err;
++			} else
++				pr_err("%s: no previous mrq\n",
++						mmc_hostname(host));
+ 			break;
+ 		case MMC_BLK_NEW_REQUEST:
+ 			cntx->is_pending_cmdq = true;
+@@ -2219,12 +2222,14 @@ static int mmc_blk_flush_cmdq(struct mmc_queue *mq, bool urgent)
+ {
+ 	int err;
+ 	unsigned long status;
+-	struct mmc_host *host = mq->card->host;
++	struct mmc_host *host;
+ 	unsigned long timeout;
+ 
+-	if (!mq)
++	if (!mq || !mq->card)
+ 		return 0;
+ 
++	host = mq->card->host;
++
+ 	if (host->context_info.is_pending_cmdq) {
+ 		host->context_info.is_pending_cmdq = false;
+ 		err = mmc_blk_execute_cmdq(mq, 0);
+@@ -2290,14 +2295,6 @@ static int mmc_blk_cmdq_data_err_check(struct mmc_card *card,
+ 	struct mmc_queue_req *mqrq = container_of(areq, struct mmc_queue_req,
+ 						    mmc_active);
+ 	struct mmc_blk_request *brq = &mqrq->brq;
+-	int err;
+-
+-	/* check card status */
+-	if (brq->data.flags & MMC_DATA_WRITE) {
+-		err = mmc_busy_wait(card->host);
+-		if (err)
+-			return MMC_BLK_ABORT;
+-	}
+ 
+ 	if (areq->success)
+ 		return MMC_BLK_SUCCESS;
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 725d1e7fa5d1..a96b901aaa45 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -300,6 +300,10 @@ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
+ 
+ 	mrq->cmd->error = 0;
+ 	mrq->cmd->mrq = mrq;
++	if (mrq->precmd) {
++		mrq->precmd->error = 0;
++		mrq->precmd->mrq = mrq;
++	}
+ 	if (mrq->data) {
+ 		BUG_ON(mrq->data->blksz > host->max_blk_size);
+ 		BUG_ON(mrq->data->blocks > host->max_blk_count);
+@@ -935,6 +939,10 @@ void mmc_set_data_timeout(struct mmc_data *data, const struct mmc_card *card)
+ 			data->timeout_ns = limit_us * 1000;
+ 			data->timeout_clks = 0;
+ 		}
++
++		/* assign limit value if invalid */
++		if (timeout_us == 0)
++			data->timeout_ns = limit_us * 1000;
+ 	}
+ 
+ 	/*
+-- 
+1.9.1
+

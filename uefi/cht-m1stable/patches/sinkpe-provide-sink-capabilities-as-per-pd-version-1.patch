@@ -1,0 +1,163 @@
+From 501457400feb5f0a7e11404c722e19225743404a Mon Sep 17 00:00:00 2001
+From: "R, Kannappan" <r.kannappan@intel.com>
+Date: Mon, 12 Oct 2015 14:32:48 +0530
+Subject: [PATCH] sinkpe: provide sink capabilities as per pd version 1.1
+
+pd version 1.1 mandates not to send the sink capability
+for the same voltage and power supply type, instead
+provide capability for a particular voltage with the
+maximum supported current. If higher power capability is
+supported update the sink flags for higher power capabilitiy.
+
+Change-Id: I802baac35de85618f7c48b0a6ebd25c9fa8e8b31
+Signed-off-by: R, Kannappan <r.kannappan@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-6435
+Reviewed-on: https://android.intel.com:443/422407
+(cherry picked from commit a2f736ae1c68b4b44eda80769a3bf14a2a5e730d)
+Reviewed-on: https://android.intel.com:443/428186
+---
+ drivers/usb/typec/pd/devpolicy_mgr.c | 19 +++-----------
+ drivers/usb/typec/pd/devpolicy_mgr.h |  5 ++++
+ drivers/usb/typec/pd/sink_port_pe.c  | 49 ++++++++++++++++++++++++++++++------
+ 3 files changed, 49 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/devpolicy_mgr.c b/drivers/usb/typec/pd/devpolicy_mgr.c
+index aa31c1b..210e49e 100644
+--- a/drivers/usb/typec/pd/devpolicy_mgr.c
++++ b/drivers/usb/typec/pd/devpolicy_mgr.c
+@@ -38,31 +38,18 @@
+ static struct power_cap spcaps[] = {
+ 	{
+ 		.mv = VIN_5V,
+-		.ma = ICHRG_P5A,
+-	},
+-	{
+-		.mv = VIN_5V,
+-		.ma = ICHRG_1P5A,
+-	},
+-	{
+-		.mv = VIN_5V,
+-		.ma = ICHRG_3A,
+-	},
+-	{
+-		.mv = VIN_9V,
+-		.ma = ICHRG_1P5A,
+-	},
+-	{
+-		.mv = VIN_9V,
+ 		.ma = ICHRG_3A,
++		.psy_type = DPM_PSY_TYPE_FIXED,
+ 	},
+ 	{
+ 		.mv = VIN_12V,
+ 		.ma = ICHRG_1A,
++		.psy_type = DPM_PSY_TYPE_FIXED,
+ 	},
+ 	{
+ 		.mv = VIN_12V,
+ 		.ma = ICHRG_3A,
++		.psy_type = DPM_PSY_TYPE_FIXED,
+ 	},
+ };
+ 
+diff --git a/drivers/usb/typec/pd/devpolicy_mgr.h b/drivers/usb/typec/pd/devpolicy_mgr.h
+index 60d8e96..6498e25 100644
+--- a/drivers/usb/typec/pd/devpolicy_mgr.h
++++ b/drivers/usb/typec/pd/devpolicy_mgr.h
+@@ -79,6 +79,10 @@ enum batt_soc_status {
+ #define ICHRG_1A	1000
+ #define ICHRG_P5A	500
+ 
++#define DPM_PSY_TYPE_FIXED	0
++#define DPM_PSY_TYPE_VARIABLE	2
++#define DPM_PSY_TYPE_BATTERY	1
++
+ enum devpolicy_mgr_events {
+ 	DEVMGR_EVENT_NONE,
+ 	DEVMGR_EVENT_DFP_CONNECTED,
+@@ -120,6 +124,7 @@ enum data_role {
+ struct power_cap {
+ 	int mv;
+ 	int ma;
++	int psy_type;
+ };
+ 
+ struct power_caps {
+diff --git a/drivers/usb/typec/pd/sink_port_pe.c b/drivers/usb/typec/pd/sink_port_pe.c
+index f67e0b3..e14660c 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.c
++++ b/drivers/usb/typec/pd/sink_port_pe.c
+@@ -609,6 +609,25 @@ error:
+ 	return ret;
+ }
+ 
++static void snkpe_fill_default_cap(struct sink_port_pe *sink)
++{
++	struct pd_sink_fixed_pdo pdo = { 0 };
++
++	/* setting default pdo as vsafe5V with ma = 0 */
++	pdo.data_role_swap = 1;
++	pdo.usb_comm = 1;
++	pdo.ext_powered = 0;
++	pdo.higher_cap = 0;
++	pdo.dual_role_pwr = 1;
++	pdo.max_cur = CURRENT_TO_DATA_OBJ(0);
++	pdo.volt = (VOLT_TO_DATA_OBJ(5000) >>
++				SNK_FSPDO_VOLT_SHIFT);
++	pdo.supply_type = 0;
++	policy_send_packet(&sink->p, &pdo, 4,
++					PD_DATA_MSG_SINK_CAP,
++					PE_EVT_SEND_SNK_CAP);
++}
++
+ static int snkpe_handle_give_snk_cap_state(struct sink_port_pe *sink)
+ {
+ 	int ret = 0;
+@@ -619,8 +638,28 @@ static int snkpe_handle_give_snk_cap_state(struct sink_port_pe *sink)
+ 	snkpe_update_state(sink, PE_SNK_GIVE_SINK_CAP);
+ 
+ 	ret = policy_get_snkpwr_caps(&sink->p, &pcaps);
+-	if (ret < 0)
++	if (ret < 0) {
++		snkpe_fill_default_cap(sink);
++		goto error;
++	}
++
++	/**
++	 * As per PD v1.1 spec except first pdo, all other Fixed Supply Power
++	 * Data Objects shall set bits 29...20 to zero.
++	 */
++	if (pcaps.n_cap > 0) {
++		/* FIXME: DPM should provide info on USB capable and
++		 * higher power support required */
++		pdo[0].data_role_swap = 1;
++		pdo[0].usb_comm = 1;
++		pdo[0].ext_powered = 0;
++		pdo[0].higher_cap = 1;
++		pdo[0].dual_role_pwr = 1;
++	} else {
++		pr_debug("SNKPE: No PDO's from dpm setting default vasafe5v\n");
++		snkpe_fill_default_cap(sink);
+ 		goto error;
++	}
+ 
+ 	for (i = 0; i < MAX_NUM_DATA_OBJ; i++) {
+ 		if (i >= pcaps.n_cap)
+@@ -629,13 +668,7 @@ static int snkpe_handle_give_snk_cap_state(struct sink_port_pe *sink)
+ 		pdo[i].max_cur = CURRENT_TO_DATA_OBJ(pcaps.pcap[i].ma);
+ 		pdo[i].volt = (VOLT_TO_DATA_OBJ(pcaps.pcap[i].mv) >>
+ 					SNK_FSPDO_VOLT_SHIFT);
+-		/* FIXME: get it from dpm once the dpm provides the caps */
+-		pdo[i].data_role_swap = 1;
+-		pdo[i].usb_comm = 1;
+-		pdo[i].ext_powered = 0;
+-		pdo[i].higher_cap = 0;
+-		pdo[i].dual_role_pwr = 1;
+-		pdo[i].supply_type = 0;
++		pdo[i].supply_type = pcaps.pcap[i].psy_type;
+ 	}
+ 
+ 	ret = policy_send_packet(&sink->p, pdo, pcaps.n_cap * 4,
+-- 
+1.9.1
+

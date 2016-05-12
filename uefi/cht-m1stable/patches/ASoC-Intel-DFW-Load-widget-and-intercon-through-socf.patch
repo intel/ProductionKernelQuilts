@@ -1,0 +1,187 @@
+From 9474080011337a67c14a5e8a85d47701867a8926 Mon Sep 17 00:00:00 2001
+From: "Subhransu S. Prusty" <subhransu.s.prusty@intel.com>
+Date: Mon, 19 May 2014 19:50:14 +0530
+Subject: [PATCH 32/39] ASoC: Intel: DFW: Load widget and intercon through
+ socfw
+
+Issue: GMINL-3680
+
+Add support to load widgets and interconnections from DFW binary
+
+Change-Id: Id878a246e42ee71ccb19682cb896e50b2a53604b
+Signed-off-by: Mythri P K <mythri.p.k@intel.com>
+---
+ sound/soc/intel/platform-libs/controls_v2_dpcm.c | 65 +++++++++++++++++++++---
+ sound/soc/intel/platform-libs/sst_vendor.h       | 43 ++++++++++++++++
+ 2 files changed, 102 insertions(+), 6 deletions(-)
+
+diff --git a/sound/soc/intel/platform-libs/controls_v2_dpcm.c b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+index 069b3cf..8a388ed 100644
+--- a/sound/soc/intel/platform-libs/controls_v2_dpcm.c
++++ b/sound/soc/intel/platform-libs/controls_v2_dpcm.c
+@@ -2022,6 +2022,20 @@ const struct snd_soc_fw_kcontrol_ops control_ops[] = {
+ 	{SOC_CONTROL_IO_SST_MUTE, sst_gain_get, sst_gain_put, snd_soc_info_bool_ext},
+ 	{SOC_CONTROL_IO_SST_ALGO_PARAMS, sst_algo_control_get, sst_algo_control_set, snd_soc_info_bytes_ext},
+ 	{SOC_CONTROL_IO_SST_ALGO_BYPASS, sst_algo_control_get, sst_algo_control_set, snd_soc_info_bool_ext},
++	{SOC_CONTROL_IO_SST_MIX, sst_mix_get, sst_mix_put, snd_soc_info_volsw},
++	{SOC_CONTROL_IO_SST_MUX, sst_mux_get, sst_mux_put, snd_soc_info_enum_double},
++};
++
++const struct snd_soc_fw_widget_events sst_widget_ops[] = {
++	{SST_HOSTLESS_STREAM, sst_hostless_stream_event},
++	{SST_SET_BE_MODULE, sst_set_be_modules},
++	{SST_SET_MEDIA_PATH, sst_set_media_path},
++	{SST_SET_MEDIA_LOOP, sst_set_media_loop},
++	{SST_SET_TONE_GEN, sst_tone_generator_event},
++	{SST_SET_SPEECH_PATH, sst_set_speech_path},
++	{SST_SET_SWM, sst_swm_mixer_event},
++	{SST_SET_LINKED_PATH, sst_set_linked_pipe},
++	{SST_SET_GENERIC_MODULE_EVENT, sst_generic_modules_event},
+ };
+ 
+ static int sst_copy_algo_control(struct snd_soc_platform *platform,
+@@ -2125,6 +2139,50 @@ int sst_fw_kcontrol_find_io(struct snd_soc_platform *platform,
+ 	return 0;
+ }
+ 
++static int sst_widget_load(struct snd_soc_platform *platform,
++		struct snd_soc_dapm_widget *w, struct snd_soc_fw_dapm_widget *fw_w)
++{
++	int ret;
++	struct sst_ids *ids;
++	struct sst_dfw_ids *dfw_ids = (struct sst_dfw_ids *)fw_w->pvt_data;
++
++	if (!fw_w->pvt_data_len)
++		goto bind_event;
++
++	ids = devm_kzalloc(platform->dev, sizeof(*ids), GFP_KERNEL);
++
++	if (!ids)
++		return -ENOMEM;
++
++	w->priv = (void *)ids;
++	ids->location_id = dfw_ids->location_id;
++	ids->module_id = dfw_ids->module_id;
++	ids->task_id = dfw_ids->task_id;
++	ids->format = dfw_ids->format;
++	ids->reg = dfw_ids->reg;
++	ids->pcm_fmt = devm_kzalloc(platform->dev,
++			sizeof(struct sst_pcm_format), GFP_KERNEL);
++	if (!ids->pcm_fmt)
++		return -ENOMEM;
++	ids->pcm_fmt->sample_bits = dfw_ids->sample_bits;
++	ids->pcm_fmt->rate_min = dfw_ids->rate_min;
++	ids->pcm_fmt->rate_max = dfw_ids->rate_max;
++	ids->pcm_fmt->channels_min = dfw_ids->channels_min;
++	ids->pcm_fmt->channels_max = dfw_ids->channels_max;
++
++bind_event:
++	ret = snd_soc_fw_widget_bind_event(fw_w->event_type, w,
++			sst_widget_ops, ARRAY_SIZE(sst_widget_ops));
++	if (ret) {
++		pr_err("%s: No matching event handlers found for %d\n",
++					__func__, fw_w->event_type);
++		return -EINVAL;
++	}
++
++
++	return 0;
++}
++
+ static int sst_pvt_load(struct snd_soc_platform *platform,
+ 			u32 io_type, unsigned long sm, unsigned long mc)
+ {
+@@ -2133,6 +2191,7 @@ static int sst_pvt_load(struct snd_soc_platform *platform,
+ }
+ 
+ static struct snd_soc_fw_platform_ops soc_fw_ops = {
++	.widget_load = sst_widget_load,
+ 	.pvt_load = sst_pvt_load,
+ 	.io_ops = control_ops,
+ 	.io_ops_count = ARRAY_SIZE(control_ops),
+@@ -2218,12 +2277,6 @@ int sst_dsp_init_v2_dpcm_dfw(struct snd_soc_platform *platform)
+ 		return -ENOMEM;
+ 	}
+ 
+-	snd_soc_dapm_new_controls(&platform->dapm, sst_dapm_widgets,
+-			ARRAY_SIZE(sst_dapm_widgets));
+-	snd_soc_dapm_add_routes(&platform->dapm, intercon,
+-			ARRAY_SIZE(intercon));
+-	snd_soc_dapm_new_widgets(platform->dapm.card);
+-
+ 	ret = request_firmware(&fw, "dfw_sst.bin", platform->dev);
+ 	if (fw == NULL) {
+ 		pr_err("config firmware request failed with %d\n", ret);
+diff --git a/sound/soc/intel/platform-libs/sst_vendor.h b/sound/soc/intel/platform-libs/sst_vendor.h
+index 38de0e4..da8ed8d 100644
+--- a/sound/soc/intel/platform-libs/sst_vendor.h
++++ b/sound/soc/intel/platform-libs/sst_vendor.h
+@@ -28,6 +28,8 @@
+ #define SOC_CONTROL_TYPE_SST_MUTE		101
+ #define SOC_CONTROL_TYPE_SST_ALGO_PARAMS	102
+ #define SOC_CONTROL_TYPE_SST_ALGO_BYPASS	103
++#define SOC_CONTROL_TYPE_SST_MUX			104
++#define SOC_CONTROL_TYPE_SST_MIX			106
+ 
+ /* REVISIT: Define sst kcontrol index */
+ #define SOC_CONTROL_IO_SST_GAIN\
+@@ -50,8 +52,35 @@
+ 	SOC_CONTROL_ID(SOC_CONTROL_TYPE_SST_ALGO_PARAMS, \
+ 		SOC_CONTROL_TYPE_SST_ALGO_PARAMS, \
+ 		SOC_CONTROL_TYPE_BOOL_EXT)
++
++#define SOC_CONTROL_IO_SST_MIX\
++	SOC_CONTROL_ID(SOC_CONTROL_TYPE_SST_MIX, \
++		SOC_CONTROL_TYPE_SST_MIX, \
++		SOC_CONTROL_TYPE_VOLSW)
++
++#define SOC_CONTROL_IO_SST_MUX\
++	SOC_CONTROL_ID(SOC_CONTROL_TYPE_SST_MUX, \
++		SOC_CONTROL_TYPE_SST_MUX, \
++		SOC_CONTROL_TYPE_SST_MUX)
++
+ #define SND_SOC_GAIN_CONTROL_NAME 44
+ 
++/* Event types goes here */
++/* Reserve event type 0 for no event handlers */
++enum sst_event_types {
++	SST_EVENT_TYPE_NONE = 0,
++	SST_HOSTLESS_STREAM,
++	SST_SET_BE_MODULE,
++	SST_SET_MEDIA_PATH,
++	SST_SET_MEDIA_LOOP,
++	SST_SET_TONE_GEN,
++	SST_SET_SPEECH_PATH,
++	SST_SET_SWM,
++	SST_EVENT_AWARE,
++	SST_SET_LINKED_PATH,
++	SST_SET_GENERIC_MODULE_EVENT,
++};
++
+ enum sst_vendor_type {
+ 	SND_SOC_FW_SST_CONTROLS = 0x1000,
+ 	SND_SOC_FW_SST_WIDGETS,
+@@ -97,6 +126,20 @@ struct sst_dfw_algo_data {
+ 	/* params will be in driver's pvt structure */
+ } __packed;
+ 
++struct sst_dfw_ids {
++	u32 sample_bits;        /* sst_pcm_format->sample_bits */
++	u32 rate_min;           /* sst_pcm_format-> rate_min */
++	u32 rate_max;           /* sst_pcm_format->rate_max */
++	u32 channels_min;       /* sst_pcm_format->channels_min */
++	u32 channels_max;       /* sst_pcm_format->channels_max */
++	u16 location_id;
++	u16 module_id;
++	u8  task_id;
++	u8  format;             /* stereo/mono */
++	u8  reg;
++	const char parent_wname[44];
++} __packed;
++
+ #if 0
+ /* sst_fw_config: FW config data organization
+  * For vendor specific:
+-- 
+1.9.1
+

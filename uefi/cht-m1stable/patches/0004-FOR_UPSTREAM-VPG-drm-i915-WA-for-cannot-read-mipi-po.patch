@@ -1,0 +1,122 @@
+From 5b33357fe8f25d71f9d9d464e6939d00f8fef5b5 Mon Sep 17 00:00:00 2001
+Message-Id: <5b33357fe8f25d71f9d9d464e6939d00f8fef5b5.1426574757.git.chang-joon.lee@intel.com>
+In-Reply-To: <eba22108096acc90a0516b200c616db90ae0cb5f.1426574757.git.chang-joon.lee@intel.com>
+References: <eba22108096acc90a0516b200c616db90ae0cb5f.1426574757.git.chang-joon.lee@intel.com>
+From: Hong Liu <hong.liu@intel.com>
+Date: Thu, 12 Mar 2015 10:41:43 +0800
+Subject: [PATCH 4/8] FOR_UPSTREAM [VPG]: drm/i915: WA for cannot read mipi
+ port reg in CHV
+
+MIPI Port C control register cannot be read for CHV Soc stepping
+<= C0. Put a SW WA to work around this problem in this patch.
+
+Since C0 is avaiable on Market, this WA needs to be in upstream driver.
+
+Issue: IMINAN-22667
+Change-Id: I2e78e226fae6b0a246a993d6242b7bc9625b40fb
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+Signed-off-by: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+Signed-off-by: Shen Lei <lei.shen@intel.com>
+Signed-off-by: Tan Wei <weix.z.tan@intel.com>
+Signed-off-by: Hong Liu <hong.liu@intel.com>
+---
+ drivers/gpu/drm/i915/intel_dsi.c |   39 ++++++++++++++++++++++++++++----------
+ drivers/gpu/drm/i915/intel_dsi.h |    3 +++
+ 2 files changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 319abe8..09fc559 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -220,9 +220,15 @@ static void intel_dsi_port_enable(struct intel_encoder *encoder)
+ 
+ 		I915_WRITE(MIPI_PORT_CTRL(0), temp);
+ 
+-		temp = I915_READ(MIPI_PORT_CTRL(1));
+-		temp = temp | port_control;
+-		I915_WRITE(MIPI_PORT_CTRL(1), temp);
++		if (pipe && IS_CHERRYVIEW(dev_priv->dev) && STEP_TO(STEP_C0)) {
++			intel_dsi->port_ctrl_reg_val |= port_control;
++			I915_WRITE(MIPI_PORT_CTRL(1),
++						intel_dsi->port_ctrl_reg_val);
++		} else {
++			temp = I915_READ(MIPI_PORT_CTRL(1));
++			temp = temp | port_control;
++			I915_WRITE(MIPI_PORT_CTRL(1), temp);
++		}
+ 
+ 		if ((intel_dsi->dual_link & MIPI_DUAL_LINK_FRONT_BACK) &&
+ 			((IS_CHERRYVIEW(dev_priv->dev) && STEP_FROM(STEP_B0)) ||
+@@ -239,10 +245,17 @@ static void intel_dsi_port_enable(struct intel_encoder *encoder)
+ 	/* Enable the ports */
+ 
+ 	do {
+-		temp = I915_READ(MIPI_PORT_CTRL(pipe));
+-		temp |= is_cmd_mode(intel_dsi) ?
++		if (pipe && IS_CHERRYVIEW(dev_priv->dev) && STEP_TO(STEP_C0)) {
++			intel_dsi->port_ctrl_reg_val |= is_cmd_mode(intel_dsi) ?
++					TEARING_EFFECT_GPIO : DPI_ENABLE;
++			I915_WRITE(MIPI_PORT_CTRL(pipe),
++						intel_dsi->port_ctrl_reg_val);
++		} else {
++			temp = I915_READ(MIPI_PORT_CTRL(pipe));
++			temp |= is_cmd_mode(intel_dsi) ?
+ 					TEARING_EFFECT_GPIO : DPI_ENABLE;
+-		I915_WRITE(MIPI_PORT_CTRL(pipe), temp);
++			I915_WRITE(MIPI_PORT_CTRL(pipe), temp);
++		}
+ 
+ 		pipe = PIPE_B;
+ 	} while (--count > 0);
+@@ -439,7 +452,7 @@ static void intel_dsi_port_disable(struct intel_encoder *encoder)
+ 	dev_priv->video_disabled = false;
+ 
+ 	if (is_cmd_mode(intel_dsi) && pipe && IS_CHERRYVIEW(dev_priv->dev)
+-						&& STEP_TO(STEP_B3)) {
++						&& STEP_TO(STEP_C0)) {
+ 		static int once_done;
+ 		if (once_done == false) {
+ 			once_done = true;
+@@ -449,8 +462,14 @@ static void intel_dsi_port_disable(struct intel_encoder *encoder)
+ 			(I915_READ(MIPI_PORT_CTRL(pipe)) & DPI_ENABLE))
+ 		dev_priv->video_disabled = true;
+ 
+-	I915_WRITE(MIPI_PORT_CTRL(pipe), 0);
+-	POSTING_READ(MIPI_PORT_CTRL(pipe));
++	if (pipe && IS_CHERRYVIEW(dev_priv->dev) && STEP_TO(STEP_C0)) {
++		/* cht hw issue that MIPI port C reg cannot be read */
++		I915_WRITE(MIPI_PORT_CTRL(pipe), 0);
++		intel_dsi->port_ctrl_reg_val = 0;
++	} else {
++		I915_WRITE(MIPI_PORT_CTRL(pipe), 0);
++		POSTING_READ(MIPI_PORT_CTRL(pipe));
++	}
+ 
+ 	if (intel_dsi->dual_link) {
+ 		I915_WRITE(MIPI_PORT_CTRL(pipe ? 0 : 1), 0);
+@@ -615,7 +634,7 @@ static bool intel_dsi_get_hw_state(struct intel_encoder *encoder,
+ 	/* XXX: this only works for one DSI output */
+ 	for (p = PIPE_A; p <= PIPE_B; p++) {
+ 		if (IS_CHERRYVIEW(dev) &&
+-				STEP_BETWEEN_INCLUSIVE(STEP_A0, STEP_B3) &&
++				STEP_BETWEEN_INCLUSIVE(STEP_A0, STEP_C0) &&
+ 				(MIPI_PORT_CTRL(p) == _MIPIB_PORT_CTRL))
+ 			dsi_status = I915_READ(PIPECONF(PIPE_B)) &
+ 							PIPECONF_ENABLE;
+diff --git a/drivers/gpu/drm/i915/intel_dsi.h b/drivers/gpu/drm/i915/intel_dsi.h
+index 46be640..d437c3d 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.h
++++ b/drivers/gpu/drm/i915/intel_dsi.h
+@@ -508,6 +508,9 @@ struct intel_dsi {
+ 	u8 dual_link;
+ 	u8 pixel_overlap;
+ 
++	/* cht hw issue that MIPI port C reg cannot be read */
++	u32 port_ctrl_reg_val;
++
+ 	struct drm_i915_gem_object *gem_obj;
+ 	void *cmd_buff;
+ 	dma_addr_t cmd_buff_phy_addr;
+-- 
+1.7.9.5
+

@@ -1,0 +1,322 @@
+From 2aa1a282ee1d8856288e9c78975f7c4058bfbdbd Mon Sep 17 00:00:00 2001
+From: Albin B <albin.bala.krishnan@intel.com>
+Date: Fri, 19 Jun 2015 23:52:44 +0530
+Subject: [PATCH] [USBC_PD]: Add support for PD system policy
+
+In Power Delivery, to support the multi port typec phy with the pd
+policy, the system policy shall hold the capability of each port based
+on the PHY registered. This shall create an instance of device policy
+manager for each port(PHY) to control the port roles.
+
+Change-Id: I1a2e7922c67bdd313dd3408fbf2a406d14848024
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-39920
+Signed-off-by: Albin B <albin.bala.krishnan@intel.com>
+---
+ drivers/usb/typec/Kconfig            |  14 +++
+ drivers/usb/typec/Makefile           |   1 +
+ drivers/usb/typec/pd/Kconfig         |  13 +++
+ drivers/usb/typec/pd/Makefile        |   5 ++
+ drivers/usb/typec/pd/system_policy.c | 162 +++++++++++++++++++++++++++++++++++
+ drivers/usb/typec/pd/system_policy.h |  28 ++++++
+ drivers/usb/typec/phy-fusb300.c      |   5 +-
+ 7 files changed, 226 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/usb/typec/pd/Kconfig
+ create mode 100644 drivers/usb/typec/pd/Makefile
+ create mode 100644 drivers/usb/typec/pd/system_policy.c
+ create mode 100644 drivers/usb/typec/pd/system_policy.h
+
+Index: linux/drivers/usb/typec/Kconfig
+===================================================================
+--- linux.orig/drivers/usb/typec/Kconfig	2015-06-26 17:11:39.609219327 -0700
++++ linux/drivers/usb/typec/Kconfig	2015-06-26 17:11:41.929219300 -0700
+@@ -15,3 +15,17 @@
+ 
+ 	  If you choose to build this driver is a dynamically linked
+ 	  module, the module will be called  phy-fusb300.ko.
++
++config USBC_PD
++	depends on USB_TYPEC
++	tristate "Support for USB Power Delivery"
++	---help---
++	  The TYPE-C Power Deliver is the high power delivery support with
++	  the special protocol. This will includes Power Delivery with the
++	  pd policy and system policy.
++
++if USBC_PD
++
++source "drivers/usb/typec/pd/Kconfig"
++
++endif
+Index: linux/drivers/usb/typec/Makefile
+===================================================================
+--- linux.orig/drivers/usb/typec/Makefile	2015-06-26 17:11:39.609219327 -0700
++++ linux/drivers/usb/typec/Makefile	2015-06-26 17:11:41.929219300 -0700
+@@ -1,3 +1,4 @@
+ obj-$(CONFIG_USB_TYPEC_CORE) += usb_typec_phy.o \
+ 						usb_typec_detect.o
+ obj-$(CONFIG_USB_TYPEC_PHY_FUSB300) += phy-fusb300.o
++obj-$(CONFIG_USBC_PD)         += pd/
+Index: linux/drivers/usb/typec/pd/Kconfig
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ linux/drivers/usb/typec/pd/Kconfig	2015-06-26 17:11:41.929219300 -0700
+@@ -0,0 +1,13 @@
++config USBC_SYSTEM_POLICY
++      depends on USBC_PD
++      tristate "Support for USBC Power Delivery System Policy"
++      help
++      Say Y or M here if your system has a Type-C connector support
++      for USB controller based on the USB phy IP Core and support for
++      Power Delivery with system policy which shall hold the
++      capability of each port based on the PHY registered. This shall
++      create an instance of device policy manager for each port(PHY)
++      to control the port roles.
++
++      If you choose to build this driver is a dynamically linked
++      module, the module will be called system_policy.ko.
+Index: linux/drivers/usb/typec/pd/Makefile
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ linux/drivers/usb/typec/pd/Makefile	2015-06-26 17:11:41.929219300 -0700
+@@ -0,0 +1,5 @@
++#
++# Makefile for USBC PD policy and System policy
++#
++
++obj-$(CONFIG_USBC_SYSTEM_POLICY)	+= system_policy.o
+Index: linux/drivers/usb/typec/pd/system_policy.c
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ linux/drivers/usb/typec/pd/system_policy.c	2015-06-26 17:11:41.929219300 -0700
+@@ -0,0 +1,162 @@
++/*
++ * system_policy.c: Intel USBC Power Delivery System Policy
++ *
++ * Copyright (C) 2015 Intel Corporation
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. Seee the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ * Author: Albin B <albin.bala.krishnan@intel.com>
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include "system_policy.h"
++
++/* exported for the USBC Power Delivery polices */
++struct class *power_delivery_class;
++EXPORT_SYMBOL_GPL(power_delivery_class);
++
++/* it is a singleton class for a system */
++static struct system_policy *spolicy;
++
++/**
++ * syspolicy_register_typec_phy - register typec phy with system policy
++ * @x: the typec_phy to be used; or NULL
++ *
++ * This call is exclusively for use by typec phy drivers, which
++ * coordinate the activities of drivers for power delivery support.
++ */
++int syspolicy_register_typec_phy(struct typec_phy *x)
++{
++	int			ret = 0;
++	unsigned long		flags;
++	struct device_list	*devlist, *tmp;
++	bool			is_pd_supported;
++
++	if (!x || !x->dev) {
++		pr_err("SYS_POLICY: Invalid Phy!\n");
++		return -EINVAL;
++	}
++
++	if (x->type != USB_TYPE_C) {
++		pr_err("SYS_POLICY: not accepting PHY %s\n",
++				x->label);
++		return -EINVAL;
++	}
++
++	spin_lock_irqsave(&spolicy->lock, flags);
++	list_for_each_entry_safe(devlist, tmp, &spolicy->list, list) {
++		if (devlist->phy == x) {
++			pr_err("SYS_POLICY: Phy is already exists\n");
++			spin_unlock_irqrestore(&spolicy->lock, flags);
++			return -EBUSY;
++		}
++	}
++	spin_unlock_irqrestore(&spolicy->lock, flags);
++
++	devlist = kzalloc(sizeof(struct device_list), GFP_KERNEL);
++	if (!devlist) {
++		dev_err(x->dev, "SYS_POLICY: kzalloc failed\n");
++		ret = -ENOMEM;
++		goto fail;
++	}
++	INIT_LIST_HEAD(&devlist->list);
++	devlist->phy = x;
++
++	is_pd_supported = devlist->phy->is_pd_capable(devlist->phy);
++	if (!is_pd_supported) {
++		dev_err(x->dev, "SYS_POLICY: PD protocol not supported!\n");
++		ret = -EPROTONOSUPPORT;
++		goto fail;
++	}
++
++	list_add_tail(&devlist->list, &spolicy->list);
++	return 0;
++
++fail:
++	kfree(devlist);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(syspolicy_register_typec_phy);
++
++/**
++ * syspolicy_unregister_typec_phy - unregister the usb typec PHY
++ * @x: the USB Typec-C phy to be removed;
++ *
++ * This reverts the effects of syspolicy_register_typec_phy
++ */
++void syspolicy_unregister_typec_phy(struct typec_phy *x)
++{
++	unsigned long	flags;
++	struct device_list *devlist, *tmp;
++
++	if (list_empty(&spolicy->list))
++		return;
++
++	spin_lock_irqsave(&spolicy->lock, flags);
++	if (x) {
++		list_for_each_entry_safe(devlist, tmp, &spolicy->list, list) {
++			if (devlist->phy == x) {
++				list_del(&devlist->list);
++				kfree(devlist);
++				break;
++			}
++		}
++	}
++	spin_unlock_irqrestore(&spolicy->lock, flags);
++}
++EXPORT_SYMBOL_GPL(syspolicy_unregister_typec_phy);
++
++static int __init system_policy_init(void)
++{
++	int ret;
++
++	power_delivery_class = class_create(THIS_MODULE, "power_delivery");
++
++	if (IS_ERR(power_delivery_class))
++		return PTR_ERR(power_delivery_class);
++
++	spolicy = kzalloc(sizeof(struct system_policy), GFP_KERNEL);
++	if (!spolicy) {
++		pr_err("SYS_POLICY: %s kzalloc failed\n", __func__);
++		ret = -ENOMEM;
++		goto exit;
++	}
++	INIT_LIST_HEAD(&spolicy->list);
++	spin_lock_init(&spolicy->lock);
++
++	return 0;
++exit:
++	return ret;
++}
++subsys_initcall(system_policy_init);
++
++static void __exit system_policy_exit(void)
++{
++	class_destroy(power_delivery_class);
++	if (spolicy)
++		kfree((void *)spolicy);
++}
++module_exit(system_policy_exit);
++
++MODULE_AUTHOR("Albin B <albin.bala.krishnan@intel.com>");
++MODULE_DESCRIPTION("Intel PD System Policy");
++MODULE_LICENSE("GPL v2");
+Index: linux/drivers/usb/typec/pd/system_policy.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ linux/drivers/usb/typec/pd/system_policy.h	2015-06-26 17:11:41.929219300 -0700
+@@ -0,0 +1,28 @@
++#ifndef __PD_SYSTEM_POLICY_H__
++#define __PD_SYSTEM_POLICY_H__
++
++#include <linux/usb_typec_phy.h>
++
++struct device_list {
++	struct list_head list;
++	struct typec_phy *phy;
++};
++
++struct system_policy {
++	struct list_head list;
++	spinlock_t lock;
++};
++
++#if defined(CONFIG_USBC_PD) && defined(CONFIG_USBC_SYSTEM_POLICY)
++extern int syspolicy_register_typec_phy(struct typec_phy *x);
++extern void syspolicy_unregister_typec_phy(struct typec_phy *x);
++#else /* CONFIG_USBC_PD && CONFIG_USBC_SYSTEM_POLICY */
++static inline int syspolicy_register_typec_phy(struct typec_phy *x)
++{
++	return 0;
++}
++static inline void syspolicy_unregister_typec_phy(struct typec_phy *x)
++{}
++#endif /* CONFIG_USBC_PD && CONFIG_USBC_SYSTEM_POLICY */
++
++#endif /* __PD_SYSTEM_POLICY_H__ */
+Index: linux/drivers/usb/typec/phy-fusb300.c
+===================================================================
+--- linux.orig/drivers/usb/typec/phy-fusb300.c	2015-06-26 17:11:39.609219327 -0700
++++ linux/drivers/usb/typec/phy-fusb300.c	2015-06-26 17:13:20.617218154 -0700
+@@ -41,6 +41,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/usb_typec_phy.h>
+ #include "usb_typec_detect.h"
++#include "pd/system_policy.h"
+ 
+ /* Status register bits */
+ #define FUSB300_STAT0_REG		0x40
+@@ -1080,7 +1081,6 @@
+ static inline int fusb302_pd_send_hard_rst(struct typec_phy *phy)
+ {
+ 	struct fusb300_chip *chip;
+-	int ret;
+ 
+ 	chip = dev_get_drvdata(phy->dev);
+ 
+@@ -1452,6 +1452,7 @@
+ 	val &= ~FUSB300_CONTROL0_MASK_INT;
+ 	regmap_write(chip->map, FUSB300_CONTROL0_REG, val);
+ 
++	syspolicy_register_typec_phy(&chip->phy);
+ 	if (!chip->i_vbus) {
+ 		fusb300_wake_on_cc_change(chip);
+ 		regmap_read(chip->map, FUSB300_STAT0_REG, &stat);
+@@ -1477,6 +1478,7 @@
+ 	struct fusb300_chip *chip = i2c_get_clientdata(client);
+ 	struct typec_phy *phy = &chip->phy;
+ 
++	syspolicy_unregister_typec_phy(phy);
+ 	typec_unbind_detect(phy);
+ 	typec_remove_phy(phy);
+ 	return 0;

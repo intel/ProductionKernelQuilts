@@ -1,0 +1,96 @@
+From c2cfade2f9660243494084973356e38bbb40bd0c Mon Sep 17 00:00:00 2001
+Message-Id: <c2cfade2f9660243494084973356e38bbb40bd0c.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 7 Oct 2014 16:49:53 +0100
+Subject: [PATCH 45/63] FOR_UPSTREAM [VPG]: drm/i915: Interrupt driven request
+ completion
+
+Added a hook to the ring noftification code to process request completion. This
+means that there is no longer a need to explicitly process request completions
+every time a request object is tested. Instead, the test code simply becomes
+'return req->completed'. Obviously, this only works if ring interrupts are
+enabled, however, this is already the case for the duration of __wait_request()
+which is the point where the driver really needs to know.
+
+To prevent stale requests floating around indefinitely, the retire work handler
+also now performs a completion check periodically.
+
+Change-Id: I0d4d3b39833372d6031e490fc67df4b458cf98bb
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h |    5 -----
+ drivers/gpu/drm/i915/i915_gem.c |   10 ++++++++++
+ drivers/gpu/drm/i915/i915_irq.c |    2 ++
+ 3 files changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index c03e1fe..42702c9 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2162,11 +2162,6 @@ static inline void i915_gem_request_assign(struct drm_i915_gem_request **pdst,
+ static inline bool i915_gem_request_completed(struct drm_i915_gem_request *req,
+ 					      bool lazy_coherency)
+ {
+-	if (req->complete)
+-		return true;
+-
+-	i915_gem_complete_requests_ring(req->ring, lazy_coherency);
+-
+ 	return req->complete;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 2fea3be..3b928f5 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1248,6 +1248,11 @@ static int __wait_request(struct drm_i915_gem_request *req,
+ 	if (!irq_test_in_progress && WARN_ON(!ring->irq_get(ring)))
+ 		return -ENODEV;
+ 
++	/* Completion status should be interrupt driven but it is possible
++	 * the request popped out before the interrupt was enabled. So do an
++	 * explicit check now... */
++	i915_gem_complete_requests_ring(req->ring, false);
++
+ 	/* Record current time in case interrupted by signal, or wedged */
+ 	trace_i915_gem_request_wait_begin(req);
+ 	getrawmonotonic(&before);
+@@ -2537,6 +2542,10 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	list_add_tail(&request->list, &ring->request_list);
+ 	request->file_priv = NULL;
+ 
++	/* Avoid race condition where the request completes before it has
++	 * been added to the list. */
++	ring->last_read_seqno = 0;
++
+ 	if (file) {
+ 		struct drm_i915_file_private *file_priv = file->driver_priv;
+ 
+@@ -2926,6 +2935,7 @@ i915_gem_retire_requests(struct drm_device *dev)
+ 	int i;
+ 
+ 	for_each_ring(ring, dev_priv, i) {
++		i915_gem_complete_requests_ring(ring, false);
+ 		i915_gem_retire_requests_ring(ring);
+ 		idle &= list_empty(&ring->request_list);
+ 		if (i915.enable_execlists) {
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index b7b13bb..8619280 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1270,6 +1270,8 @@ static void notify_ring(struct drm_device *dev,
+ 	ring->last_irq_seqno = ring->get_seqno(ring, false);
+ 	trace_i915_gem_request_notify(ring);
+ 
++	i915_gem_complete_requests_ring(ring, false);
++
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET))
+ 		intel_notify_mmio_flip(ring);
+ 
+-- 
+1.7.9.5
+

@@ -1,0 +1,261 @@
+From 6e502ac92e020baa8239dc8223a95d6e9943bab7 Mon Sep 17 00:00:00 2001
+Message-Id: <6e502ac92e020baa8239dc8223a95d6e9943bab7.1437119985.git.chang-joon.lee@intel.com>
+From: cli8 <alex.c.li@intel.com>
+Date: Thu, 25 Jun 2015 16:04:48 +0800
+Subject: [PATCH] FOR_UPSTREAM [VPG]: drm/i915:Generic patch for ESD recovery
+ feature[RCR#1024950]
+
+This is "Generic Patch" for ESD recovery feature. Which implement through a
+function "intel_connector_reset" in "intel_display.c". Reset uevent will
+send out when "intel_connector_reset" get called. And HWC will receive the event
+and send DMPS off/on to display driver to do display reset. Meanwhile, HWC will
+hold flip and mode set until reset done.
+
+With this patch, not only ESD recovery feature can call "intel_connector_reset"
+to recover any hang display port. Other application or driver also can detect
+any other display hang cases and call "intel_connector_reset" to notify
+HWC to do display recovery.
+
+Note: "intel_connector_reset" will notify HWC by uevent. Below are uevents
+defined for display reset:
+	#define I915_UEVENT_ESD_DISPLAY_RESET_DSI    "I915_DISPLAY_RESET=DSI"
+	#define I915_UEVENT_ESD_DISPLAY_RESET_EDP    "I915_DISPLAY_RESET=EDP"
+
+Issue: GMINL-9916
+Change-Id: Ie7fa11090964a816a6a424727e07cfedf9f26910
+Signed-off-by: Alex Li <alex.c.li@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c  | 92 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_display.c | 98 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_drv.h     |  1 +
+ 3 files changed, 191 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 8bfdcc6..e31f082 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4942,6 +4942,97 @@ static const struct file_operations i915_forcewake_fops = {
+ 	.release = i915_forcewake_release,
+ };
+ 
++static ssize_t i915_connector_reset_read(struct file *filp, char __user *ubuf,
++	size_t max, loff_t *ppos)
++{
++	struct drm_device *dev = filp->private_data;
++	struct intel_connector *connector;
++	char *tmpbuf;
++	int ret_count = 0;
++
++	tmpbuf = kmalloc(max + 1, GFP_KERNEL);
++	if (!tmpbuf)
++		return -ENOMEM;
++
++	mutex_lock(&dev->mode_config.mutex);
++	snprintf(&tmpbuf[ret_count], max - ret_count, "List Connectors:\n");
++	ret_count = strlen(tmpbuf);
++
++	list_for_each_entry(connector, &dev->mode_config.connector_list,
++				base.head) {
++	    switch (connector->encoder->type) {
++	    case INTEL_OUTPUT_DSI:
++		snprintf(&tmpbuf[ret_count], max - ret_count,
++			"\tID=%d; Active:%d; Type=DSI\n",
++			connector->base.base.id,
++			connector->encoder->connectors_active);
++		break;
++	    case INTEL_OUTPUT_EDP:
++		snprintf(&tmpbuf[ret_count], max - ret_count,
++			"\tID=%d; Active:%d; Type=EDP\n",
++			connector->base.base.id,
++			connector->encoder->connectors_active);
++		break;
++	    default:
++		break;
++	    }
++	    ret_count = strlen(tmpbuf);
++	}
++	ret_count = simple_read_from_buffer(ubuf, max, ppos,
++		(const void *)tmpbuf, ret_count);
++	mutex_unlock(&dev->mode_config.mutex);
++	kfree(tmpbuf);
++	return ret_count;
++}
++
++static ssize_t i915_connector_reset_write(struct file *filp,
++			const char __user *ubuf,
++			size_t cnt, loff_t *ppos)
++{
++	struct drm_device *dev = filp->private_data;
++	struct intel_connector *connector;
++	u32 connector_id;
++	char *tmpbuf;
++	ssize_t ret;
++
++	if (cnt == 0)
++		return cnt;
++	tmpbuf = kmalloc(cnt + 1, GFP_KERNEL);
++	if (!tmpbuf)
++		return -ENOMEM;
++
++	if (copy_from_user(tmpbuf, ubuf, cnt)) {
++		kfree(tmpbuf);
++		return -EFAULT;
++	}
++	tmpbuf[cnt] = '\0';
++	ret = kstrtou32(tmpbuf, 0, &connector_id);
++	kfree(tmpbuf);
++	if (ret)
++		return -EINVAL;
++
++	mutex_lock(&dev->mode_config.mutex);
++	list_for_each_entry(connector, &dev->mode_config.connector_list,
++			base.head) {
++		if (connector->base.base.id == connector_id) {
++			intel_connector_reset(&connector->base);
++			DRM_DEBUG_DRIVER("Try to reset Connector %d\n",
++				connector_id);
++		}
++	}
++	mutex_unlock(&dev->mode_config.mutex);
++
++	return cnt;
++}
++
++static const struct file_operations i915_connector_reset_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = i915_connector_reset_read,
++	.write = i915_connector_reset_write,
++	.llseek = default_llseek,
++};
++
+ static int i915_forcewake_create(struct dentry *root, struct drm_minor *minor)
+ {
+ 	struct drm_device *dev = minor->dev;
+@@ -5061,6 +5152,7 @@ static const struct i915_debugfs_files {
+ 	{"i915_timestamp", &i915_timestamp_fops},
+ 	{"i915_punit_read", &i915_punit_read_fops},
+ 	{"i915_fuse_read", &i915_fuse_read_fops},
++	{"i915_connector_reset", &i915_connector_reset_fops},
+ };
+ 
+ void intel_display_crc_init(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 1a72ba6..2bd32a8 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -14946,3 +14946,101 @@ exit:
+ 				intel_dp->lane_count, intel_dp->link_bw);
+ 	return found;
+ }
++
++int intel_connector_reset(struct drm_connector *connector)
++{
++	struct drm_device *dev;
++	struct drm_i915_private *dev_priv;
++	struct intel_crtc *intel_crtc;
++	struct intel_connector *intel_connector;
++	enum plane plane;
++	/* default refresh rate is 60Hz */
++	int mode_vrefresh = 60;
++	char *uevp[3];
++	unsigned long flags;
++
++	if (connector == NULL)
++		return -EINVAL;
++	if (connector->encoder == NULL)
++		return -EINVAL;
++	intel_crtc = to_intel_crtc(connector->encoder->crtc);
++	intel_connector = to_intel_connector(connector);
++	if (connector->dpms == DRM_MODE_DPMS_OFF) {
++		/* when connector DPMS is off, no need do reset */
++		DRM_DEBUG_DRIVER("Connector is Off. No reset needed\n");
++		return -EINVAL;
++	}
++
++	dev = connector->dev;
++	/*
++	 * According connector type, send reset message to HWC
++	 * Only support DSI and EDP connector so far
++	 */
++	switch (intel_connector->encoder->type) {
++	case INTEL_OUTPUT_EDP:
++		uevp[0] = kasprintf(GFP_KERNEL, "I915_DISPLAY_RESET=EDP");
++		break;
++	case INTEL_OUTPUT_DSI:
++		uevp[0] = kasprintf(GFP_KERNEL, "I915_DISPLAY_RESET=DSI");
++		break;
++	default:
++		/*
++		 * currently, only support DSI/EDP reset, for other
++		 * connector type, can add if needed
++		 */
++		DRM_ERROR("Unsupported Connector type = %d\n",
++			intel_connector->encoder->type);
++		return -EINVAL;
++	}
++
++	uevp[1] = kasprintf(GFP_KERNEL, "CONNECTOR_ID=%d", connector->base.id);
++	uevp[2] = NULL;
++	/* send uevent, the user space can file DSI/eDP reset process */
++	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, uevp);
++	DRM_DEBUG_DRIVER("Reset uevent sent: [%s][%s]\n", uevp[0], uevp[1]);
++	kfree(uevp[1]);
++	kfree(uevp[0]);
++
++	/*
++	 * Flips in the rings may been blocked by the abnormal case,
++	 * Currently, HWC have time out to wait for flip done event.
++	 * Maybe no need to trigger flip done to HWC. But to ensure
++	 * driver to complete all pending flips so that user space
++	 * will get its events and not get stuck.
++	 * We do force flip done here
++	 */
++
++	dev_priv = dev->dev_private;
++	plane = intel_crtc->plane;
++	if (intel_crtc->base.mode.vrefresh) {
++		DRM_DEBUG_DRIVER("Current Referesh rate is %d\n",
++			intel_crtc->base.mode.vrefresh);
++		mode_vrefresh = intel_crtc->base.mode.vrefresh;
++	}
++	/*
++	 * wait for 2 frame to make sure flip done is blocked by the abnormal
++	 * case, and try to do send flip done event
++	 */
++	usleep_range((1000000*2)/mode_vrefresh, (1000000*2)/mode_vrefresh + 10);
++	spin_lock_irqsave(&dev->event_lock, flags);
++	/* if primary unpin work don't get flip done IRQ, do flip done */
++	if (intel_crtc->unpin_work) {
++		atomic_inc_not_zero(&intel_crtc->unpin_work->pending);
++		spin_unlock_irqrestore(&dev->event_lock, flags);
++		intel_finish_page_flip(dev, intel_crtc->pipe);
++	} else {
++		spin_unlock_irqrestore(&dev->event_lock, flags);
++	}
++
++	spin_lock_irqsave(&dev->event_lock, flags);
++	/* if sprint unpin work don't get flip done IRQ, do flip done */
++	if (intel_crtc->sprite_unpin_work) {
++		atomic_inc(&intel_crtc->sprite_unpin_work->pending);
++		spin_unlock_irqrestore(&dev->event_lock, flags);
++		intel_finish_sprite_page_flip(dev, intel_crtc->pipe);
++	} else {
++		spin_unlock_irqrestore(&dev->event_lock, flags);
++	}
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 7be545c..365aa84 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1233,4 +1233,5 @@ struct chv_sprite_csc {
+ extern struct chv_sprite_csc *chv_sprite_cscs[];
+ extern const uint32_t chv_sprite_csc_num_entries;
+ 
++extern int intel_connector_reset(struct drm_connector *connector);
+ #endif /* __INTEL_DRV_H__ */
+-- 
+1.9.1
+

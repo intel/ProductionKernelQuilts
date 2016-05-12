@@ -1,0 +1,175 @@
+From 1ae9edd7c42c60a69cf68a934d59e1cb7439ff01 Mon Sep 17 00:00:00 2001
+From: weizeye <weize.ye@intel.com>
+Date: Wed, 26 Aug 2015 14:08:01 +0800
+Subject: [PATCH] FOR_UPSTREAM [VPG]: drm/i915: Add shutdown function to i915
+ and stop accepting new DRM IOCTLs
+
+I915 driver needs to call panel disable sequence as part of device
+powered off. Driver is not receiving shutdown call from DRM layer.
+Add shutdown callback from PCI driver. After driver shutdown is
+called stop processing new DRM IOCTL calls.
+
+Change-Id: I3153be8c45e47447dcc387a1cff0b4e81004c524
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-19694
+Signed-off-by: weizeye <weize.ye@intel.com>
+Signed-off-by: Gajanan Bhat <gajanan.bhat@intel.com>
+---
+ drivers/gpu/drm/drm_drv.c            | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_dma.c      |  1 +
+ drivers/gpu/drm/i915/i915_drv.c      | 33 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h      |  1 +
+ drivers/gpu/drm/i915/intel_display.c |  3 +++
+ include/drm/drmP.h                   |  2 ++
+ 6 files changed, 62 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_drv.c b/drivers/gpu/drm/drm_drv.c
+index 5e88fad..ee16638 100644
+--- a/drivers/gpu/drm/drm_drv.c
++++ b/drivers/gpu/drm/drm_drv.c
+@@ -332,6 +332,21 @@ int drm_ioctl_permit(u32 flags, struct drm_file *file_priv)
+ }
+ 
+ /**
++ * Prevent new IOCTLs from starting.
++ */
++void drm_halt(struct drm_device *dev)
++{
++	DRM_DEBUG("Halt request\n");
++
++	/* Hold the mutex to prevent the ioctl_count incrementing
++	* while halt_count == 0 in drm_ioctl */
++	mutex_lock(&drm_global_mutex);
++	atomic_inc(&dev->halt_count);
++	mutex_unlock(&drm_global_mutex);
++}
++EXPORT_SYMBOL(drm_halt);
++
++/**
+  * Called whenever a process performs an ioctl on /dev/drm.
+  *
+  * \param inode device inode.
+@@ -361,6 +376,13 @@ long drm_ioctl(struct file *filp,
+ 	if (drm_device_is_unplugged(dev))
+ 		return -ENODEV;
+ 
++	mutex_lock(&drm_global_mutex);
++	if (atomic_read(&dev->halt_count)) {
++		mutex_unlock(&drm_global_mutex);
++		return -EBUSY;
++	}
++	mutex_unlock(&drm_global_mutex);
++
+ 	if ((nr >= DRM_CORE_IOCTL_COUNT) &&
+ 	    ((nr < DRM_COMMAND_BASE) || (nr >= DRM_COMMAND_END)))
+ 		goto err_i1;
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index c91977c75..09f2628 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1709,6 +1709,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 
+ 	dev->dev_private = (void *)dev_priv;
+ 	dev_priv->dev = dev;
++	dev_priv->shutdown_in_progress = false;
+ 
+ 	dev_priv->quick_modeset = true;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index b9e08a2..aecf41c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -2198,12 +2198,45 @@ static struct drm_driver driver = {
+ 	.patchlevel = DRIVER_PATCHLEVEL,
+ };
+ 
++static void i915_pm_shutdown(struct pci_dev *pdev)
++{
++	struct drm_device *drm_dev = pci_get_drvdata(pdev);
++	struct drm_i915_private *dev_priv = drm_dev->dev_private;
++	struct drm_crtc *crtc;
++
++	if (drm_dev->switch_power_state == DRM_SWITCH_POWER_OFF)
++		return;
++
++	/* make sure drm stops processing new ioctls */
++	drm_halt(drm_dev);
++
++	/* Device already in suspend state */
++	if (i915_is_device_suspended(drm_dev))
++		return;
++
++	dev_priv->shutdown_in_progress = true;
++
++	/* If KMS is active, we do the leavevt stuff here */
++	if (drm_core_check_feature(drm_dev, DRIVER_MODESET)) {
++		/* Disable CRTCs */
++		list_for_each_entry(crtc, &drm_dev->mode_config.crtc_list,
++									head) {
++			drm_modeset_lock(&crtc->mutex, NULL);
++			dev_priv->display.crtc_disable(crtc);
++			drm_modeset_unlock(&crtc->mutex);
++		}
++	}
++
++	i915_drm_freeze(drm_dev);
++}
++
+ static struct pci_driver i915_pci_driver = {
+ 	.name = DRIVER_NAME,
+ 	.id_table = pciidlist,
+ 	.probe = i915_pci_probe,
+ 	.remove = i915_pci_remove,
+ 	.driver.pm = &i915_pm_ops,
++	.shutdown = i915_pm_shutdown,
+ };
+ 
+ static int __init i915_init(void)
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 53958b6..38ccd69 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2011,6 +2011,7 @@ struct drm_i915_private {
+ 	bool video_disabled;
+ 	uint32_t request_uniq;
+ 
++	bool shutdown_in_progress;
+ 	/*
+ 	 * NOTE: This is the dri1/ums dungeon, don't add stuff here. Your patch
+ 	 * will be rejected. Instead look for a better place.
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 5595ae9..0c9bcb0 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -4067,6 +4067,9 @@ void intel_crtc_wait_for_pending_flips(struct drm_crtc *crtc)
+ 	if (crtc->primary->fb == NULL)
+ 		return;
+ 
++	if (dev_priv->shutdown_in_progress)
++		flush_workqueue(dev_priv->wq);
++
+ 	flush_work(&to_intel_crtc(crtc)->vblank_work.work);
+ 
+ 	WARN_ON(waitqueue_active(&dev_priv->pending_flip_queue));
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index a270ca6..f0161f0 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -1172,6 +1172,7 @@ struct drm_device {
+ 	struct drm_vma_offset_manager *vma_offset_manager;
+ 	/*@} */
+ 	int switch_power_state;
++	atomic_t halt_count;
+ };
+ 
+ #define DRM_SWITCH_POWER_ON 0
+@@ -1476,6 +1477,7 @@ extern int drm_vblank_info(struct seq_file *m, void *data);
+ extern int drm_clients_info(struct seq_file *m, void* data);
+ extern int drm_gem_name_info(struct seq_file *m, void *data);
+ 
++extern void drm_halt(struct drm_device *dev);
+ 
+ extern struct dma_buf *drm_gem_prime_export(struct drm_device *dev,
+ 		struct drm_gem_object *obj, int flags);
+-- 
+1.9.1
+

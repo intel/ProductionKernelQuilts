@@ -1,0 +1,73 @@
+From 825b14201662ec5b9f85e793060fcd1c3809480e Mon Sep 17 00:00:00 2001
+Message-Id: <825b14201662ec5b9f85e793060fcd1c3809480e.1424979244.git.feitong.yi@intel.com>
+In-Reply-To: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+References: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+From: Tomas Elf <tomas.elf@intel.com>
+Date: Thu, 12 Feb 2015 17:30:39 +0000
+Subject: [PATCH 23/28] SQUASHME! [VPG]: drm/i915: Fixed manual hang recovery
+ for gen8 TDR hang
+
+The i915_wedged_set debugfs interface allows users to manually invoke hang
+recovery as inherited from the gen7 TDR implementation. In gen7 legacy ring
+buffer submission mode there are no consequences for doing hang recovery at any
+time so this is a trivial operation in gen7. In gen8+ under execlist submission
+it is slightly less trivial, however. We need to be able to spot inconsistent
+context submission states (and also lack of actual work in the execlist queue)
+at the onset of the per-engine recovery path and allow for early exit at that
+point if we don't actually have work at the head of the execlist queue that
+could possibly be hung and that also is in a consistent context submission
+state. Unfortunately, this fall-back path was never properly tested since the
+i915_wedged_set debugfs interface was never properly exercised for gen8+.
+
+It turns out that if you did this manual hang recovery invokation for gen8+ it
+would cause an irrecoverable hang due to the early exit not properly clearing
+the hang status flags before exiting, which would mean that the hang would
+persist after the TDR exited from the hang recovery path. Nobody would be able
+to make any more submissions from that point on since access to the
+struct_mutex through i915_mutex_lock_interruptible requires that no hangs have
+been detected and no resets are in progress, but since the hang flag would be
+persistently set to "hung" the struct_mutex would effectively be locked out
+from all submitters.
+
+This fix solves the problem by simply clearing the hang flag on early exit
+allowing the TDR to retry, more manual hang recovery invokations to be made and
+simply more work to be submitted to the driver.
+
+SQUASHME! - This patch should be squashed into the following patch:
+
+    Author: Tomas Elf <tomas.elf@intel.com>
+    Date:   Fri Oct 24 13:57:09 2014 +0100
+    Change-Id: I45de965b4a81d93c135a74248eb22a8a5c816e9f
+    FOR_UPSTREAM [VPG]: drm/i915: Added gen8 support for Timeout Detection Recovery for engine hangs
+
+Issue: GMIN-3564
+Tracked-On: https://jira01.devtools.intel.com/browse/GMIN-3564
+Signed-off-by: Tomas Elf <tomas.elf@intel.com>
+Change-Id: Ia03ffbedae5730db42cdb4117faeb18aa49aee4d
+---
+ drivers/gpu/drm/i915/i915_drv.c |    9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 4f74afe..12ce00e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -946,6 +946,15 @@ int i915_handle_hung_ring(struct drm_device *dev, uint32_t ringid)
+ 		 * current context state information.
+ 		 */
+ 		if (status != CONTEXT_SUBMISSION_STATUS_OK) {
++			DRM_DEBUG_TDR("%s hung: Context submission status NOT OK! (status: %u)\n",
++			        ring->name, status);
++
++			/* Clear last_acthd for the next hang check on this ring */
++			dev_priv->ring[ringid].hangcheck.last_acthd = 0;
++
++			/* Clear reset flags to allow future hangchecks */
++			atomic_set(&dev_priv->ring[ringid].hangcheck.flags, 0);
++
+ 			ret = -EAGAIN;
+ 			goto handle_hung_ring_error;
+ 		}
+-- 
+1.7.9.5
+

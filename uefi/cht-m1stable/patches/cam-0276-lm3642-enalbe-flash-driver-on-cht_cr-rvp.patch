@@ -1,0 +1,411 @@
+From 27d955632356a52a8fc3d2860b0054155ad9f61a Mon Sep 17 00:00:00 2001
+From: Qing Xu <qing.xu@intel.com>
+Date: Thu, 12 Feb 2015 15:32:25 +0800
+Subject: [PATCH] lm3642: enalbe flash driver on cht_cr rvp
+
+enable flash driver lm3642 on cht_cr_rvp
+
+Change-Id: I342c5d261ef92598d66577c639ab936106280c06
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-22535
+Signed-off-by: Qing Xu <qing.xu@intel.com>
+Reviewed-on: https://android.intel.com:443/333509
+---
+ .../camera/drivers/media/i2c/lm3642.c              | 104 ++++++++++++--
+ include/media/lm3642.h                             | 153 +++++++++++++++++++++
+ 2 files changed, 248 insertions(+), 9 deletions(-)
+ create mode 100644 include/media/lm3642.h
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/lm3642.c b/drivers/external_drivers/camera/drivers/media/i2c/lm3642.c
+index 3cc1df6..98c42dd 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/lm3642.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/lm3642.c
+@@ -30,6 +30,11 @@
+ #include <media/v4l2-device.h>
+ 
+ #include <linux/atomisp.h>
++#ifdef CONFIG_GMIN_INTEL_MID
++#include <linux/acpi.h>
++#include <linux/gpio/consumer.h>
++#include <linux/atomisp_gmin_platform.h>
++#endif
+ 
+ struct lm3642_ctrl_id {
+ 	struct v4l2_queryctrl qc;
+@@ -63,6 +68,8 @@ struct lm3642_ctrl_id {
+ #define LM3642_TX_EN_SHIFT		5
+ #define LM3642_IVFM_EN_SHIFT		7
+ 
++#define INVALID_GPIO -1
++
+ struct lm3642 {
+ 	struct v4l2_subdev sd;
+ 
+@@ -168,7 +175,8 @@ static void lm3642_flash_off_delay(long unsigned int arg)
+ 	struct lm3642 *flash = to_lm3642(sd);
+ 	struct lm3642_platform_data *pdata = flash->pdata;
+ 
+-	gpio_set_value(pdata->gpio_strobe, 0);
++	if (pdata->gpio_strobe != INVALID_GPIO)
++		gpio_set_value(pdata->gpio_strobe, 0);
+ }
+ 
+ static int lm3642_hw_strobe(struct i2c_client *client, bool strobe)
+@@ -178,6 +186,11 @@ static int lm3642_hw_strobe(struct i2c_client *client, bool strobe)
+ 	struct lm3642 *flash = to_lm3642(sd);
+ 	struct lm3642_platform_data *pdata = flash->pdata;
+ 
++	if (pdata->gpio_strobe ==  INVALID_GPIO) {
++		dev_warn(&client->dev, "no strobe gpio supported\n");
++		return 0;
++	}
++
+ 	/*
+ 	 * An abnormal high flash current is observed when strobe off the
+ 	 * flash. Workaround here is firstly set flash current to lower level,
+@@ -591,6 +604,7 @@ static int lm3642_detect(struct v4l2_subdev *sd)
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+ 	struct i2c_adapter *adapter = client->adapter;
+ 	struct lm3642 *flash = to_lm3642(sd);
++	struct lm3642_platform_data *pdata = flash->pdata;
+ 	int ret;
+ 
+ 	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA)) {
+@@ -603,17 +617,26 @@ static int lm3642_detect(struct v4l2_subdev *sd)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* TODO: this power_ctrl is to enable i2c bus 1.8V, use same 1.8V LDO
++	* as rear/front camera on CHT_CR RVP B1, Need better code design
++	* for this power control.
++	*/
++	if (pdata->power_ctrl)
++		pdata->power_ctrl(sd, 1);
++
+ 	/* Setup default values. This makes sure that the chip is in a known
+ 	 * state.
+ 	 */
+ 	ret = lm3642_setup(flash);
+ 	if (ret < 0)
+ 		goto fail;
+-
+ 	dev_dbg(&client->dev, "Successfully detected lm3642 LED flash\n");
++
++	if (pdata->power_ctrl)
++		pdata->power_ctrl(sd, 0);
+ 	lm3642_s_power(&flash->sd, 0);
+-	return 0;
+ 
++	return 0;
+ fail:
+ 	lm3642_s_power(&flash->sd, 0);
+ 	return ret;
+@@ -688,17 +711,28 @@ static int lm3642_gpio_init(struct i2c_client *client)
+ 	struct lm3642_platform_data *pdata = flash->pdata;
+ 	int ret;
+ 
++#ifdef CONFIG_GMIN_INTEL_MID
++	if (!gpio_is_valid(pdata->gpio_strobe))
++		return -EINVAL;
++#else
+ 	ret = gpio_request(pdata->gpio_strobe, "flash");
+ 	if (ret < 0)
+ 		return ret;
+-
++#endif
+ 	ret = gpio_direction_output(pdata->gpio_strobe, 0);
+ 	if (ret < 0)
+ 		goto err_gpio_flash;
+ 
++#ifdef CONFIG_GMIN_INTEL_MID
++	if (!gpio_is_valid(pdata->gpio_torch)) {
++			ret = -EINVAL;
++			goto err_gpio_flash;
++	}
++#else
+ 	ret = gpio_request(pdata->gpio_torch, "torch");
+ 	if (ret < 0)
+ 		goto err_gpio_flash;
++#endif
+ 
+ 	ret = gpio_direction_output(pdata->gpio_torch, 0);
+ 	if (ret < 0)
+@@ -708,8 +742,10 @@ static int lm3642_gpio_init(struct i2c_client *client)
+ 
+ err_gpio_torch:
+ 	gpio_free(pdata->gpio_torch);
++	pdata->gpio_torch = INVALID_GPIO;
+ err_gpio_flash:
+ 	gpio_free(pdata->gpio_strobe);
++	pdata->gpio_strobe = INVALID_GPIO;
+ 	return ret;
+ }
+ 
+@@ -735,16 +771,49 @@ static int lm3642_gpio_uninit(struct i2c_client *client)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_GMIN_INTEL_MID
++void *lm3642_platform_data_func(struct i2c_client *client)
++{
++	static struct lm3642_platform_data platform_data;
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct camera_sensor_platform_data *lm3642_dev;
++
++	if (ACPI_COMPANION(&client->dev)) {
++		lm3642_dev = gmin_camera_platform_data(sd, 0, 0);
++		platform_data.power_ctrl = lm3642_dev->v1p8_ctrl;
++	}
++
++	if (ACPI_COMPANION(&client->dev)) {
++		platform_data.gpio_strobe =
++			desc_to_gpio(gpiod_get_index(&(client->dev),
++							"lm3642_gpio0", 0));
++		platform_data.gpio_torch  =
++			desc_to_gpio(gpiod_get_index(&(client->dev),
++							"lm3642_gpio1", 1));
++	} else {
++		platform_data.gpio_strobe = INVALID_GPIO;
++		platform_data.gpio_torch = INVALID_GPIO;
++	}
++
++	dev_info(&client->dev, "camera pdata: lm3642: strobe %d torch %d\n",
++		platform_data.gpio_strobe,
++		platform_data.gpio_torch);
++
++	return &platform_data;
++}
++#endif
++
+ static int lm3642_probe(struct i2c_client *client,
+ 				  const struct i2c_device_id *id)
+ {
+ 	int err;
+ 	struct lm3642 *flash;
+-
++#ifndef CONFIG_GMIN_INTEL_MID
+ 	if (client->dev.platform_data == NULL) {
+ 		dev_err(&client->dev, "no platform data\n");
+ 		return -ENODEV;
+ 	}
++#endif
+ 
+ 	flash = kzalloc(sizeof(*flash), GFP_KERNEL);
+ 	if (!flash) {
+@@ -752,7 +821,12 @@ static int lm3642_probe(struct i2c_client *client,
+ 		return -ENOMEM;
+ 	}
+ 
++#ifdef CONFIG_GMIN_INTEL_MID
++	if (!flash->pdata || ACPI_COMPANION(&client->dev))
++		flash->pdata = lm3642_platform_data_func(client);
++#else
+ 	flash->pdata = client->dev.platform_data;
++#endif
+ 
+ 	v4l2_i2c_subdev_init(&flash->sd, client, &lm3642_ops);
+ 	flash->sd.internal_ops = &lm3642_internal_ops;
+@@ -778,14 +852,18 @@ static int lm3642_probe(struct i2c_client *client,
+ 
+ 	err = lm3642_gpio_init(client);
+ 	if (err) {
+-		dev_err(&client->dev, "gpio request/direction_output fail");
+-		goto fail2;
++		dev_warn(&client->dev,
++			"gpio request/direction_output fail, gpio connected?");
+ 	}
+ 
++#ifdef CONFIG_GMIN_INTEL_MID
++	if (ACPI_HANDLE(&client->dev))
++		err = atomisp_register_i2c_module(&flash->sd, NULL, LED_FLASH);
++#endif
++
+ 	return 0;
+-fail2:
+-	media_entity_cleanup(&flash->sd.entity);
+ fail1:
++	media_entity_cleanup(&flash->sd.entity);
+ 	v4l2_device_unregister_subdev(&flash->sd);
+ 	kfree(flash);
+ 
+@@ -827,11 +905,19 @@ static const struct dev_pm_ops lm3642_pm_ops = {
+ 	.resume = lm3642_resume,
+ };
+ 
++static struct acpi_device_id lm3642_acpi_match[] = {
++	{ "INTCF1D" },
++	{},
++};
++
++MODULE_DEVICE_TABLE(acpi, lm3642_acpi_match);
++
+ static struct i2c_driver lm3642_driver = {
+ 	.driver = {
+ 		.owner = THIS_MODULE,
+ 		.name = LM3642_NAME,
+ 		.pm   = &lm3642_pm_ops,
++		.acpi_match_table = ACPI_PTR(lm3642_acpi_match),
+ 	},
+ 	.probe = lm3642_probe,
+ 	.remove = lm3642_remove,
+diff --git a/include/media/lm3642.h b/include/media/lm3642.h
+new file mode 100644
+index 0000000..545d957
+--- /dev/null
++++ b/include/media/lm3642.h
+@@ -0,0 +1,153 @@
++/*
++ * include/media/lm3642.h
++ *
++ * Copyright (c) 2010-2012 Intel Corporation. All Rights Reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.
++ */
++
++#ifndef _LM3642_H_
++#define _LM3642_H_
++
++#include <linux/videodev2.h>
++#include <media/v4l2-subdev.h>
++
++#define LM3642_NAME    "lm3642"
++#define LM3642_ID      3642
++
++#define	v4l2_queryctrl_entry_integer(_id, _name,\
++		_minimum, _maximum, _step, \
++		_default_value, _flags)	\
++	{\
++		.id = (_id), \
++		.type = V4L2_CTRL_TYPE_INTEGER, \
++		.name = _name, \
++		.minimum = (_minimum), \
++		.maximum = (_maximum), \
++		.step = (_step), \
++		.default_value = (_default_value),\
++		.flags = (_flags),\
++	}
++#define	v4l2_queryctrl_entry_boolean(_id, _name,\
++		_default_value, _flags)	\
++	{\
++		.id = (_id), \
++		.type = V4L2_CTRL_TYPE_BOOLEAN, \
++		.name = _name, \
++		.minimum = 0, \
++		.maximum = 1, \
++		.step = 1, \
++		.default_value = (_default_value),\
++		.flags = (_flags),\
++	}
++
++#define	s_ctrl_id_entry_integer(_id, _name, \
++		_minimum, _maximum, _step, \
++		_default_value, _flags, \
++		_s_ctrl, _g_ctrl)	\
++	{\
++		.qc = v4l2_queryctrl_entry_integer(_id, _name,\
++				_minimum, _maximum, _step,\
++				_default_value, _flags), \
++		.s_ctrl = _s_ctrl, \
++		.g_ctrl = _g_ctrl, \
++	}
++
++#define	s_ctrl_id_entry_boolean(_id, _name, \
++		_default_value, _flags, \
++		_s_ctrl, _g_ctrl)	\
++	{\
++		.qc = v4l2_queryctrl_entry_boolean(_id, _name,\
++				_default_value, _flags), \
++		.s_ctrl = _s_ctrl, \
++		.g_ctrl = _g_ctrl, \
++	}
++
++
++/* Default Values */
++#define LM3642_DEFAULT_TIMEOUT           300U
++#define LM3642_DEFAULT_RAMP_TIME	 0x10 /* 1.024ms */
++#define LM3642_DEFAULT_INDICATOR_CURRENT 0x01 /* 1.88A */
++#define LM3642_DEFAULT_FLASH_CURRENT	 0x0f /* 1500mA */
++
++/* Value settings for Flash Time-out Duration*/
++#define LM3642_MIN_TIMEOUT              100U
++#define LM3642_MAX_TIMEOUT              800U
++#define LM3642_TIMEOUT_STEPSIZE         100U
++
++/* Flash modes */
++#define LM3642_MODE_SHUTDOWN            0
++#define LM3642_MODE_INDICATOR           1
++#define LM3642_MODE_TORCH               2
++#define LM3642_MODE_FLASH               3
++
++/* timer delay time */
++#define LM3642_TIMER_DELAY		5
++
++/* Percentage <-> value macros */
++#define LM3642_MIN_PERCENT                   0U
++#define LM3642_MAX_PERCENT                   100U
++#define LM3642_CLAMP_PERCENTAGE(val) \
++	clamp(val, LM3642_MIN_PERCENT, LM3642_MAX_PERCENT)
++
++#define LM3642_VALUE_TO_PERCENT(v, step) \
++	(((((unsigned long)((v)+1))*(step))+50)/100)
++#define LM3642_PERCENT_TO_VALUE(p, step) \
++	(((((unsigned long)(p))*100)+((step)>>1))/(step)-1)
++
++/* Product specific limits
++ * TODO: get these from platform data */
++#define LM3642_FLASH_MAX_LVL   0x0F /* 1500mA */
++#define LM3642_TORCH_MAX_LVL   0x07 /* 187mA */
++#define LM3642_INDICATOR_MAX_LVL   0x01 /* 1.88A */
++
++/* Flash brightness, input is percentage, output is [0..15] */
++#define LM3642_FLASH_STEP	\
++	((100ul*(LM3642_MAX_PERCENT) \
++	+((LM3642_FLASH_MAX_LVL+1)>>1)) \
++	/((LM3642_FLASH_MAX_LVL+1)))
++#define LM3642_FLASH_DEFAULT_BRIGHTNESS \
++	LM3642_VALUE_TO_PERCENT(15, LM3642_FLASH_STEP)
++
++/* Torch brightness, input is percentage, output is [0..7] */
++#define LM3642_TORCH_STEP	\
++	((100ul*(LM3642_MAX_PERCENT) \
++	+((LM3642_TORCH_MAX_LVL+1)>>1)) \
++	/((LM3642_TORCH_MAX_LVL+1)))
++#define LM3642_TORCH_DEFAULT_BRIGHTNESS \
++	LM3642_VALUE_TO_PERCENT(0, LM3642_TORCH_STEP)
++
++/* Indicator brightness, input is percentage, output is [0..1] */
++#define LM3642_INDICATOR_STEP	\
++	((100ul*(LM3642_MAX_PERCENT) \
++	+((LM3642_INDICATOR_MAX_LVL+1)>>1)) \
++	/((LM3642_INDICATOR_MAX_LVL+1)))
++#define LM3642_INDICATOR_DEFAULT_BRIGHTNESS \
++	LM3642_VALUE_TO_PERCENT(1, LM3642_INDICATOR_STEP)
++
++/*
++ * lm3642_platform_data - Flash controller platform data
++ */
++struct lm3642_platform_data {
++	int gpio_torch;
++	int gpio_strobe;
++	int (*power_ctrl)(struct v4l2_subdev *subdev, int on);
++
++	unsigned int torch_en;
++	unsigned int flash_en;
++	unsigned int tx_en;
++	unsigned int ivfm_en;
++};
++
++#endif /* _LM3642_H_ */
++
+-- 
+1.9.1
+

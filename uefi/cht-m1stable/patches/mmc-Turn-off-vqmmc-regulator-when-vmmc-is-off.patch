@@ -1,0 +1,98 @@
+From c28744ba3c2f0e52a394800e7111de77768266b5 Mon Sep 17 00:00:00 2001
+From: Yuan Juntao <juntao.yuan@intel.com>
+Date: Thu, 2 Apr 2015 18:13:52 +0800
+Subject: [PATCH] mmc: Turn off vqmmc regulator when vmmc is off.
+
+In some PMICs vqmmc regulator is independent of vmmc regulator. In
+this condition, vqmmc regulator will be leave on even vmmc regulator
+has been turned off.
+
+This patch will turn off vqmmc regulator after vmmc is turned off.
+
+Change-Id: If787d084e6d6c393d4e54888b6438d513340b8a4
+Signed-off-by: Yuan Juntao <juntao.yuan@intel.com>
+---
+ drivers/mmc/host/sdhci.c  | 27 ++++++++++++++++++++++++---
+ include/linux/mmc/sdhci.h |  1 +
+ 2 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index 1aad04b..6f3defa 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -1313,7 +1313,7 @@ static int sdhci_set_power(struct sdhci_host *host, unsigned short power)
+ 		}
+ 	}
+ 
+-	if (host->pwr == pwr)
++	if ((host->pwr == pwr) && (pwr != 0))
+ 		return -1;
+ 
+ 	host->pwr = pwr;
+@@ -1501,13 +1501,20 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
+ 	unsigned long flags;
+ 	int vdd_bit = -1;
+ 	u8 ctrl;
++	int ret;
+ 
+ 	spin_lock_irqsave(&host->lock, flags);
+ 
+ 	if (host->flags & SDHCI_DEVICE_DEAD) {
+ 		spin_unlock_irqrestore(&host->lock, flags);
+-		if (host->vmmc && ios->power_mode == MMC_POWER_OFF)
++		if (host->vmmc && ios->power_mode == MMC_POWER_OFF) {
+ 			mmc_regulator_set_ocr(host->mmc, host->vmmc, 0);
++			if (host->vqmmc) {
++				ret = regulator_disable(host->vqmmc);
++				if (!ret)
++					host->vqmmc_enabled = false;
++			}
++		}
+ 		return;
+ 	}
+ 
+@@ -1566,6 +1573,17 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
+ 	if (host->vmmc && vdd_bit != -1) {
+ 		spin_unlock_irqrestore(&host->lock, flags);
+ 		mmc_regulator_set_ocr(host->mmc, host->vmmc, vdd_bit);
++		if (host->vqmmc) {
++			if (vdd_bit && !host->vqmmc_enabled) {
++				ret = regulator_enable(host->vqmmc);
++				if (!ret)
++					host->vqmmc_enabled = true;
++			} else if (!vdd_bit && host->vqmmc_enabled) {
++				ret = regulator_disable(host->vqmmc);
++				if (!ret)
++					host->vqmmc_enabled = false;
++			}
++		}
+ 		spin_lock_irqsave(&host->lock, flags);
+ 	}
+ 
+@@ -3234,7 +3252,10 @@ int sdhci_add_host(struct sdhci_host *host)
+ 			pr_warn("%s: Failed to enable vqmmc regulator: %d\n",
+ 				mmc_hostname(mmc), ret);
+ 			host->vqmmc = NULL;
+-		}
++		} else
++			/* Turn off vqmmc until a card has been inserted */
++			if (!regulator_disable(host->vqmmc))
++				host->vqmmc_enabled = false;
+ 	}
+ 
+ 	if (host->quirks2 & SDHCI_QUIRK2_NO_1_8_V)
+diff --git a/include/linux/mmc/sdhci.h b/include/linux/mmc/sdhci.h
+index a2889f1..12cb8ca 100644
+--- a/include/linux/mmc/sdhci.h
++++ b/include/linux/mmc/sdhci.h
+@@ -110,6 +110,7 @@ struct sdhci_host {
+ 
+ 	struct regulator *vmmc;		/* Power regulator (vmmc) */
+ 	struct regulator *vqmmc;	/* Signaling regulator (vccq) */
++	bool vqmmc_enabled;			/* vqmmc regulator status */
+ 
+ 	/* Internal data */
+ 	struct mmc_host *mmc;	/* MMC structure */
+-- 
+1.9.1
+

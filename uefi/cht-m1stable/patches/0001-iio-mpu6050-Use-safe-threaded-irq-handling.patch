@@ -1,0 +1,69 @@
+From e1db4ba01407913375be510403b2acd990b1a8f3 Mon Sep 17 00:00:00 2001
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date: Thu, 10 Apr 2014 17:25:12 -0700
+Subject: [PATCH] iio: mpu6050: Use safe threaded irq handling
+
+The driver is using default iio generic data poll handler. This is
+good for most drivers, but we have to make sure that the device interrupt
+is disabled for bottom half handler processing.
+Here interrupts are cleared on any reads, so potentially the interrupts,
+will arrive while we didn't complete the processing.
+This needs i2c calls to disable client interrupt, so it can't be done in
+hard IRQ handler.
+
+Change-Id: I212caee239a4249342c35127dc383a65ce9ac8ff
+Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Signed-off-by: Samuel Ortiz <sameo@linux.intel.com>
+---
+ drivers/iio/imu/inv_mpu6050/inv_mpu_ring.c    | 6 ++----
+ drivers/iio/imu/inv_mpu6050/inv_mpu_trigger.c | 9 ++++++---
+ 2 files changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/iio/imu/inv_mpu6050/inv_mpu_ring.c b/drivers/iio/imu/inv_mpu6050/inv_mpu_ring.c
+index 4295171..133b1dc 100644
+--- a/drivers/iio/imu/inv_mpu6050/inv_mpu_ring.c
++++ b/drivers/iio/imu/inv_mpu6050/inv_mpu_ring.c
+@@ -99,8 +99,7 @@ static void inv_clear_kfifo(struct inv_mpu6050_state *st)
+  */
+ irqreturn_t inv_mpu6050_irq_handler(int irq, void *p)
+ {
+-	struct iio_poll_func *pf = p;
+-	struct iio_dev *indio_dev = pf->indio_dev;
++	struct iio_dev *indio_dev = p;
+ 	struct inv_mpu6050_state *st = iio_priv(indio_dev);
+ 	s64 timestamp;
+ 
+@@ -116,8 +115,7 @@ irqreturn_t inv_mpu6050_irq_handler(int irq, void *p)
+  */
+ irqreturn_t inv_mpu6050_read_fifo(int irq, void *p)
+ {
+-	struct iio_poll_func *pf = p;
+-	struct iio_dev *indio_dev = pf->indio_dev;
++	struct iio_dev *indio_dev = p;
+ 	struct inv_mpu6050_state *st = iio_priv(indio_dev);
+ 	size_t bytes_per_datum;
+ 	int result;
+diff --git a/drivers/iio/imu/inv_mpu6050/inv_mpu_trigger.c b/drivers/iio/imu/inv_mpu6050/inv_mpu_trigger.c
+index 03b9372..e1f72ce 100644
+--- a/drivers/iio/imu/inv_mpu6050/inv_mpu_trigger.c
++++ b/drivers/iio/imu/inv_mpu6050/inv_mpu_trigger.c
+@@ -123,10 +123,13 @@ int inv_mpu6050_probe_trigger(struct iio_dev *indio_dev)
+ 		ret = -ENOMEM;
+ 		goto error_ret;
+ 	}
+-	ret = request_irq(st->client->irq, &iio_trigger_generic_data_rdy_poll,
+-				IRQF_TRIGGER_RISING,
++
++	ret = request_threaded_irq(st->client->irq, inv_mpu6050_irq_handler,
++				inv_mpu6050_read_fifo,
++				IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+ 				"inv_mpu",
+-				st->trig);
++				indio_dev
++				);
+ 	if (ret)
+ 		goto error_free_trig;
+ 	st->trig->dev.parent = &st->client->dev;
+-- 
+1.8.3.2
+

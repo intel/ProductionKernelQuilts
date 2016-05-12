@@ -1,0 +1,84 @@
+From 555eeffb4b9d9e3a57e012f39ed368866feecfc4 Mon Sep 17 00:00:00 2001
+From: Frode Isaksen <frodex.isaksen@intel.com>
+Date: Mon, 17 Aug 2015 14:58:36 +0200
+Subject: [PATCH] PPPoPNS: handle non-linear socket buffers
+
+The received socket buffers may be non-linear
+(containing paged data).
+Handle this by doing 'pskb_may_pull' and 'pskb_pull'
+ before touching the GRE and PPP header contents.
+Note that we receive non-linear socket buffers from the
+'iwlwifi' driver.
+Avoids this kernel BUG:
+ - kernel BUG at include/linux/skbuff.h:1516!
+ - Call Trace:
+ - pppopns_recv_core+0xc4/0x390
+ - sk_receive_skb+0x111/0x160
+ - pppopns_recv+0x31/0x50
+ - sock_queue_rcv_skb+0x156/0x230
+ - raw_rcv_skb+0x22/0x50
+ - raw_rcv+0xc6/0xe0
+ - raw_local_deliver+0xcd/0x1e0
+ - ? ip_rcv_finish+0x300/0x300
+ - ip_local_deliver_finish+0xa7/0x200
+ - ip_local_deliver+0x48/0x80
+ - ip_rcv_finish+0x7d/0x300
+ - ip_rcv+0x27f/0x380
+ -  __netif_receive_skb_core+0x616/0x8a0
+ - ? inet_gro_receive+0x8f/0x240
+ -  __netif_receive_skb+0x16/0x70
+ - netif_receive_skb_internal+0x23/0xb0
+ - napi_gro_receive+0xa5/0x110
+ - ieee80211_deliver_skb+0xe3/0x480 [iwl_mac80211]
+
+Change-Id: Id95c45dbc540e95ab4846dcccaf2cf9b07d4914b
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-16313
+Signed-off-by: Frode Isaksen <frodex.isaksen@intel.com>
+---
+ drivers/net/ppp/pppopns.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ppp/pppopns.c b/drivers/net/ppp/pppopns.c
+index 6016d29c0660..634a5b8d9816 100644
+--- a/drivers/net/ppp/pppopns.c
++++ b/drivers/net/ppp/pppopns.c
+@@ -79,7 +79,7 @@ static int pppopns_recv_core(struct sock *sk_raw, struct sk_buff *skb)
+ 	skb_pull(skb, skb_transport_header(skb) - skb->data);
+ 
+ 	/* Drop the packet if GRE header is missing. */
+-	if (skb->len < GRE_HEADER_SIZE)
++	if (!pskb_may_pull(skb, GRE_HEADER_SIZE))
+ 		goto drop;
+ 	hdr = (struct header *)skb->data;
+ 
+@@ -89,7 +89,7 @@ static int pppopns_recv_core(struct sock *sk_raw, struct sk_buff *skb)
+ 		goto drop;
+ 
+ 	/* Skip all fields including optional ones. */
+-	if (!skb_pull(skb, GRE_HEADER_SIZE +
++	if (!pskb_pull(skb, GRE_HEADER_SIZE +
+ 			(hdr->bits & PPTP_GRE_SEQ_BIT ? 4 : 0) +
+ 			(hdr->bits & PPTP_GRE_ACK_BIT ? 4 : 0)))
+ 		goto drop;
+@@ -106,12 +106,15 @@ static int pppopns_recv_core(struct sock *sk_raw, struct sk_buff *skb)
+ 	}
+ 
+ 	/* Skip PPP address and control if they are present. */
+-	if (skb->len >= 2 && skb->data[0] == PPP_ADDR &&
+-			skb->data[1] == PPP_CTRL)
++	if (!pskb_may_pull(skb, 2))
++		goto drop;
++	if (skb->data[0] == PPP_ADDR && skb->data[1] == PPP_CTRL)
+ 		skb_pull(skb, 2);
+ 
+ 	/* Fix PPP protocol if it is compressed. */
+-	if (skb->len >= 1 && skb->data[0] & 1)
++	if (!pskb_may_pull(skb, 1))
++		goto drop;
++	if (skb->data[0] & 1)
+ 		skb_push(skb, 1)[0] = 0;
+ 
+ 	/* Drop the packet if PPP protocol is missing. */
+-- 
+1.9.1
+

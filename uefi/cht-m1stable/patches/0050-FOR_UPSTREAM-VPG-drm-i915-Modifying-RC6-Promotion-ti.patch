@@ -1,0 +1,152 @@
+From d9b2ac7a97aff7e40ce541c4d3c68e8662242a5d Mon Sep 17 00:00:00 2001
+Message-Id: <d9b2ac7a97aff7e40ce541c4d3c68e8662242a5d.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Thu, 20 Feb 2014 21:42:37 +0530
+Subject: [PATCH 50/71] FOR_UPSTREAM [VPG]: drm/i915: Modifying RC6 Promotion
+ timer for Media workloads on VLV.
+
+In normal cases, RC6 promotion timer is 1700us. This will result in more
+time spent in C1 state. For more residency in C6 in case of media workloads,
+this is changed to 250us. Not doing this for 3D workloads as too many C6-C0
+transition delays can result in performance impact. Tracking the media
+workloads based on command submission to MFX engine
+
+v2: Add #define for magic numbers (Jon)
+
+v3: Resolved conflict in i915_gem_execbuffer.c
+
+Issue: VIZ-3566
+Signed-off-by: Satyanantha, Rama Gopal M <rama.gopal.m.satyanantha@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Reviewed-on: https://android.intel.com/165495
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+(cherry picked from commit afd15fa0f7d1d2c87d42e496887541580ccfec12)
+
+Change-Id: I18069d753f6e2a4735f86c0d203bbb971c9f62f7
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    3 +++
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   15 ++++++++++++++
+ drivers/gpu/drm/i915/i915_reg.h            |    2 ++
+ drivers/gpu/drm/i915/intel_drv.h           |    2 ++
+ drivers/gpu/drm/i915/intel_pm.c            |   29 ++++++++++++++++++++++++++++
+ 5 files changed, 51 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index e7c7c77..4b6760c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1029,6 +1029,9 @@ struct intel_gen6_power_mgmt {
+ 	 * Must be taken after struct_mutex if nested.
+ 	 */
+ 	struct mutex hw_lock;
++
++	/* Delayed work to adjust RC6 promotion timer */
++	struct delayed_work vlv_media_timeout_work;
+ };
+ 
+ /* defined intel_pm.c */
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 306920c..8f6e122 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1206,6 +1206,21 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
+ 
++	/* For VLV, modify RC6 promotion timer upon hitting Media workload only
++	   This will help in better power savings with media scenarios.
++	*/
++	if (((args->flags & I915_EXEC_RING_MASK) == I915_EXEC_BSD) &&
++		IS_VALLEYVIEW(dev) && dev_priv->rps.enabled) {
++
++		vlv_modify_rc6_promotion_timer(dev_priv, true);
++
++		/*Start a timer for 1 sec to reset this value to original*/
++		mod_delayed_work(dev_priv->wq,
++				&dev_priv->rps.vlv_media_timeout_work,
++				msecs_to_jiffies(1000));
++
++	}
++
+ error:
+ 	if (ret || sync_err)
+ 		i915_sync_cancel_request(handle, args, ring);
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 7a92f52..06820d6 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -5717,6 +5717,8 @@ enum punit_power_well {
+ #define GEN6_RCUBMABDTMR			0xA0B0
+ #define GEN6_RC1e_THRESHOLD			0xA0B4
+ #define GEN6_RC6_THRESHOLD			0xA0B8
++#define GEN6_RC6_RENDER_PROMOTION_TIMER_TO	0x0557
++#define GEN6_RC6_MEDIA_PROMOTION_TIMER_TO	0x00C3
+ #define GEN6_RC6p_THRESHOLD			0xA0BC
+ #define VLV_RCEDATA				0xA0BC
+ #define GEN6_RC6pp_THRESHOLD			0xA0C0
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index c0b5211..7f8caf0 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1054,6 +1054,8 @@ void intel_init_drrs_idleness_detection(struct drm_device *dev,
+ 		struct intel_connector *connector);
+ void intel_update_drrs(struct drm_device *dev);
+ void intel_disable_drrs(struct drm_device *dev);
++extern void vlv_modify_rc6_promotion_timer(struct drm_i915_private *dev_priv,
++					    bool media_active);
+ 
+ /* intel_sdvo.c */
+ bool intel_sdvo_init(struct drm_device *dev, uint32_t sdvo_reg, bool is_sdvob);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 0751a28..ef872c4 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3971,6 +3971,29 @@ static void valleyview_disable_rps(struct drm_device *dev)
+ 	/* Disable rps */
+ 	vlv_set_rps_mode(dev, true);
+ 
++	/*Cancel any pending work-item*/
++	cancel_delayed_work_sync(&dev_priv->rps.vlv_media_timeout_work);
++
++}
++
++void vlv_modify_rc6_promotion_timer(struct drm_i915_private *dev_priv,
++				    bool media_active)
++{
++	/* Update RC6 promotion timers */
++	if (media_active)
++		I915_WRITE(GEN6_RC6_THRESHOLD,
++				GEN6_RC6_MEDIA_PROMOTION_TIMER_TO);
++	else
++		I915_WRITE(GEN6_RC6_THRESHOLD,
++				GEN6_RC6_RENDER_PROMOTION_TIMER_TO);
++}
++
++static void vlv_media_timeout_work_func(struct work_struct *work)
++{
++	struct drm_i915_private *dev_priv = container_of(work, struct drm_i915_private,
++					    rps.vlv_media_timeout_work.work);
++
++	vlv_modify_rc6_promotion_timer(dev_priv, false);
+ }
+ 
+ static void intel_print_rc6_info(struct drm_device *dev, u32 mode)
+@@ -8085,6 +8108,12 @@ void intel_pm_setup(struct drm_device *dev)
+ 	INIT_DELAYED_WORK(&dev_priv->rps.delayed_resume_work,
+ 			  intel_gen6_powersave_work);
+ 
++	/* Initialize a work item to modify RC6 promotion timer
++	 * based on MFX engine activity
++	 */
++	INIT_DELAYED_WORK(&dev_priv->rps.vlv_media_timeout_work,
++				vlv_media_timeout_work_func);
++
+ 	dev_priv->pm.suspended = false;
+ 	dev_priv->pm.irqs_disabled = false;
+ }
+-- 
+1.7.9.5
+

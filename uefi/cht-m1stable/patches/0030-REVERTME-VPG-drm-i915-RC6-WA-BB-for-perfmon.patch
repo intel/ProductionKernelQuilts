@@ -1,0 +1,328 @@
+From b197a6e28c9799680189413f0747c2c2e944bf16 Mon Sep 17 00:00:00 2001
+Message-Id: <b197a6e28c9799680189413f0747c2c2e944bf16.1417780177.git.chang-joon.lee@intel.com>
+In-Reply-To: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+References: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+From: Adam Rutkowski <adam.j.rutkowski@intel.com>
+Date: Tue, 30 Sep 2014 07:51:20 -0400
+Subject: [PATCH 30/30] REVERTME [VPG]: drm/i915: RC6 WA BB for perfmon
+
+Programming RC6 workaround batch buffer to restore OA configuration
+once hardware is awake from RC6.
+
+Patch is marked with REVERTME as Perfmon IOCTL will be removed
+once OA couters are exposed via 'perf event' framework.
+
+Issue: GMINL-3120
+Change-Id: I58d468421e3f073b2bc7fb19a89a9ffe773c5b72
+Signed-off-by: Adam Rutkowski <adam.j.rutkowski@intel.com>
+Signed-off-by: Andrzej Datczuk <andrzej.datczuk@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c     |    1 +
+ drivers/gpu/drm/i915/i915_drv.h     |   10 ++
+ drivers/gpu/drm/i915/i915_perfmon.c |  204 ++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_reg.h     |    2 +
+ drivers/gpu/drm/i915/intel_lrc.c    |    2 +
+ 5 files changed, 215 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 1488da0..51931d4 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1679,6 +1679,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 	mutex_init(&dev_priv->modeset_restore_lock);
+ 	mutex_init(&dev_priv->dpst.ioctl_lock);
+ 	mutex_init(&dev_priv->perfmon.config.lock);
++	mutex_init(&dev_priv->rc6_wa_bb.lock);
+ 
+ 	intel_pm_setup(dev);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 911f9be..5c39ab7 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1724,6 +1724,14 @@ struct drm_i915_private {
+ 
+ 	struct drm_i915_perfmon_device perfmon;
+ 
++	struct {
++		struct drm_i915_gem_object *obj;
++		unsigned long offset;
++		void *address;
++		atomic_t enable;
++		struct mutex lock;
++	} rc6_wa_bb;
++
+ 	/*
+ 	 * workarounds are currently applied at different places and
+ 	 * changes are being done to consolidate them so exact count is
+@@ -3030,6 +3038,8 @@ void i915_perfmon_setup(struct drm_i915_private *dev_priv);
+ void i915_perfmon_cleanup(struct drm_i915_private *dev_priv);
+ void i915_perfmon_ctx_setup(struct intel_context *ctx);
+ void i915_perfmon_ctx_cleanup(struct intel_context *ctx);
++int i915_perfmon_update_workaround_bb(struct drm_i915_private *dev_priv,
++	struct drm_i915_perfmon_config *config);
+ 
+ extern void i915_write_bits32(struct drm_i915_private *dev_priv,
+ 	u32 reg, u32 val, u32 mask, bool trace);
+diff --git a/drivers/gpu/drm/i915/i915_perfmon.c b/drivers/gpu/drm/i915/i915_perfmon.c
+index 7886bed..60b77b3 100644
+--- a/drivers/gpu/drm/i915/i915_perfmon.c
++++ b/drivers/gpu/drm/i915/i915_perfmon.c
+@@ -560,6 +560,191 @@ unlock_dev:
+ 	return ret;
+ }
+ 
++static void *emit_dword(void *mem, __u32 cmd)
++{
++	iowrite32(cmd, mem);
++	return ((__u32 *)mem) + 1;
++}
++
++static void *emit_load_register_imm(void *mem, __u32 reg, __u32 val)
++{
++	mem = emit_dword(mem, MI_NOOP);
++	mem = emit_dword(mem, MI_LOAD_REGISTER_IMM(1));
++	mem = emit_dword(mem, reg);
++	mem = emit_dword(mem, val);
++	return mem;
++}
++
++static void *emit_cs_stall_pipe_control(void *mem)
++{
++	mem = emit_dword(mem, GFX_OP_PIPE_CONTROL(6));
++	mem = emit_dword(mem, PIPE_CONTROL_CS_STALL);
++	mem = emit_dword(mem, 0);
++	mem = emit_dword(mem, 0);
++	mem = emit_dword(mem, 0);
++	mem = emit_dword(mem, 0);
++	return mem;
++}
++
++int i915_perfmon_update_workaround_bb(struct drm_i915_private *dev_priv,
++				      struct drm_i915_perfmon_config *config)
++{
++	const size_t commands_size = 6 + /* pipe control */
++				     config->size * 4 + /* NOOP + LRI */
++				     6 + /* pipe control */
++				     1;  /* BB end */
++	void *buffer_tail;
++	unsigned int i = 0;
++	int ret = 0;
++
++	if (commands_size > PAGE_SIZE) {
++		DRM_ERROR("OA cfg too long to fit into workarond BB\n");
++		return -ENOSPC;
++	}
++
++	BUG_ON(!mutex_is_locked(&dev_priv->perfmon.config.lock));
++
++	if (atomic_read(&dev_priv->perfmon.config.enable) == 0 ||
++	    !dev_priv->rc6_wa_bb.obj) {
++		DRM_ERROR("not ready to write WA BB commands\n");
++		return -EINVAL;
++	}
++
++	ret = mutex_lock_interruptible(&dev_priv->rc6_wa_bb.lock);
++	if (ret)
++		return ret;
++
++	if (!dev_priv->rc6_wa_bb.obj) {
++		mutex_unlock(&dev_priv->rc6_wa_bb.lock);
++		return 0;
++	}
++
++	/* diable RC6 WA BB */
++	I915_WRITE(GEN8_RC6_WA_BB, 0x0);
++
++	buffer_tail = dev_priv->rc6_wa_bb.address;
++	buffer_tail = emit_cs_stall_pipe_control(buffer_tail);
++
++	/* OA/NOA config */
++	for (i = 0; i < config->size; i++)
++		buffer_tail = emit_load_register_imm(
++			buffer_tail,
++			config->entries[i].offset,
++			config->entries[i].value);
++
++	buffer_tail = emit_cs_stall_pipe_control(buffer_tail);
++
++	/* BB END */
++	buffer_tail = emit_dword(buffer_tail, MI_BATCH_BUFFER_END);
++
++	/* enable WA BB */
++	I915_WRITE(GEN8_RC6_WA_BB, dev_priv->rc6_wa_bb.offset | 0x1);
++
++	mutex_unlock(&dev_priv->rc6_wa_bb.lock);
++	return 0;
++}
++
++static int allocate_wa_bb(struct drm_i915_private *dev_priv)
++{
++	int ret = 0;
++
++	BUG_ON(!mutex_is_locked(&dev_priv->dev->struct_mutex));
++
++	ret = mutex_lock_interruptible(&dev_priv->rc6_wa_bb.lock);
++	if (ret)
++		return ret;
++
++	if (atomic_inc_return(&dev_priv->rc6_wa_bb.enable) > 1) {
++		mutex_unlock(&dev_priv->rc6_wa_bb.lock);
++		return 0;
++	}
++
++	BUG_ON(dev_priv->rc6_wa_bb.obj != NULL);
++
++	dev_priv->rc6_wa_bb.obj = i915_gem_alloc_object(
++						dev_priv->dev,
++						PAGE_SIZE);
++	if (!dev_priv->rc6_wa_bb.obj) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++
++	ret = i915_gem_obj_ggtt_pin(
++			dev_priv->rc6_wa_bb.obj,
++			PAGE_SIZE, PIN_MAPPABLE);
++
++	if (ret) {
++		drm_gem_object_unreference_unlocked(
++			&dev_priv->rc6_wa_bb.obj->base);
++		goto unlock;
++	}
++
++	ret = i915_gem_object_set_to_gtt_domain(dev_priv->rc6_wa_bb.obj,
++						true);
++	if (ret) {
++		i915_gem_object_ggtt_unpin(dev_priv->rc6_wa_bb.obj);
++		drm_gem_object_unreference_unlocked(
++			&dev_priv->rc6_wa_bb.obj->base);
++		goto unlock;
++	}
++
++	dev_priv->rc6_wa_bb.offset = i915_gem_obj_ggtt_offset(
++						dev_priv->rc6_wa_bb.obj);
++
++	dev_priv->rc6_wa_bb.address = ioremap_wc(
++		dev_priv->gtt.mappable_base + dev_priv->rc6_wa_bb.offset,
++		PAGE_SIZE);
++
++	if (!dev_priv->rc6_wa_bb.address) {
++		i915_gem_object_ggtt_unpin(dev_priv->rc6_wa_bb.obj);
++		drm_gem_object_unreference_unlocked(
++			&dev_priv->rc6_wa_bb.obj->base);
++		ret =  -ENOMEM;
++		goto unlock;
++	}
++
++	DRM_DEBUG("RC6 WA BB, offset %lx address %p, GGTT mapping: %s\n",
++		  dev_priv->rc6_wa_bb.offset,
++		  dev_priv->rc6_wa_bb.address,
++		  dev_priv->rc6_wa_bb.obj->has_global_gtt_mapping ?
++			"yes" : "no");
++
++	memset(dev_priv->rc6_wa_bb.address, 0, PAGE_SIZE);
++
++unlock:
++	if (ret) {
++		dev_priv->rc6_wa_bb.obj = NULL;
++		dev_priv->rc6_wa_bb.offset = 0;
++	}
++	mutex_unlock(&dev_priv->rc6_wa_bb.lock);
++	return ret;
++}
++
++static void deallocate_wa_bb(struct drm_i915_private *dev_priv)
++{
++	BUG_ON(!mutex_is_locked(&dev_priv->dev->struct_mutex));
++
++	mutex_lock(&dev_priv->rc6_wa_bb.lock);
++
++	if (atomic_read(&dev_priv->rc6_wa_bb.enable) == 0)
++		goto unlock;
++
++	if (atomic_dec_return(&dev_priv->rc6_wa_bb.enable) > 1)
++		goto unlock;
++
++	I915_WRITE(GEN8_RC6_WA_BB, 0);
++
++	if (dev_priv->rc6_wa_bb.obj != NULL) {
++		iounmap(dev_priv->rc6_wa_bb.address);
++		i915_gem_object_ggtt_unpin(dev_priv->rc6_wa_bb.obj);
++		drm_gem_object_unreference(&dev_priv->rc6_wa_bb.obj->base);
++		dev_priv->rc6_wa_bb.obj = NULL;
++		dev_priv->rc6_wa_bb.offset = 0;
++	}
++unlock:
++	mutex_unlock(&dev_priv->rc6_wa_bb.lock);
++}
++
+ /**
+ * i915_perfmon_config_enable_disable
+ *
+@@ -576,23 +761,34 @@ static int i915_perfmon_config_enable_disable(
+ 	if (!(IS_GEN8(dev)))
+ 		return -EINVAL;
+ 
+-	ret = mutex_lock_interruptible(&dev_priv->perfmon.config.lock);
++	ret = i915_mutex_lock_interruptible(dev_priv->dev);
+ 	if (ret)
+ 		return ret;
+ 
++	ret = mutex_lock_interruptible(&dev_priv->perfmon.config.lock);
++	if (ret) {
++		mutex_unlock(&dev->struct_mutex);
++		return ret;
++	}
++
+ 	if (enable) {
+-		if (atomic_inc_return(&dev_priv->perfmon.config.enable) == 1) {
++		ret = allocate_wa_bb(dev_priv);
++		if (!ret &&
++		    atomic_inc_return(&dev_priv->perfmon.config.enable) == 1) {
+ 			dev_priv->perfmon.config.target =
+ 				I915_PERFMON_CONFIG_TARGET_ALL;
+ 			dev_priv->perfmon.config.oa.id = 0;
+ 			dev_priv->perfmon.config.gp.id = 0;
+ 		}
+-	} else if (atomic_read(&dev_priv->perfmon.config.enable))
++	} else if (atomic_read(&dev_priv->perfmon.config.enable)) {
+ 		atomic_dec(&dev_priv->perfmon.config.enable);
++		deallocate_wa_bb(dev_priv);
++	}
+ 
+ 	mutex_unlock(&dev_priv->perfmon.config.lock);
++	mutex_unlock(&dev->struct_mutex);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 88b6b19..696fec5 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -6782,4 +6782,6 @@ enum punit_power_well {
+ 
+ #define GEN8_OA_CTX_CONTROL 0x2360
+ 
++#define GEN8_RC6_WA_BB	    0x2058
++
+ #endif /* _I915_REG_H_ */
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 4ecf0b6..5115a0d 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -476,6 +476,8 @@ i915_program_perfmon(struct drm_device *dev,
+ 			ringbuf,
+ 			config_oa);
+ 		ctx->perfmon.config.oa.submitted_id = config_oa->id;
++
++		i915_perfmon_update_workaround_bb(dev_priv, config_oa);
+ 	}
+ 
+ 
+-- 
+1.7.9.5
+

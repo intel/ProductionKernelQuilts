@@ -1,0 +1,144 @@
+From 979f895e4849d2891f0b3f6f3f603612c0355502 Mon Sep 17 00:00:00 2001
+Message-Id: <979f895e4849d2891f0b3f6f3f603612c0355502.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 31 Mar 2015 11:21:13 +0100
+Subject: [PATCH 47/68] SQUASHME! [VPG]: drm/i915: Fix for unbounded fence
+ waits
+
+The scheduler has a facility to wait on native sync fence points when
+the only batch buffers remaining are blocked on said fences.
+Unfortunately, a new wait was queued up every time the scheduler
+reached this decision. If a given fence took a while to complete or
+lots of other work was dependent upon it, this could mean a very large
+number of wait threads would be queued up. This is unnecessary and
+wasteful.
+
+This patch adds a 'am I already waiting on this fence' flag to the
+scheduler node. Using this means that one and only one wait will ever
+be queued for any given batch buffer.
+
+This patch could be squashed in to the one that originally added the
+scheduler:
+  commit c64b5c1f236ee9c9362f06a675b4bc906ad3cb04
+  Author: John Harrison <John.C.Harrison@Intel.com>
+  Date:   Thu Apr 10 10:58:56 2014 +0100
+  Subject: FOR_UPSTREAM [VPG]: drm/i915: Added trace points to scheduler
+  Change-Id: I9886390cfc7897bc1faf50a104bc651d8baed8a5
+
+Change-Id: I7c9aed3e62a866de768604e13512fcd099c94e83
+For: VIZ-1587
+For: VIZ-4741
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_scheduler.c |   27 ++++++++++++++++++++++-----
+ drivers/gpu/drm/i915/i915_scheduler.h |    6 ++++++
+ 2 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 9801c59..8fc5f0c 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -1215,6 +1215,7 @@ int i915_scheduler_submit_max_priority(struct intel_engine_cs *ring,
+ struct i915_sync_fence_waiter {
+ 	struct sync_fence_waiter sfw;
+ 	struct drm_device	 *dev;
++	struct i915_scheduler_queue_entry *node;
+ };
+ 
+ static void i915_scheduler_wait_fence_signaled(struct sync_fence *fence,
+@@ -1231,19 +1232,35 @@ static void i915_scheduler_wait_fence_signaled(struct sync_fence *fence,
+ 	 * NB: The callback is executed at interrupt time, thus it can not
+ 	 * call _submit() directly. It must go via the delayed work handler.
+ 	 */
+-	if (dev_priv)
++	if (dev_priv) {
++		struct i915_scheduler   *scheduler;
++		unsigned long           flags;
++
++		scheduler = dev_priv->scheduler;
++
++		spin_lock_irqsave(&scheduler->lock, flags);
++		i915_waiter->node->flags &= ~i915_qef_fence_waiting;
++		spin_unlock_irqrestore(&scheduler->lock, flags);
++
+ 		queue_work(dev_priv->wq, &dev_priv->mm.scheduler_work);
++	}
+ 
+ 	kfree(waiter);
+ }
+ 
+ static bool i915_scheduler_async_fence_wait(struct drm_device *dev,
+-					    struct sync_fence *fence)
++					    struct i915_scheduler_queue_entry *node)
+ {
+ 	struct i915_sync_fence_waiter	*fence_waiter;
++	struct sync_fence		*fence = node->params.fence_wait;
+ 	int				signaled;
+ 	bool				success = true;
+ 
++	if ((node->flags & i915_qef_fence_waiting) == 0)
++		node->flags |= i915_qef_fence_waiting;
++	else
++		return true;
++
+ 	if (fence == NULL)
+ 		return false;
+ 
+@@ -1257,6 +1274,7 @@ static bool i915_scheduler_async_fence_wait(struct drm_device *dev,
+ 
+ 		INIT_LIST_HEAD(&fence_waiter->sfw.waiter_list);
+ 		fence_waiter->sfw.callback = i915_scheduler_wait_fence_signaled;
++		fence_waiter->node = node;
+ 		fence_waiter->dev = dev;
+ 
+ 		if (sync_fence_wait_async(fence, &fence_waiter->sfw)) {
+@@ -1280,10 +1298,9 @@ static int i915_scheduler_pop_from_queue_locked(struct intel_engine_cs *ring,
+ {
+ 	struct drm_i915_private            *dev_priv = ring->dev->dev_private;
+ 	struct i915_scheduler              *scheduler = dev_priv->scheduler;
+-	struct i915_scheduler_queue_entry  *best_wait;
++	struct i915_scheduler_queue_entry  *best_wait, *fence_wait = NULL;
+ 	struct i915_scheduler_queue_entry  *best;
+ 	struct i915_scheduler_queue_entry  *node;
+-	struct sync_fence  *fence_wait = NULL;
+ 	int     ret;
+ 	int     i;
+ 	bool	signalled, any_queued;
+@@ -1380,7 +1397,7 @@ static int i915_scheduler_pop_from_queue_locked(struct intel_engine_cs *ring,
+ 			 * spinlock is still held and the wait requires doing
+ 			 * a memory allocation.
+ 			 */
+-			fence_wait = best_wait->params.fence_wait;
++			fence_wait = best_wait;
+ 			ret = -EAGAIN;
+ 		} else if (only_remote) {
+ 			/* The only dependent buffers are on another ring. */
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index d90687b..0c3261e 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -59,6 +59,11 @@ struct i915_scheduler_obj_entry {
+ 	struct drm_i915_gem_object          *obj;
+ };
+ 
++enum i915_scheduler_queue_entry_flags {
++	/* Fence is being waited on */
++	i915_qef_fence_waiting              = (1 << 0),
++};
++
+ struct i915_scheduler_queue_entry {
+ 	struct i915_execbuffer_params       params;
+ 	uint32_t                            priority;
+@@ -71,6 +76,7 @@ struct i915_scheduler_queue_entry {
+ 	struct timespec                     stamp;
+ 	struct list_head                    link;
+ 	uint32_t                            scheduler_index;
++	uint32_t                            flags;
+ };
+ const char *i915_qe_state_str(struct i915_scheduler_queue_entry *node);
+ 
+-- 
+1.7.9.5
+

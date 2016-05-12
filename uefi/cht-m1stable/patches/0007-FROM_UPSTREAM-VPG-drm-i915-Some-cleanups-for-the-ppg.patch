@@ -1,0 +1,241 @@
+From cd41bb2c40537a8a9653b50acef933ba0e1f7b02 Mon Sep 17 00:00:00 2001
+Message-Id: <cd41bb2c40537a8a9653b50acef933ba0e1f7b02.1415245452.git.chang-joon.lee@intel.com>
+In-Reply-To: <76203ad7c635d495ef3ec1e07b47bad9db4745ba.1415245452.git.chang-joon.lee@intel.com>
+References: <76203ad7c635d495ef3ec1e07b47bad9db4745ba.1415245452.git.chang-joon.lee@intel.com>
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Wed, 6 Aug 2014 15:04:45 +0200
+Subject: [PATCH 07/30] FROM_UPSTREAM [VPG]: drm/i915: Some cleanups for the
+ ppgtt lifetime handling
+
+So when reviewing Michel's patch I've noticed a few things and cleaned
+them up:
+- The early checks in ppgtt_release are now redundant: The inactive
+  list should always be empty now, so we can ditch these checks. Even
+  for the aliasing ppgtt (though that's a different confusion) since
+  we tear that down after all the objects are gone.
+- The ppgtt handling functions are splattered all over. Consolidate
+  them in i915_gem_gtt.c, give them OCD prefixes and add wrappers for
+  get/put.
+- There was a bit a confusion in ppgtt_release about whether it cares
+  about the active or inactive list. It should care about them both,
+  so augment the WARNINGs to check for both.
+
+There's still create_vm_for_ctx left to do, put that is blocked on the
+removal of ppgtt->ctx. Once that's done we can rename it to
+i915_ppgtt_create and move it to its siblings for handling ppgtts.
+
+v2: Move the ppgtt checks into the inline get/put functions as
+suggested by Chris.
+
+v3: Inline the now redundant ppgtt local variable.
+
+Cc: Michel Thierry <michel.thierry@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit ee960be7bb09b201926cb37eaa82fb7da605ea7c)
+
+Change-Id: I5a63bc83fd0f795aff3ca591fa0a45ba752fbdea
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: ee960be7bb09b201926cb37eaa82fb7da605ea7c
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMINL-2586
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    1 -
+ drivers/gpu/drm/i915/i915_gem.c         |    5 +----
+ drivers/gpu/drm/i915/i915_gem_context.c |   36 ++++---------------------------
+ drivers/gpu/drm/i915/i915_gem_gtt.c     |   20 ++++++++++++-----
+ drivers/gpu/drm/i915/i915_gem_gtt.h     |   14 +++++++++++-
+ 5 files changed, 33 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index c4ea3b1..390ab82 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2721,7 +2721,6 @@ void i915_gem_object_ggtt_unpin(struct drm_i915_gem_object *obj);
+ #define ctx_to_ppgtt(ctx) container_of((ctx)->vm, struct i915_hw_ppgtt, base)
+ #define vm_to_ppgtt(vm) container_of(vm, struct i915_hw_ppgtt, base)
+ int __must_check i915_gem_context_init(struct drm_device *dev);
+-void ppgtt_release(struct kref *kref);
+ void i915_gem_context_fini(struct drm_device *dev);
+ void i915_gem_context_reset(struct drm_device *dev);
+ int i915_gem_context_open(struct drm_device *dev, struct drm_file *file);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 1afdbcc..03127c4 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4692,7 +4692,6 @@ struct i915_vma *i915_gem_obj_to_vma(struct drm_i915_gem_object *obj,
+ void i915_gem_vma_destroy(struct i915_vma *vma)
+ {
+ 	struct i915_address_space *vm = NULL;
+-	struct i915_hw_ppgtt *ppgtt = NULL;
+ 	WARN_ON(vma->node.allocated);
+ 
+ 	/* Keep the vma as a placeholder in the execbuffer reservation lists */
+@@ -4700,10 +4699,8 @@ void i915_gem_vma_destroy(struct i915_vma *vma)
+ 		return;
+ 
+ 	vm = vma->vm;
+-	ppgtt = vm_to_ppgtt(vm);
+ 
+-	if (ppgtt)
+-		kref_put(&ppgtt->ref, ppgtt_release);
++	i915_ppgtt_put(vm_to_ppgtt(vm));
+ 
+ 	list_del(&vma->vma_link);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index c33c70f..bb3f32d 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -96,33 +96,6 @@
+ #define GEN6_CONTEXT_ALIGN (64<<10)
+ #define GEN7_CONTEXT_ALIGN 4096
+ 
+-static void do_ppgtt_cleanup(struct i915_hw_ppgtt *ppgtt)
+-{
+-	struct drm_device *dev = ppgtt->base.dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct i915_address_space *vm = &ppgtt->base;
+-
+-	if (ppgtt == dev_priv->mm.aliasing_ppgtt ||
+-	    (list_empty(&vm->active_list) && list_empty(&vm->inactive_list))) {
+-		ppgtt->base.cleanup(&ppgtt->base);
+-		return;
+-	}
+-
+-	/* vmas should already be unbound */
+-	WARN_ON(!list_empty(&vm->active_list));
+-
+-	ppgtt->base.cleanup(&ppgtt->base);
+-}
+-
+-void ppgtt_release(struct kref *kref)
+-{
+-	struct i915_hw_ppgtt *ppgtt =
+-		container_of(kref, struct i915_hw_ppgtt, ref);
+-
+-	do_ppgtt_cleanup(ppgtt);
+-	kfree(ppgtt);
+-}
+-
+ static size_t get_context_alignment(struct drm_device *dev)
+ {
+ 	if (IS_GEN6(dev))
+@@ -174,8 +147,7 @@ void i915_gem_context_free(struct kref *ctx_ref)
+ 			ppgtt = ctx_to_ppgtt(ctx);
+ 	}
+ 
+-	if (ppgtt)
+-		kref_put(&ppgtt->ref, ppgtt_release);
++	i915_ppgtt_put(ppgtt);
+ 	if (ctx->legacy_hw_ctx.rcs_state)
+ 		drm_gem_object_unreference(&ctx->legacy_hw_ctx.rcs_state->base);
+ 	list_del(&ctx->link);
+@@ -222,7 +194,7 @@ create_vm_for_ctx(struct drm_device *dev, struct intel_context *ctx)
+ 	if (!ppgtt)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	ret = i915_gem_init_ppgtt(dev, ppgtt);
++	ret = i915_ppgtt_init(dev, ppgtt);
+ 	if (ret) {
+ 		kfree(ppgtt);
+ 		return ERR_PTR(ret);
+@@ -234,7 +206,7 @@ create_vm_for_ctx(struct drm_device *dev, struct intel_context *ctx)
+ 
+ static struct intel_context *
+ __create_hw_context(struct drm_device *dev,
+-		  struct drm_i915_file_private *file_priv)
++		    struct drm_i915_file_private *file_priv)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_context *ctx;
+@@ -342,7 +314,7 @@ i915_gem_create_context(struct drm_device *dev,
+ 		/* For platforms which only have aliasing PPGTT, we fake the
+ 		 * address space and refcounting. */
+ 		ctx->vm = &dev_priv->mm.aliasing_ppgtt->base;
+-		kref_get(&dev_priv->mm.aliasing_ppgtt->ref);
++		i915_ppgtt_get(dev_priv->mm.aliasing_ppgtt);
+ 	} else
+ 		ctx->vm = &dev_priv->gtt.base;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 9014d8c..d075aa2 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -1234,7 +1234,7 @@ static int gen6_ppgtt_init(struct i915_hw_ppgtt *ppgtt)
+ 	return 0;
+ }
+ 
+-int i915_gem_init_ppgtt(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt)
++int i915_ppgtt_init(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int ret = 0;
+@@ -1265,6 +1265,19 @@ int i915_gem_init_ppgtt(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt)
+ 	return ret;
+ }
+ 
++void  i915_ppgtt_release(struct kref *kref)
++{
++	struct i915_hw_ppgtt *ppgtt =
++		container_of(kref, struct i915_hw_ppgtt, ref);
++
++	/* vmas should already be unbound */
++	WARN_ON(!list_empty(&ppgtt->base.active_list));
++	WARN_ON(!list_empty(&ppgtt->base.inactive_list));
++
++	ppgtt->base.cleanup(&ppgtt->base);
++	kfree(ppgtt);
++}
++
+ static void
+ ppgtt_bind_vma(struct i915_vma *vma,
+ 	       enum i915_cache_level cache_level,
+@@ -2203,15 +2216,12 @@ i915_gem_obj_lookup_or_create_vma(struct drm_i915_gem_object *obj,
+ 				  struct i915_address_space *vm)
+ {
+ 	struct i915_vma *vma;
+-	struct i915_hw_ppgtt *ppgtt = NULL;
+ 
+ 	vma = i915_gem_obj_to_vma(obj, vm);
+ 	if (!vma)
+ 		vma = __i915_gem_vma_create(obj, vm);
+ 
+-	ppgtt = vm_to_ppgtt(vm);
+-	if (ppgtt)
+-		kref_get(&ppgtt->ref);
++	i915_ppgtt_get(vm_to_ppgtt(vm));
+ 
+ 	return vma;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index d96912c..c106fa5 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -275,7 +275,19 @@ void i915_gem_init_global_gtt(struct drm_device *dev);
+ void i915_gem_setup_global_gtt(struct drm_device *dev, unsigned long start,
+ 			       unsigned long mappable_end, unsigned long end);
+ 
+-int i915_gem_init_ppgtt(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt);
++
++int i915_ppgtt_init(struct drm_device *dev, struct i915_hw_ppgtt *ppgtt);
++void i915_ppgtt_release(struct kref *kref);
++static inline void i915_ppgtt_get(struct i915_hw_ppgtt *ppgtt)
++{
++	if (ppgtt)
++		kref_get(&ppgtt->ref);
++}
++static inline void i915_ppgtt_put(struct i915_hw_ppgtt *ppgtt)
++{
++	if (ppgtt)
++		kref_put(&ppgtt->ref, i915_ppgtt_release);
++}
+ 
+ void i915_check_and_clear_faults(struct drm_device *dev);
+ void i915_gem_suspend_gtt_mappings(struct drm_device *dev);
+-- 
+1.7.9.5
+

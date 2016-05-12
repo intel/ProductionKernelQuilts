@@ -1,0 +1,276 @@
+From 0f558221a99adc0062c7a463fcb89f74c6e56d74 Mon Sep 17 00:00:00 2001
+From: Ashwin <ashwin.bhat@broadcom.com>
+Date: Fri, 1 Aug 2014 18:33:51 -0700
+Subject: [PATCH 49/77] net: wireless: bcmdhd: PNO MAC address rotation
+
+This change will need updated FW to work
+
+Change-Id: Iaa94ee1969ddab1a3c3d61a3e1bbdebaea2022af
+Signed-off-by: Ashwin <ashwin.bhat@broadcom.com>
+---
+ drivers/net/wireless/bcmdhd/dhd_linux.c       |  6 +++
+ drivers/net/wireless/bcmdhd/dhd_pno.c         | 55 +++++++++++++++++++++++++++
+ drivers/net/wireless/bcmdhd/dhd_pno.h         | 10 +++--
+ drivers/net/wireless/bcmdhd/include/wlioctl.h | 10 +++++
+ drivers/net/wireless/bcmdhd/wl_cfgvendor.c    | 33 ++++++++++++++++
+ drivers/net/wireless/bcmdhd/wl_cfgvendor.h    |  6 ++-
+ 6 files changed, 114 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/wireless/bcmdhd/dhd_linux.c b/drivers/net/wireless/bcmdhd/dhd_linux.c
+index d5b0bb974305..d8e2c3e98149 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_linux.c
++++ b/drivers/net/wireless/bcmdhd/dhd_linux.c
+@@ -7433,6 +7433,12 @@ dhd_dev_pno_get_for_batch(struct net_device *dev, char *buf, int bufsize)
+ 	dhd_info_t *dhd = DHD_DEV_INFO(dev);
+ 	return (dhd_pno_get_for_batch(&dhd->pub, buf, bufsize, PNO_STATUS_NORMAL));
+ }
++/* Linux wrapper to call common dhd_pno_set_mac_oui */
++int dhd_dev_pno_set_mac_oui(struct net_device *dev, uint8 *oui)
++{
++	dhd_info_t *dhd = DHD_DEV_INFO(dev);
++	return (dhd_pno_set_mac_oui(&dhd->pub, oui));
++}
+ #endif /* PNO_SUPPORT */
+ 
+ #ifdef GSCAN_SUPPORT
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pno.c b/drivers/net/wireless/bcmdhd/dhd_pno.c
+index e2562853c189..24678a0d89ad 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pno.c
++++ b/drivers/net/wireless/bcmdhd/dhd_pno.c
+@@ -145,6 +145,29 @@ bool dhd_is_pno_supported(dhd_pub_t *dhd)
+ 	return WLS_SUPPORTED(_pno_state);
+ }
+ 
++int dhd_pno_set_mac_oui(dhd_pub_t *dhd, uint8 *oui)
++{
++	int err = BCME_OK;
++	dhd_pno_status_info_t *_pno_state;
++
++	if (!dhd || !dhd->pno_state) {
++		DHD_ERROR(("NULL POINTER : %s\n",
++			__FUNCTION__));
++		return BCME_ERROR;
++	}
++	_pno_state = PNO_GET_PNOSTATE(dhd);
++	if (ETHER_ISMULTI(oui)) {
++		DHD_ERROR(("Expected unicast OUI\n"));
++		err = BCME_ERROR;
++	} else {
++		memcpy(_pno_state->pno_oui, oui, DOT11_OUI_LEN);
++		DHD_PNO(("PNO mac oui to be used - %02x:%02x:%02x\n", _pno_state->pno_oui[0],
++		    _pno_state->pno_oui[1], _pno_state->pno_oui[2]));
++	}
++
++	return err;
++}
++
+ #ifdef GSCAN_SUPPORT
+ static uint64 convert_fw_rel_time_to_systime(uint32 fw_ts_ms)
+ {
+@@ -173,6 +196,26 @@ exit:
+ #endif /* GSCAN_SUPPORT */
+ 
+ static int
++dhd_pno_set_mac_addr(dhd_pub_t *dhd, struct ether_addr *macaddr)
++{
++	int err;
++	wl_pfn_macaddr_cfg_t cfg;
++
++	cfg.version = WL_PFN_MACADDR_CFG_VER;
++	if (ETHER_ISNULLADDR(macaddr))
++		cfg.flags = 0;
++	else
++		cfg.flags = (WL_PFN_MAC_OUI_ONLY_MASK | WL_PFN_SET_MAC_UNASSOC_MASK);
++	memcpy(&cfg.macaddr, macaddr, ETHER_ADDR_LEN);
++
++	err = dhd_iovar(dhd, 0, "pfn_macaddr", (char *)&cfg, sizeof(cfg), 1);
++	if (err < 0)
++		DHD_ERROR(("%s : failed to execute pfn_macaddr\n", __FUNCTION__));
++
++	return err;
++}
++
++static int
+ _dhd_pno_suspend(dhd_pub_t *dhd)
+ {
+ 	int err;
+@@ -247,6 +290,7 @@ _dhd_pno_set(dhd_pub_t *dhd, const dhd_pno_params_t *pno_params, dhd_pno_mode_t
+ 	dhd_pno_params_t *_params;
+ 	dhd_pno_status_info_t *_pno_state;
+ 	bool combined_scan = FALSE;
++	struct ether_addr macaddr;
+ 	DHD_PNO(("%s enter\n", __FUNCTION__));
+ 
+ 	NULL_CHECK(dhd, "dhd is NULL", err);
+@@ -398,6 +442,17 @@ _dhd_pno_set(dhd_pub_t *dhd, const dhd_pno_params_t *pno_params, dhd_pno_mode_t
+ 		}
+ 	}
+ 
++	memset(&macaddr, 0, ETHER_ADDR_LEN);
++	memcpy(&macaddr, _pno_state->pno_oui, DOT11_OUI_LEN);
++
++	DHD_PNO(("Setting mac oui to FW - %02x:%02x:%02x\n", _pno_state->pno_oui[0],
++	    _pno_state->pno_oui[1], _pno_state->pno_oui[2]));
++	err = dhd_pno_set_mac_addr(dhd, &macaddr);
++	if (err < 0) {
++		DHD_ERROR(("%s : failed to set pno mac address, error - %d\n", __FUNCTION__, err));
++		goto exit;
++	}
++
+ #ifdef GSCAN_SUPPORT
+ 	if (mode == DHD_PNO_BATCH_MODE ||
+ 	((mode & DHD_PNO_GSCAN_MODE) && pno_params->params_gscan.mscan)) {
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pno.h b/drivers/net/wireless/bcmdhd/dhd_pno.h
+index 8d809b116f34..2cba53ecd6c0 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pno.h
++++ b/drivers/net/wireless/bcmdhd/dhd_pno.h
+@@ -2,13 +2,13 @@
+  * Header file of Broadcom Dongle Host Driver (DHD)
+  * Prefered Network Offload code and Wi-Fi Location Service(WLS) code.
+  * Copyright (C) 1999-2014, Broadcom Corporation
+- * 
++ *
+  *      Unless you and Broadcom execute a separate written software license
+  * agreement governing use of this software, this software is licensed to you
+  * under the terms of the GNU General Public License version 2 (the "GPL"),
+  * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+  * following added to such license:
+- * 
++ *
+  *      As a special exception, the copyright holders of this software give you
+  * permission to link this software with independent modules, and to copy and
+  * distribute the resulting executable under terms of your choice, provided that
+@@ -16,7 +16,7 @@
+  * the license of that module.  An independent module is a module which is not
+  * derived from this software.  The special exception does not apply to any
+  * modifications of the software.
+- * 
++ *
+  *      Notwithstanding the above, under no circumstances may you combine this
+  * software in any way with any other Broadcom software provided under a license
+  * other than the GPL, without Broadcom's express prior written consent.
+@@ -384,6 +384,7 @@ typedef union dhd_pno_params {
+ #endif /* GSCAN_SUPPORT */
+ } dhd_pno_params_t;
+ typedef struct dhd_pno_status_info {
++	uint8 pno_oui[DOT11_OUI_LEN];
+ 	dhd_pub_t *dhd;
+ 	struct work_struct work;
+ 	struct mutex pno_mutex;
+@@ -419,6 +420,7 @@ dhd_dev_pno_stop_for_batch(struct net_device *dev);
+ extern int
+ dhd_dev_pno_set_for_hotlist(struct net_device *dev, wl_pfn_bssid_t *p_pfn_bssid,
+ 	struct dhd_pno_hotlist_params *hotlist_params);
++extern int dhd_dev_pno_set_mac_oui(struct net_device *dev, uint8 *oui);
+ #ifdef GSCAN_SUPPORT
+ extern int
+ dhd_dev_pno_set_cfg_gscan(struct net_device *dev, dhd_pno_gscan_cmd_cfg_t type,
+@@ -463,7 +465,7 @@ extern int dhd_pno_event_handler(dhd_pub_t *dhd, wl_event_msg_t *event, void *ev
+ extern int dhd_pno_init(dhd_pub_t *dhd);
+ extern int dhd_pno_deinit(dhd_pub_t *dhd);
+ extern bool dhd_is_pno_supported(dhd_pub_t *dhd);
+-
++extern int dhd_pno_set_mac_oui(dhd_pub_t *dhd, uint8 *oui);
+ #ifdef GSCAN_SUPPORT
+ extern int dhd_pno_set_cfg_gscan(dhd_pub_t *dhd, dhd_pno_gscan_cmd_cfg_t type,
+                        void *buf, uint8 flush);
+diff --git a/drivers/net/wireless/bcmdhd/include/wlioctl.h b/drivers/net/wireless/bcmdhd/include/wlioctl.h
+index c3029370416c..47c6d7c6123e 100644
+--- a/drivers/net/wireless/bcmdhd/include/wlioctl.h
++++ b/drivers/net/wireless/bcmdhd/include/wlioctl.h
+@@ -2709,6 +2709,16 @@ typedef struct wl_pfn_list {
+ 	wl_pfn_t	pfn[1];
+ } wl_pfn_list_t;
+ 
++#define WL_PFN_MAC_OUI_ONLY_MASK      1
++#define WL_PFN_SET_MAC_UNASSOC_MASK   2
++/* To configure pfn_macaddr */
++typedef struct wl_pfn_macaddr_cfg {
++	uint8 version;
++	uint8 flags;
++	struct ether_addr macaddr;
++} wl_pfn_macaddr_cfg_t;
++#define WL_PFN_MACADDR_CFG_VER 1
++
+ typedef BWL_PRE_PACKED_STRUCT struct pfn_olmsg_params_t {
+ 	wlc_ssid_t ssid;
+ 	uint32	cipher_type;
+diff --git a/drivers/net/wireless/bcmdhd/wl_cfgvendor.c b/drivers/net/wireless/bcmdhd/wl_cfgvendor.c
+index 52f742b78e66..9a733c6c2044 100644
+--- a/drivers/net/wireless/bcmdhd/wl_cfgvendor.c
++++ b/drivers/net/wireless/bcmdhd/wl_cfgvendor.c
+@@ -184,6 +184,31 @@ exit:
+ 	return err;
+ }
+ 
++static int wl_cfgvendor_set_pno_mac_oui(struct wiphy *wiphy,
++	struct wireless_dev *wdev, const void  *data, int len)
++{
++	int err = 0;
++	struct bcm_cfg80211 *cfg = wiphy_priv(wiphy);
++	int type;
++	uint8 pno_random_mac_oui[DOT11_OUI_LEN];
++
++	type = nla_type(data);
++
++	if (type == ANDR_WIFI_ATTRIBUTE_PNO_RANDOM_MAC_OUI) {
++		memcpy(pno_random_mac_oui, nla_data(data), DOT11_OUI_LEN);
++
++		err = dhd_dev_pno_set_mac_oui(bcmcfg_to_prmry_ndev(cfg), pno_random_mac_oui);
++
++		if (unlikely(err))
++			WL_ERR(("Bad OUI, could not set:%d \n", err));
++
++	} else {
++		err = -1;
++	}
++
++	return err;
++}
++
+ #ifdef GSCAN_SUPPORT
+ int wl_cfgvendor_send_hotlist_event(struct wiphy *wiphy,
+ 	struct net_device *dev, void  *data, int len, wl_vendor_event_t event)
+@@ -1114,6 +1139,14 @@ static const struct wiphy_vendor_command wl_vendor_cmds [] = {
+ 		},
+ 		.flags = WIPHY_VENDOR_CMD_NEED_WDEV | WIPHY_VENDOR_CMD_NEED_NETDEV,
+ 		.doit = wl_cfgvendor_get_feature_set_matrix
++	},
++	{
++		{
++			.vendor_id = OUI_GOOGLE,
++			.subcmd = ANDR_WIFI_PNO_RANDOM_MAC_OUI
++		},
++		.flags = WIPHY_VENDOR_CMD_NEED_WDEV | WIPHY_VENDOR_CMD_NEED_NETDEV,
++		.doit = wl_cfgvendor_set_pno_mac_oui
+ 	}
+ };
+ 
+diff --git a/drivers/net/wireless/bcmdhd/wl_cfgvendor.h b/drivers/net/wireless/bcmdhd/wl_cfgvendor.h
+index 0087d1282f2b..b04c7f022238 100644
+--- a/drivers/net/wireless/bcmdhd/wl_cfgvendor.h
++++ b/drivers/net/wireless/bcmdhd/wl_cfgvendor.h
+@@ -98,6 +98,7 @@ enum wl_vendor_subcmd {
+ 	GSCAN_SUBCMD_GET_CHANNEL_LIST,
+ 	ANDR_WIFI_SUBCMD_GET_FEATURE_SET,
+ 	ANDR_WIFI_SUBCMD_GET_FEATURE_SET_MATRIX,
++	ANDR_WIFI_PNO_RANDOM_MAC_OUI,
+ 	RTT_SUBCMD_SET_CONFIG = ANDROID_NL80211_SUBCMD_RTT_RANGE_START,
+ 	RTT_SUBCMD_CANCEL_CONFIG,
+ 	RTT_SUBCMD_GETCAPABILITY,
+@@ -206,9 +207,10 @@ typedef enum wl_vendor_event {
+ 	GOOGLE_GSCAN_GEOFENCE_LOST_EVENT
+ } wl_vendor_event_t;
+ 
+-enum andr_wifi_feature_set_attr {
++enum andr_wifi_attr {
+     ANDR_WIFI_ATTRIBUTE_NUM_FEATURE_SET,
+-    ANDR_WIFI_ATTRIBUTE_FEATURE_SET
++    ANDR_WIFI_ATTRIBUTE_FEATURE_SET,
++    ANDR_WIFI_ATTRIBUTE_PNO_RANDOM_MAC_OUI
+ };
+ 
+ typedef enum wl_vendor_gscan_attribute {
+-- 
+2.0.3
+

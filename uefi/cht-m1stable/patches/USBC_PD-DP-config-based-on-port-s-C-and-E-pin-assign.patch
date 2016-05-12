@@ -1,0 +1,154 @@
+From 7be76ae5a780ee70f52681bc78698ff9d638d472 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Wed, 23 Sep 2015 12:13:14 +0530
+Subject: [PATCH] USBC_PD: DP config based on port's C and E pin assignment
+
+Currently display pe configures the port to pin assignment E if port
+publishes it's config as either C or E. Even though functionality wise
+both C and E are same,  some devices expects same pin configuration
+which they publish during DP negotiation.
+
+Change-Id: I59bc157a23897e6e6b7dae257dc1f994f23f8064
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-18917
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+---
+ drivers/usb/typec/pd/display_pe.c |   90 +++++++++++++++++++++++++++-----------
+ 1 file changed, 64 insertions(+), 26 deletions(-)
+
+Index: b/drivers/usb/typec/pd/display_pe.c
+===================================================================
+--- a/drivers/usb/typec/pd/display_pe.c	2016-03-08 10:56:48.161659818 -0800
++++ b/drivers/usb/typec/pd/display_pe.c	2016-03-08 10:58:20.718635411 -0800
+@@ -64,10 +64,11 @@
+ 
+ 
+ struct disp_port_caps {
+-	bool usb_dev_support;
+-	bool usb_host_support;
+ 	int dmode_2x_index;
+ 	int dmode_4x_index;
++	bool usb_dev_support;
++	bool usb_host_support;
++	u8 pin_assign;
+ };
+ 
+ struct disp_port_pe {
+@@ -259,23 +260,48 @@
+ static int disp_pe_send_display_configure(struct disp_port_pe *disp_pe)
+ {
+ 	struct pd_packet pkt;
+-	struct disp_config *dconf;
+-	int ret;
++	struct disp_config dconf;
++	int ret, index;
++
++
++	memset(&dconf, 0, sizeof(dconf));
++	dconf.conf_sel = DISP_CONFIG_UFPU_AS_UFP_D;
++	dconf.trans_sig = DISP_PORT_SIGNAL_DP_1P3;
++
++	if (disp_pe->dp_mode == TYPEC_DP_TYPE_2X) {
++		dconf.dfp_pin = DISP_PORT_PIN_ASSIGN_D;
++		index = disp_pe->port_caps.dmode_2x_index;
++
++	} else if (disp_pe->dp_mode == TYPEC_DP_TYPE_4X) {
++		if (disp_pe->port_caps.pin_assign
++				& DISP_PORT_PIN_ASSIGN_E)
++			dconf.dfp_pin = DISP_PORT_PIN_ASSIGN_E;
++
++		else if (disp_pe->port_caps.pin_assign
++				& DISP_PORT_PIN_ASSIGN_C)
++			dconf.dfp_pin = DISP_PORT_PIN_ASSIGN_C;
++		else {
++			log_err("Unknown 4X pin assign=%x\n",
++					disp_pe->port_caps.pin_assign);
++			ret = -EINVAL;
++			goto config_error;
++		}
++		index = disp_pe->port_caps.dmode_4x_index;
++
++	} else {
++		log_err("Invalid dp_mode=%d\n", disp_pe->dp_mode);
++		ret = -EINVAL;
++		goto config_error;
++	}
+ 
+ 	disp_pe_prepare_vdm_header(&pkt, DP_CONFIGURE,
+-						VESA_SVID, 0);
+-	dconf = (struct disp_config *)&pkt.data_obj[1];
+-	dconf->conf_sel = DISP_CONFIG_UFPU_AS_UFP_D;
+-	dconf->trans_sig = DISP_PORT_SIGNAL_DP_1P3;
+-
+-	if (disp_pe->dp_mode == TYPEC_DP_TYPE_2X)
+-		dconf->dfp_pin = DISP_PORT_PIN_ASSIGN_D;
+-	else if (disp_pe->dp_mode == TYPEC_DP_TYPE_4X)
+-		dconf->dfp_pin = DISP_PORT_PIN_ASSIGN_E;
++						VESA_SVID, index);
++	memcpy(&pkt.data_obj[1], &dconf, sizeof(dconf));
+ 
+ 	ret = policy_send_packet(&disp_pe->p, &pkt.data_obj[0], 8,
+ 				PD_DATA_MSG_VENDOR_DEF, PE_EVT_SEND_VDM);
+ 
++config_error:
+ 	return ret;
+ }
+ 
+@@ -380,25 +406,37 @@
+ 
+ 	for (i = 0; i < dmode_pkt->msg_hdr.num_data_obj - 1; i++) {
+ 		if (!index_4x) {
+-			if ((dmode_pkt->mode[i].ufp_pin
+-				& DISP_PORT_PIN_ASSIGN_E)
+-				|| (dmode_pkt->mode[i].ufp_pin
+-				& DISP_PORT_PIN_ASSIGN_C)
+-				|| (dmode_pkt->mode[i].dfp_pin
+-				& DISP_PORT_PIN_ASSIGN_E)
+-				|| (dmode_pkt->mode[i].dfp_pin
+-				& DISP_PORT_PIN_ASSIGN_C)) {
++			if (dmode_pkt->mode[i].ufp_pin
++					& DISP_PORT_PIN_ASSIGN_E
++				|| dmode_pkt->mode[i].dfp_pin
++					& DISP_PORT_PIN_ASSIGN_E) {
++				/* Mode intex starts from 1 */
++				index_4x = i + 1;
++				disp_pe->port_caps.pin_assign |=
++					DISP_PORT_PIN_ASSIGN_E;
++				log_dbg("Port supports Pin Assign E\n");
++			}
++			if (dmode_pkt->mode[i].ufp_pin
++					& DISP_PORT_PIN_ASSIGN_C
++				|| dmode_pkt->mode[i].dfp_pin
++					& DISP_PORT_PIN_ASSIGN_C) {
+ 				/* Mode intex starts from 1 */
+ 				index_4x = i + 1;
++				disp_pe->port_caps.pin_assign |=
++					DISP_PORT_PIN_ASSIGN_C;
++				log_dbg("Port supports Pin Assign C\n");
+ 			}
+ 		}
+ 		if (!index_2x) {
+-			if ((dmode_pkt->mode[i].ufp_pin
+-			& DISP_PORT_PIN_ASSIGN_D)
+-			|| (dmode_pkt->mode[i].dfp_pin
+-			& DISP_PORT_PIN_ASSIGN_D)) {
++			if (dmode_pkt->mode[i].ufp_pin
++					& DISP_PORT_PIN_ASSIGN_D
++				|| dmode_pkt->mode[i].dfp_pin
++					& DISP_PORT_PIN_ASSIGN_D) {
+ 				/* Mode intex starts from 1 */
+ 				index_2x = i + 1;
++				disp_pe->port_caps.pin_assign |=
++					DISP_PORT_PIN_ASSIGN_D;
++				log_dbg("Port supports Pin Assign D\n");
+ 			}
+ 		}
+ 		if (index_2x && index_4x)
+@@ -677,7 +715,7 @@
+ 		schedule_delayed_work(&disp_pe->start_comm,
+ 					HZ * CMD_NORESPONCE_TIME);
+ 	} else {
+-		log_warn("Not scheduling srccap as max re-try reached\n");
++		log_warn("Not scheduling DI worker as max re-try reached\n");
+ 		disp_pe_handle_dp_fail(disp_pe);
+ 	}
+ }

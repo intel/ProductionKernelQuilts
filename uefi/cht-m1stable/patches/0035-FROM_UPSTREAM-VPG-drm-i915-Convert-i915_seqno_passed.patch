@@ -1,0 +1,210 @@
+From e0733129b2b193f512fc6b7c97a9137f943f007b Mon Sep 17 00:00:00 2001
+Message-Id: <e0733129b2b193f512fc6b7c97a9137f943f007b.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:42 +0000
+Subject: [PATCH 35/63] FROM_UPSTREAM [VPG]: drm/i915: Convert
+ 'i915_seqno_passed' calls into
+ 'i915_gem_request_completed'
+
+Almost everywhere that caled i915_seqno_passed() was really asking 'has the
+given seqno popped out of the hardware yet?'. Thus it had to query the current
+hardware seqno and then do a signed delta comparison (which copes with wrapping
+around zero but not with seqno values more than 2GB apart, although the latter
+is unlikely!).
+
+Now that the majority of seqno instances have been replaced with request
+structures, it is possible to convert this test to be request based as well.
+There is now a 'i915_gem_request_completed()' function which takes a request and
+returns true or false as appropriate. Note that this currently just wraps up the
+original _passed() test but a later patch in the series will reduce this to
+simply returning a cached internal value, i.e.:
+  _completed(req) { return req->completed; }'
+
+This checkin converts almost all _seqno_passed() calls. The only one left is in
+the semaphore code which still requires seqnos not request structures.
+
+Change-Id: Idab003cc1218996d3ba1a71a67860e9eb0bb0a26
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+[danvet: Drop hunk touching the trace_irq code since I've dropped the
+patch which converts that, and resolve resulting conflict.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 1b5a433a4dd967b125131da42b89b5cc0d5b1f57
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_drv.h |   18 ++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gem.c |   26 ++++++++------------------
+ drivers/gpu/drm/i915/i915_irq.c |    7 +++----
+ 3 files changed, 29 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 781d74a..4f0c124 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2153,6 +2153,12 @@ static inline void i915_gem_request_assign(struct drm_i915_gem_request **pdst,
+ 	*pdst = src;
+ }
+ 
++/*
++ * XXX: i915_gem_request_completed should be here but currently needs the
++ * definition of i915_seqno_passed() which is below. It will be moved in
++ * a later patch when the call to i915_seqno_passed() is obsoleted...
++ */
++
+ struct drm_i915_file_private {
+ 	struct drm_i915_private *dev_priv;
+ 	struct drm_file *file;
+@@ -2594,6 +2600,18 @@ i915_seqno_passed(uint32_t seq1, uint32_t seq2)
+ 	return (int32_t)(seq1 - seq2) >= 0;
+ }
+ 
++static inline bool i915_gem_request_completed(struct drm_i915_gem_request *req,
++					      bool lazy_coherency)
++{
++	u32 seqno;
++
++	BUG_ON(req == NULL);
++
++	seqno = req->ring->get_seqno(req->ring, lazy_coherency);
++
++	return i915_seqno_passed(seqno, req->seqno);
++}
++
+ int __must_check i915_gem_get_seqno(struct drm_device *dev, u32 *seqno);
+ int __must_check i915_gem_set_seqno(struct drm_device *dev, u32 seqno);
+ int __must_check i915_gem_object_get_fence(struct drm_i915_gem_object *obj);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 9ea13bd..01832ea 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1231,8 +1231,7 @@ static int __wait_request(struct drm_i915_gem_request *req,
+ 
+ 	WARN(dev_priv->pm.irqs_disabled, "IRQs disabled\n");
+ 
+-	if (i915_seqno_passed(ring->get_seqno(ring, true),
+-			      i915_gem_request_get_seqno(req)))
++	if (i915_gem_request_completed(req, true))
+ 		return 0;
+ 
+ 	timeout_expire = timeout ? jiffies + timespec_to_jiffies_timeout(timeout) : 0;
+@@ -1275,8 +1274,7 @@ static int __wait_request(struct drm_i915_gem_request *req,
+ 			break;
+ 		}
+ 
+-		if (i915_seqno_passed(ring->get_seqno(ring, false),
+-				      i915_gem_request_get_seqno(req))) {
++		if (i915_gem_request_completed(req, false)) {
+ 			ret = 0;
+ 			break;
+ 		}
+@@ -2380,8 +2378,7 @@ i915_gem_object_retire(struct drm_i915_gem_object *obj)
+ 	if (ring == NULL)
+ 		return;
+ 
+-	if (i915_seqno_passed(ring->get_seqno(ring, true),
+-			      i915_gem_request_get_seqno(obj->last_read_req)))
++	if (i915_gem_request_completed(obj->last_read_req, true))
+ 		i915_gem_object_move_to_inactive(obj);
+ }
+ 
+@@ -2656,12 +2653,9 @@ struct drm_i915_gem_request *
+ i915_gem_find_active_request(struct intel_engine_cs *ring)
+ {
+ 	struct drm_i915_gem_request *request;
+-	u32 completed_seqno;
+-
+-	completed_seqno = ring->get_seqno(ring, false);
+ 
+ 	list_for_each_entry(request, &ring->request_list, list) {
+-		if (i915_seqno_passed(completed_seqno, request->seqno))
++		if (i915_gem_request_completed(request, false))
+ 			continue;
+ 
+ 		return request;
+@@ -2803,15 +2797,11 @@ void i915_gem_request_unreference_irq(struct drm_i915_gem_request *req)
+ void
+ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ {
+-	uint32_t seqno;
+-
+ 	if (list_empty(&ring->request_list))
+ 		return;
+ 
+ 	WARN_ON(i915_verify_lists(ring->dev));
+ 
+-	seqno = ring->get_seqno(ring, true);
+-
+ 	/* Move any buffers on the active list that are no longer referenced
+ 	 * by the ringbuffer to the flushing/inactive lists as appropriate,
+ 	 * before we free the context associated with the requests.
+@@ -2823,8 +2813,7 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ 				      struct drm_i915_gem_object,
+ 				      ring_list);
+ 
+-		if (!i915_seqno_passed(seqno,
+-			     i915_gem_request_get_seqno(obj->last_read_req)))
++		if (!i915_gem_request_completed(obj->last_read_req, true))
+ 			break;
+ 
+ 		i915_gem_object_move_to_inactive(obj);
+@@ -2839,7 +2828,7 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ 					   struct drm_i915_gem_request,
+ 					   list);
+ 
+-		if (!i915_seqno_passed(seqno, request->seqno))
++		if (!i915_gem_request_completed(request, true))
+ 			break;
+ 
+ 		trace_i915_gem_request_retire(request);
+@@ -2866,7 +2855,8 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ 	}
+ 
+ 	if (unlikely(ring->trace_irq_seqno &&
+-		     i915_seqno_passed(seqno, ring->trace_irq_seqno))) {
++		     i915_seqno_passed(ring->get_seqno(ring, true),
++				       ring->trace_irq_seqno))) {
+ 		ring->irq_put(ring);
+ 		ring->trace_irq_seqno = 0;
+ 	}
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index d85b236..4eea07b 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -3401,7 +3401,6 @@ void i915_hangcheck_sample(unsigned long data)
+ 	int instdone_cmp;
+ 	int pending_work = 1;
+ 	int resched_timer = 1;
+-	uint32_t cur_seqno = 0;
+ 	struct drm_i915_gem_request *last_req = NULL;
+ 	uint32_t head, tail, acthd, instdone[I915_NUM_INSTDONE_REG];
+ 	struct drm_device *dev;
+@@ -3436,11 +3435,10 @@ void i915_hangcheck_sample(unsigned long data)
+ 	if (!empty) {
+ 		/* Examine the request list to see where the HW has got to
+ 		* (Only call ring_last_request when the list is non-empty)*/
+-		cur_seqno = ring->get_seqno(ring, false);
+ 		last_req = ring_last_request(ring);
+ 	}
+ 
+-	if (empty || i915_seqno_passed(cur_seqno, i915_gem_request_get_seqno(last_req))) {
++	if (empty || i915_gem_request_completed(last_req, false)) {
+ 		/* If the request list is empty or the HW has passed the
+ 		* last seqno of the last item in the request list then the
+ 		* HW is considered idle.
+@@ -3454,7 +3452,8 @@ void i915_hangcheck_sample(unsigned long data)
+ 		ring->id, head, hc->last_hd, acthd, hc->last_acthd,
+ 		instdone_cmp);
+ 	DRM_DEBUG_TDR("E:%d PW:%d TL:0x%08x Csq:0x%08x Lsq:0x%08x Idle: %d\n",
+-		empty, pending_work, tail, cur_seqno, i915_gem_request_get_seqno(last_req), idle);
++		empty, pending_work, tail, ring->get_seqno(ring, false),
++		i915_gem_request_get_seqno(last_req), idle);
+ 
+ 	/* Check both head and active head.
+ 	* Neither is enough on its own - acthd can be pointing within the
+-- 
+1.7.9.5
+

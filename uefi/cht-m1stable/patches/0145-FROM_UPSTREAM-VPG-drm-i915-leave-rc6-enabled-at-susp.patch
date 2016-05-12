@@ -1,0 +1,123 @@
+From 26551496480668e5c8c87b9080d282e206986287 Mon Sep 17 00:00:00 2001
+Message-Id: <26551496480668e5c8c87b9080d282e206986287.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Jesse Barnes <jbarnes@virtuousgeek.org>
+Date: Thu, 12 Jun 2014 08:35:45 -0700
+Subject: [PATCH 145/312] FROM_UPSTREAM [VPG]: drm/i915: leave rc6 enabled at
+ suspend time v4
+
+This allows the system to enter the lowest power mode during system freeze.
+
+v2: delete force wake timer at suspend (Imre)
+v3: add GT work suspend function (Imre)
+v4: use uncore forcewake reset (Daniel)
+
+FOR: LCK-1074
+Change-Id: Ie492efb7eb88354eab618bb059cbdc0909606b0b
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Signed-off-by: Kristen Carlson Accardi <kristen@linux.intel.com>
+Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_drv.c     |    4 ++--
+ drivers/gpu/drm/i915/i915_drv.h     |    1 +
+ drivers/gpu/drm/i915/intel_drv.h    |    1 +
+ drivers/gpu/drm/i915/intel_pm.c     |   20 ++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_uncore.c |    2 +-
+ 5 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index c1b30b4..39a6775 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -531,7 +531,7 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 
+ 		drm_irq_uninstall(dev);
+ 
+-		intel_disable_gt_powersave(dev);
++		intel_suspend_gt_powersave(dev);
+ 
+ 		/*
+ 		 * Disable CRTCs directly since we want to preserve sw state
+@@ -550,8 +550,8 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 
+ 	i915_save_state(dev);
+ 
++	intel_uncore_forcewake_reset(dev, false);
+ 	intel_opregion_fini(dev);
+-	intel_uncore_fini(dev);
+ 
+ 	console_lock();
+ 	intel_fbdev_set_suspend(dev, FBINFO_STATE_SUSPENDED);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 27e9f02..aa3999c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2245,6 +2245,7 @@ extern void intel_uncore_early_sanitize(struct drm_device *dev);
+ extern void intel_uncore_init(struct drm_device *dev);
+ extern void intel_uncore_check_errors(struct drm_device *dev);
+ extern void intel_uncore_fini(struct drm_device *dev);
++extern void intel_uncore_forcewake_reset(struct drm_device *dev, bool restore);
+ 
+ void
+ i915_enable_pipestat(struct drm_i915_private *dev_priv, enum pipe pipe,
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index ff93452..f51e7a4 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1028,6 +1028,7 @@ void intel_init_gt_powersave(struct drm_device *dev);
+ void intel_cleanup_gt_powersave(struct drm_device *dev);
+ void intel_enable_gt_powersave(struct drm_device *dev);
+ void intel_disable_gt_powersave(struct drm_device *dev);
++void intel_suspend_gt_powersave(struct drm_device *dev);
+ void intel_reset_gt_powersave(struct drm_device *dev);
+ void ironlake_teardown_rc6(struct drm_device *dev);
+ void gen6_update_ring_freq(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index da67486..876c2ab 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -5105,6 +5105,26 @@ void intel_cleanup_gt_powersave(struct drm_device *dev)
+ 		valleyview_cleanup_gt_powersave(dev);
+ }
+ 
++/**
++ * intel_suspend_gt_powersave - suspend PM work and helper threads
++ * @dev: drm device
++ *
++ * We don't want to disable RC6 or other features here, we just want
++ * to make sure any work we've queued has finished and won't bother
++ * us while we're suspended.
++ */
++void intel_suspend_gt_powersave(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* Interrupts should be disabled already to avoid re-arming. */
++	WARN_ON(dev->irq_enabled);
++
++	flush_delayed_work(&dev_priv->rps.delayed_resume_work);
++
++	cancel_work_sync(&dev_priv->rps.work);
++}
++
+ void intel_disable_gt_powersave(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index 89fcbab..afa6458 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -315,7 +315,7 @@ static void gen6_force_wake_timer(unsigned long arg)
+ 	intel_runtime_pm_put(dev_priv);
+ }
+ 
+-static void intel_uncore_forcewake_reset(struct drm_device *dev, bool restore)
++void intel_uncore_forcewake_reset(struct drm_device *dev, bool restore)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	unsigned long irqflags;
+-- 
+1.7.9.5
+

@@ -1,0 +1,300 @@
+From 3db8f890273ac6e8081b9837c1e98cdf24ee907b Mon Sep 17 00:00:00 2001
+From: Bin Han <bin.b.han@intel.com>
+Date: Thu, 29 Jan 2015 14:06:03 +0800
+Subject: [PATCH 242/255] atomisp2: DVS grid info API is changed
+
+To align to the CSS change:
+https://icggerrit.ir.intel.com/#/c/26099/
+
+atomisp2 driver changes where to get the DVS grid info.
+
+Change-Id: Ia0be9f3bd5a493259ed8baf2cf64652d20f5c94a
+Tracked-On: #H1603928335
+Signed-off-by: Bin Han <bin.b.han@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/38413
+Reviewed-by: Dan Shifrin <dan.shifrin@intel.com>
+Approver: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.c      | 34 +++++++++----
+ .../atomisp2/atomisp_driver/atomisp_compat_css20.c | 56 +++++++++++++++-------
+ .../atomisp2/atomisp_driver/atomisp_compat_css20.h |  2 +
+ .../pci/atomisp2/atomisp_driver/atomisp_fops.c     |  4 +-
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.c    |  6 ++-
+ 5 files changed, 74 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index 375e6f9..a55e980 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -2860,8 +2860,14 @@ void atomisp_apply_css_parameters(
+ 	if (arg->morph_table && asd->params.gdc_cac_en)
+ 		atomisp_css_set_morph_table(asd, css_param->morph_table);
+ 
+-	if (arg->dvs2_coefs && asd->params.curr_grid_info.dvs_grid.enable)
+-		atomisp_css_set_dvs2_coefs(asd, css_param->dvs2_coeff);
++	if (arg->dvs2_coefs) {
++		struct atomisp_css_dvs_grid_info *dvs_grid_info =
++			atomisp_css_get_dvs_grid_info(
++				&asd->params.curr_grid_info);
++
++		if (dvs_grid_info && dvs_grid_info->enable)
++			atomisp_css_set_dvs2_coefs(asd, css_param->dvs2_coeff);
++	}
+ 
+ 	if (arg->dvs_6axis_config)
+ 		atomisp_css_set_dvs_6axis(asd, css_param->dvs_6axis);
+@@ -3138,9 +3144,9 @@ static int __atomisp_css_cp_dvs2_coefs(struct atomisp_sub_device *asd,
+ 				struct atomisp_css_params *css_param)
+ {
+ 	struct atomisp_css_dvs_grid_info *cur =
+-	    &asd->params.curr_grid_info.dvs_grid;
++		atomisp_css_get_dvs_grid_info(&asd->params.curr_grid_info);
+ 
+-	if (!coefs)
++	if (!coefs || !cur)
+ 		return 0;
+ 
+ 	if (sizeof(*cur) != sizeof(coefs->grid) ||
+@@ -3164,8 +3170,7 @@ static int __atomisp_css_cp_dvs2_coefs(struct atomisp_sub_device *asd,
+ 
+ 	if (!css_param->dvs2_coeff) {
+ 		/* DIS coefficients. */
+-		css_param->dvs2_coeff = ia_css_dvs2_coefficients_allocate(
+-					&asd->params.curr_grid_info.dvs_grid);
++		css_param->dvs2_coeff = ia_css_dvs2_coefficients_allocate(cur);
+ 		if (!css_param->dvs2_coeff)
+ 			return -ENOMEM;
+ 	}
+@@ -3202,6 +3207,8 @@ int atomisp_cp_dvs_6axis_config(struct atomisp_sub_device *asd,
+ 	struct atomisp_css_dvs_6axis_config *old_6axis_config;
+ 	struct ia_css_stream *stream =
+ 			asd->stream_env[ATOMISP_INPUT_STREAM_GENERAL].stream;
++	struct atomisp_css_dvs_grid_info *dvs_grid_info =
++		atomisp_css_get_dvs_grid_info(&asd->params.curr_grid_info);
+ 	int ret = -EFAULT;
+ 
+ 	if (stream == NULL) {
+@@ -3209,7 +3216,10 @@ int atomisp_cp_dvs_6axis_config(struct atomisp_sub_device *asd,
+ 		return -EINVAL;
+ 	}
+ 
+-	if (!user_6axis_config || !asd->params.curr_grid_info.dvs_grid.enable)
++	if (!user_6axis_config || !dvs_grid_info)
++		return 0;
++
++	if (!dvs_grid_info->enable)
+ 		return 0;
+ 
+ 	/* check whether need to reallocate for 6 axis config */
+@@ -3509,6 +3519,10 @@ int atomisp_param(struct atomisp_sub_device *asd, int flag,
+ 
+ 	/* Read parameter for 3A binary info */
+ 	if (flag == 0) {
++		struct atomisp_css_dvs_grid_info *dvs_grid_info =
++			atomisp_css_get_dvs_grid_info(
++				&asd->params.curr_grid_info);
++
+ 		if (&config->info == NULL) {
+ 			dev_err(isp->dev, "ERROR: NULL pointer in grid_info\n");
+ 			return -EINVAL;
+@@ -3526,8 +3540,10 @@ int atomisp_param(struct atomisp_sub_device *asd, int flag,
+ 			metadata_info.stride;
+ 
+ 		/* update dvs grid info */
+-		memcpy(&config->dvs_grid, &asd->params.curr_grid_info.dvs_grid,
+-			sizeof(struct atomisp_css_dvs_grid_info));
++		if (dvs_grid_info)
++			memcpy(&config->dvs_grid,
++				dvs_grid_info,
++				sizeof(struct atomisp_css_dvs_grid_info));
+ 
+ 		if (asd->run_mode->val != ATOMISP_RUN_MODE_VIDEO) {
+ 			config->dvs_envelop.width = 0;
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+index 94fb9cf..868d486 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+@@ -1485,6 +1485,9 @@ int atomisp_css_allocate_stat_buffers(struct atomisp_sub_device   *asd,
+ 				      struct atomisp_metadata_buf *md_buf)
+ {
+ 	struct atomisp_device *isp = asd->isp;
++	struct atomisp_css_dvs_grid_info *dvs_grid_info =
++		atomisp_css_get_dvs_grid_info(&asd->params.curr_grid_info);
++
+ 	if (s3a_buf && asd->params.curr_grid_info.s3a_grid.enable) {
+ 		void *s3a_ptr;
+ 
+@@ -1500,11 +1503,11 @@ int atomisp_css_allocate_stat_buffers(struct atomisp_sub_device   *asd,
+ 						s3a_buf->s3a_data, s3a_ptr);
+ 	}
+ 
+-	if (dis_buf && asd->params.curr_grid_info.dvs_grid.enable) {
++	if (dis_buf && dvs_grid_info && dvs_grid_info->enable) {
+ 		void *dvs_ptr;
+ 
+ 		dis_buf->dis_data = ia_css_isp_dvs2_statistics_allocate(
+-				&asd->params.curr_grid_info.dvs_grid);
++					dvs_grid_info);
+ 		if (!dis_buf->dis_data) {
+ 			dev_err(isp->dev, "dvs buf allocation failed.\n");
+ 			if (s3a_buf)
+@@ -1569,10 +1572,12 @@ void atomisp_css_free_stat_buffers(struct atomisp_sub_device *asd)
+ 	struct atomisp_s3a_buf *s3a_buf, *_s3a_buf;
+ 	struct atomisp_dis_buf *dis_buf, *_dis_buf;
+ 	struct atomisp_metadata_buf *md_buf, *_md_buf;
++	struct atomisp_css_dvs_grid_info *dvs_grid_info =
++		atomisp_css_get_dvs_grid_info(&asd->params.curr_grid_info);
+ 	unsigned int i;
+ 
+ 	/* 3A statistics use vmalloc, DIS use kmalloc */
+-	if (asd->params.curr_grid_info.dvs_grid.enable) {
++	if (dvs_grid_info && dvs_grid_info->enable) {
+ 		ia_css_dvs2_coefficients_free(asd->params.css_param.dvs2_coeff);
+ 		ia_css_dvs2_statistics_free(asd->params.dvs_stat);
+ 		asd->params.css_param.dvs2_coeff = NULL;
+@@ -1729,40 +1734,41 @@ int atomisp_alloc_3a_output_buf(struct atomisp_sub_device *asd)
+ 
+ int atomisp_alloc_dis_coef_buf(struct atomisp_sub_device *asd)
+ {
+-	if (!asd->params.curr_grid_info.dvs_grid.enable) {
++	struct atomisp_css_dvs_grid_info *dvs_grid =
++		atomisp_css_get_dvs_grid_info(&asd->params.curr_grid_info);
++
++	if (!dvs_grid)
++		return 0;
++
++	if (!dvs_grid->enable) {
+ 		dev_dbg(asd->isp->dev, "%s: dvs_grid not enabled.\n", __func__);
+ 		return 0;
+ 	}
+ 
+ 	/* DIS coefficients. */
+ 	asd->params.css_param.dvs2_coeff = ia_css_dvs2_coefficients_allocate(
+-					&asd->params.curr_grid_info.dvs_grid);
++			dvs_grid);
+ 	if (!asd->params.css_param.dvs2_coeff)
+ 		return -ENOMEM;
+ 
+-	asd->params.dvs_hor_coef_bytes =
+-		asd->params.curr_grid_info.dvs_grid.num_hor_coefs *
++	asd->params.dvs_hor_coef_bytes = dvs_grid->num_hor_coefs *
+ 		sizeof(*asd->params.css_param.dvs2_coeff->hor_coefs.odd_real);
+ 
+-	asd->params.dvs_ver_coef_bytes =
+-		asd->params.curr_grid_info.dvs_grid.num_ver_coefs *
++	asd->params.dvs_ver_coef_bytes = dvs_grid->num_ver_coefs *
+ 		sizeof(*asd->params.css_param.dvs2_coeff->ver_coefs.odd_real);
+ 
+ 	/* DIS projections. */
+ 	asd->params.dis_proj_data_valid = false;
+-	asd->params.dvs_stat = ia_css_dvs2_statistics_allocate(
+-				&asd->params.curr_grid_info.dvs_grid);
++	asd->params.dvs_stat = ia_css_dvs2_statistics_allocate(dvs_grid);
+ 	if (!asd->params.dvs_stat)
+ 		return -ENOMEM;
+ 
+ 	asd->params.dvs_hor_proj_bytes =
+-		asd->params.curr_grid_info.dvs_grid.aligned_height *
+-		asd->params.curr_grid_info.dvs_grid.aligned_width *
++		dvs_grid->aligned_height * dvs_grid->aligned_width *
+ 		sizeof(*asd->params.dvs_stat->hor_prod.odd_real);
+ 
+ 	asd->params.dvs_ver_proj_bytes =
+-		asd->params.curr_grid_info.dvs_grid.aligned_height *
+-		asd->params.curr_grid_info.dvs_grid.aligned_width *
++		dvs_grid->aligned_height * dvs_grid->aligned_width *
+ 		sizeof(*asd->params.dvs_stat->ver_prod.odd_real);
+ 
+ 	return 0;
+@@ -3725,7 +3731,12 @@ static int atomisp_compare_dvs_grid(struct atomisp_sub_device *asd,
+ 				struct atomisp_dvs_grid_info *atomgrid)
+ {
+ 	struct atomisp_css_dvs_grid_info *cur =
+-	    &asd->params.curr_grid_info.dvs_grid;
++		atomisp_css_get_dvs_grid_info(&asd->params.curr_grid_info);
++
++	if (!cur) {
++		dev_err(asd->isp->dev, "dvs grid not available!\n");
++		return -EINVAL;
++	}
+ 
+ 	if (sizeof(*cur) != sizeof(*atomgrid)) {
+ 		dev_err(asd->isp->dev, "dvs grid mis-match!\n");
+@@ -4771,3 +4782,16 @@ void atomisp_en_dz_capt_pipe(struct atomisp_sub_device *asd, bool enable)
+ 		asd->stream_env[ATOMISP_INPUT_STREAM_GENERAL].stream,
+ 		enable);
+ }
++
++struct atomisp_css_dvs_grid_info *atomisp_css_get_dvs_grid_info(
++	struct atomisp_css_grid_info *grid_info)
++{
++	if (!grid_info)
++		return NULL;
++
++#ifdef IA_CSS_DVS_STAT_GRID_INFO_SUPPORTED
++	return &grid_info->dvs_grid.dvs_grid_info;
++#else
++	return &grid_info->dvs_grid;
++#endif
++}
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.h
+index 7c8dc72..b62ad90 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.h
+@@ -277,4 +277,6 @@ void atomisp_css_set_isp_config_applied_frame(struct atomisp_sub_device *asd,
+ int atomisp_get_css_dbgfunc(void);
+ 
+ int atomisp_set_css_dbgfunc(struct atomisp_device *isp, int opt);
++struct atomisp_css_dvs_grid_info *atomisp_css_get_dvs_grid_info(
++	struct atomisp_css_grid_info *grid_info);
+ #endif
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
+index 31238cc..4240d0e 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_fops.c
+@@ -407,6 +407,8 @@ int atomisp_qbuffers_to_css(struct atomisp_sub_device *asd)
+ 	struct atomisp_video_pipe *video_pipe = NULL;
+ 	bool raw_mode = atomisp_is_mbuscode_raw(
+ 			    asd->fmt[asd->capture_pad].fmt.code);
++	struct atomisp_css_dvs_grid_info *dvs_grid =
++		atomisp_css_get_dvs_grid_info(&asd->params.curr_grid_info);
+ 
+ 	if (asd->isp->inputs[asd->input_curr].camera_caps->
+ 	    sensor[asd->sensor_curr].stream_num == 2 &&
+@@ -576,7 +578,7 @@ int atomisp_qbuffers_to_css(struct atomisp_sub_device *asd)
+ 					css_preview_pipe_id);
+ 	}
+ 
+-	if (asd->params.curr_grid_info.dvs_grid.enable)
++	if (dvs_grid && dvs_grid->enable)
+ 		atomisp_q_dis_buffers_to_css(asd,
+ 					ATOMISP_INPUT_STREAM_GENERAL,
+ 					css_video_pipe_id);
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index 412a9d4..7ba2385 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -1000,6 +1000,8 @@ int atomisp_alloc_css_stat_bufs(struct atomisp_sub_device *asd,
+ 	struct atomisp_dis_buf *dis_buf = NULL, *_dis_buf;
+ 	struct atomisp_metadata_buf *md_buf = NULL, *_md_buf;
+ 	int count;
++	struct atomisp_css_dvs_grid_info *dvs_grid_info =
++		atomisp_css_get_dvs_grid_info(&asd->params.curr_grid_info);
+ 	unsigned int i;
+ 
+ 	if (list_empty(&asd->s3a_stats) &&
+@@ -1024,8 +1026,8 @@ int atomisp_alloc_css_stat_bufs(struct atomisp_sub_device *asd,
+ 		}
+ 	}
+ 
+-	if (list_empty(&asd->dis_stats) &&
+-		asd->params.curr_grid_info.dvs_grid.enable) {
++	if (list_empty(&asd->dis_stats) && dvs_grid_info &&
++		dvs_grid_info->enable) {
+ 		count = ATOMISP_CSS_Q_DEPTH + 1;
+ 		dev_dbg(isp->dev, "allocating %d dis buffers\n", count);
+ 		while (count--) {
+-- 
+1.9.1
+

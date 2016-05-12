@@ -1,0 +1,152 @@
+From 65fb2ad6c01aa6cf252bd1e6123666e2ecd68a0b Mon Sep 17 00:00:00 2001
+Message-Id: <65fb2ad6c01aa6cf252bd1e6123666e2ecd68a0b.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:23 +0000
+Subject: [PATCH 15/63] FROM_UPSTREAM [VPG]: drm/i915: Ensure OLS & PLR are
+ always in sync
+
+The aim is to replace seqno values with request structures. A step along the way
+is to switch to using the PLR in preference to the OLS. That requires the PLR to
+only be valid when and only when the OLS is also valid. I.e., the two must be
+kept in lock step. Then, code which was using the OLS can be safely switched
+over to using the PLR instead.
+
+Change-Id: Id7be010ade7e6bed3598a654d8e4565c923e972c
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 9eba5d4a1d79d5094321469479b4dbe418f60110
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/intel_lrc.c        |   55 ++++++++++++++++++-------------
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   29 +++++++++++-----
+ 2 files changed, 54 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 81f7775..2bcb86b 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1251,37 +1251,48 @@ void intel_lr_context_unpin(struct intel_engine_cs *ring,
+ static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
+ 				    struct intel_context *ctx)
+ {
++	struct drm_i915_gem_request *request;
+ 	int ret;
+ 
+-	if (ring->outstanding_lazy_seqno)
+-		return 0;
++	/* XXX: The aim is to replace seqno values with request structures.
++	 * A step along the way is to switch to using the PLR in preference
++	 * to the OLS. That requires the PLR to only be valid when the OLS is
++	 * also valid. I.e., the two must be kept in step. */
+ 
+-	if (ring->preallocated_lazy_request == NULL) {
+-		struct drm_i915_gem_request *request;
++	if (ring->outstanding_lazy_seqno) {
++		WARN_ON(ring->preallocated_lazy_request == NULL);
++		return 0;
++	}
++	WARN_ON(ring->preallocated_lazy_request != NULL);
+ 
+-		request = kmalloc(sizeof(*request), GFP_KERNEL);
+-		if (request == NULL)
+-			return -ENOMEM;
++	request = kmalloc(sizeof(*request), GFP_KERNEL);
++	if (request == NULL)
++		return -ENOMEM;
+ 
+-		if (ctx != ring->default_context) {
+-			ret = intel_lr_context_pin(ring, ctx);
+-			if (ret) {
+-				kfree(request);
+-				return ret;
+-			}
++	if (ctx != ring->default_context) {
++		ret = intel_lr_context_pin(ring, ctx);
++		if (ret) {
++			kfree(request);
++			return ret;
+ 		}
++	}
+ 
+-		/* Hold a reference to the context this request belongs to
+-		 * (we will need it when the time comes to emit/retire the
+-		 * request).
+-		 */
+-		request->ctx = ctx;
+-		i915_gem_context_reference(request->ctx);
+-
+-		ring->preallocated_lazy_request = request;
++	ret = i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
++	if (ret) {
++		intel_lr_context_unpin(ring, ctx);
++		kfree(request);
++		return ret;
+ 	}
+ 
+-	return i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
++	/* Hold a reference to the context this request belongs to
++	 * (we will need it when the time comes to emit/retire the
++	 * request).
++	 */
++	request->ctx = ctx;
++	i915_gem_context_reference(request->ctx);
++
++	ring->preallocated_lazy_request = request;
++	return 0;
+ }
+ 
+ static int logical_ring_wait_request(struct intel_ringbuffer *ringbuf,
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 3b3aecb..e4e5208 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2373,20 +2373,33 @@ int intel_ring_idle(struct intel_engine_cs *ring)
+ int
+ intel_ring_alloc_seqno(struct intel_engine_cs *ring)
+ {
+-	if (ring->outstanding_lazy_seqno)
++	int ret;
++	struct drm_i915_gem_request *request;
++
++	/* XXX: The aim is to replace seqno values with request structures.
++	 * A step along the way is to switch to using the PLR in preference
++	 * to the OLS. That requires the PLR to only be valid when the OLS
++	 * is also valid. I.e., the two must be kept in step. */
++
++	if (ring->outstanding_lazy_seqno) {
++		WARN_ON(ring->preallocated_lazy_request == NULL);
+ 		return 0;
++	}
+ 
+-	if (ring->preallocated_lazy_request == NULL) {
+-		struct drm_i915_gem_request *request;
++	WARN_ON(ring->preallocated_lazy_request != NULL);
+ 
+-		request = kmalloc(sizeof(*request), GFP_KERNEL);
+-		if (request == NULL)
+-			return -ENOMEM;
++	request = kmalloc(sizeof(*request), GFP_KERNEL);
++	if (request == NULL)
++		return -ENOMEM;
+ 
+-		ring->preallocated_lazy_request = request;
++	ret = i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
++	if (ret) {
++		kfree(request);
++		return ret;
+ 	}
+ 
+-	return i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
++	ring->preallocated_lazy_request = request;
++	return 0;
+ }
+ 
+ static int __intel_ring_prepare(struct intel_engine_cs *ring,
+-- 
+1.7.9.5
+

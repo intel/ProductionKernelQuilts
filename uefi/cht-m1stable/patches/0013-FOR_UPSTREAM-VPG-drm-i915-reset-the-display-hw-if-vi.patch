@@ -1,0 +1,168 @@
+From 69564c02f9530bf5db619ea74c949b10e5b489d1 Mon Sep 17 00:00:00 2001
+Message-Id: <69564c02f9530bf5db619ea74c949b10e5b489d1.1421830309.git.chang-joon.lee@intel.com>
+In-Reply-To: <49dde4951ccd12ce81e60aed3b24793e0ac12fed.1421830308.git.chang-joon.lee@intel.com>
+References: <49dde4951ccd12ce81e60aed3b24793e0ac12fed.1421830308.git.chang-joon.lee@intel.com>
+From: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+Date: Wed, 22 Oct 2014 14:41:42 +0530
+Subject: [PATCH 13/17] FOR_UPSTREAM [VPG]: drm/i915: reset the display hw if
+ vid mode to cmd mode
+
+reset the display hardware if video mode to command mode transition has
+to be done in MIPI display. otherwise command mode will not work.
+
+Issue: GMINL-1644
+Change-Id: Ie60c37d124ec39316705d7d54fd57daa1a830f9f
+Signed-off-by: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    3 ++
+ drivers/gpu/drm/i915/intel_display.c |   81 ++++++++++++++++++++++++++--------
+ drivers/gpu/drm/i915/intel_dsi.c     |    6 +++
+ 3 files changed, 71 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 10796a7..c0cafcb 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1878,6 +1878,9 @@ struct drm_i915_private {
+ 		void (*stop_ring)(struct intel_engine_cs *ring);
+ 	} gt;
+ 
++
++	bool video_disabled;
++
+ 	/*
+ 	 * NOTE: This is the dri1/ums dungeon, don't add stuff here. Your patch
+ 	 * will be rejected. Instead look for a better place.
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index ffb6360..0b9521c 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5573,6 +5573,25 @@ static void i9xx_crtc_enable(struct drm_crtc *crtc)
+ 	i9xx_check_fifo_underruns(dev);
+ }
+ 
++/* Disable the VGA plane that we never use */
++static void i915_disable_vga(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u8 sr1;
++	u32 vga_reg = i915_vgacntrl_reg(dev);
++
++	/* WaEnableVGAAccessThroughIOPort:ctg,elk,ilk,snb,ivb,vlv,hsw */
++	vga_get_uninterruptible(dev->pdev, VGA_RSRC_LEGACY_IO);
++	outb(SR01, VGA_SR_INDEX);
++	sr1 = inb(VGA_SR_DATA);
++	outb(sr1 | 1<<5, VGA_SR_DATA);
++	vga_put(dev->pdev, VGA_RSRC_LEGACY_IO);
++	udelay(300);
++
++	I915_WRITE(vga_reg, VGA_DISP_DISABLE);
++	POSTING_READ(vga_reg);
++}
++
+ static void i9xx_pfit_disable(struct intel_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->base.dev;
+@@ -5597,6 +5616,8 @@ static void i9xx_crtc_disable(struct drm_crtc *crtc)
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct intel_encoder *encoder;
+ 	int pipe = intel_crtc->pipe;
++	bool all_pipe_disabled;
++	u32 val;
+ 
+ 	if (!intel_crtc->active)
+ 		return;
+@@ -5667,6 +5688,47 @@ static void i9xx_crtc_disable(struct drm_crtc *crtc)
+ 	intel_edp_psr_update(dev);
+ 	intel_update_drrs(dev);
+ 	mutex_unlock(&dev->struct_mutex);
++
++	all_pipe_disabled = true;
++	for_each_pipe(pipe) {
++		if ((I915_READ(PIPECONF(pipe)) &
++				PIPECONF_ENABLE) == PIPECONF_ENABLE)
++			all_pipe_disabled = false;
++	}
++
++	if ((all_pipe_disabled == true) &&
++				(dev_priv->video_disabled == true)) {
++
++		/*
++		 * to switch from video mode to command mode, need to reset
++		 * the display.
++		 * FIXME: Even after resetting the display, the first modeset
++		 * works sporadically(2 out of 3 times). Need to fix this.
++		 * FIXME: Need to find a better way of doing this, because
++		 * resetting the display resets all the registers in the
++		 * display controller. Need to save and restore some of these
++		 * required registers.
++		 */
++		DRM_DEBUG_KMS("vid mode to cmd mode, reset display\n");
++		if (IS_CHERRYVIEW(dev)) {
++			val = vlv_punit_read(dev_priv, PUNIT_REG_DSPFREQ);
++			val = val | DP_SSC_PWR_GATE(0);
++			vlv_punit_write(dev_priv, PUNIT_REG_DSPFREQ, val);
++
++			/* delay to power gate display controller */
++			udelay(5000);
++
++			val = vlv_punit_read(dev_priv, PUNIT_REG_DSPFREQ);
++			val = val & ~((u32)DP_SSC_MASK(0));
++			vlv_punit_write(dev_priv, PUNIT_REG_DSPFREQ, val);
++
++			/* delay to power on display controller */
++			udelay(10000);
++		} else
++			DRM_ERROR("vid mode to cmd mode reset is not done.\n");
++
++		i915_disable_vga(dev_priv->dev);
++	}
+ }
+ 
+ static void i9xx_crtc_off(struct drm_crtc *crtc)
+@@ -13437,25 +13499,6 @@ static void intel_init_quirks(struct drm_device *dev)
+ 	}
+ }
+ 
+-/* Disable the VGA plane that we never use */
+-static void i915_disable_vga(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	u8 sr1;
+-	u32 vga_reg = i915_vgacntrl_reg(dev);
+-
+-	/* WaEnableVGAAccessThroughIOPort:ctg,elk,ilk,snb,ivb,vlv,hsw */
+-	vga_get_uninterruptible(dev->pdev, VGA_RSRC_LEGACY_IO);
+-	outb(SR01, VGA_SR_INDEX);
+-	sr1 = inb(VGA_SR_DATA);
+-	outb(sr1 | 1<<5, VGA_SR_DATA);
+-	vga_put(dev->pdev, VGA_RSRC_LEGACY_IO);
+-	udelay(300);
+-
+-	I915_WRITE(vga_reg, VGA_DISP_DISABLE);
+-	POSTING_READ(vga_reg);
+-}
+-
+ void intel_modeset_init_hw(struct drm_device *dev)
+ {
+ 	intel_prepare_ddi(dev);
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index ca8a338..f750b83 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -438,6 +438,12 @@ static void intel_dsi_port_disable(struct intel_encoder *encoder)
+ 
+ 	wait_for_dsi_fifo_empty(intel_dsi);
+ 
++	dev_priv->video_disabled = false;
++
++	if (is_cmd_mode(intel_dsi) &&
++			(I915_READ(MIPI_PORT_CTRL(pipe)) & DPI_ENABLE))
++		dev_priv->video_disabled = true;
++
+ 	if (pipe && IS_CHERRYVIEW(dev_priv->dev) && STEP_TO(STEP_B3)) {
+ 		/* cht hw issue that MIPI port C reg cannot be read */
+ 		I915_WRITE(MIPI_PORT_CTRL(pipe), 0);
+-- 
+1.7.9.5
+

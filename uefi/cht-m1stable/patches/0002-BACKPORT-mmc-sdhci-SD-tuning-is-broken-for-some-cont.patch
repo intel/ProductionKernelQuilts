@@ -1,0 +1,113 @@
+From 91a536b6980d4b05e6ea057ae1eb69375798843e Mon Sep 17 00:00:00 2001
+From: Al Cooper <alcooperx@gmail.com>
+Date: Fri, 12 Sep 2014 11:15:26 +0800
+Subject: [PATCH 02/18] BACKPORT: mmc: sdhci: SD tuning is broken for some
+ controllers
+
+The SD Host Controller spec states that the SD Host Controller can
+request that the driver send up to 40 CMD19's while doing tuning
+and that the total time the card spends responding must be < 150ms.
+The sdhci_execute_tuning() function in sdhci.c that loops through
+sending the CMD19's has multiple bugs. First it sets a "timeout"
+variable to 150 and a loop counter variable to 40. It then decrements
+both variables by 1 at the end of each loop. It tries to handle
+violations of the count and time by doing a break when BOTH variables
+are equal to zero, which can never happen because they we set to
+different values and decremented by 1 at the same time. The timeout
+variable is not based on time at all and is totally useless.
+The routine also considers a loop counter of zero to be an error
+which means that any controller that requests the max of 40 CMD19s
+will cause tuning to fail and be disabled.
+
+I've fixed these issues by allowing up to 40 CMD19's and I've removed
+any attempt to handle the 150ms time limit. Removing timeout checking
+seems safe here because each CMD19 is timeout protected and the max
+loop counters insures we don't loop forever. Adding timeout checking
+would not be as simple as snapping the time at the loop start and
+checking for 150ms to pass because the loop queues the CMD19's and
+uses events to wait for completion so the time would include
+all the normal scheduler latencies.
+
+Signed-off-by: Al Cooper <alcooperx@gmail.com>
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Signed-off-by: Chris Ball <chris@printf.net>
+
+Change-Id: I7e4de335ca4e16e3eaeb9bb578ecf137cc8dddc0
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+---
+ drivers/mmc/host/sdhci.c |   24 +++++++++---------------
+ 1 file changed, 9 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index 72cae718785f..21757de186d8 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -1886,7 +1886,6 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 	u16 ctrl;
+ 	u32 ier;
+ 	int tuning_loop_counter = MAX_TUNING_LOOP;
+-	unsigned long timeout;
+ 	int err = 0;
+ 	bool requires_tuning_nonuhs = false;
+ 	unsigned long flags;
+@@ -1948,14 +1947,10 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 	 * Issue CMD19 repeatedly till Execute Tuning is set to 0 or the number
+ 	 * of loops reaches 40 times or a timeout of 150ms occurs.
+ 	 */
+-	timeout = 150;
+ 	do {
+ 		struct mmc_command cmd = {0};
+ 		struct mmc_request mrq = {NULL};
+ 
+-		if (!tuning_loop_counter && !timeout)
+-			break;
+-
+ 		cmd.opcode = opcode;
+ 		cmd.arg = 0;
+ 		cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
+@@ -1963,6 +1958,9 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 		cmd.data = NULL;
+ 		cmd.error = 0;
+ 
++		if (tuning_loop_counter-- == 0)
++			break;
++
+ 		mrq.cmd = &cmd;
+ 		host->mrq = &mrq;
+ 
+@@ -2035,8 +2033,6 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 		host->tuning_done = 0;
+ 
+ 		ctrl = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+-		tuning_loop_counter--;
+-		timeout--;
+ 
+ 		/* eMMC spec does not require a delay between tuning cycles */
+ 		if (opcode == MMC_SEND_TUNING_BLOCK)
+@@ -2047,17 +2043,15 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 	 * The Host Driver has exhausted the maximum number of loops allowed,
+ 	 * so use fixed sampling frequency.
+ 	 */
+-	if (!tuning_loop_counter || !timeout) {
++	if (tuning_loop_counter < 0) {
+ 		ctrl &= ~SDHCI_CTRL_TUNED_CLK;
+ 		sdhci_writew(host, ctrl, SDHCI_HOST_CONTROL2);
+ 		err = -EIO;
+-	} else {
+-		if (!(ctrl & SDHCI_CTRL_TUNED_CLK)) {
+-			pr_info(DRIVER_NAME ": Tuning procedure"
+-				" failed, falling back to fixed sampling"
+-				" clock\n");
+-			err = -EIO;
+-		}
++	}
++	if (!(ctrl & SDHCI_CTRL_TUNED_CLK)) {
++		pr_info(DRIVER_NAME ": Tuning procedure"
++			" failed, falling back to fixed sampling"
++			" clock\n");
+ 	}
+ 
+ out:
+-- 
+1.7.9.5
+

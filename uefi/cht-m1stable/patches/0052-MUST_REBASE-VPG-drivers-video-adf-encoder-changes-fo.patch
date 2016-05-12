@@ -1,0 +1,1128 @@
+From 8bd7615ee6af0ac361183094cf2a682b72d33d30 Mon Sep 17 00:00:00 2001
+Message-Id: <8bd7615ee6af0ac361183094cf2a682b72d33d30.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: "Thulasimani, Sivakumar" <sivakumar.thulasimani@intel.com>
+Date: Wed, 28 Jan 2015 21:15:14 +0530
+Subject: [PATCH 52/95] MUST_REBASE [VPG]: drivers/video/adf: encoder changes
+ for eDP/DP
+
+This patch adds encoder code to handle eDP/DP, with the following
+ design
+1) all communications with panel happening in dp_panel
+2) generic modeset and dpms routines in gen_dp_pipe
+3) enumerating dp encoder in vlv_dc_config
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5485
+Change-Id: Ib0236b3b0c79ab4f8a9fd51baa46e067d7fdc863
+Signed-off-by: Thulasimani, Sivakumar <sivakumar.thulasimani@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+---
+ drivers/video/adf/intel/core/common/Makefile       |    1 +
+ drivers/video/adf/intel/core/common/dp/Makefile    |    5 +
+ drivers/video/adf/intel/core/common/dp/dp_panel.c  |  425 +++++++++++++++
+ .../video/adf/intel/core/common/dp/gen_dp_pipe.c   |  541 ++++++++++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_dc_config.c   |   16 +
+ .../adf/intel/include/core/common/dp/dp_panel.h    |    2 +-
+ .../adf/intel/include/core/intel_platform_config.h |   25 +-
+ 7 files changed, 1013 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/common/dp/Makefile
+ create mode 100644 drivers/video/adf/intel/core/common/dp/dp_panel.c
+ create mode 100644 drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c
+
+diff --git a/drivers/video/adf/intel/core/common/Makefile b/drivers/video/adf/intel/core/common/Makefile
+index c5fe1d8..31b00f7 100644
+--- a/drivers/video/adf/intel/core/common/Makefile
++++ b/drivers/video/adf/intel/core/common/Makefile
+@@ -7,3 +7,4 @@ obj-y 			+= intel_adf_events.o
+ 
+ obj-y			+= dsi/
+ obj-y			+= hdmi/
++obj-y			+= dp/
+diff --git a/drivers/video/adf/intel/core/common/dp/Makefile b/drivers/video/adf/intel/core/common/dp/Makefile
+new file mode 100644
+index 0000000..2ac0037
+--- /dev/null
++++ b/drivers/video/adf/intel/core/common/dp/Makefile
+@@ -0,0 +1,5 @@
++# Makefile for Intel display driver based on ADF framework
++ccflags-y := -Idrivers/staging/ -Iinclude/adf -Iinclude/uapi/adf -Idrivers/video/adf/intel/include -Werror
++
++obj-y = gen_dp_pipe.o \
++	dp_panel.o
+diff --git a/drivers/video/adf/intel/core/common/dp/dp_panel.c b/drivers/video/adf/intel/core/common/dp/dp_panel.c
+new file mode 100644
+index 0000000..148f967
+--- /dev/null
++++ b/drivers/video/adf/intel/core/common/dp/dp_panel.c
+@@ -0,0 +1,425 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Create on 15 Dec 2014
++ * Author: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
++ */
++
++#include <core/intel_platform_config.h>
++#include <core/common/hdmi/gen_hdmi_pipe.h>
++#include <core/common/dp/gen_dp_pipe.h>
++#include <core/common/dp/dp_panel.h>
++
++#define EDID_LENGTH 128
++
++
++#ifdef DP_USE_FALLBACK_EDID
++static u8 raw_edid[] = {
++0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x10, 0xAC,
++0x73, 0x40, 0x4C, 0x36, 0x33, 0x37, 0x24, 0x16, 0x01, 0x04,
++0xA5, 0x33, 0x1D, 0x78, 0x3B, 0xDD, 0x45, 0xA3, 0x55, 0x4F,
++0xA0, 0x27, 0x12, 0x50, 0x54, 0xA5, 0x4B, 0x00, 0x71, 0x4F,
++0x81, 0x80, 0xD1, 0xC0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++0x01, 0x01, 0x01, 0x01, 0x02, 0x3A, 0x80, 0x18, 0x71, 0x38,
++0x2D, 0x40, 0x58, 0x2C, 0x45, 0x00, 0xFE, 0x1F, 0x11, 0x00,
++0x00, 0x1E, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x57, 0x4D, 0x59,
++0x4A, 0x57, 0x32, 0x39, 0x37, 0x37, 0x33, 0x36, 0x4C, 0x0A,
++0x00, 0x00, 0x00, 0xFC, 0x00, 0x44, 0x45, 0x4C, 0x4C, 0x20,
++0x55, 0x32, 0x33, 0x31, 0x32, 0x48, 0x4D, 0x0A, 0x00, 0x00,
++0x00, 0xFD, 0x00, 0x38, 0x4C, 0x1E, 0x53, 0x11, 0x00, 0x0A,
++0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x98,
++};
++
++#endif
++
++void dp_panel_copy_data_from_monitor(struct dp_panel *panel,
++	struct hdmi_monitor *monitor)
++{
++	struct drm_mode_modeinfo *probed_modes = NULL;
++	struct hdmi_mode_info *t, *mode;
++	int count = 0;
++
++	if (!monitor) {
++		pr_err("%s: invalid pointer passed\n", __func__);
++		return;
++	}
++
++	memcpy(&panel->eld, monitor->eld, sizeof(panel->eld));
++	panel->is_hdmi = monitor->is_hdmi;
++	panel->has_audio = monitor->has_audio;
++
++	panel->probed_modes = monitor->probed_modes;
++	panel->preferred_mode = monitor->preferred_mode;
++	panel->screen_width_mm = monitor->screen_width_mm;
++	panel->screen_height_mm = monitor->screen_height_mm;
++	panel->video_code = monitor->video_code;
++	panel->no_probed_modes = monitor->no_probed_modes;
++
++	probed_modes = kzalloc(monitor->no_probed_modes *
++			sizeof(struct drm_mode_modeinfo), GFP_KERNEL);
++	if (!probed_modes) {
++		pr_err("%s OOM\n", __func__);
++		return;
++	}
++
++	list_for_each_entry_safe(mode, t, &monitor->probed_modes, head) {
++		memcpy(&probed_modes[count], &mode->drm_mode,
++				sizeof(struct drm_mode_modeinfo));
++		if (++count == monitor->no_probed_modes)
++			break;
++	}
++
++	/* Update list */
++	panel->modelist = probed_modes;
++}
++
++bool dp_panel_probe(struct dp_panel *panel, struct intel_pipeline *pipeline)
++{
++	/* bool live_status = false; */
++	struct hdmi_monitor *monitor = NULL;
++	struct i2c_adapter *adapter = vlv_get_i2c_adapter(pipeline);
++
++	panel->edid = get_edid(adapter);
++	if (!panel->edid) {
++		pr_err("%s:Failed to read EDID\n", __func__);
++#ifdef DP_USE_FALLBACK_EDID
++		panel->edid = kzalloc(EDID_LENGTH, GFP_KERNEL);
++		if (!panel->edid) {
++			pr_err("%s: OOM(EDID)\n", __func__);
++			return false;
++		}
++
++		/* Fallback to hard coded EDID */
++		memcpy(panel->edid, raw_edid, EDID_LENGTH);
++		pr_err("%s:falback EDID loaded\n", __func__);
++#else
++		/* live_status = false; */
++#endif
++	}
++
++	/*
++	 * HACK: to avoid duplication of edid parser logic,
++	 * current edid parser takes hdmi_monitor only so call it with
++	 * dummy pointer and copy the values if panel is detected
++	 */
++	monitor = intel_adf_hdmi_get_monitor(panel->edid);
++	if (!monitor) {
++		pr_err("%s: Failed mode parsing monitor\n", __func__);
++		kfree(panel->edid);
++		return false;
++	}
++
++	dp_panel_copy_data_from_monitor(panel, monitor);
++	kfree(monitor);
++	pr_info("%s: DP Connected\n", __func__);
++
++	return true;
++}
++
++
++#define DP_LINK_ALIGNED (1 << 3)
++
++static u32 dp_panel_get_dpcd(struct dp_panel *panel, u32 address,
++			u8 *buffer, u32 size)
++{
++	struct intel_pipeline *pipeline = panel->pipeline;
++	struct dp_aux_msg msg = {0};
++	u32 err;
++
++	/* read dpcd aux or i2c */
++	msg.address = address;
++	msg.request = DP_AUX_NATIVE_READ;
++	msg.buffer = buffer;
++	msg.size = (size_t) size;
++	err = vlv_aux_transfer(pipeline, &msg);
++
++	return err;
++}
++
++u32 dp_panel_set_dpcd(struct dp_panel *panel, u32 address,
++			u8 *buffer, u32 size)
++{
++	struct intel_pipeline *pipeline = panel->pipeline;
++	struct dp_aux_msg msg = {0};
++	u32 err;
++
++	/* write dpcd aux or i2c */
++	msg.address = address;
++	msg.request = DP_AUX_NATIVE_WRITE;
++	msg.buffer = buffer;
++	msg.size = (size_t) size;
++	err = vlv_aux_transfer(pipeline, &msg);
++
++	return err;
++}
++
++u32 dp_panel_get_max_link_bw(struct dp_panel *panel)
++{
++	u8 link_rate = 0;
++
++	if (panel->dpcd_start[DP_MAX_LINK_RATE] == 0) {
++		dp_panel_get_dpcd(panel, DP_MAX_LINK_RATE, &link_rate, 1);
++		panel->dpcd_start[DP_MAX_LINK_RATE] = link_rate;
++	} else
++		link_rate = panel->dpcd_start[DP_MAX_LINK_RATE];
++
++	if (link_rate > DP_LINK_BW_2_7) {
++		pr_err("limiting link bw to HBR from HBR2\n");
++		link_rate = DP_LINK_BW_2_7;
++	}
++
++	return link_rate;
++}
++
++u32 dp_panel_get_max_lane_count(struct dp_panel *panel)
++{
++	u8 lane_count = 0;
++	if (panel->dpcd_start[DP_MAX_LANE_COUNT] == 0) {
++		dp_panel_get_dpcd(panel, DP_MAX_LANE_COUNT, &lane_count, 1);
++		panel->dpcd_start[DP_MAX_LANE_COUNT] = lane_count;
++	} else
++		lane_count = panel->dpcd_start[DP_MAX_LANE_COUNT];
++
++	lane_count &= DP_MAX_LANE_COUNT_MASK;
++
++	return lane_count;
++}
++
++static bool dp_panel_set_vswing_premp(struct dp_panel *panel,
++	struct link_params *params, bool max_vswing, bool max_preemp)
++{
++	u8 lane_set[4] = {0};
++	int i = 0;
++
++	for (i = 0; i < params->lane_count ; i++) {
++
++		/* update vsync and preemp based on dp spec offsets */
++		lane_set[i] = params->vswing;
++		lane_set[i] |= ((max_vswing) ? 1 : 0) << 2;
++		lane_set[i] |= params->preemp << DP_TRAIN_PRE_EMPHASIS_SHIFT;
++		lane_set[i] |= ((max_preemp) ? 1 : 0) << 5;
++	}
++
++	/* program vswing and preemp to dpcd*/
++	return dp_panel_set_dpcd(panel, DP_TRAINING_LANE0_SET,
++			lane_set, params->lane_count);
++}
++
++static u32 dp_panel_get_link_status(struct dp_panel *panel,
++	struct link_params *params)
++{
++	u32 link_status;
++	u8 ret_status = 0, temp = 0;
++	u8 val = 0, i = 0;
++
++	/* read dpcd */
++	dp_panel_get_dpcd(panel, DP_LANE0_1_STATUS, (u8 *)&link_status, 3);
++
++	/* return value must be OR of all lanes */
++	for (i = 0; i < params->lane_count; i++) {
++		val = (u8)(link_status >> (i * 4));
++		val = val & 0xF;
++		temp = (DP_LANE_CR_DONE & val);
++		temp |= (DP_LANE_CHANNEL_EQ_DONE & val);
++		temp |= (DP_LANE_SYMBOL_LOCKED & val);
++		if (i == 0)
++			ret_status = temp;
++		ret_status &= temp;
++	}
++
++	/* get dpcd 204 */
++	val = (u8)(link_status >> 16);
++	if (val & DP_INTERLANE_ALIGN_DONE)
++		ret_status |= DP_LINK_ALIGNED;
++
++	return ret_status;
++}
++
++static bool dp_panel_train(struct dp_panel *panel,
++			struct link_params *params, bool eq)
++{
++	u8 train_pattern = DP_TRAINING_PATTERN_1 | DP_LINK_SCRAMBLING_DISABLE;
++	bool max_vswing_reached = false;
++	bool max_preemp_reached = false;
++	enum vswing_level vswing = e0_4;
++	u32 i = 0;
++	u32 link_status = 0;
++	bool ret = false;
++
++	if (eq == true) {
++		/* if eq write TP2/TP3 to port and dpcd */
++		if (params->link_bw == DP_LINK_BW_5_4)
++			train_pattern = DP_TRAINING_PATTERN_3 |
++					DP_LINK_SCRAMBLING_DISABLE;
++		else
++			train_pattern = DP_TRAINING_PATTERN_2 |
++					DP_LINK_SCRAMBLING_DISABLE;
++	}
++
++	/* write TP to port and dpcd */
++	vlv_set_link_pattern(panel->pipeline, train_pattern);
++	dp_panel_set_dpcd(panel, DP_TRAINING_PATTERN_SET, &train_pattern, 1);
++
++	for (i = 0; i < 5 && max_vswing_reached == false; i++) {
++		if (vswing != params->vswing) {
++			/* reset counter for new voltage */
++			i = 0;
++			vswing = params->vswing;
++		}
++		max_preemp_reached = false;
++		max_vswing_reached = false;
++
++		/* if max voltage is reached try once */
++		if (params->preemp >= panel->max_preemp)
++			max_preemp_reached = true;
++
++		if (params->vswing >= panel->max_vswing)
++			max_vswing_reached = true;
++
++		/* write vswing and preemp to port / dpcd */
++		vlv_set_signal_levels(panel->pipeline, params);
++		dp_panel_set_vswing_premp(panel, params,
++			max_vswing_reached, max_preemp_reached);
++
++		/* wait for delay */
++		if (eq == false)
++			mdelay(100);
++		else
++			mdelay(400);
++
++		/* read CR */
++		link_status = dp_panel_get_link_status(panel, params);
++		if ((link_status & DP_LANE_CR_DONE) != 0) {
++			if (eq == false) {
++				/* this call was for CR alone , so exit */
++				ret = true;
++				break;
++			}
++		} else if (eq == true) {
++			/* this was for EQ, CR should not fail, exit */
++			ret = false;
++			break;
++		}
++
++		/* if call was for eq check EQ, symbol locked & aligned */
++		if (eq == true) {
++			if ((link_status & DP_LANE_CHANNEL_EQ_DONE) &&
++				(link_status & DP_LANE_SYMBOL_LOCKED) &&
++				(link_status & DP_LINK_ALIGNED)) {
++				ret = true;
++				break;
++			}
++			/* some thing failed :( retry */
++		}
++
++		/* read parms requested by panel */
++		vlv_get_adjust_train(panel->pipeline, params);
++	} /* for */
++
++	return ret;
++}
++
++bool dp_panel_fast_link_train(struct dp_panel *panel,
++		struct link_params *params)
++{
++	return false;
++}
++
++bool dp_panel_train_link(struct dp_panel *panel, struct link_params *params)
++{
++	u8 link_config[2];
++	bool ret = false;
++	u8 tmp = 1, i;
++	u32 err = 0;
++
++	for (i = 0; i < 3; i++) {
++		err = dp_panel_set_dpcd(panel, DP_SET_POWER, &tmp, 1);
++		if (err == 1)
++			break;
++		mdelay(1);
++	}
++
++	link_config[0] = params->link_bw;
++	link_config[1] = (params->lane_count | (1 << 7));
++
++	/* write link bw and lane count */
++	dp_panel_set_dpcd(panel, DP_LINK_BW_SET, link_config, 2);
++
++	/* write downspread ctrl */
++	link_config[0] = 0;
++	link_config[1] = DP_SET_ANSI_8B10B;
++	dp_panel_set_dpcd(panel, DP_DOWNSPREAD_CTRL, link_config, 2);
++
++	/* start with lowest vswing & preemp */
++	params->preemp = e0dB;
++	params->vswing = e0_4;
++
++	/* check for CR alone */
++	ret = dp_panel_train(panel, params, false);
++	if (ret == false) {
++		pr_err("%s:%d CR Failed\n", __func__, __LINE__);
++		goto err;
++	}
++
++	/* check for CR and EQ */
++	ret = dp_panel_train(panel, params, true);
++	if (ret == false) {
++		pr_err("%s:%d EQ failed\n", __func__, __LINE__);
++		goto err;
++	}
++
++	link_config[0] = DP_TRAINING_PATTERN_DISABLE;
++	dp_panel_set_dpcd(panel, DP_TRAINING_PATTERN_SET,
++			link_config, 1);
++	vlv_set_link_pattern(panel->pipeline,
++			DP_PORT_IDLE_PATTERN_SET);
++	vlv_set_link_pattern(panel->pipeline,
++			DP_TRAINING_PATTERN_DISABLE);
++
++err:
++	return ret;
++
++}
++
++/* dp_panel_init : assume that panel is connected when called */
++bool dp_panel_init(struct dp_panel *panel, struct intel_pipeline *pipeline)
++{
++	u32 err = 0;
++
++	panel->pipeline = pipeline;
++	vlv_get_max_vswing_preemp(pipeline, &panel->max_vswing,
++			&panel->max_preemp);
++
++	/* read first 11 bytes from DPCD */
++	err = dp_panel_get_dpcd(panel, DP_DPCD_REV,
++			(u8 *)panel->dpcd_start, 11);
++	pr_err("Received %d bytes for start panel %x %x\n", err,
++			panel->dpcd_start[0], panel->dpcd_start[1]);
++
++	return true;
++}
++
++bool dp_panel_destroy(struct dp_panel *panel)
++{
++	kfree(panel->edid);
++	panel->edid = NULL;
++	kfree(panel->modelist);
++	panel->modelist = NULL;
++
++	panel->preferred_mode = NULL;
++	panel->screen_width_mm = 0;
++	panel->screen_height_mm = 0;
++	panel->video_code = 0;
++	panel->no_probed_modes = 0;
++
++	return true;
++}
+diff --git a/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c b/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c
+new file mode 100644
+index 0000000..64dec1f
+--- /dev/null
++++ b/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c
+@@ -0,0 +1,541 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Created on 15 Dec 2014
++ * Author: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
++ */
++
++#include <drm/i915_adf.h>
++#include <core/common/dp/gen_dp_pipe.h>
++#include <core/intel_platform_config.h>
++
++#define  DATA_LINK_M_N_MASK     (0xffffff)
++#define  DATA_LINK_N_MAX        (0x800000)
++
++#define LINK_TO_DOT_CLK(x) ((x) * 27 * 1000)
++#define BITS_PER_BYTE		8
++
++static void compute_m_n(u32 m, u32 n,
++		u32 *ret_m, u32 *ret_n)
++{
++	*ret_n = min_t(u32, roundup_pow_of_two(n), DATA_LINK_N_MAX);
++	*ret_m = div_u64((uint64_t) m * *ret_n, n);
++	while (*ret_m > DATA_LINK_M_N_MASK ||
++		*ret_n > DATA_LINK_M_N_MASK) {
++		*ret_m >>= 1;
++		*ret_n >>= 1;
++	}
++}
++
++static void dp_pipe_compute_m_n(u32 bits_per_pixel, u32 nlanes,
++		u32 pixel_clock, u32 link_clock, struct intel_link_m_n *m_n)
++{
++	m_n->tu = 64;
++
++	/* link rate was passed so convert to link clock */
++	link_clock = LINK_TO_DOT_CLK(link_clock);
++	pr_info("bpp = %x, lanes = %x, pixel_clock = %x, link_clock = %x\n",
++			bits_per_pixel, nlanes, pixel_clock, link_clock);
++
++	compute_m_n(bits_per_pixel * pixel_clock,
++			link_clock * nlanes * BITS_PER_BYTE,
++			&m_n->gmch_m, &m_n->gmch_n);
++	compute_m_n(pixel_clock, link_clock,
++			&m_n->link_m, &m_n->link_n);
++}
++
++static void dp_pipe_get_current_mode(struct intel_pipe *pipe,
++		struct drm_mode_modeinfo *mode)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++
++	if (dp_pipe->current_mode.clock == 0)
++		return;
++
++	if (!mode)
++		pr_err("%s: null pointer passed\n", __func__);
++	else
++		*mode = dp_pipe->current_mode;
++}
++
++static bool get_next_link_params(struct dp_panel *panel,
++		struct link_params *params, u32 dotclock)
++{
++	bool found = false;
++	u32 link_bw = 0;
++	u32 link_clock = 0, lane_count = 0;
++	u64 bw_available = 0, dotclock_req = 0;
++
++	if (params->link_bw == 0) {
++		/* start with max bw */
++		link_bw = params->link_bw = dp_panel_get_max_link_bw(panel);
++		params->lane_count = dp_panel_get_max_lane_count(panel);
++	} else {
++		/* get the next lower link rate */
++		switch (params->link_bw) {
++		case DP_LINK_BW_1_62:
++			pr_err("%s:Already tried lowest link rate\n", __func__);
++			return false;
++		case DP_LINK_BW_2_7:
++			link_bw = DP_LINK_BW_1_62;
++			break;
++		case DP_LINK_BW_5_4:
++			link_bw = DP_LINK_BW_2_7;
++			break;
++		default:
++			BUG();
++			break;
++		}
++		params->link_bw = link_bw;
++	}
++
++	/* temp to keep the value same */
++	pr_err("%s::TBD optimize lane usage %x %x\n", __func__,
++			params->link_bw, params->lane_count);
++	/*
++	 * FIXME: HACK : Avoiding lane optimization as of now to be
++	 * revisted in future.
++	 */
++	return true;
++
++	/* return the link_rate & lane_count that can drive the dotclock */
++	for (lane_count = 1; lane_count <= params->lane_count;
++		lane_count <<= 1) {
++		link_clock = LINK_TO_DOT_CLK(link_bw);
++		bw_available = (link_clock * lane_count * BITS_PER_BYTE);
++
++		/*
++		 * consider the bpp as well, dotclock is in KHz
++		 * convert to Hz
++		 */
++		dotclock_req = dotclock * params->bpp;
++		if (dotclock_req <= bw_available) {
++			params->link_bw = link_bw;
++			params->lane_count = lane_count;
++			found = true;
++			break;
++		}
++	}
++
++	pr_err("%s: get %d %d\n", __func__, params->link_bw,
++		params->lane_count);
++}
++
++void dp_pipe_dump_modes(struct drm_mode_modeinfo *modelist, u32 n_modes)
++{
++	u32 i = 0;
++	struct drm_mode_modeinfo *modeinfo = modelist;
++	for (i = 0; i < n_modes; i++) {
++		pr_info("Mode::%d-%d-%d-%d-%d-%d-%d-%d-%d-%d\n",
++			modeinfo->clock, modeinfo->hdisplay,
++			modeinfo->hsync_start, modeinfo->hsync_end,
++			modeinfo->htotal, modeinfo->vdisplay,
++			modeinfo->vsync_start, modeinfo->vsync_end,
++			modeinfo->vtotal, modeinfo->vrefresh);
++		modeinfo++;
++	}
++}
++
++static int dp_pipe_modeset(struct intel_pipe *pipe,
++		struct drm_mode_modeinfo *mode)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dp_pipe->pipeline;
++	struct intel_link_m_n m_n = {0};
++	struct link_params *params;
++	bool ret = false, err = 0;
++	u8 dpcdval = 1;
++	u32 dotclock = mode->clock;
++	u32 bpp = 0;
++
++	params = &dp_pipe->link_params;
++	params->link_bw = 0;
++	params->lane_count = 0;
++
++	/* Avoid duplicate modesets */
++	if (dp_pipe->dpms_state == DRM_MODE_DPMS_ON)
++		goto modeset_exit;
++
++	pr_err("%s:FIXME: get bpp from edid\n", __func__);
++	bpp = 24;
++	dp_pipe_dump_modes(mode, 1);
++	vlv_dp_backlight_seq(pipeline, false);
++
++	do {
++		/* pps off if edp display */
++		vlv_dp_panel_power_seq(pipeline, false);
++		err = vlv_pipeline_off(pipeline);
++		if (err != 0) {
++			pr_err("%s: pipeline off failed\n", __func__);
++			goto modeset_exit;
++		}
++
++		params->bpp = (u32) bpp;
++		ret = get_next_link_params(&dp_pipe->panel,
++			params, dotclock);
++		if (ret == false) {
++			pr_err("%s: get link params failed\n", __func__);
++			goto modeset_exit;
++		}
++		dp_panel_set_dpcd(&dp_pipe->panel, DP_SET_POWER,
++			&dpcdval, 1);
++
++		dp_pipe_compute_m_n(bpp, params->lane_count, mode->clock,
++			params->link_bw, &m_n);
++		pipeline->params.dp.m_n = &m_n;
++		pipeline->params.dp.lane_count = params->lane_count;
++		pipeline->params.dp.link_bw = params->link_bw;
++		pipeline->params.dp.bpp = bpp;
++		err = vlv_pipeline_on(pipeline, mode);
++		if (err != 0) {
++			pr_err("%s: pipeline on failed\n", __func__);
++			goto modeset_exit;
++		}
++
++		/* pps on if edp display */
++		vlv_dp_panel_power_seq(pipeline, true);
++
++		ret = dp_panel_train_link(&dp_pipe->panel,
++			&dp_pipe->link_params);
++		/* retry with lower linkrate and appropriate lanes if failed */
++	} while (ret == false);
++
++	vlv_dp_backlight_seq(pipeline, true);
++
++	/* Backup the current mode */
++	dp_pipe->dpms_state = DRM_MODE_DPMS_ON;
++	dp_pipe->current_mode = *mode;
++
++modeset_exit:
++	if (!err)
++		pr_debug("%s:ModeSet Success\n", __func__);
++	else
++		pr_err("%s:Modeset failed :(\n", __func__);
++
++	return err;
++}
++
++static int dp_pipe_dpms(struct intel_pipe *pipe, u8 state)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dp_pipe->pipeline;
++	struct drm_mode_modeinfo mode;
++	u32 err = 0;
++
++	pr_err("ADF: %s current_state = %d, requested_state = %d\n",
++			__func__, dp_pipe->dpms_state, state);
++
++	if (dp_pipe->dpms_state == state)
++		return 0;
++
++	switch (state) {
++	case DRM_MODE_DPMS_ON:
++		intel_adf_display_rpm_get();
++		dp_pipe_get_current_mode(pipe, &mode);
++		err = dp_pipe_modeset(pipe, &mode);
++		if (err != 0)
++			goto dpms_exit;
++		break;
++	case DRM_MODE_DPMS_OFF:
++		vlv_dp_backlight_seq(pipeline, false);
++		vlv_dp_panel_power_seq(pipeline, false);
++		err = vlv_pipeline_off(pipeline);
++		if (err != 0)
++			goto dpms_exit;
++		intel_adf_display_rpm_put();
++		break;
++	case DRM_MODE_DPMS_STANDBY:
++	case DRM_MODE_DPMS_SUSPEND:
++	default:
++		pr_debug("%s: unsupported dpms mode\n", __func__);
++		return -EOPNOTSUPP;
++	}
++	dp_pipe->dpms_state = state;
++
++dpms_exit:
++	pr_info("%s::exit:%x\n", __func__, (unsigned int) err);
++	return err;
++}
++
++static bool dp_pipe_is_screen_connected(struct intel_pipe *pipe)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dp_pipe->pipeline;
++	struct dp_panel *panel = &dp_pipe->panel;
++	bool panel_detected = false;
++
++	panel_detected = vlv_is_screen_connected(pipeline);
++	panel_detected = dp_panel_probe(panel, pipeline);
++	if (panel_detected && dp_pipe->panel_present == false) {
++		dp_panel_init(&dp_pipe->panel, pipeline);
++		dp_pipe->panel_present = panel_detected;
++	} else if ((panel_detected == false) && dp_pipe->panel_present) {
++		/* panel removed */
++		dp_pipe->panel_present = false;
++		dp_panel_destroy(&dp_pipe->panel);
++	}
++
++	return panel_detected;
++}
++
++static void dp_pipe_get_modelist(struct intel_pipe *pipe,
++		struct drm_mode_modeinfo **modelist, size_t *n_modes)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct dp_panel *panel = &dp_pipe->panel;
++
++	if (!panel->no_probed_modes) {
++		pr_err("%s call before probe, returning 0 modes\n", __func__);
++		*n_modes = 0;
++		return;
++	}
++
++	*modelist = panel->modelist;
++	*n_modes = panel->no_probed_modes;
++	dp_pipe_dump_modes(*modelist, *n_modes);
++	pr_err("%s done, no_modes=%d\n", __func__, (int)*n_modes);
++}
++
++static void dp_pipe_get_preferred_mode(struct intel_pipe *pipe,
++		struct drm_mode_modeinfo **mode)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++
++	if (dp_pipe->panel.preferred_mode->clock == 0) {
++		pr_err("%s:Panel not detected yet\n", __func__);
++		return;
++	}
++
++	*mode = dp_pipe->panel.preferred_mode;
++	pr_info("ADF: %s: Preferred Mode = %dx%d @%d\n", __func__,
++		(*mode)->hdisplay, (*mode)->vdisplay, (*mode)->vrefresh);
++}
++
++static void dp_pipe_hw_deinit(struct intel_pipe *pipe)
++{
++	pr_err("ADF: %s\n", __func__);
++	return;
++}
++
++static int dp_pipe_hw_init(struct intel_pipe *pipe)
++{
++	pr_err("ADF: %s\n", __func__);
++
++	return 0;
++}
++
++static void dp_pipe_handle_events(struct intel_pipe *pipe, u32 events)
++{
++	return;
++}
++
++static int dp_pipe_set_event(struct intel_pipe *pipe, u16 event, bool enabled)
++{
++	return intel_adf_set_event(pipe, event, enabled);
++}
++
++/*
++ * FIXME: hardware vsync counter failed to work on ANN. use static SW
++ * counter for now.
++ */
++static u32 vsync_counter;
++
++#define VSYNC_COUNT_MAX_MASK 0xffffff
++
++static void dp_pipe_get_events(struct intel_pipe *pipe, u32 *events)
++{
++	intel_adf_get_events(pipe, events);
++
++	/*
++	 * FIXME: should use hardware vsync counter.
++	 */
++	if (*events & INTEL_PIPE_EVENT_VSYNC) {
++		if (++vsync_counter > VSYNC_COUNT_MAX_MASK)
++			vsync_counter = 0;
++	}
++
++}
++
++static int dp_pipe_get_screen_size(struct intel_pipe *pipe,
++		u16 *width_mm, u16 *height_mm)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct dp_panel *panel = &dp_pipe->panel;
++
++	if (dp_pipe->panel_present) {
++		*width_mm = panel->screen_width_mm;
++		*height_mm = panel->screen_height_mm;
++	} else {
++		*width_mm = 0;
++		*height_mm = 0;
++	}
++
++	pr_info("%s: DP Panel hXw=%dX%d\n",
++		__func__, *width_mm, *height_mm);
++	return 0;
++}
++
++static void dp_pipe_on_post(struct intel_pipe *pipe)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dp_pipe->pipeline;
++	struct drm_mode_modeinfo tmp;
++	int num_planes = 0;
++
++	num_planes = vlv_num_planes_enabled(pipeline);
++
++	/* Enable maxfifo if required */
++	if (!pipe->status.maxfifo_enabled && (num_planes == 1)) {
++		vlv_update_maxfifo_status(pipeline, true);
++		pipe->status.maxfifo_enabled = true;
++	}
++	dp_pipe_get_current_mode(pipe, &tmp);
++	vlv_evade_vblank(pipeline, &tmp, &pipe->status.wait_vblank);
++}
++
++static void dp_pipe_pre_validate(struct intel_pipe *pipe,
++		struct intel_adf_post_custom_data *custom)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dp_pipe->pipeline;
++
++	if (custom->n_configs > 1 && pipe->status.maxfifo_enabled) {
++		vlv_update_maxfifo_status(pipeline, false);
++		pipe->status.maxfifo_enabled = false;
++		pipe->status.wait_vblank = true;
++		pipe->status.vsync_counter =
++				pipe->ops->get_vsync_counter(pipe, 0);
++	}
++}
++
++static void dp_pipe_pre_post(struct intel_pipe *pipe)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dp_pipe->pipeline;
++
++	if (pipe->status.wait_vblank && pipe->status.vsync_counter ==
++			pipe->ops->get_vsync_counter(pipe, 0)) {
++		vlv_wait_for_vblank(pipeline);
++		pipe->status.wait_vblank = false;
++	}
++}
++
++static u32 dp_pipe_get_supported_events(struct intel_pipe *pipe)
++{
++	return INTEL_PIPE_EVENT_VSYNC;
++}
++
++u32 dp_pipe_get_vsync_counter(struct intel_pipe *pipe, u32 interval)
++{
++	u32 count = 0;
++	u32 max_count_mask = VSYNC_COUNT_MAX_MASK;
++
++	count = vsync_counter;
++	count |= (~max_count_mask);
++	count += interval;
++	count &= max_count_mask;
++
++	pr_debug("%s: count = %#x\n", __func__, count);
++
++	return count;
++}
++
++static long dp_pipe_dpst_context(struct intel_pipe *pipe, unsigned long arg)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dp_pipe->pipeline;
++	long val = vlv_dpst_context(pipeline, arg);
++
++	return val;
++}
++
++static long dp_pipe_dpst_irq_handler(struct intel_pipe *pipe)
++{
++	struct dp_pipe *dsi_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dsi_pipe->pipeline;
++
++	return vlv_dpst_irq_handler(pipeline);
++
++}
++
++static int dp_set_brightness(struct intel_pipe *pipe, int level)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dp_pipe->pipeline;
++
++	return vlv_dp_set_brightness(pipeline, level);
++}
++
++static int dp_get_brightness(struct intel_pipe *pipe)
++{
++	struct dp_pipe *dp_pipe = to_dp_pipe(pipe);
++	struct intel_pipeline *pipeline = dp_pipe->pipeline;
++	return vlv_dp_get_brightness(pipeline);
++}
++
++static struct intel_pipe_ops dp_base_ops = {
++	.hw_init = dp_pipe_hw_init,
++	.hw_deinit = dp_pipe_hw_deinit,
++	.get_preferred_mode = dp_pipe_get_preferred_mode,
++	.get_current_mode = dp_pipe_get_current_mode,
++	.get_modelist = dp_pipe_get_modelist,
++	.dpms = dp_pipe_dpms,
++	.modeset = dp_pipe_modeset,
++	.get_screen_size = dp_pipe_get_screen_size,
++	.is_screen_connected = dp_pipe_is_screen_connected,
++	.get_supported_events = dp_pipe_get_supported_events,
++	.set_event = dp_pipe_set_event,
++	.get_events = dp_pipe_get_events,
++	.get_vsync_counter = dp_pipe_get_vsync_counter,
++	.handle_events = dp_pipe_handle_events,
++	.pre_validate = dp_pipe_pre_validate,
++	.pre_post = dp_pipe_pre_post,
++	.on_post = dp_pipe_on_post,
++	.dpst_context = dp_pipe_dpst_context,
++	.dpst_irq_handler = dp_pipe_dpst_irq_handler,
++};
++
++u32 dp_pipe_init(struct dp_pipe *dp_pipe, struct device *dev,
++	struct intel_plane *primary_plane, u8 idx,
++	struct intel_pipeline *pipeline, enum intel_pipe_type type)
++{
++	struct intel_pipe *intel_pipe = &dp_pipe->base;
++	u32 err = 0;
++
++	intel_pipe->pipeline = pipeline;
++	dp_pipe->pipeline = pipeline;
++	dp_pipe->panel_present = false;
++	dp_pipe->dpms_state = DRM_MODE_DPMS_OFF;
++
++	/* encoder init  */
++	if (type == INTEL_PIPE_DP) {
++		dp_base_ops.set_brightness = NULL;
++		dp_base_ops.get_brightness = NULL;
++		err = intel_pipe_init(intel_pipe, dev, idx, true,
++			INTEL_PIPE_DP, primary_plane, &dp_base_ops, "dp_pipe");
++	} else {
++		dp_base_ops.set_brightness = dp_set_brightness;
++		dp_base_ops.get_brightness = dp_get_brightness;
++
++		err = intel_pipe_init(intel_pipe, dev, idx, true,
++			INTEL_PIPE_EDP, primary_plane, &dp_base_ops,
++			"edp_pipe");
++	}
++
++	pr_debug("%s: exit :%x\n", __func__, (unsigned int)err);
++	return err;
++}
++
++u32 dp_pipe_destroy(struct dp_pipe *pipe)
++{
++	return 0;
++}
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+index a906870..be09aef 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dc_config.c
+@@ -173,6 +173,7 @@ static int vlv_display_encoder_init(struct vlv_dc_config *vlv_config, int pipe,
+ 				int port, u8 disp_no)
+ {
+ 	struct dsi_pipe *dsi_pipe = NULL;
++	struct dp_pipe *dp_pipe = NULL;
+ 	struct hdmi_pipe *hdmi_pipe = NULL;
+ 	struct intel_pipeline *intel_pipeline;
+ 	struct vlv_pipeline *disp = &vlv_config->pipeline[disp_no];
+@@ -201,7 +202,22 @@ static int vlv_display_encoder_init(struct vlv_dc_config *vlv_config, int pipe,
+ 		/* vlv_dpst_init(&config->base);*/
+ 
+ 		disp->dpst = &vlv_config->dpst;
++	} else if ((disp->type == INTEL_PIPE_DP) ||
++		    (disp->type == INTEL_PIPE_EDP)) {
++		dp_pipe = &disp->gen.dp;
++		intel_pipeline = &disp->base;
++
++		err = dp_pipe_init(dp_pipe, vlv_config->base.dev,
++			&disp->pplane.base, pipe, intel_pipeline, disp->type);
++		if (err) {
++			dev_err(vlv_config->base.dev,
++				"%s: failed to init pipe for DP(%d)\n",
++					__func__, err);
++			return err;
++		}
+ 
++		intel_dc_config_add_pipe(&vlv_config->base,
++			&dp_pipe->base, *n_pipes);
+ 	} else if (disp->type == INTEL_PIPE_HDMI) {
+ 		hdmi_pipe = &disp->gen.hdmi;
+ 		intel_pipeline = &disp->base;
+diff --git a/drivers/video/adf/intel/include/core/common/dp/dp_panel.h b/drivers/video/adf/intel/include/core/common/dp/dp_panel.h
+index c874f17..5cbdf84 100644
+--- a/drivers/video/adf/intel/include/core/common/dp/dp_panel.h
++++ b/drivers/video/adf/intel/include/core/common/dp/dp_panel.h
+@@ -388,7 +388,7 @@ struct dp_panel {
+ 	bool is_hdmi;
+ 	bool has_audio;
+ 
+-	struct list_head probedModes;
++	struct list_head probed_modes;
+ 	struct drm_mode_modeinfo *modelist;
+ 	struct drm_mode_modeinfo *preferred_mode;
+ 
+diff --git a/drivers/video/adf/intel/include/core/intel_platform_config.h b/drivers/video/adf/intel/include/core/intel_platform_config.h
+index 13f567e..75f84eb 100644
+--- a/drivers/video/adf/intel/include/core/intel_platform_config.h
++++ b/drivers/video/adf/intel/include/core/intel_platform_config.h
+@@ -19,7 +19,8 @@
+ #include <linux/module.h>
+ #include <video/intel_adf.h>
+ #include <core/intel_dc_config.h>
+-
++#include <core/common/dp/gen_dp_pipe.h>
++#include <core/common/dp/dp_panel.h>
+ #if defined(CONFIG_ADF)
+ #include <video/adf.h>
+ #endif
+@@ -68,6 +69,28 @@ int vlv_cmd_vc_dcs_read(struct intel_pipeline *pipeline, int channel,
+ int vlv_cmd_vc_generic_read(struct intel_pipeline *pipeline, int channel,
+ 		u8 *reqdata, int reqlen, u8 *buf, int buflen, enum port port);
+ int vlv_cmd_dpi_send_cmd(struct intel_pipeline *pipeline, u32 cmd, bool hs);
++u32 vlv_aux_transfer(struct intel_pipeline *pipeline,
++		struct dp_aux_msg *msg);
++u32 vlv_set_signal_levels(struct intel_pipeline *pipeline,
++		struct link_params *params);
++u32 chv_set_signal_levels(struct intel_pipeline *pipeline,
++		struct link_params *params);
++u32 vlv_set_link_pattern(struct intel_pipeline *pipeline,
++		u8 train_pattern);
++void vlv_get_max_vswing_preemp(struct intel_pipeline *pipeline,
++		enum vswing_level *max_v, enum preemp_level *max_p);
++void vlv_get_adjust_train(struct intel_pipeline *pipeline,
++		struct link_params *params);
++u32 vlv_dp_panel_power_seq(struct intel_pipeline *pipeline,
++		bool enable);
++u32 vlv_dp_backlight_seq(struct intel_pipeline *pipeline,
++		bool enable);
++u32 vlv_dp_get_brightness(struct intel_pipeline *pipeline);
++u32 vlv_dp_set_brightness(struct intel_pipeline *pipeline, int level);
++struct i2c_adapter *vlv_get_i2c_adapter(struct intel_pipeline *pipeline);
++
++u32 vlv_set_event(struct intel_pipeline *pipeline, u32 event, bool enabled);
++u32 vlv_get_event(struct intel_pipeline *pipeline, u32 *event);
+ 
+ /*
+  * Supported configs can be declared here for use inside
+-- 
+1.7.9.5
+

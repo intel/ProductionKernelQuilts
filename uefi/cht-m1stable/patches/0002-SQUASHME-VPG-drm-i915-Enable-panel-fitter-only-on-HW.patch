@@ -1,0 +1,202 @@
+From 202530e44f71a4709fa9cd281467b2cb03143306 Mon Sep 17 00:00:00 2001
+Message-Id: <202530e44f71a4709fa9cd281467b2cb03143306.1426116068.git.feitong.yi@intel.com>
+In-Reply-To: <581bcb8c8802c2b763f5abc462a37e22e0195720.1426116068.git.feitong.yi@intel.com>
+References: <581bcb8c8802c2b763f5abc462a37e22e0195720.1426116068.git.feitong.yi@intel.com>
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Tue, 3 Mar 2015 14:27:59 +0530
+Subject: [PATCH 2/5] SQUASHME! [VPG]: drm/i915: Enable panel fitter only on
+ HWC request
+
+Programming Panel Fitter register frequently is causing pipe hangs. Unless there
+are changes in Panel Fitter mode or status, don't program it.
+
+Panel fitter can be enabled across the pipes, but before enabling
+panel fitter on the second pipe, panel fitter should be disabled on
+the pipe that it was enabled.
+
+SQUASHME! - This patch should be squashed into the following exising patch:
+	Author: Arun R Murthy <arun.r.murthy@intel.com>
+	Change-Id: Id9fb3280aa59680a27536658dcaa335504a02e31
+	REVERTME [VPG]: drm/i915: Add atomicity to i915.
+
+Issue: GMINL-6633
+Change-Id: I92651ed84d9d3f85fdcabbadd9cbb2f565483e11
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    1 +
+ drivers/gpu/drm/i915/intel_display.c |   60 +++++++++++++++++++---------------
+ drivers/gpu/drm/i915/intel_dp.c      |    7 ----
+ drivers/gpu/drm/i915/intel_drv.h     |    1 +
+ drivers/gpu/drm/i915/intel_dsi.c     |    6 ----
+ 5 files changed, 35 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 3a1d710..9f38814 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1732,6 +1732,7 @@ struct drm_i915_private {
+ 
+ 	/* Atomicity fixes */
+ 	u32 pfit_pipe;
++	bool pfit_changed;
+ 	bool atomic_update;
+ 	bool pri_update;
+ 	u32 dspcntr;
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 279dc42..148b628 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10734,22 +10734,10 @@ static void i915_commit(struct drm_i915_private *dev_priv,
+ 		plane = intel_crtc->plane;
+ 	}
+ 
+-	if (reg->pfit_control && reg->pipesrc) {
+-		if (dev_priv->pfit_pipe ==
+-			((reg->pfit_control & PFIT_PIPE_MASK) >> 29) &&
+-			I915_READ(PFIT_CONTROL) != reg->pfit_control)
+-				I915_WRITE(PFIT_CONTROL, reg->pfit_control);
+-		if (I915_READ(PIPESRC(pipe)) != reg->pipesrc)
+-			I915_WRITE(PIPESRC(pipe), reg->pipesrc);
+-		intel_crtc->pfit_en_status = true;
+-	} else if (intel_crtc->pfit_en_status) {
+-		if (I915_READ(PIPESRC(pipe)) != reg->pipesrc)
+-			I915_WRITE(PIPESRC(pipe), reg->pipesrc);
+-		if (dev_priv->pfit_pipe ==
+-			((reg->pfit_control & PFIT_PIPE_MASK) >> 29)
+-			&& I915_READ(PFIT_CONTROL) != reg->pfit_control)
+-				I915_WRITE(PFIT_CONTROL, reg->pfit_control);
+-		intel_crtc->pfit_en_status = false;
++	if (dev_priv->pfit_changed) {
++		I915_WRITE(PFIT_CONTROL, intel_crtc->pfit_control);
++		I915_WRITE(PIPESRC(pipe), intel_crtc->scaling_src_size);
++		dev_priv->pfit_changed = false;
+ 	}
+ 
+ 	if (type == SPRITE_PLANE) {
+@@ -10892,6 +10880,7 @@ int intel_set_disp_calc_flip(struct drm_mode_set_display *disp,
+ 	struct drm_device *dev, struct drm_file *file_priv,
+ 	struct intel_crtc *intel_crtc)
+ {
++	struct drm_display_mode *mode = &intel_crtc->config.requested_mode;
+ 	struct drm_i915_plane_180_rotation *rotate;
+ 	struct drm_i915_set_plane_zorder *zorder;
+ 	int i, tmp_ret, ret = 0;
+@@ -10899,9 +10888,24 @@ int intel_set_disp_calc_flip(struct drm_mode_set_display *disp,
+ 
+ 	/* Update the panel fitter */
+ 	if (disp->update_flag & DRM_MODE_SET_DISPLAY_UPDATE_PANEL_FITTER) {
+-		if (intel_crtc->config.gmch_pfit.control ||
+-				disp->panel_fitter.mode) {
+-			u32 pfit_control = intel_crtc->config.gmch_pfit.control;
++		u32 pfitcontrol = I915_READ(PFIT_CONTROL);
++		u32 pfit_control = pfitcontrol;
++
++		/* Check if panel fitter is already enabled on another pipe */
++		if (((pfit_control & PFIT_PIPE_MASK) >> PFIT_PIPE_SHIFT)
++			!= intel_crtc->pipe && (pfit_control & PFIT_ENABLE)) {
++			DRM_ERROR("panel fitter req received on pipe %d but already enabled on pipe %d",
++				intel_crtc->pipe,
++				((pfit_control & PFIT_PIPE_MASK) >>
++							PFIT_PIPE_SHIFT));
++			DRM_ERROR("Not enabling Panel Fitter\n");
++		} else {
++			pfit_control &= ~PFIT_PIPE_MASK;
++			pfit_control |= (intel_crtc->pipe << PFIT_PIPE_SHIFT);
++
++			intel_crtc->scaling_src_size =
++				(((disp->panel_fitter.src_w - 1) << 16) |
++						(disp->panel_fitter.src_h - 1));
+ 
+ 			/* Enable Panel fitter if any valid mode is set */
+ 			pfit_control = (1 << 31) | pfit_control;
+@@ -10915,16 +10919,18 @@ int intel_set_disp_calc_flip(struct drm_mode_set_display *disp,
+ 				pfit_control &=  MASK_PFIT_SCALING_MODE;
+ 				pfit_control |= PFIT_SCALING_LETTER;
+ 			} else {
+-				if (!dev_priv->scaling_reqd)
+-					pfit_control &= ~PFIT_ENABLE;
+-				else
+-					pfit_control &=  MASK_PFIT_SCALING_MODE;
++
++				/* None of the above mode, then pfit is disabled */
++				pfit_control &= ~PFIT_ENABLE;
++				intel_crtc->scaling_src_size =
++						(((mode->hdisplay - 1) << 16) |
++							(mode->vdisplay - 1));
+ 			}
+-			intel_crtc->config.gmch_pfit.control = pfit_control;
++			intel_crtc->pfit_control = pfit_control;
++			if (pfit_control != pfitcontrol)
++				dev_priv->pfit_changed = true;
+ 		}
+-		intel_crtc->scaling_src_size =
+-			(((disp->panel_fitter.src_w - 1) << 16) |
+-			(disp->panel_fitter.src_h - 1));
++
+ 	}
+ 
+ 	/* Update the z-order */
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index a1527b4..e11101d 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -936,7 +936,6 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 	struct drm_display_mode *adjusted_mode = &pipe_config->adjusted_mode;
+ 	struct intel_dp *intel_dp = enc_to_intel_dp(&encoder->base);
+ 	enum port port = dp_to_dig_port(intel_dp)->port;
+-	struct intel_crtc *intel_crtc = encoder->new_crtc;
+ 	struct intel_connector *intel_connector = intel_dp->attached_connector;
+ 	int lane_count, clock;
+ 	int min_lane_count = 1;
+@@ -959,12 +958,6 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 	if (is_edp(intel_dp) && intel_connector->panel.fixed_mode) {
+ 		intel_fixed_panel_mode(intel_connector->panel.fixed_mode,
+ 				       adjusted_mode);
+-		if (!HAS_PCH_SPLIT(dev))
+-			intel_gmch_panel_fitting(intel_crtc, pipe_config,
+-						 intel_connector->panel.fitting_mode);
+-		else
+-			intel_pch_panel_fitting(intel_crtc, pipe_config,
+-						intel_connector->panel.fitting_mode);
+ 	}
+ 
+ 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLCLK)
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index de25f89..8e7868a 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -473,6 +473,7 @@ struct intel_crtc {
+ 	bool pch_fifo_underrun_disabled;
+ 
+ 	/* panel fitter input src size */
++	uint32_t pfit_control;
+ 	uint32_t scaling_src_size;
+ 
+ 	/* panel fitter status flag */
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 33a5e8c..6fe0a44 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -95,7 +95,6 @@ static bool intel_dsi_compute_config(struct intel_encoder *encoder,
+ 	struct drm_display_mode *fixed_mode = intel_connector->panel.fixed_mode;
+ 	struct drm_display_mode *adjusted_mode = &config->adjusted_mode;
+ 	struct drm_display_mode *mode = &config->requested_mode;
+-	struct intel_crtc *intel_crtc = encoder->new_crtc;
+ 	struct drm_device *dev = encoder->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+@@ -115,11 +114,6 @@ static bool intel_dsi_compute_config(struct intel_encoder *encoder,
+ 		DRM_DEBUG("Enabling PF scaling required flag set\n");
+ 	}
+ 
+-	if (IS_VALLEYVIEW(dev)) {
+-		intel_gmch_panel_fitting(intel_crtc, config,
+-			intel_connector->panel.fitting_mode);
+-	}
+-
+ 	if (intel_dsi->dev.dev_ops->mode_fixup)
+ 		return intel_dsi->dev.dev_ops->mode_fixup(&intel_dsi->dev,
+ 							  mode, adjusted_mode);
+-- 
+1.7.9.5
+

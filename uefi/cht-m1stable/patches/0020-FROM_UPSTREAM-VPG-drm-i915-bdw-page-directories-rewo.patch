@@ -1,0 +1,118 @@
+From 9c7a5da4972a992994a63907b2ea9cb3762bbc0b Mon Sep 17 00:00:00 2001
+Message-Id: <9c7a5da4972a992994a63907b2ea9cb3762bbc0b.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Thu, 27 Mar 2014 09:24:47 -0700
+Subject: [PATCH 20/68] FROM_UPSTREAM [VPG]: drm/i915/bdw: page directories
+ rework allocation
+
+Start using gen8_for_each_pdpe macro to allocate the page directories.
+
+v2: Rebased after s/free_pt_*/unmap_and_free_pt/ change.
+v3: Rebased after teardown va range logic was removed.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com> (v2+)
+
+This is a backport of v4 of "PPGTT dynamic page allocations" posted in
+intel-gfx.
+
+Change-Id: I7f3d72de23c6bd3facef52970b48585daea9b569
+Upstream-repo: https://www.mail-archive.com/intel-gfx@lists.freedesktop.org/msg51911.html
+Upstream-commit: none
+Upstream-as-of-tag: none
+For: GMINL-5449
+For: VIZ-4619
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_gtt.c |   43 ++++++++++++++++++++++++-----------
+ 1 file changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 4845e96..4f29be3 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -619,25 +619,39 @@ unwind_out:
+ 	return -ENOMEM;
+ }
+ 
+-static int gen8_ppgtt_allocate_page_directories(struct i915_hw_ppgtt *ppgtt,
+-						const int max_pdp)
++static int gen8_ppgtt_alloc_page_directories(struct i915_page_directory_pointer_entry *pdp,
++				     uint64_t start,
++				     uint64_t length)
+ {
+-	int i;
+-
+-	for (i = 0; i < max_pdp; i++) {
+-		ppgtt->pdp.page_directory[i] = alloc_pd_single();
+-		if (IS_ERR(ppgtt->pdp.page_directory[i]))
++	struct i915_hw_ppgtt *ppgtt =
++		container_of(pdp, struct i915_hw_ppgtt, pdp);
++	struct i915_page_directory_entry *unused;
++	uint64_t temp;
++	uint32_t pdpe;
++
++	/* FIXME: PPGTT container_of won't work for 64b */
++	BUG_ON((start + length) > 0x800000000ULL);
++
++	gen8_for_each_pdpe(unused, pdp, start, length, temp, pdpe) {
++		BUG_ON(unused);
++		pdp->page_directory[pdpe] = alloc_pd_single();
++		if (IS_ERR(ppgtt->pdp.page_directory[pdpe]))
+ 			goto unwind_out;
++
++		ppgtt->num_pd_pages++;
+ 	}
+ 
+-	ppgtt->num_pd_pages = max_pdp;
+ 	BUG_ON(ppgtt->num_pd_pages > GEN8_LEGACY_PDPES);
+ 
+ 	return 0;
+ 
+ unwind_out:
+-	while (i--)
+-		unmap_and_free_pd(ppgtt->pdp.page_directory[i]);
++	while (pdpe--) {
++		unmap_and_free_pd(ppgtt->pdp.page_directory[pdpe]);
++		ppgtt->num_pd_pages--;
++	}
++
++	WARN_ON(ppgtt->num_pd_pages);
+ 
+ 	return -ENOMEM;
+ }
+@@ -647,7 +661,8 @@ static int gen8_ppgtt_alloc(struct i915_hw_ppgtt *ppgtt,
+ {
+ 	int ret;
+ 
+-	ret = gen8_ppgtt_allocate_page_directories(ppgtt, max_pdp);
++	ret = gen8_ppgtt_alloc_page_directories(&ppgtt->pdp, ppgtt->base.start,
++					ppgtt->base.total);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -724,6 +739,10 @@ static int gen8_ppgtt_init(struct i915_hw_ppgtt *ppgtt, uint64_t size)
+ 	if (size % (1<<30))
+ 		DRM_INFO("Pages will be wasted unless GTT size (%llu) is divisible by 1GB\n", size);
+ 
++	ppgtt->base.start = 0;
++	ppgtt->base.total = size;
++	BUG_ON(ppgtt->base.total == 0);
++
+ 	/* 1. Do all our allocations for page directories and page tables. */
+ 	ret = gen8_ppgtt_alloc(ppgtt, max_pdp);
+ 	if (ret)
+@@ -771,8 +790,6 @@ static int gen8_ppgtt_init(struct i915_hw_ppgtt *ppgtt, uint64_t size)
+ 	ppgtt->base.clear_range = gen8_ppgtt_clear_range;
+ 	ppgtt->base.insert_entries = gen8_ppgtt_insert_entries;
+ 	ppgtt->base.cleanup = gen8_ppgtt_cleanup;
+-	ppgtt->base.start = 0;
+-	ppgtt->base.total = ppgtt->num_pd_entries * GEN8_PTES_PER_PAGE * PAGE_SIZE;
+ 
+ 	ppgtt->base.clear_range(&ppgtt->base, 0, ppgtt->base.total, true);
+ 
+-- 
+1.7.9.5
+

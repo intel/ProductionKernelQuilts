@@ -1,0 +1,143 @@
+From 19dd735f1ce85b265cdef0fcb7fca6222defe179 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+Date: Wed, 24 Sep 2014 15:55:02 +0100
+Subject: [PATCH 324/351] ASoC: arizona: Update FLL output check to use Fvco
+
+Changing the output on an active FLL is only a problem if Fvco changes.
+The final output divider is free to change. This patch updates the
+arizona_validate_fll function to use Fvco as a basis for checking if the
+new rate is acceptable.
+
+Change-Id: I1c3dbfa42db8cb791b3bd78e42ba29dbb8005122
+Signed-off-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+---
+ sound/soc/codecs/arizona.c |   48 ++++++++++++++++++++++----------------------
+ sound/soc/codecs/arizona.h |    2 ++
+ 2 files changed, 26 insertions(+), 24 deletions(-)
+
+diff --git a/sound/soc/codecs/arizona.c b/sound/soc/codecs/arizona.c
+index adf8e4f..d059ced 100644
+--- a/sound/soc/codecs/arizona.c
++++ b/sound/soc/codecs/arizona.c
+@@ -2244,11 +2244,9 @@ struct arizona_fll_cfg {
+ 
+ static int arizona_validate_fll(struct arizona_fll *fll,
+ 				unsigned int Fref,
+-				unsigned int Fout)
++				unsigned int Fvco)
+ {
+-	unsigned int Fvco_min;
+-
+-	if (fll->fout && Fout != fll->fout) {
++	if (fll->fvco && Fvco != fll->fvco) {
+ 		arizona_fll_err(fll,
+ 				"Can't change output on active FLL\n");
+ 		return -EINVAL;
+@@ -2261,13 +2259,6 @@ static int arizona_validate_fll(struct arizona_fll *fll,
+ 		return -EINVAL;
+ 	}
+ 
+-	Fvco_min = ARIZONA_FLL_MIN_FVCO * fll->vco_mult;
+-	if (Fout * ARIZONA_FLL_MAX_OUTDIV < Fvco_min) {
+-		arizona_fll_err(fll, "No FLL_OUTDIV for Fout=%uHz\n",
+-				Fout);
+-		return -EINVAL;
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -2371,20 +2362,13 @@ static int arizona_calc_fll(struct arizona_fll *fll,
+ 			    struct arizona_fll_cfg *cfg,
+ 			    unsigned int Fref, bool sync)
+ {
+-	unsigned int target, div, gcd_fll;
++	unsigned int target, gcd_fll;
+ 	int i, ratio;
+ 
+ 	arizona_fll_dbg(fll, "Fref=%u Fout=%u\n", Fref, fll->fout);
+ 
+-	/* Fvco should be over the targt; don't check the upper bound */
+-	div = ARIZONA_FLL_MIN_OUTDIV;
+-	while (fll->fout * div < ARIZONA_FLL_MIN_FVCO * fll->vco_mult) {
+-		div++;
+-		if (div > ARIZONA_FLL_MAX_OUTDIV)
+-			return -EINVAL;
+-	}
+-	target = fll->fout * div / fll->vco_mult;
+-	cfg->outdiv = div;
++	target = fll->fvco;
++	cfg->outdiv = fll->outdiv;
+ 
+ 	arizona_fll_dbg(fll, "Fvco=%dHz\n", target);
+ 
+@@ -2604,7 +2588,7 @@ int arizona_set_fll_refclk(struct arizona_fll *fll, int source,
+ 		return 0;
+ 
+ 	if (fll->fout && Fref > 0) {
+-		ret = arizona_validate_fll(fll, Fref, fll->fout);
++		ret = arizona_validate_fll(fll, Fref, fll->fvco);
+ 		if (ret != 0)
+ 			return ret;
+ 	}
+@@ -2623,6 +2607,8 @@ EXPORT_SYMBOL_GPL(arizona_set_fll_refclk);
+ int arizona_set_fll(struct arizona_fll *fll, int source,
+ 		    unsigned int Fref, unsigned int Fout)
+ {
++	unsigned int Fvco = 0;
++	int div = 0;
+ 	int ret = 0;
+ 
+ 	if (fll->sync_src == source &&
+@@ -2630,19 +2616,33 @@ int arizona_set_fll(struct arizona_fll *fll, int source,
+ 		return 0;
+ 
+ 	if (Fout) {
++		div = ARIZONA_FLL_MIN_OUTDIV;
++		while (Fout * div < ARIZONA_FLL_MIN_FVCO * fll->vco_mult) {
++			div++;
++			if (div > ARIZONA_FLL_MAX_OUTDIV) {
++				arizona_fll_err(fll,
++						"No FLL_OUTDIV for Fout=%uHz\n",
++						Fout);
++				return -EINVAL;
++			}
++		}
++		Fvco = Fout * div / fll->vco_mult;
++
+ 		if (fll->ref_src >= 0) {
+-			ret = arizona_validate_fll(fll, fll->ref_freq, Fout);
++			ret = arizona_validate_fll(fll, fll->ref_freq, Fvco);
+ 			if (ret != 0)
+ 				return ret;
+ 		}
+ 
+-		ret = arizona_validate_fll(fll, Fref, Fout);
++		ret = arizona_validate_fll(fll, Fref, Fvco);
+ 		if (ret != 0)
+ 			return ret;
+ 	}
+ 
+ 	fll->sync_src = source;
+ 	fll->sync_freq = Fref;
++	fll->fvco = Fvco;
++	fll->outdiv = div;
+ 	fll->fout = Fout;
+ 
+ 	if (Fout)
+diff --git a/sound/soc/codecs/arizona.h b/sound/soc/codecs/arizona.h
+index 9790e09..a36e5f1 100644
+--- a/sound/soc/codecs/arizona.h
++++ b/sound/soc/codecs/arizona.h
+@@ -265,6 +265,8 @@ struct arizona_fll {
+ 	unsigned int vco_mult;
+ 	struct completion ok;
+ 
++	unsigned int fvco;
++	int outdiv;
+ 	unsigned int fout;
+ 	int sync_src;
+ 	unsigned int sync_freq;
+-- 
+1.7.9.5
+

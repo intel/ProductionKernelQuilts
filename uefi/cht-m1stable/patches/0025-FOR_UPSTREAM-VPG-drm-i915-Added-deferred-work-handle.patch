@@ -1,0 +1,148 @@
+From c6d5c7dac3e7ff7d746e1fa1c7ef8788dad509f2 Mon Sep 17 00:00:00 2001
+Message-Id: <c6d5c7dac3e7ff7d746e1fa1c7ef8788dad509f2.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 3 Apr 2014 14:03:37 +0100
+Subject: [PATCH 25/61] FOR_UPSTREAM [VPG]: drm/i915: Added deferred work
+ handler for scheduler
+
+The scheduler needs to do interrupt triggered work that is too complex to do in
+the interrupt handler. Thus it requires a deferred work handler to process this
+work asynchronously.
+
+Change-Id: I0f7cc2b6f034a50bf8f7e368b60ad8bafd00f993
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c       |    3 +++
+ drivers/gpu/drm/i915/i915_drv.h       |   10 ++++++++++
+ drivers/gpu/drm/i915/i915_gem.c       |    2 ++
+ drivers/gpu/drm/i915/i915_scheduler.c |   29 +++++++++++++++++++++++++----
+ drivers/gpu/drm/i915/i915_scheduler.h |    1 +
+ 5 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 5d587cb..89d3eb6 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1988,6 +1988,9 @@ int i915_driver_unload(struct drm_device *dev)
+ 	WARN_ON(unregister_oom_notifier(&dev_priv->mm.oom_notifier));
+ 	unregister_shrinker(&dev_priv->mm.shrinker);
+ 
++	/* Cancel the scheduler work handler, which should be idle now. */
++	cancel_work_sync(&dev_priv->mm.scheduler_work);
++
+ 	io_mapping_free(dev_priv->gtt.mappable);
+ 	arch_phys_wc_del(dev_priv->gtt.mtrr);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index f8aa12e..03ede2f 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1229,6 +1229,16 @@ struct i915_gem_mm {
+ 	unsigned long retire_work_timestamp;
+ 
+ 	/**
++	 * New scheme is to get an interrupt after every work packet
++	 * in order to allow the low latency scheduling of pending
++	 * packets. The idea behind adding new packets to a pending
++	 * queue rather than directly into the hardware ring buffer
++	 * is to allow high priority packets to over take low priority
++	 * ones.
++	 */
++	struct work_struct scheduler_work;
++
++	/**
+ 	 * When we detect an idle GPU, we want to turn on
+ 	 * powersaving features. So once we see that there
+ 	 * are no more requests outstanding and no more
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index ac437b6..bcacbba 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5377,6 +5377,8 @@ i915_gem_load(struct drm_device *dev)
+ 			  i915_gem_retire_work_handler);
+ 	INIT_DELAYED_WORK(&dev_priv->mm.idle_work,
+ 			  i915_gem_idle_work_handler);
++	INIT_WORK(&dev_priv->mm.scheduler_work,
++				i915_gem_scheduler_work_handler);
+ 	init_waitqueue_head(&dev_priv->gpu_error.reset_queue);
+ 
+ 	/* On GEN3 we really need to make sure the ARB C3 LP bit is set */
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index b9642ba..e4ae552 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -407,12 +407,12 @@ int i915_scheduler_handle_irq(struct intel_engine_cs *ring)
+ 	i915_scheduler_seqno_complete(ring, seqno);
+ 	spin_unlock_irqrestore(&scheduler->lock, flags);
+ 
+-	/* XXX: Need to also call i915_scheduler_remove() via work handler. */
++	queue_work(dev_priv->wq, &dev_priv->mm.scheduler_work);
+ 
+ 	return 0;
+ }
+ 
+-int i915_scheduler_remove(struct intel_engine_cs *ring)
++static int i915_scheduler_remove(struct intel_engine_cs *ring)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	struct i915_scheduler   *scheduler = dev_priv->scheduler;
+@@ -536,6 +536,25 @@ int i915_scheduler_remove(struct intel_engine_cs *ring)
+ 	return ret;
+ }
+ 
++void i915_gem_scheduler_work_handler(struct work_struct *work)
++{
++	struct intel_engine_cs  *ring;
++	struct drm_i915_private *dev_priv;
++	struct drm_device       *dev;
++	int                     i;
++
++	dev_priv = container_of(work, struct drm_i915_private, mm.scheduler_work);
++	dev = dev_priv->dev;
++
++	mutex_lock(&dev->struct_mutex);
++
++	for_each_ring(ring, dev_priv, i) {
++		i915_scheduler_remove(ring);
++	}
++
++	mutex_unlock(&dev->struct_mutex);
++}
++
+ void i915_scheduler_priority_bump_clear(struct i915_scheduler *scheduler)
+ {
+ 	struct i915_scheduler_queue_entry *node;
+@@ -645,9 +664,11 @@ static void i915_scheduler_wait_fence_signaled(struct sync_fence *fence,
+ 					    i915_waiter->dev->dev_private : NULL;
+ 
+ 	/*
+-	 * XXX: The callback is executed at interrupt time, thus it can not
+-	 * call _submit() directly. It must go via a delayed work handler.
++	 * NB: The callback is executed at interrupt time, thus it can not
++	 * call _submit() directly. It must go via the delayed work handler.
+ 	 */
++	if (dev_priv)
++		queue_work(dev_priv->wq, &dev_priv->mm.scheduler_work);
+ 
+ 	kfree(waiter);
+ }
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 6690507..f9d7d93 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -89,6 +89,7 @@ int         i915_scheduler_closefile(struct drm_device *dev,
+ 				     struct drm_file *file);
+ int         i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe);
+ int         i915_scheduler_handle_irq(struct intel_engine_cs *ring);
++void        i915_gem_scheduler_work_handler(struct work_struct *work);
+ bool        i915_scheduler_is_request_tracked(struct drm_i915_gem_request *req,
+ 					      bool *completed, bool *busy);
+ 
+-- 
+1.7.9.5
+

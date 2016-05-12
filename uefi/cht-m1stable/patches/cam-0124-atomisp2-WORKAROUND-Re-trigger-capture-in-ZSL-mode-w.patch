@@ -1,0 +1,102 @@
+From c6ab4284b0f48a8a734c9c2e2a58ddcfdac6b926 Mon Sep 17 00:00:00 2001
+From: Tianshu Qiu <tian.shu.qiu@intel.com>
+Date: Mon, 17 Nov 2014 11:28:55 +0800
+Subject: [PATCH 04/10] atomisp2: [WORKAROUND]Re-trigger capture in ZSL mode
+ when multiple buffers are queued
+
+Due to the design of HALv3, sometimes in ZSL mode HAL needs to
+capture multiple images within one streaming cycle.
+But the capture number cannot be determined by HAL.
+So HAL only sets the capture number to be 1 and queue multiple
+buffers. Atomisp driver needs to check this case and re-trigger
+CSS to do capture when new buffer is queued.
+
+Change-Id: Iba193e86d49dc9a71a1da1d8a2c4aa0422044808
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-4029
+Signed-off-by: Tianshu Qiu <tian.shu.qiu@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/28933
+Reviewed-by: Bin B Han <bin.b.han@intel.com>
+Maintainer: Wei Tao <wei.tao@intel.com>
+Approver: Wei Tao <wei.tao@intel.com>
+Build: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_cmd.c      |    9 +++++++++
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.c    |   21 ++++++++++++++++++++
+ .../pci/atomisp2/atomisp_driver/atomisp_subdev.h   |    1 +
+ 3 files changed, 31 insertions(+)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+index c167765..1f181f5 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_cmd.c
+@@ -1044,6 +1044,15 @@ void atomisp_buf_done(struct atomisp_sub_device *asd, int error,
+ 			WARN_ON(!vb);
+ 			if (vb)
+ 				pipe->frame_config_id[vb->i] = frame->isp_config_id;
++			if (asd->pending_capture_request > 0) {
++				err = atomisp_css_offline_capture_configure(
++					asd,
++					asd->params.offline_parm.num_captures,
++					asd->params.offline_parm.skip_frames,
++					asd->params.offline_parm.offset);
++				asd->pending_capture_request--;
++				dev_dbg(isp->dev, "Trigger capture again for new buffer. err=%d\n", err);
++			}
+ 			break;
+ 		case CSS_BUFFER_TYPE_OUTPUT_FRAME:
+ 		case CSS_BUFFER_TYPE_SEC_OUTPUT_FRAME:
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index 94ca844..288fab1 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -1329,6 +1329,24 @@ done:
+ 				atomisp_wdt_start(isp);
+ 		}
+ 	}
++
++	/* Workaround: Due to the design of HALv3,
++	 * sometimes in ZSL mode HAL needs to
++	 * capture multiple images within one streaming cycle.
++	 * But the capture number cannot be determined by HAL.
++	 * So HAL only sets the capture number to be 1 and queue multiple
++	 * buffers. Atomisp driver needs to check this case and re-trigger
++	 * CSS to do capture when new buffer is queued. */
++	if (asd->continuous_mode->val &&
++	    asd->run_mode->val == ATOMISP_RUN_MODE_PREVIEW &&
++	    atomisp_subdev_source_pad(vdev)
++	    == ATOMISP_SUBDEV_PAD_SOURCE_CAPTURE &&
++	    pipe->capq.streaming &&
++	    !asd->enable_raw_buffer_lock->val &&
++	    asd->params.offline_parm.num_captures == 1) {
++		asd->pending_capture_request++;
++		dev_dbg(isp->dev, "Add one pending capture request.\n");
++	}
+ 	rt_mutex_unlock(&isp->mutex);
+ 
+ 	dev_dbg(isp->dev, "qbuf buffer %d (%s)\n", buf->index, vdev->name);
+@@ -1610,6 +1628,9 @@ static int atomisp_streamon(struct file *file, void *fh,
+ 	if (ret)
+ 		goto out;
+ 
++	/* Reset pending capture request count. */
++	asd->pending_capture_request = 0;
++
+ 	if ((atomisp_subdev_streaming_count(asd) > sensor_start_stream) &&
+ 	    (!isp->inputs[asd->input_curr].camera_caps->multi_stream_ctrl)) {
+ 		/* trigger still capture */
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+index 3e10d0d..7696cb1 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+@@ -345,6 +345,7 @@ struct atomisp_sub_device {
+ 	spinlock_t raw_buffer_bitmap_lock;
+ 
+ 	bool high_speed_mode; /* Indicate whether now is a high speed mode */
++	int pending_capture_request; /* Indicates the number of pending capture requests. */
+ };
+ 
+ extern const struct atomisp_in_fmt_conv atomisp_in_fmt_conv[];
+-- 
+1.7.9.5
+

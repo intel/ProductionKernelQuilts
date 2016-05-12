@@ -1,0 +1,128 @@
+From 97ac410a5187c9c4738846a73e484635970da97f Mon Sep 17 00:00:00 2001
+Message-Id: <97ac410a5187c9c4738846a73e484635970da97f.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 9 Apr 2014 13:05:40 +0100
+Subject: [PATCH 26/61] FOR_UPSTREAM [VPG]: drm/i915: Redirect
+ execbuffer_final() via scheduler
+
+Updated the execbuffer() code to pass the packaged up batch buffer information
+to the scheduler rather than calling execbuffer_final() directly. The scheduler
+queue() code is currently a stub which simply chains on to _final()
+immediately.
+
+Change-Id: I2a19062a9e66845f2e886332fc4b5fc7ac992864
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   19 +++++++------------
+ drivers/gpu/drm/i915/intel_lrc.c           |   12 ++++--------
+ 2 files changed, 11 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 9a2b374..b012b2b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -34,6 +34,7 @@
+ #include "i915_trace.h"
+ #include "intel_sync.h"
+ #include "intel_drv.h"
++#include "i915_scheduler.h"
+ 
+ #define  __EXEC_OBJECT_HAS_PIN (1<<31)
+ #define  __EXEC_OBJECT_HAS_FENCE (1<<30)
+@@ -1040,6 +1041,7 @@ i915_gem_ringbuffer_submission(struct i915_execbuffer_params *params,
+ 			       struct drm_i915_gem_execbuffer2 *args,
+ 			       struct list_head *vmas)
+ {
++	struct i915_scheduler_queue_entry *qe;
+ 	struct drm_device *dev = params->dev;
+ 	struct intel_engine_cs *ring = params->ring;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1156,18 +1158,11 @@ i915_gem_ringbuffer_submission(struct i915_execbuffer_params *params,
+ 	 * of the work in progress which in turn would be a Bad Thing). */
+ 	WARN_ON(ring->outstanding_lazy_request != params->request);
+ 
+-	ret = dev_priv->gt.do_execfinal(params);
++	qe = container_of(params, typeof(*qe), params);
++	ret = i915_scheduler_queue_execbuffer(qe);
+ 	if (ret)
+ 		goto error;
+ 
+-	/*
+-	 * Free everything that was stored in the QE structure (until the
+-	 * scheduler arrives and does it instead):
+-	 */
+-	kfree(params->cliprects);
+-	if (params->dispatch_flags & I915_DISPATCH_SECURE)
+-		i915_gem_execbuff_release_batch_obj(params->batch_obj);
+-
+ 	return 0;
+ 
+ error:
+@@ -1392,8 +1387,8 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	struct intel_engine_cs *ring;
+ 	struct intel_context *ctx;
+ 	struct i915_address_space *vm;
+-	struct i915_execbuffer_params params_master; /* XXX: will be removed later */
+-	struct i915_execbuffer_params *params = &params_master;
++	struct i915_scheduler_queue_entry qe;
++	struct i915_execbuffer_params *params = &qe.params;
+ 	const u32 ctx_id = i915_execbuffer2_get_context_id(*args);
+ 	u32 dispatch_flags;
+ 	int ret;
+@@ -1484,7 +1479,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	else
+ 		vm = &dev_priv->gtt.base;
+ 
+-	memset(&params_master, 0x00, sizeof(params_master));
++	memset(&qe, 0x00, sizeof(qe));
+ 
+ 	eb = eb_create(args);
+ 	if (eb == NULL) {
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index dac94c3..dada2ac 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -138,6 +138,7 @@
+ #include "i915_drv.h"
+ #include "intel_sync.h"
+ #include "intel_lrc_tdr.h"
++#include "i915_scheduler.h"
+ 
+ #define GEN8_LR_CONTEXT_RENDER_SIZE (20 * PAGE_SIZE)
+ #define GEN8_LR_CONTEXT_OTHER_SIZE (2 * PAGE_SIZE)
+@@ -1312,6 +1313,7 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
+ 			       struct drm_i915_gem_execbuffer2 *args,
+ 			       struct list_head *vmas)
+ {
++	struct i915_scheduler_queue_entry *qe;
+ 	struct drm_device       *dev = params->dev;
+ 	struct intel_engine_cs  *ring = params->ring;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1388,17 +1390,11 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
+ 	 * of the work in progress which in turn would be a Bad Thing). */
+ 	WARN_ON(ring->outstanding_lazy_request != params->request);
+ 
+-	ret = dev_priv->gt.do_execfinal(params);
++	qe = container_of(params, typeof(*qe), params);
++	ret = i915_scheduler_queue_execbuffer(qe);
+ 	if (ret)
+ 		return ret;
+ 
+-	/*
+-	 * Free everything that was stored in the QE structure (until the
+-	 * scheduler arrives and does it instead):
+-	 */
+-	if (params->dispatch_flags & I915_DISPATCH_SECURE)
+-		i915_gem_execbuff_release_batch_obj(params->batch_obj);
+-
+ 	return 0;
+ }
+ 
+-- 
+1.7.9.5
+

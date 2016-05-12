@@ -1,0 +1,180 @@
+From bd743418d5f0245f085fc8c64259e737dfa854dd Mon Sep 17 00:00:00 2001
+Message-Id: <bd743418d5f0245f085fc8c64259e737dfa854dd.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 24 Jul 2014 17:04:23 +0100
+Subject: [PATCH 20/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Generic logical
+ ring init and cleanup
+
+Allocate and populate the default LRC for every ring, call
+gen-specific init/cleanup, init/fini the command parser and
+set the status page (now inside the LRC object). These are
+things all engines/rings have in common.
+
+Stopping the ring before cleanup and initializing the seqnos
+is left as a TODO task (we need more infrastructure in place
+before we can achieve this).
+
+v2: Check the ringbuffer backing obj for ring_is_initialized,
+instead of the context backing obj (similar, but not exactly
+the same).
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 48d823878d64f93163f5a949623346748bbce1b4)
+
+Change-Id: I685152721e4223466f599bc072ecc053176c7ffb
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 48d823878d64f93163f5a949623346748bbce1b4
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |    4 ---
+ drivers/gpu/drm/i915/intel_lrc.c        |   54 +++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   17 ++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    6 +---
+ 4 files changed, 70 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 1b5fc9e..d4e7fbf 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -447,10 +447,6 @@ int i915_gem_context_init(struct drm_device *dev)
+ 
+ 		/* NB: RCS will hold a ref for all rings */
+ 		ring->default_context = ctx;
+-
+-		/* FIXME: we really only want to do this for initialized rings */
+-		if (i915.enable_execlists)
+-			intel_lr_context_deferred_create(ctx, ring);
+ 	}
+ 
+ 	DRM_DEBUG_DRIVER("%s context support initialized\n",
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index f757aef..3d69572 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -108,12 +108,60 @@ void intel_logical_ring_stop(struct intel_engine_cs *ring)
+ 
+ void intel_logical_ring_cleanup(struct intel_engine_cs *ring)
+ {
+-	/* TODO */
++	if (!intel_ring_initialized(ring))
++		return;
++
++	/* TODO: make sure the ring is stopped */
++	ring->preallocated_lazy_request = NULL;
++	ring->outstanding_lazy_seqno = 0;
++
++	if (ring->cleanup)
++		ring->cleanup(ring);
++
++	i915_cmd_parser_fini_ring(ring);
++
++	if (ring->status_page.obj) {
++		kunmap(sg_page(ring->status_page.obj->pages->sgl));
++		ring->status_page.obj = NULL;
++	}
+ }
+ 
+ static int logical_ring_init(struct drm_device *dev, struct intel_engine_cs *ring)
+ {
+-	/* TODO */
++	int ret;
++	struct intel_context *dctx = ring->default_context;
++	struct drm_i915_gem_object *dctx_obj;
++
++	/* Intentionally left blank. */
++	ring->buffer = NULL;
++
++	ring->dev = dev;
++	INIT_LIST_HEAD(&ring->active_list);
++	INIT_LIST_HEAD(&ring->request_list);
++	init_waitqueue_head(&ring->irq_queue);
++
++	ret = intel_lr_context_deferred_create(dctx, ring);
++	if (ret)
++		return ret;
++
++	/* The status page is offset 0 from the context object in LRCs. */
++	dctx_obj = dctx->engine[ring->id].state;
++	ring->status_page.gfx_addr = i915_gem_obj_ggtt_offset(dctx_obj);
++	ring->status_page.page_addr = kmap(sg_page(dctx_obj->pages->sgl));
++	if (ring->status_page.page_addr == NULL)
++		return -ENOMEM;
++	ring->status_page.obj = dctx_obj;
++
++	ret = i915_cmd_parser_init_ring(ring);
++	if (ret)
++		return ret;
++
++	if (ring->init) {
++		ret = ring->init(ring);
++		if (ret)
++			return ret;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -397,6 +445,8 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	int ret;
+ 
+ 	WARN_ON(ctx->legacy_hw_ctx.rcs_state != NULL);
++	if (ctx->engine[ring->id].state)
++		return 0;
+ 
+ 	context_size = round_up(get_lr_context_size(ring), 4096);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 3c5700a..06e7035 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -40,6 +40,23 @@
+  */
+ #define CACHELINE_BYTES 64
+ 
++bool
++intel_ring_initialized(struct intel_engine_cs *ring)
++{
++	struct drm_device *dev = ring->dev;
++
++	if (!dev)
++		return false;
++
++	if (i915.enable_execlists) {
++		struct intel_context *dctx = ring->default_context;
++		struct intel_ringbuffer *ringbuf = dctx->engine[ring->id].ringbuf;
++
++		return ringbuf->obj;
++	} else
++		return ring->buffer && ring->buffer->obj;
++}
++
+ static inline int __ring_space(int head, int tail, int size)
+ {
+ 	int space = head - (tail + I915_RING_FREE_SPACE);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index c96b5c0..240b29d 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -223,11 +223,7 @@ struct  intel_engine_cs {
+ 	u32 (*get_cmd_length_mask)(u32 cmd_header);
+ };
+ 
+-static inline bool
+-intel_ring_initialized(struct intel_engine_cs *ring)
+-{
+-	return ring->buffer && ring->buffer->obj;
+-}
++bool intel_ring_initialized(struct intel_engine_cs *ring);
+ 
+ static inline unsigned
+ intel_ring_flag(struct intel_engine_cs *ring)
+-- 
+1.7.9.5
+

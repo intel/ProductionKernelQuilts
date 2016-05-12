@@ -1,0 +1,132 @@
+From b5f4ba5b4149c103f4f5957c461a0e3ccbd7b9a8 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Tue, 22 Dec 2015 19:13:32 +0530
+Subject: [PATCH 05/14] USBC-PD: Add high priority work queue for PD framework.
+
+As the PD packet processing and reply are very time critical,
+the worker threads in protocol and PE state handler should put
+in high priority work queue. This patch will create a high
+proprity pd workqueue to process these time critical workers.
+
+Change-Id: I6e3ea4ab200eaff5361b23d8d85725929745f151
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-15496
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Reviewed-on: https://android.intel.com:443/451046
+---
+ drivers/usb/typec/pd/pd_policy.h     | 10 ++++++++++
+ drivers/usb/typec/pd/policy_engine.c | 17 +++++++++++++++--
+ drivers/usb/typec/pd/protocol.c      |  6 +++---
+ 3 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/pd_policy.h b/drivers/usb/typec/pd/pd_policy.h
+index 4927e91..b92b59c 100644
+--- a/drivers/usb/typec/pd/pd_policy.h
++++ b/drivers/usb/typec/pd/pd_policy.h
+@@ -105,6 +105,8 @@ struct policy {
+ 	struct pd_prot *prot;
+ 	struct devpolicy_mgr *dpm;
+ 	struct pe_operations *ops;
++	/* work queue for pd framework */
++	struct workqueue_struct *pd_wq;
+ };
+ 
+ #define pe_get_phy(x)	((x) ?  x->dpm->phy : NULL)
+@@ -146,6 +148,14 @@ static inline int pe_notify_dpm_evt(struct policy *p,
+ 	return -ENOTSUPP;
+ }
+ 
++static inline int
++pe_schedule_work_pd_wq(struct policy *p, struct work_struct *work)
++{
++	if (p && p->pd_wq)
++		return queue_work(p->pd_wq, work);
++	return -ENOTSUPP;
++}
++
+ #if defined(CONFIG_USBC_PD) && defined(CONFIG_USBC_PD_POLICY)
+ extern int policy_engine_bind_dpm(struct devpolicy_mgr *dpm);
+ extern void policy_engine_unbind_dpm(struct devpolicy_mgr *dpm);
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index b8c0006..e6ff1ae 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -54,7 +54,7 @@ static void pe_change_state(struct policy_engine *pe, enum pe_states state)
+ {
+ 	pe->prev_state = pe->cur_state;
+ 	pe->cur_state = state;
+-	schedule_work(&pe->policy_state_work);
++	pe_schedule_work_pd_wq(&pe->p, &pe->policy_state_work);
+ }
+ 
+ static void pe_deactivate_all_timers(struct policy_engine *pe)
+@@ -2647,8 +2647,18 @@ int policy_engine_bind_dpm(struct devpolicy_mgr *dpm)
+ 	if (!pe)
+ 		return -ENOMEM;
+ 
+-	pe->p.dpm = dpm;
+ 
++	/*
++	 * As PD negotiation is time bound, create work queue with
++	 * WQ_HIGHPRI  to schedule the work as soon as possible.
++	 */
++	pe->p.pd_wq = alloc_workqueue("pd_wq", WQ_HIGHPRI, 0);
++	if (!pe->p.pd_wq) {
++		log_err("Failed to allocate pd work queue");
++		return -ENOMEM;
++	}
++
++	pe->p.dpm = dpm;
+ 	ret = protocol_bind_pe(&pe->p);
+ 	if (ret) {
+ 		log_err("Failed to bind pe to protocol\n");
+@@ -2664,6 +2674,7 @@ int policy_engine_bind_dpm(struct devpolicy_mgr *dpm)
+ 	return 0;
+ 
+ bind_error:
++	destroy_workqueue(pe->p.pd_wq);
+ 	kfree(pe);
+ 	return ret;
+ }
+@@ -2689,6 +2700,8 @@ void policy_engine_unbind_dpm(struct devpolicy_mgr *dpm)
+ 
+ 	/* Unbind from protocol layer */
+ 	protocol_unbind_pe(&pe->p);
++	if (pe->p.pd_wq)
++		destroy_workqueue(pe->p.pd_wq);
+ 	mutex_unlock(&pe->pe_lock);
+ 
+ 	kfree(pe);
+diff --git a/drivers/usb/typec/pd/protocol.c b/drivers/usb/typec/pd/protocol.c
+index c6e0551..44e34ad 100644
+--- a/drivers/usb/typec/pd/protocol.c
++++ b/drivers/usb/typec/pd/protocol.c
+@@ -81,7 +81,7 @@ static void pd_policy_update_data_role(struct pd_prot *prot,
+ 	else if (drole == DATA_ROLE_DFP)
+ 		prot->data_role = PD_DATA_ROLE_DFP;
+ 
+-	schedule_work(&prot->role_chng_work);
++	pe_schedule_work_pd_wq(prot->p, &prot->role_chng_work);
+ }
+ 
+ static void pd_policy_update_power_role(struct pd_prot *prot,
+@@ -95,7 +95,7 @@ static void pd_policy_update_power_role(struct pd_prot *prot,
+ 	else if (prole == POWER_ROLE_SOURCE)
+ 		prot->pwr_role = PD_POWER_ROLE_PROVIDER;
+ 
+-	schedule_work(&prot->role_chng_work);
++	pe_schedule_work_pd_wq(prot->p, &prot->role_chng_work);
+ }
+ 
+ static struct prot_msg *prot_alloc_msg(void)
+@@ -393,7 +393,7 @@ static int pd_prot_add_msg_rx_list(struct pd_prot *pd,
+ 	/* Add the message to the rx list */
+ 	list_add_tail(&msg->node, &pd->rx_list);
+ 	mutex_unlock(&pd->rx_list_lock);
+-	schedule_work(&pd->proc_rx_msg);
++	pe_schedule_work_pd_wq(pd->p, &pd->proc_rx_msg);
+ 	return 0;
+ }
+ static bool pd_prot_is_valid_ctrl_msg(struct pd_packet *pkt)
+-- 
+1.9.1
+

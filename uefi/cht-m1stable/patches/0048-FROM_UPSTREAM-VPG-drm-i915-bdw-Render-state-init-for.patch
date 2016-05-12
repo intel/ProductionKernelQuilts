@@ -1,0 +1,360 @@
+From 32754b02f6d3a9f4b4d16ecafe368a3649e92d41 Mon Sep 17 00:00:00 2001
+Message-Id: <32754b02f6d3a9f4b4d16ecafe368a3649e92d41.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 21 Aug 2014 11:40:54 +0100
+Subject: [PATCH 48/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Render state init
+ for Execlists
+
+The batchbuffer that sets the render context state is submitted
+in a different way, and from different places.
+
+We needed to make both the render state preparation and free functions
+outside accesible, and namespace accordingly. This mess is so that all
+LR, LRC and Execlists functionality can go together in intel_lrc.c: we
+can fix all of this later on, once the interfaces are clear.
+
+v2: Create a separate ctx->rcs_initialized for the Execlists case, as
+suggested by Chris Wilson.
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+
+v3: Setup ring status page in lr_context_deferred_create when the
+default context is being created. This means that the render state
+init for the default context is no longer a special case.  Execute
+deferred creation of the default context at the end of
+logical_ring_init to allow the render state commands to be submitted.
+Fix style errors reported by checkpatch. Rebased.
+
+Signed-off-by: Thomas Daniel <thomas.daniel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 564ddb2fae4da01406a24e5a763e601dc21c23d7)
+
+Change-Id: Ie2fda39e39632d23e41b2fc8cc8599eabc5bf412
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 564ddb2fae4da01406a24e5a763e601dc21c23d7
+Upstream-as-of-tag: drm-intel-next-2014-09-05
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h              |    4 +-
+ drivers/gpu/drm/i915/i915_gem_render_state.c |   40 ++++++++------
+ drivers/gpu/drm/i915/i915_gem_render_state.h |   47 +++++++++++++++++
+ drivers/gpu/drm/i915/intel_lrc.c             |   73 ++++++++++++++++++++------
+ drivers/gpu/drm/i915/intel_lrc.h             |    2 +
+ drivers/gpu/drm/i915/intel_renderstate.h     |    8 +--
+ 6 files changed, 135 insertions(+), 39 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/i915_gem_render_state.h
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 6bafa32..e7c7c77 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -37,6 +37,7 @@
+ #include "intel_ringbuffer.h"
+ #include "intel_lrc.h"
+ #include "i915_gem_gtt.h"
++#include "i915_gem_render_state.h"
+ #include <linux/io-mapping.h>
+ #include <linux/i2c.h>
+ #include <linux/i2c-algo-bit.h>
+@@ -647,6 +648,7 @@ struct intel_context {
+ 	} legacy_hw_ctx;
+ 
+ 	/* Execlists */
++	bool rcs_initialized;
+ 	struct {
+ 		struct drm_i915_gem_object *state;
+ 		struct intel_ringbuffer *ringbuf;
+@@ -2704,8 +2706,6 @@ int i915_gem_context_create_ioctl(struct drm_device *dev, void *data,
+ int i915_gem_context_destroy_ioctl(struct drm_device *dev, void *data,
+ 				   struct drm_file *file);
+ 
+-/* i915_gem_render_state.c */
+-int i915_gem_render_state_init(struct intel_engine_cs *ring);
+ /* i915_gem_evict.c */
+ int __must_check i915_gem_evict_something(struct drm_device *dev,
+ 					  struct i915_address_space *vm,
+diff --git a/drivers/gpu/drm/i915/i915_gem_render_state.c b/drivers/gpu/drm/i915/i915_gem_render_state.c
+index e60be3f..a9a62d7 100644
+--- a/drivers/gpu/drm/i915/i915_gem_render_state.c
++++ b/drivers/gpu/drm/i915/i915_gem_render_state.c
+@@ -28,13 +28,6 @@
+ #include "i915_drv.h"
+ #include "intel_renderstate.h"
+ 
+-struct render_state {
+-	const struct intel_renderstate_rodata *rodata;
+-	struct drm_i915_gem_object *obj;
+-	u64 ggtt_offset;
+-	int gen;
+-};
+-
+ static const struct intel_renderstate_rodata *
+ render_state_get_rodata(struct drm_device *dev, const int gen)
+ {
+@@ -127,30 +120,47 @@ static int render_state_setup(struct render_state *so)
+ 	return 0;
+ }
+ 
+-static void render_state_fini(struct render_state *so)
++void i915_gem_render_state_fini(struct render_state *so)
+ {
+ 	i915_gem_object_ggtt_unpin(so->obj);
+ 	drm_gem_object_unreference(&so->obj->base);
+ }
+ 
+-int i915_gem_render_state_init(struct intel_engine_cs *ring)
++int i915_gem_render_state_prepare(struct intel_engine_cs *ring,
++				  struct render_state *so)
+ {
+-	struct render_state so;
+ 	int ret;
+ 
+ 	if (WARN_ON(ring->id != RCS))
+ 		return -ENOENT;
+ 
+-	ret = render_state_init(&so, ring->dev);
++	ret = render_state_init(so, ring->dev);
+ 	if (ret)
+ 		return ret;
+ 
+-	if (so.rodata == NULL)
++	if (so->rodata == NULL)
+ 		return 0;
+ 
+-	ret = render_state_setup(&so);
++	ret = render_state_setup(so);
++	if (ret) {
++		i915_gem_render_state_fini(so);
++		return ret;
++	}
++
++	return 0;
++}
++
++int i915_gem_render_state_init(struct intel_engine_cs *ring)
++{
++	struct render_state so;
++	int ret;
++
++	ret = i915_gem_render_state_prepare(ring, &so);
+ 	if (ret)
+-		goto out;
++		return ret;
++
++	if (so.rodata == NULL)
++		return 0;
+ 
+ 	ret = ring->dispatch_execbuffer(ring,
+ 					so.ggtt_offset,
+@@ -164,6 +174,6 @@ int i915_gem_render_state_init(struct intel_engine_cs *ring)
+ 	ret = __i915_add_request(ring, NULL, so.obj, NULL);
+ 	/* __i915_add_request moves object to inactive if it fails */
+ out:
+-	render_state_fini(&so);
++	i915_gem_render_state_fini(&so);
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_render_state.h b/drivers/gpu/drm/i915/i915_gem_render_state.h
+new file mode 100644
+index 0000000..c44961e
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_gem_render_state.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright © 2014 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#ifndef _I915_GEM_RENDER_STATE_H_
++#define _I915_GEM_RENDER_STATE_H_
++
++#include <linux/types.h>
++
++struct intel_renderstate_rodata {
++	const u32 *reloc;
++	const u32 *batch;
++	const u32 batch_items;
++};
++
++struct render_state {
++	const struct intel_renderstate_rodata *rodata;
++	struct drm_i915_gem_object *obj;
++	u64 ggtt_offset;
++	int gen;
++};
++
++int i915_gem_render_state_init(struct intel_engine_cs *ring);
++void i915_gem_render_state_fini(struct render_state *so);
++int i915_gem_render_state_prepare(struct intel_engine_cs *ring,
++				  struct render_state *so);
++
++#endif /* _I915_GEM_RENDER_STATE_H_ */
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index ee1427e..fd73bbc 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1215,8 +1215,6 @@ void intel_logical_ring_cleanup(struct intel_engine_cs *ring)
+ static int logical_ring_init(struct drm_device *dev, struct intel_engine_cs *ring)
+ {
+ 	int ret;
+-	struct intel_context *dctx = ring->default_context;
+-	struct drm_i915_gem_object *dctx_obj;
+ 
+ 	/* Intentionally left blank. */
+ 	ring->buffer = NULL;
+@@ -1230,18 +1228,6 @@ static int logical_ring_init(struct drm_device *dev, struct intel_engine_cs *rin
+ 	spin_lock_init(&ring->execlist_lock);
+ 	ring->next_context_status_buffer = 0;
+ 
+-	ret = intel_lr_context_deferred_create(dctx, ring);
+-	if (ret)
+-		return ret;
+-
+-	/* The status page is offset 0 from the context object in LRCs. */
+-	dctx_obj = dctx->engine[ring->id].state;
+-	ring->status_page.gfx_addr = i915_gem_obj_ggtt_offset(dctx_obj);
+-	ring->status_page.page_addr = kmap(sg_page(dctx_obj->pages->sgl));
+-	if (ring->status_page.page_addr == NULL)
+-		return -ENOMEM;
+-	ring->status_page.obj = dctx_obj;
+-
+ 	ret = i915_cmd_parser_init_ring(ring);
+ 	if (ret)
+ 		return ret;
+@@ -1252,7 +1238,9 @@ static int logical_ring_init(struct drm_device *dev, struct intel_engine_cs *rin
+ 			return ret;
+ 	}
+ 
+-	return 0;
++	ret = intel_lr_context_deferred_create(ring->default_context, ring);
++
++	return ret;
+ }
+ 
+ static int logical_render_ring_init(struct drm_device *dev)
+@@ -1446,6 +1434,38 @@ cleanup_render_ring:
+ 	return ret;
+ }
+ 
++int intel_lr_context_render_state_init(struct intel_engine_cs *ring,
++				       struct intel_context *ctx)
++{
++	struct intel_ringbuffer *ringbuf = ctx->engine[ring->id].ringbuf;
++	struct render_state so;
++	struct drm_i915_file_private *file_priv = ctx->file_priv;
++	struct drm_file *file = file_priv ? file_priv->file : NULL;
++	int ret;
++
++	ret = i915_gem_render_state_prepare(ring, &so);
++	if (ret)
++		return ret;
++
++	if (so.rodata == NULL)
++		return 0;
++
++	ret = ring->emit_bb_start(ringbuf,
++			so.ggtt_offset,
++			I915_DISPATCH_SECURE);
++	if (ret)
++		goto out;
++
++	i915_vma_move_to_active(i915_gem_obj_to_ggtt(so.obj), ring);
++
++	ret = __i915_add_request(ring, file, so.obj, NULL);
++	/* intel_logical_ring_add_request moves object to inactive if it
++	 * fails */
++out:
++	i915_gem_render_state_fini(&so);
++	return ret;
++}
++
+ static int
+ populate_lr_context(struct intel_context *ctx, struct drm_i915_gem_object *ctx_obj,
+ 		    struct intel_engine_cs *ring, struct intel_ringbuffer *ringbuf)
+@@ -1685,6 +1705,29 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	ctx->engine[ring->id].ringbuf = ringbuf;
+ 	ctx->engine[ring->id].state = ctx_obj;
+ 
++	if (ctx == ring->default_context) {
++		/* The status page is offset 0 from the default context object
++		 * in LRC mode. */
++		ring->status_page.gfx_addr = i915_gem_obj_ggtt_offset(ctx_obj);
++		ring->status_page.page_addr =
++				kmap(sg_page(ctx_obj->pages->sgl));
++		if (ring->status_page.page_addr == NULL)
++			return -ENOMEM;
++		ring->status_page.obj = ctx_obj;
++	}
++
++	if (ring->id == RCS && !ctx->rcs_initialized) {
++		ret = intel_lr_context_render_state_init(ring, ctx);
++		if (ret) {
++			DRM_ERROR("Init render state failed: %d\n", ret);
++			ctx->engine[ring->id].ringbuf = NULL;
++			ctx->engine[ring->id].state = NULL;
++			intel_destroy_ringbuffer_obj(ringbuf);
++			goto error;
++		}
++		ctx->rcs_initialized = true;
++	}
++
+ 	return 0;
+ 
+ error:
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index 991d449..33c3b4b 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -62,6 +62,8 @@ static inline void intel_logical_ring_emit(struct intel_ringbuffer *ringbuf,
+ int intel_logical_ring_begin(struct intel_ringbuffer *ringbuf, int num_dwords);
+ 
+ /* Logical Ring Contexts */
++int intel_lr_context_render_state_init(struct intel_engine_cs *ring,
++				       struct intel_context *ctx);
+ void intel_lr_context_free(struct intel_context *ctx);
+ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 				     struct intel_engine_cs *ring);
+diff --git a/drivers/gpu/drm/i915/intel_renderstate.h b/drivers/gpu/drm/i915/intel_renderstate.h
+index fd4f662..6c792d3 100644
+--- a/drivers/gpu/drm/i915/intel_renderstate.h
++++ b/drivers/gpu/drm/i915/intel_renderstate.h
+@@ -24,13 +24,7 @@
+ #ifndef _INTEL_RENDERSTATE_H
+ #define _INTEL_RENDERSTATE_H
+ 
+-#include <linux/types.h>
+-
+-struct intel_renderstate_rodata {
+-	const u32 *reloc;
+-	const u32 *batch;
+-	const u32 batch_items;
+-};
++#include "i915_drv.h"
+ 
+ extern const struct intel_renderstate_rodata gen6_null_state;
+ extern const struct intel_renderstate_rodata gen7_null_state;
+-- 
+1.7.9.5
+

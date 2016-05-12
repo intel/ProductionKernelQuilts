@@ -1,0 +1,115 @@
+From 4afcabe8b6cfb6c54e2460f9c9a8b96e9cccb517 Mon Sep 17 00:00:00 2001
+From: zhengq <qi.zheng@intel.com>
+Date: Tue, 21 Oct 2014 21:12:52 +0800
+Subject: [PATCH 1/1] x86/irq: handle chained interrupts during IRQ migration
+
+Chained interrupt handlers dont have an irqaction and hence are not
+handled during migrating interrupts when some cores go offline.
+
+Handle this by introducing a irq_is_chained() check which is based
+on the CHAINED flag being set for such interrupts. fixup_irq()
+can then handle such interrupts and not skip them over.
+
+Merge from below commit.
+commit cbeaab1436f6feeb7b5b0a7d7ed7664fa0bc9844
+Author: Axel Haslam <axelx.haslam@intel.com>
+
+Change-Id: I5767fca5fc7895e1d4af1d97425d32f7aea9a928
+Signed-off-by: zhengq <qi.zheng@intel.com>
+---
+ arch/x86/kernel/irq.c   |    4 +++-
+ include/linux/irq.h     |    1 +
+ include/linux/irqdesc.h |    7 +++++++
+ kernel/irq/chip.c       |    1 +
+ kernel/irq/settings.h   |    7 +++++++
+ 5 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index d99f31d9a750..5ca03063ab29 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -367,7 +367,9 @@ void fixup_irqs(void)
+ 
+ 		data = irq_desc_get_irq_data(desc);
+ 		affinity = data->affinity;
+-		if (!irq_has_action(irq) || irqd_is_per_cpu(data) ||
++		/* include IRQs who have no action, but are chained */
++		if ((!irq_has_action(irq) && !irq_is_chained(irq)) ||
++			irqd_is_per_cpu(data) ||
+ 		    cpumask_subset(affinity, cpu_online_mask)) {
+ 			raw_spin_unlock(&desc->lock);
+ 			continue;
+diff --git a/include/linux/irq.h b/include/linux/irq.h
+index f5a2149fec5c..0d6fe9a4d04a 100644
+--- a/include/linux/irq.h
++++ b/include/linux/irq.h
+@@ -98,6 +98,7 @@ enum {
+ 	IRQ_NOTHREAD		= (1 << 16),
+ 	IRQ_PER_CPU_DEVID	= (1 << 17),
+ 	IRQ_IS_POLLED		= (1 << 18),
++	IRQ_CHAINED		= (1 << 19),
+ };
+ 
+ #define IRQF_MODIFY_MASK	\
+diff --git a/include/linux/irqdesc.h b/include/linux/irqdesc.h
+index 472c021a2d4f..9712741a8a12 100644
+--- a/include/linux/irqdesc.h
++++ b/include/linux/irqdesc.h
+@@ -125,6 +125,13 @@ static inline int irq_has_action(unsigned int irq)
+ 	return desc->action != NULL;
+ }
+ 
++/* Test to see if the IRQ is chained */
++static inline int irq_is_chained(unsigned int irq)
++{
++	struct irq_desc *desc = irq_to_desc(irq);
++	return desc->status_use_accessors & IRQ_CHAINED;
++}
++
+ /* caller has locked the irq_desc and both params are valid */
+ static inline void __irq_set_handler_locked(unsigned int irq,
+ 					    irq_flow_handler_t handler)
+diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
+index dc04c166c54d..8d21fca4fbfe 100644
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -685,6 +685,7 @@ __irq_set_handler(unsigned int irq, irq_flow_handler_t handle, int is_chained,
+ 		irq_settings_set_noprobe(desc);
+ 		irq_settings_set_norequest(desc);
+ 		irq_settings_set_nothread(desc);
++		irq_settings_set_chained(desc);
+ 		irq_startup(desc, true);
+ 	}
+ out:
+diff --git a/kernel/irq/settings.h b/kernel/irq/settings.h
+index 3320b84cc60f..98339648c14a 100644
+--- a/kernel/irq/settings.h
++++ b/kernel/irq/settings.h
+@@ -16,6 +16,7 @@ enum {
+ 	_IRQ_PER_CPU_DEVID	= IRQ_PER_CPU_DEVID,
+ 	_IRQ_IS_POLLED		= IRQ_IS_POLLED,
+ 	_IRQF_MODIFY_MASK	= IRQF_MODIFY_MASK,
++	_IRQ_CHAINED		= IRQ_CHAINED,
+ };
+ 
+ #define IRQ_PER_CPU		GOT_YOU_MORON
+@@ -30,6 +31,7 @@ enum {
+ #define IRQ_IS_POLLED		GOT_YOU_MORON
+ #undef IRQF_MODIFY_MASK
+ #define IRQF_MODIFY_MASK	GOT_YOU_MORON
++#define IRQ_CHAINED		GOT_YOU_MORON
+ 
+ static inline void
+ irq_settings_clr_and_set(struct irq_desc *desc, u32 clr, u32 set)
+@@ -154,3 +156,8 @@ static inline bool irq_settings_is_polled(struct irq_desc *desc)
+ {
+ 	return desc->status_use_accessors & _IRQ_IS_POLLED;
+ }
++
++static inline bool irq_settings_set_chained(struct irq_desc *desc)
++{
++	return desc->status_use_accessors |= _IRQ_CHAINED;
++}
+-- 
+1.7.9.5
+

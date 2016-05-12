@@ -1,0 +1,177 @@
+From db7e7cf74215b68eb928cb7b96d6998702b971e2 Mon Sep 17 00:00:00 2001
+Message-Id: <db7e7cf74215b68eb928cb7b96d6998702b971e2.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Fri, 17 Jan 2014 21:23:56 +0530
+Subject: [PATCH 119/312] FOR_UPSTREAM [VPG]: drm/i915: Added a new render
+ specific hw(VLV) workaround
+ 'WaSendDummy3dPrimitveAfterSetContext'.
+
+This workaround is needed for the HW context feature. It is used after
+adding the mi_set_context command in ring buffer for Hw context switch.
+As per the Bspec "The software must send a pipe_control with a CS stall
+and a post sync operation and then a dummy DRAW after every
+MI_SET_CONTEXT and after any PIPELINE_SELECT that is enabling 3D mode.
+A dummy draw is a 3DPRIMITIVE command with Indirect Parameter Enable set
+to 0, UAV Coherency required set to 0, Predicate Enable set to 0,End
+Offset Enable set to 0, and Vertex Count Per Instance set to 0, All
+other parameters are don't care"
+
+v2: Remove extraneous whitespace (Jon)
+
+v3: Restrict WA to VLV (Jon)
+
+Issue: VIZ-3568
+Change-Id: Ie52d5d67237a3eccc457fdb45684a815a87ab3e6
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Signed-off-by: Deepak S <deepak.s@intel.com>
+Reviewed-on: https://android.intel.com/165496
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |   65 ++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_reg.h         |    5 +++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    9 +++++
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    1 +
+ 4 files changed, 78 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 0d2c75b..1ab0f5b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -540,6 +540,58 @@ i915_gem_context_get(struct drm_i915_file_private *file_priv, u32 id)
+ 	return ctx;
+ }
+ 
++static inline void
++mi_set_context_dummy3d_prim_wa(struct intel_engine_cs *ring)
++{
++	u32 scratch_addr;
++	u32 flags = 0;
++
++	/*
++	 * Check if we have the scratch page allocated needed
++	 * for the Pipe Control command, otherwise don't apply
++	 * the dummmy 3d primitive workaround & add NOOPs instead
++	 */
++	if (get_pipe_control_scratch_addr(ring)) {
++		/* Actual scratch location is at 128 bytes offset */
++		scratch_addr = get_pipe_control_scratch_addr(ring) + 128;
++
++		/*
++		 * WaSendDummy3dPrimitveAfterSetContext:vlv
++		 * Software must send a pipe_control with a CS stall
++		 * and a post sync operation and then a dummy DRAW after
++		 * every MI_SET_CONTEXT and after any PIPELINE_SELECT that
++		 * is enabling 3D mode. A dummy draw is a 3DPRIMITIVE command
++		 * with Indirect Parameter Enable set to 0, UAV Coherency
++		 * Required set to 0, Predicate Enable set to 0,
++		 * End Offset Enable set to 0, and Vertex Count Per Instance
++		 * set to 0, All other parameters are a don't care.
++		 */
++
++		/*
++		 * Add a pipe control with CS Stall and postsync op
++		 * before dummy 3D_PRIMITIVE
++		 */
++		flags |= PIPE_CONTROL_QW_WRITE | PIPE_CONTROL_CS_STALL;
++		intel_ring_emit(ring, GFX_OP_PIPE_CONTROL(4));
++		intel_ring_emit(ring, flags);
++		intel_ring_emit(ring, scratch_addr | PIPE_CONTROL_GLOBAL_GTT);
++		intel_ring_emit(ring, 0);
++
++		/* Add a dummy 3D_PRIMITVE */
++		intel_ring_emit(ring, GFX_OP_3DPRIMITIVE());
++		intel_ring_emit(ring, 4); /* PrimTopoType*/
++		intel_ring_emit(ring, 0); /* VertexCountPerInstance */
++		intel_ring_emit(ring, 0); /* StartVertexLocation */
++		intel_ring_emit(ring, 0); /* InstanceCount */
++		intel_ring_emit(ring, 0); /* StartInstanceLocation */
++		intel_ring_emit(ring, 0); /* BaseVertexLocation  */
++	} else {
++		int i;
++		for (i = 0; i < 11; i++)
++			intel_ring_emit(ring, MI_NOOP);
++	}
++}
++
+ static inline int
+ mi_set_context(struct intel_engine_cs *ring,
+ 	       struct intel_context *new_context,
+@@ -558,13 +610,22 @@ mi_set_context(struct intel_engine_cs *ring,
+ 			return ret;
+ 	}
+ 
+-	ret = intel_ring_begin(ring, 6);
++	if (IS_VALLEYVIEW(ring->dev) && IS_GEN7(ring->dev))
++		ret = intel_ring_begin(ring, 6+4+8);
++	else
++		ret = intel_ring_begin(ring, 6);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* WaProgramMiArbOnOffAroundMiSetContext:ivb,vlv,hsw,bdw,chv */
+ 	if (INTEL_INFO(ring->dev)->gen >= 7)
+-		intel_ring_emit(ring, MI_ARB_ON_OFF | MI_ARB_DISABLE);
++		if (IS_VALLEYVIEW(ring->dev) && IS_GEN7(ring->dev)) {
++			/* FIXME, should also apply to ivb */
++			mi_set_context_dummy3d_prim_wa(ring);
++			intel_ring_emit(ring, MI_ARB_ON_OFF | MI_ARB_ENABLE);
++			intel_ring_emit(ring, MI_NOOP);
++		} else
++			intel_ring_emit(ring, MI_ARB_ON_OFF | MI_ARB_ENABLE);
+ 	else
+ 		intel_ring_emit(ring, MI_NOOP);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 4e9ff49..6e785a5 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -367,6 +367,11 @@
+ #define   PIPE_CONTROL_DEPTH_CACHE_FLUSH		(1<<0)
+ #define   PIPE_CONTROL_GLOBAL_GTT (1<<2) /* in addr dword */
+ 
++#define GFX_OP_3DPRIMITIVE()              \
++	((0x3<<29)|(0x3<<27)|(0x3<<24)|       \
++	 (0x0<<16)|(0x0<<10)|(0x0<<8)|(7-2))
++
++
+ /*
+  * Commands used only by the command parser
+  */
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 69ca84f..00b00a5 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -599,6 +599,15 @@ err:
+ 	return ret;
+ }
+ 
++u32
++get_pipe_control_scratch_addr(struct intel_engine_cs *ring)
++{
++	if (ring->scratch.obj == NULL)
++		return 0;
++
++	return ring->scratch.gtt_offset;
++}
++
+ static int init_render_ring(struct intel_engine_cs *ring)
+ {
+ 	struct drm_device *dev = ring->dev;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index e72017b..d104515 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -317,6 +317,7 @@ int intel_init_vebox_ring_buffer(struct drm_device *dev);
+ 
+ u64 intel_ring_get_active_head(struct intel_engine_cs *ring);
+ void intel_ring_setup_status_page(struct intel_engine_cs *ring);
++u32 get_pipe_control_scratch_addr(struct intel_engine_cs *ring);
+ 
+ static inline u32 intel_ring_get_tail(struct intel_engine_cs *ring)
+ {
+-- 
+1.7.9.5
+

@@ -1,0 +1,91 @@
+From 00cc8d98c8fb75c36bd810df05f0505b1c60b4e6 Mon Sep 17 00:00:00 2001
+From: David Cohen <david.a.cohen@linux.intel.com>
+Date: Wed, 5 Mar 2014 14:21:36 -0800
+Subject: [PATCH 1/2] mmc: sdhci: implement quirk to poll for buf_ready event
+
+Certain Samsung cards with a particular eMMC firmware have an
+issue caused by an automatic power-saving feature implemented
+on the device.  The tuning command (CMD21) cannot wake the Samsung
+eMMC device if it is in the middle of entering the power saving state.
+
+To workaround this, we introduce this quirk to change from interrupt
+driven to polling when listening for buf_ready event.
+
+While this is only necessary for particular Samsung eMMC devices, PnP
+measurements show that polling for this event results in lower
+platform power due to much fewer platform wake events.  As a result,
+this patch doesn't switch for just particular Samsung eMMC devices.
+
+Warning observed before this workaround shown below:
+
+sdhci: Timeout waiting for Buffer Read Ready interrupt during tuning procedure, falling back to fixed sampling clock
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 0 at /home/david/nextLTS/linux/kernel-next/drivers/mmc/host/sdhci.c:994 sdhci_send_command+0xb98/0xc90()
+Modules linked in: g_ffs usb_f_fs libcomposite
+CPU: 0 PID: 0 Comm: swapper/0 Tainted: G        W    3.14.0-rc5-00034-g8240b20-dirty #27
+Hardware name: Intel Corp. VALLEYVIEW C0 PLATFORM/BYT-T FFD8, BIOS BLAKFF81.86C.0084.R20.1402250434 FFD8_IA32_R_2014_09_2_00 02/25/2014
+00000000 00000000 f300de48 c1a5e169 00000000 f300de78 c1242fd4 c1cc7900
+00000000 00000000 c1d2e880 000003e2 c18a8b48 c18a8b48 f2670480 f275594c
+f2670480 f300de88 c1243012 00000009 00000000 f300def8 c18a8b48 00000033
+
+Change-Id: I473c1f6633f838860e181b9789773f78ee9e1f0c
+Signed-off-by: David Cohen <david.a.cohen@linux.intel.com>
+Signed-off-by: Eric Ernst <eric.ernst@linux.intel.com>
+---
+ drivers/mmc/host/sdhci.c  |   27 +++++++++++++++++++++------
+ include/linux/mmc/sdhci.h |    1 +
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index 9ddef4763541..2b9011cc75c6 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -1966,12 +1966,27 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 		host->cmd = NULL;
+ 		host->mrq = NULL;
+ 
+-		spin_unlock_irqrestore(&host->lock, flags);
+-		/* Wait for Buffer Read Ready interrupt */
+-		wait_event_interruptible_timeout(host->buf_ready_int,
+-					(host->tuning_done == 1),
+-					msecs_to_jiffies(50));
+-		spin_lock_irqsave(&host->lock, flags);
++		if (unlikely(host->quirks2 & SDHCI_QUIRK2_TUNING_POLL)) {
++			unsigned long timeout = jiffies + msecs_to_jiffies(150);
++			do {
++				unsigned int intmask =
++					sdhci_readl(host, SDHCI_INT_STATUS);
++				if (!(intmask & SDHCI_INT_DATA_AVAIL))
++					continue;
++				host->tuning_done = 1;
++				sdhci_writel(host,
++						intmask & SDHCI_INT_DATA_AVAIL,
++						SDHCI_INT_STATUS);
++				break;
++			} while (!time_after(jiffies, timeout));
++		} else {
++			spin_unlock_irqrestore(&host->lock, flags);
++			/* Wait for Buffer Read Ready interrupt */
++			wait_event_interruptible_timeout(host->buf_ready_int,
++						(host->tuning_done == 1),
++						msecs_to_jiffies(50));
++			spin_lock_irqsave(&host->lock, flags);
++		}
+ 
+ 		if (!host->tuning_done) {
+ 			pr_info(DRIVER_NAME ": Timeout waiting for "
+diff --git a/include/linux/mmc/sdhci.h b/include/linux/mmc/sdhci.h
+index 362927c48f97..e8ed1b1774bb 100644
+--- a/include/linux/mmc/sdhci.h
++++ b/include/linux/mmc/sdhci.h
+@@ -100,6 +100,7 @@ struct sdhci_host {
+ #define SDHCI_QUIRK2_BROKEN_HOST_CONTROL		(1<<5)
+ /* Controller does not support HS200 */
+ #define SDHCI_QUIRK2_BROKEN_HS200			(1<<6)
++#define SDHCI_QUIRK2_TUNING_POLL			(1<<7)
+ 
+ 	int irq;		/* Device IRQ */
+ 	void __iomem *ioaddr;	/* Mapped address */
+-- 
+1.7.9.5
+

@@ -1,0 +1,113 @@
+From a1a90d2f10d08343d1febdd2e6503930e6c4c6e9 Mon Sep 17 00:00:00 2001
+From: Petre Pircalabu <petre.ovidiu.pircalabu@intel.com>
+Date: Mon, 6 Oct 2014 15:46:16 +0300
+Subject: [PATCH] hci_ldisc: Fix race condition hci_uart_tx_wakeup
+
+When transmitting a packet, hci_uart_tx_wakeup checks first if
+hci_uart_write_work is still running by atomically testing the
+HCI_UART_SENDING flag. If so, it atomically sets HCI_UART_TX_WAKEUP thus
+causing the write work to restart and process the newly added skbs.
+
+Despite the fact the tests are atomic by themselves, the sequence is not.
+A race condition appears when HCI_UART_SENDING tests positive but
+HCI_UART_TX_WAKEUP checking was already performed.
+
+This patch removes the atomic test sequence completely, moving the
+retry logic to workqueues. If write_work is not pending it will be scheduled
+for execution, otherwise schedule_work will silently return false.
+WORK_STRUCT_PENDING_BIT is cleared just before invoking the work function,
+so at least one more write_work run occurs after the schedule_work call.
+This ensures the processing of all enqueued skbs.
+
+In order to preserve the existing hci_ath transmit sequence, a new flag
+was added to tx_state, HCI_UART_TX_INHIBIT. Setting it inhibits the write_work
+scheduling in the hci_disc driver.
+
+Issue: GMINL-423
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-423
+
+Change-Id: I9ac750c417e1ad5b439ca6699cfced6abce898e5
+Signed-off-by: Petre Pircalabu <petre.ovidiu.pircalabu@intel.com>
+---
+ drivers/bluetooth/hci_ath.c   |  4 ++--
+ drivers/bluetooth/hci_ldisc.c | 12 +-----------
+ drivers/bluetooth/hci_uart.h  |  3 +--
+ 3 files changed, 4 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_ath.c b/drivers/bluetooth/hci_ath.c
+index 0bc8a6a..a6cc1f4 100644
+--- a/drivers/bluetooth/hci_ath.c
++++ b/drivers/bluetooth/hci_ath.c
+@@ -101,7 +101,7 @@ static void ath_hci_uart_work(struct work_struct *work)
+ 	}
+ 
+ 	/* Ready to send Data */
+-	clear_bit(HCI_UART_SENDING, &hu->tx_state);
++	clear_bit(HCI_UART_TX_INHIBIT, &hu->tx_state);
+ 	hci_uart_tx_wakeup(hu);
+ }
+ 
+@@ -184,7 +184,7 @@ static int ath_enqueue(struct hci_uart *hu, struct sk_buff *skb)
+ 	memcpy(skb_push(skb, 1), &bt_cb(skb)->pkt_type, 1);
+ 
+ 	skb_queue_tail(&ath->txq, skb);
+-	set_bit(HCI_UART_SENDING, &hu->tx_state);
++	set_bit(HCI_UART_TX_INHIBIT, &hu->tx_state);
+ 
+ 	schedule_work(&ath->ctxtsw);
+ 
+diff --git a/drivers/bluetooth/hci_ldisc.c b/drivers/bluetooth/hci_ldisc.c
+index 77af52f..ca00216 100644
+--- a/drivers/bluetooth/hci_ldisc.c
++++ b/drivers/bluetooth/hci_ldisc.c
+@@ -118,10 +118,8 @@ static inline struct sk_buff *hci_uart_dequeue(struct hci_uart *hu)
+ 
+ int hci_uart_tx_wakeup(struct hci_uart *hu)
+ {
+-	if (test_and_set_bit(HCI_UART_SENDING, &hu->tx_state)) {
+-		set_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
++	if (test_bit(HCI_UART_TX_INHIBIT, &hu->hdev_flags))
+ 		return 0;
+-	}
+ 
+ 	BT_DBG("");
+ 
+@@ -141,9 +139,6 @@ static void hci_uart_write_work(struct work_struct *work)
+ 	 * and error value ?
+ 	 */
+ 
+-restart:
+-	clear_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
+-
+ 	while ((skb = hci_uart_dequeue(hu))) {
+ 		int len;
+ 
+@@ -160,11 +155,6 @@ restart:
+ 		hci_uart_tx_complete(hu, bt_cb(skb)->pkt_type);
+ 		kfree_skb(skb);
+ 	}
+-
+-	if (test_bit(HCI_UART_TX_WAKEUP, &hu->tx_state))
+-		goto restart;
+-
+-	clear_bit(HCI_UART_SENDING, &hu->tx_state);
+ }
+ 
+ static void hci_uart_init_work(struct work_struct *work)
+diff --git a/drivers/bluetooth/hci_uart.h b/drivers/bluetooth/hci_uart.h
+index 12df101..40ddbb8 100644
+--- a/drivers/bluetooth/hci_uart.h
++++ b/drivers/bluetooth/hci_uart.h
+@@ -83,8 +83,7 @@ struct hci_uart {
+ #define HCI_UART_REGISTERED	1
+ 
+ /* TX states  */
+-#define HCI_UART_SENDING	1
+-#define HCI_UART_TX_WAKEUP	2
++#define HCI_UART_TX_INHIBIT	1
+ 
+ int hci_uart_register_proto(struct hci_uart_proto *p);
+ int hci_uart_unregister_proto(struct hci_uart_proto *p);
+-- 
+1.9.1
+

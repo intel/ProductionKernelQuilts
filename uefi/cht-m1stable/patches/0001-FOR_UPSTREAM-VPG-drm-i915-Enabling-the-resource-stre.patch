@@ -1,0 +1,141 @@
+From 18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8 Mon Sep 17 00:00:00 2001
+Message-Id: <18bb7324f916bffbc75e07ea0ffd3e6e68e7b6d8.1423172493.git.feitong.yi@intel.com>
+From: Minu <minu.mathai@intel.com>
+Date: Tue, 8 Jul 2014 13:38:25 +0100
+Subject: [PATCH 01/29] FOR_UPSTREAM [VPG]: drm/i915: Enabling the resource
+ streamer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This patch adds support to enable the resource streamer.
+It is originally Abdiel’s resource streamer patchset from
+http://www.spinics.net/lists/intel-gfx/msg44780.html
+
+The resource streamer is enabled only for render ring and on Broadwell.
+The patch was put on hold by the kernel and mesa maintainers
+because it does not give any substantial performance, but the RS
+support is requested by 3D team because it may reduce the
+driver overhead.
+
+v2: Resolved Conflicts (Deepak)
+
+v3: Enable RS support to gen8 & above (Deepak)
+
+v4: Enable MI_BATCH_RESOURCE_STREAMER for lrc submission (Deepak)
+
+v5: Resolved Conflicts (Deepak)
+
+Issue: GMIN-2431
+Signed-off-by: : Minu Mathai <minu.mathai@intel.com>
+Change-Id: I86263377609dc1b89afa1807ca69f91110fbde28
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   14 ++++++++++++++
+ drivers/gpu/drm/i915/i915_reg.h            |    1 +
+ drivers/gpu/drm/i915/intel_lrc.c           |    5 ++++-
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |    4 +++-
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    1 +
+ include/uapi/drm/i915_drm.h                |    7 ++++++-
+ 6 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 03eb731..4ebe15b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1427,6 +1427,20 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	} else
+ 		ring = &dev_priv->ring[(args->flags & I915_EXEC_RING_MASK) - 1];
+ 
++	if (args->flags & I915_EXEC_RESOURCE_STREAMER) {
++		if (INTEL_INFO(dev)->gen < 8) {
++			DRM_DEBUG("RS is only allowed for Gen8 and above\n");
++			return -EINVAL;
++		}
++		if (ring->id != RCS) {
++			DRM_DEBUG("RS is not available on %s)\n",
++				  ring->name);
++			return -EINVAL;
++		}
++
++		dispatch_flags |= I915_DISPATCH_RS;
++	}
++
+ 	if (!intel_ring_initialized(ring)) {
+ 		DRM_DEBUG("execbuf with invalid ring: %d\n",
+ 			  (int)(args->flags & I915_EXEC_RING_MASK));
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 137c5e0..8ffb9f2 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -321,6 +321,7 @@
+ #define   MI_BATCH_GTT		    (2<<6) /* aliased with (1<<7) on gen4 */
+ #define   MI_BATCH_2ND_LEVEL_HSW    (1<<22)
+ #define   MI_BATCH_ADD_OFFSET_HSW   (1<<16)
++#define   MI_BATCH_RESOURCE_STREAMER	(1<<10)
+ #define MI_BATCH_BUFFER_START_GEN8	MI_INSTR(0x31, 1)
+ 
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 56483bf..ee9fc6a 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1943,7 +1943,10 @@ static int gen8_emit_bb_start(struct intel_ringbuffer *ringbuf,
+ 		return ret;
+ 
+ 	/* FIXME(BDW): Address space and security selectors. */
+-	intel_logical_ring_emit(ringbuf, MI_BATCH_BUFFER_START_GEN8 | (ppgtt<<8));
++	intel_logical_ring_emit(ringbuf, MI_BATCH_BUFFER_START_GEN8 |
++			(ppgtt<<8) |
++			(flags &
++			 I915_DISPATCH_RS ? MI_BATCH_RESOURCE_STREAMER : 0));
+ 	intel_logical_ring_emit(ringbuf, lower_32_bits(offset));
+ 	intel_logical_ring_emit(ringbuf, upper_32_bits(offset));
+ 	intel_logical_ring_emit(ringbuf, MI_NOOP);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index c89929e..50e1258 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2693,7 +2693,9 @@ gen8_ring_dispatch_execbuffer(struct intel_engine_cs *ring,
+ 		return ret;
+ 
+ 	/* FIXME(BDW): Address space and security selectors. */
+-	intel_ring_emit(ring, MI_BATCH_BUFFER_START_GEN8 | (ppgtt<<8));
++	intel_ring_emit(ring, MI_BATCH_BUFFER_START_GEN8 | (ppgtt<<8) |
++			(flags &
++			 I915_DISPATCH_RS ? MI_BATCH_RESOURCE_STREAMER : 0));
+ 	intel_ring_emit(ring, lower_32_bits(offset));
+ 	intel_ring_emit(ring, upper_32_bits(offset));
+ 	intel_ring_emit(ring, MI_NOOP);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 7c60cd7..9a2bb15 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -342,6 +342,7 @@ struct intel_engine_cs {
+ #define I915_DISPATCH_SECURE            (1 << 0)
+ #define I915_DISPATCH_PINNED            (1 << 1)
+ #define I915_DISPATCH_LAUNCH_CB2        (1 << 2)
++#define I915_DISPATCH_RS		(1 << 3)
+ 	void		(*cleanup)(struct intel_engine_cs *ring);
+ 	int (*enable)(struct intel_engine_cs *ring, struct intel_context *ctx);
+ 	int (*disable)(struct intel_engine_cs *ring, struct intel_context *ctx);
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 51dd0b2..0be5530 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -844,7 +844,12 @@ struct drm_i915_gem_execbuffer2 {
+ /* Enable watchdog timer for this batch buffer */
+ #define I915_EXEC_ENABLE_WATCHDOG       (1<<15)
+ 
+-#define __I915_EXEC_UNKNOWN_FLAGS -(I915_EXEC_ENABLE_WATCHDOG<<1)
++/** Tell the kernel that the batchbuffer is processed by
++ *  the resource streamer.
++ */
++#define I915_EXEC_RESOURCE_STREAMER     (1<<16)
++
++#define __I915_EXEC_UNKNOWN_FLAGS -(I915_EXEC_RESOURCE_STREAMER << 1)
+ 
+ #define I915_EXEC_CONTEXT_ID_MASK	(0xffffffff)
+ #define i915_execbuffer2_set_context_id(eb2, context) \
+-- 
+1.7.9.5
+

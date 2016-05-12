@@ -1,0 +1,120 @@
+From 1e088916cd4231f9f6e9d54a0e79d68761982146 Mon Sep 17 00:00:00 2001
+From: AKASHI Takahiro <takahiro.akashi@linaro.org>
+Date: Wed, 30 Apr 2014 10:51:30 +0100
+Subject: [PATCH 460/634] arm64: split syscall_trace() into separate functions
+ for enter/exit
+
+As done in arm, this change makes it easy to confirm we invoke syscall
+related hooks, including syscall tracepoint, audit and seccomp which would
+be implemented later, in correct order. That is, undoing operations in the
+opposite order on exit that they were done on entry.
+
+Acked-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: AKASHI Takahiro <takahiro.akashi@linaro.org>
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+---
+ arch/arm64/kernel/entry.S  | 10 ++++------
+ arch/arm64/kernel/ptrace.c | 50 +++++++++++++++++++++++++++-------------------
+ 2 files changed, 33 insertions(+), 27 deletions(-)
+
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index 9ccb891..09352ad 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -648,9 +648,8 @@ ENDPROC(el0_svc)
+ 	 * switches, and waiting for our parent to respond.
+ 	 */
+ __sys_trace:
+-	mov	x1, sp
+-	mov	w0, #0				// trace entry
+-	bl	syscall_trace
++	mov	x0, sp
++	bl	syscall_trace_enter
+ 	adr	lr, __sys_trace_return		// return address
+ 	uxtw	scno, w0			// syscall number (possibly new)
+ 	mov	x1, sp				// pointer to regs
+@@ -665,9 +664,8 @@ __sys_trace:
+ 
+ __sys_trace_return:
+ 	str	x0, [sp]			// save returned x0
+-	mov	x1, sp
+-	mov	w0, #1				// trace exit
+-	bl	syscall_trace
++	mov	x0, sp
++	bl	syscall_trace_exit
+ 	b	ret_to_user
+ 
+ /*
+diff --git a/arch/arm64/kernel/ptrace.c b/arch/arm64/kernel/ptrace.c
+index 6558c77..2219334 100644
+--- a/arch/arm64/kernel/ptrace.c
++++ b/arch/arm64/kernel/ptrace.c
+@@ -1075,35 +1075,43 @@ long arch_ptrace(struct task_struct *child, long request,
+ 	return ptrace_request(child, request, addr, data);
+ }
+ 
+-asmlinkage int syscall_trace(int dir, struct pt_regs *regs)
++enum ptrace_syscall_dir {
++	PTRACE_SYSCALL_ENTER = 0,
++	PTRACE_SYSCALL_EXIT,
++};
++
++static void tracehook_report_syscall(struct pt_regs *regs,
++				     enum ptrace_syscall_dir dir)
+ {
++	int regno;
+ 	unsigned long saved_reg;
+ 
+-	if (!test_thread_flag(TIF_SYSCALL_TRACE))
+-		return regs->syscallno;
+-
+-	if (is_compat_task()) {
+-		/* AArch32 uses ip (r12) for scratch */
+-		saved_reg = regs->regs[12];
+-		regs->regs[12] = dir;
+-	} else {
+-		/*
+-		 * Save X7. X7 is used to denote syscall entry/exit:
+-		 *   X7 = 0 -> entry, = 1 -> exit
+-		 */
+-		saved_reg = regs->regs[7];
+-		regs->regs[7] = dir;
+-	}
++	/*
++	 * A scratch register (ip(r12) on AArch32, x7 on AArch64) is
++	 * used to denote syscall entry/exit:
++	 */
++	regno = (is_compat_task() ? 12 : 7);
++	saved_reg = regs->regs[regno];
++	regs->regs[regno] = dir;
+ 
+-	if (dir)
++	if (dir == PTRACE_SYSCALL_EXIT)
+ 		tracehook_report_syscall_exit(regs, 0);
+ 	else if (tracehook_report_syscall_entry(regs))
+ 		regs->syscallno = ~0UL;
+ 
+-	if (is_compat_task())
+-		regs->regs[12] = saved_reg;
+-	else
+-		regs->regs[7] = saved_reg;
++	regs->regs[regno] = saved_reg;
++}
++
++asmlinkage int syscall_trace_enter(struct pt_regs *regs)
++{
++	if (test_thread_flag(TIF_SYSCALL_TRACE))
++		tracehook_report_syscall(regs, PTRACE_SYSCALL_ENTER);
+ 
+ 	return regs->syscallno;
+ }
++
++asmlinkage void syscall_trace_exit(struct pt_regs *regs)
++{
++	if (test_thread_flag(TIF_SYSCALL_TRACE))
++		tracehook_report_syscall(regs, PTRACE_SYSCALL_EXIT);
++}
+-- 
+1.9.1
+

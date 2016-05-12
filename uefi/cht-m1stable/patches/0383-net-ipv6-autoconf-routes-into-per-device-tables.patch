@@ -1,0 +1,351 @@
+From e7ca8f7091d62f2286b34021b7fc61bc22ce0c60 Mon Sep 17 00:00:00 2001
+From: Lorenzo Colitti <lorenzo@google.com>
+Date: Wed, 26 Mar 2014 19:35:41 +0900
+Subject: [PATCH 383/634] net: ipv6: autoconf routes into per-device tables
+
+Currently, IPv6 router discovery always puts routes into
+RT6_TABLE_MAIN. This causes problems for connection managers
+that want to support multiple simultaneous network connections
+and want control over which one is used by default (e.g., wifi
+and wired).
+
+To work around this connection managers typically take the routes
+they prefer and copy them to static routes with low metrics in
+the main table. This puts the burden on the connection manager
+to watch netlink to see if the routes have changed, delete the
+routes when their lifetime expires, etc.
+
+Instead, this patch adds a per-interface sysctl to have the
+kernel put autoconf routes into different tables. This allows
+each interface to have its own autoconf table, and choosing the
+default interface (or using different interfaces at the same
+time for different types of traffic) can be done using
+appropriate ip rules.
+
+The sysctl behaves as follows:
+
+- = 0: default. Put routes into RT6_TABLE_MAIN as before.
+- > 0: manual. Put routes into the specified table.
+- < 0: automatic. Add the absolute value of the sysctl to the
+       device's ifindex, and use that table.
+
+The automatic mode is most useful in conjunction with
+net.ipv6.conf.default.accept_ra_rt_table. A connection manager
+or distribution could set it to, say, -100 on boot, and
+thereafter just use IP rules.
+
+Change-Id: I82d16e3737d9cdfa6489e649e247894d0d60cbb1
+Signed-off-by: Lorenzo Colitti <lorenzo@google.com>
+---
+ include/linux/ipv6.h      |  1 +
+ include/net/addrconf.h    |  2 ++
+ include/uapi/linux/ipv6.h |  1 +
+ net/ipv6/addrconf.c       | 40 ++++++++++++++++++++++++--
+ net/ipv6/route.c          | 72 +++++++++++++++++++----------------------------
+ 5 files changed, 71 insertions(+), 45 deletions(-)
+
+diff --git a/include/linux/ipv6.h b/include/linux/ipv6.h
+index 2faef33..3e4c6b9 100644
+--- a/include/linux/ipv6.h
++++ b/include/linux/ipv6.h
+@@ -37,6 +37,7 @@ struct ipv6_devconf {
+ 	__s32		accept_ra_rt_info_max_plen;
+ #endif
+ #endif
++	__s32		accept_ra_rt_table;
+ 	__s32		proxy_ndp;
+ 	__s32		accept_source_route;
+ #ifdef CONFIG_IPV6_OPTIMISTIC_DAD
+diff --git a/include/net/addrconf.h b/include/net/addrconf.h
+index 50e39a8..b811775 100644
+--- a/include/net/addrconf.h
++++ b/include/net/addrconf.h
+@@ -193,6 +193,8 @@ static inline bool ipv6_is_mld(struct sk_buff *skb, int nexthdr, int offset)
+ void addrconf_prefix_rcv(struct net_device *dev,
+ 			 u8 *opt, int len, bool sllao);
+ 
++u32 addrconf_rt_table(const struct net_device *dev, u32 default_table);
++
+ /*
+  *	anycast prototypes (anycast.c)
+  */
+diff --git a/include/uapi/linux/ipv6.h b/include/uapi/linux/ipv6.h
+index 593b0e3..40e9a53 100644
+--- a/include/uapi/linux/ipv6.h
++++ b/include/uapi/linux/ipv6.h
+@@ -160,6 +160,7 @@ enum {
+ 	DEVCONF_ACCEPT_DAD,
+ 	DEVCONF_FORCE_TLLAO,
+ 	DEVCONF_NDISC_NOTIFY,
++	DEVCONF_ACCEPT_RA_RT_TABLE,
+ 	DEVCONF_MLDV1_UNSOLICITED_REPORT_INTERVAL,
+ 	DEVCONF_MLDV2_UNSOLICITED_REPORT_INTERVAL,
+ 	DEVCONF_SUPPRESS_FRAG_NDISC,
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index 3f0ec06..293afd7 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -194,6 +194,7 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
+ 	.accept_ra_rt_info_max_plen = 0,
+ #endif
+ #endif
++	.accept_ra_rt_table	= 0,
+ 	.proxy_ndp		= 0,
+ 	.accept_source_route	= 0,	/* we do not accept RH0 by default. */
+ 	.disable_ipv6		= 0,
+@@ -230,6 +231,7 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
+ 	.accept_ra_rt_info_max_plen = 0,
+ #endif
+ #endif
++	.accept_ra_rt_table	= 0,
+ 	.proxy_ndp		= 0,
+ 	.accept_source_route	= 0,	/* we do not accept RH0 by default. */
+ 	.disable_ipv6		= 0,
+@@ -1960,6 +1962,31 @@ static void  __ipv6_try_regen_rndid(struct inet6_dev *idev, struct in6_addr *tmp
+ 		__ipv6_regen_rndid(idev);
+ }
+ 
++u32 addrconf_rt_table(const struct net_device *dev, u32 default_table) {
++	/* Determines into what table to put autoconf PIO/RIO/default routes
++	 * learned on this device.
++	 *
++	 * - If 0, use the same table for every device. This puts routes into
++	 *   one of RT_TABLE_{PREFIX,INFO,DFLT} depending on the type of route
++	 *   (but note that these three are currently all equal to
++	 *   RT6_TABLE_MAIN).
++	 * - If > 0, use the specified table.
++	 * - If < 0, put routes into table dev->ifindex + (-rt_table).
++	 */
++	struct inet6_dev *idev = in6_dev_get(dev);
++	u32 table;
++	int sysctl = idev->cnf.accept_ra_rt_table;
++	if (sysctl == 0) {
++		table = default_table;
++	} else if (sysctl > 0) {
++		table = (u32) sysctl;
++	} else {
++		table = (unsigned) dev->ifindex + (-sysctl);
++	}
++	in6_dev_put(idev);
++	return table;
++}
++
+ /*
+  *	Add prefix route.
+  */
+@@ -1969,7 +1996,7 @@ addrconf_prefix_route(struct in6_addr *pfx, int plen, struct net_device *dev,
+ 		      unsigned long expires, u32 flags)
+ {
+ 	struct fib6_config cfg = {
+-		.fc_table = RT6_TABLE_PREFIX,
++		.fc_table = addrconf_rt_table(dev, RT6_TABLE_PREFIX),
+ 		.fc_metric = IP6_RT_PRIO_ADDRCONF,
+ 		.fc_ifindex = dev->ifindex,
+ 		.fc_expires = expires,
+@@ -2003,7 +2030,8 @@ static struct rt6_info *addrconf_get_prefix_route(const struct in6_addr *pfx,
+ 	struct rt6_info *rt = NULL;
+ 	struct fib6_table *table;
+ 
+-	table = fib6_get_table(dev_net(dev), RT6_TABLE_PREFIX);
++	table = fib6_get_table(dev_net(dev),
++			       addrconf_rt_table(dev, RT6_TABLE_PREFIX));
+ 	if (table == NULL)
+ 		return NULL;
+ 
+@@ -4308,6 +4336,7 @@ static inline void ipv6_store_devconf(struct ipv6_devconf *cnf,
+ 	array[DEVCONF_ACCEPT_RA_RT_INFO_MAX_PLEN] = cnf->accept_ra_rt_info_max_plen;
+ #endif
+ #endif
++	array[DEVCONF_ACCEPT_RA_RT_TABLE] = cnf->accept_ra_rt_table;
+ 	array[DEVCONF_PROXY_NDP] = cnf->proxy_ndp;
+ 	array[DEVCONF_ACCEPT_SOURCE_ROUTE] = cnf->accept_source_route;
+ #ifdef CONFIG_IPV6_OPTIMISTIC_DAD
+@@ -5100,6 +5129,13 @@ static struct addrconf_sysctl_table
+ #endif
+ #endif
+ 		{
++			.procname	= "accept_ra_rt_table",
++			.data		= &ipv6_devconf.accept_ra_rt_table,
++			.maxlen		= sizeof(int),
++			.mode		= 0644,
++			.proc_handler	= proc_dointvec,
++		},
++		{
+ 			.procname	= "proxy_ndp",
+ 			.data		= &ipv6_devconf.proxy_ndp,
+ 			.maxlen		= sizeof(int),
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 3809ca2..665c4b6 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -95,13 +95,12 @@ static void		rt6_do_redirect(struct dst_entry *dst, struct sock *sk,
+ static int rt6_score_route(struct rt6_info *rt, int oif, int strict);
+ 
+ #ifdef CONFIG_IPV6_ROUTE_INFO
+-static struct rt6_info *rt6_add_route_info(struct net *net,
++static struct rt6_info *rt6_add_route_info(struct net_device *dev,
+ 					   const struct in6_addr *prefix, int prefixlen,
+-					   const struct in6_addr *gwaddr, int ifindex,
+-					   unsigned int pref);
+-static struct rt6_info *rt6_get_route_info(struct net *net,
++					   const struct in6_addr *gwaddr, unsigned int pref);
++static struct rt6_info *rt6_get_route_info(struct net_device *dev,
+ 					   const struct in6_addr *prefix, int prefixlen,
+-					   const struct in6_addr *gwaddr, int ifindex);
++					   const struct in6_addr *gwaddr);
+ #endif
+ 
+ static void rt6_bind_peer(struct rt6_info *rt, int create)
+@@ -706,7 +705,6 @@ static struct rt6_info *rt6_select(struct fib6_node *fn, int oif, int strict)
+ int rt6_route_rcv(struct net_device *dev, u8 *opt, int len,
+ 		  const struct in6_addr *gwaddr)
+ {
+-	struct net *net = dev_net(dev);
+ 	struct route_info *rinfo = (struct route_info *) opt;
+ 	struct in6_addr prefix_buf, *prefix;
+ 	unsigned int pref;
+@@ -751,8 +749,7 @@ int rt6_route_rcv(struct net_device *dev, u8 *opt, int len,
+ 	if (rinfo->prefix_len == 0)
+ 		rt = rt6_get_dflt_router(gwaddr, dev);
+ 	else
+-		rt = rt6_get_route_info(net, prefix, rinfo->prefix_len,
+-					gwaddr, dev->ifindex);
++		rt = rt6_get_route_info(net, prefix, rinfo->prefix_len,	gwaddr);
+ 
+ 	if (rt && !lifetime) {
+ 		ip6_del_rt(rt);
+@@ -760,8 +757,7 @@ int rt6_route_rcv(struct net_device *dev, u8 *opt, int len,
+ 	}
+ 
+ 	if (!rt && lifetime)
+-		rt = rt6_add_route_info(net, prefix, rinfo->prefix_len, gwaddr, dev->ifindex,
+-					pref);
++		rt = rt6_add_route_info(dev, prefix, rinfo->prefix_len, gwaddr, pref);
+ 	else if (rt)
+ 		rt->rt6i_flags = RTF_ROUTEINFO |
+ 				 (rt->rt6i_flags & ~RTF_PREF_MASK) | RTF_PREF(pref);
+@@ -1934,15 +1930,16 @@ static struct rt6_info *ip6_rt_copy(struct rt6_info *ort,
+ }
+ 
+ #ifdef CONFIG_IPV6_ROUTE_INFO
+-static struct rt6_info *rt6_get_route_info(struct net *net,
++static struct rt6_info *rt6_get_route_info(struct net_device *dev,
+ 					   const struct in6_addr *prefix, int prefixlen,
+-					   const struct in6_addr *gwaddr, int ifindex)
++					   const struct in6_addr *gwaddr)
+ {
+ 	struct fib6_node *fn;
+ 	struct rt6_info *rt = NULL;
+ 	struct fib6_table *table;
+ 
+-	table = fib6_get_table(net, RT6_TABLE_INFO);
++	table = fib6_get_table(dev_net(dev),
++			       addrconf_rt_table(dev, RT6_TABLE_INFO));
+ 	if (!table)
+ 		return NULL;
+ 
+@@ -1952,7 +1949,7 @@ static struct rt6_info *rt6_get_route_info(struct net *net,
+ 		goto out;
+ 
+ 	for (rt = fn->leaf; rt; rt = rt->dst.rt6_next) {
+-		if (rt->dst.dev->ifindex != ifindex)
++		if (rt->dst.dev->ifindex != dev->ifindex)
+ 			continue;
+ 		if ((rt->rt6i_flags & (RTF_ROUTEINFO|RTF_GATEWAY)) != (RTF_ROUTEINFO|RTF_GATEWAY))
+ 			continue;
+@@ -1966,21 +1963,20 @@ out:
+ 	return rt;
+ }
+ 
+-static struct rt6_info *rt6_add_route_info(struct net *net,
++static struct rt6_info *rt6_add_route_info(struct net_device *dev,
+ 					   const struct in6_addr *prefix, int prefixlen,
+-					   const struct in6_addr *gwaddr, int ifindex,
+-					   unsigned int pref)
++					   const struct in6_addr *gwaddr, unsigned int pref)
+ {
+ 	struct fib6_config cfg = {
+-		.fc_table	= RT6_TABLE_INFO,
++		.fc_table	= addrconf_rt_table(dev, RT6_TABLE_INFO),
+ 		.fc_metric	= IP6_RT_PRIO_USER,
+-		.fc_ifindex	= ifindex,
++		.fc_ifindex	= dev->ifindex,
+ 		.fc_dst_len	= prefixlen,
+ 		.fc_flags	= RTF_GATEWAY | RTF_ADDRCONF | RTF_ROUTEINFO |
+ 				  RTF_UP | RTF_PREF(pref),
+ 		.fc_nlinfo.portid = 0,
+ 		.fc_nlinfo.nlh = NULL,
+-		.fc_nlinfo.nl_net = net,
++		.fc_nlinfo.nl_net = dev_net(dev),
+ 	};
+ 
+ 	cfg.fc_dst = *prefix;
+@@ -1992,7 +1988,7 @@ static struct rt6_info *rt6_add_route_info(struct net *net,
+ 
+ 	ip6_route_add(&cfg);
+ 
+-	return rt6_get_route_info(net, prefix, prefixlen, gwaddr, ifindex);
++	return rt6_get_route_info(dev, prefix, prefixlen, gwaddr);
+ }
+ #endif
+ 
+@@ -2001,7 +1997,8 @@ struct rt6_info *rt6_get_dflt_router(const struct in6_addr *addr, struct net_dev
+ 	struct rt6_info *rt;
+ 	struct fib6_table *table;
+ 
+-	table = fib6_get_table(dev_net(dev), RT6_TABLE_DFLT);
++	table = fib6_get_table(dev_net(dev),
++			       addrconf_rt_table(dev, RT6_TABLE_MAIN));
+ 	if (!table)
+ 		return NULL;
+ 
+@@ -2023,7 +2020,7 @@ struct rt6_info *rt6_add_dflt_router(const struct in6_addr *gwaddr,
+ 				     unsigned int pref)
+ {
+ 	struct fib6_config cfg = {
+-		.fc_table	= RT6_TABLE_DFLT,
++		.fc_table	= addrconf_rt_table(dev, RT6_TABLE_DFLT),
+ 		.fc_metric	= IP6_RT_PRIO_USER,
+ 		.fc_ifindex	= dev->ifindex,
+ 		.fc_flags	= RTF_GATEWAY | RTF_ADDRCONF | RTF_DEFAULT |
+@@ -2040,28 +2037,17 @@ struct rt6_info *rt6_add_dflt_router(const struct in6_addr *gwaddr,
+ 	return rt6_get_dflt_router(gwaddr, dev);
+ }
+ 
+-void rt6_purge_dflt_routers(struct net *net)
+-{
+-	struct rt6_info *rt;
+-	struct fib6_table *table;
+ 
+-	/* NOTE: Keep consistent with rt6_get_dflt_router */
+-	table = fib6_get_table(net, RT6_TABLE_DFLT);
+-	if (!table)
+-		return;
++int rt6_addrconf_purge(struct rt6_info *rt, void *arg) {
++	if (rt->rt6i_flags & (RTF_DEFAULT | RTF_ADDRCONF) &&
++	    (!rt->rt6i_idev || rt->rt6i_idev->cnf.accept_ra != 2))
++		return -1;
++	return 0;
++}
+ 
+-restart:
+-	read_lock_bh(&table->tb6_lock);
+-	for (rt = table->tb6_root.leaf; rt; rt = rt->dst.rt6_next) {
+-		if (rt->rt6i_flags & (RTF_DEFAULT | RTF_ADDRCONF) &&
+-		    (!rt->rt6i_idev || rt->rt6i_idev->cnf.accept_ra != 2)) {
+-			dst_hold(&rt->dst);
+-			read_unlock_bh(&table->tb6_lock);
+-			ip6_del_rt(rt);
+-			goto restart;
+-		}
+-	}
+-	read_unlock_bh(&table->tb6_lock);
++void rt6_purge_dflt_routers(struct net *net)
++{
++	fib6_clean_all(net, rt6_addrconf_purge, NULL);
+ }
+ 
+ static void rtmsg_to_fib6_config(struct net *net,
+-- 
+1.9.1
+

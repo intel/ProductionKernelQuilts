@@ -1,0 +1,188 @@
+From fb4471553712ed525b9d5d260287fa277e43af50 Mon Sep 17 00:00:00 2001
+From: Dmitry Shmidt <dimitrysh@google.com>
+Date: Tue, 4 Nov 2014 16:22:17 -0800
+Subject: [PATCH 17/27] net: wireless: bcmdhd: Add wake source dump for SDIO
+ driver
+
+Change-Id: I0fd99668d267b7f1ce8600163dc085d87204efa6
+Signed-off-by: Dmitry Shmidt <dimitrysh@google.com>
+---
+ drivers/net/wireless/bcmdhd/Makefile         |  2 ++
+ drivers/net/wireless/bcmdhd/bcmsdh_linux.c   | 27 +++++++++++++++++++++++++++
+ drivers/net/wireless/bcmdhd/dhd_sdio.c       | 25 +++++++++++++++++++++++++
+ drivers/net/wireless/bcmdhd/include/bcmsdh.h |  8 ++++++++
+ 4 files changed, 62 insertions(+)
+
+diff --git a/drivers/net/wireless/bcmdhd/Makefile b/drivers/net/wireless/bcmdhd/Makefile
+index 1d37aa3..d2cc732 100644
+--- a/drivers/net/wireless/bcmdhd/Makefile
++++ b/drivers/net/wireless/bcmdhd/Makefile
+@@ -149,6 +149,8 @@ ifneq ($(CONFIG_BCMDHD_SDIO),)
+ 
+ # bcn_timeout
+   DHDCFLAGS += -DCUSTOM_BCN_TIMEOUT_SETTING=5
++# debug info
++  DHDCFLAGS += -DDHD_WAKE_STATUS
+ endif
+ 
+ ifneq ($(CONFIG_BCMDHD_PCIE),)
+diff --git a/drivers/net/wireless/bcmdhd/bcmsdh_linux.c b/drivers/net/wireless/bcmdhd/bcmsdh_linux.c
+index 5b2d8b4..6a00fc1 100644
+--- a/drivers/net/wireless/bcmdhd/bcmsdh_linux.c
++++ b/drivers/net/wireless/bcmdhd/bcmsdh_linux.c
+@@ -34,6 +34,9 @@
+ #include <linuxver.h>
+ #include <linux/pci.h>
+ #include <linux/completion.h>
++#ifdef DHD_WAKE_STATUS
++#include <linux/wakeup_reason.h>
++#endif
+ 
+ #include <osl.h>
+ #include <pcicfg.h>
+@@ -211,6 +214,25 @@ int bcmsdh_remove(bcmsdh_info_t *bcmsdh)
+ 	return 0;
+ }
+ 
++#ifdef DHD_WAKE_STATUS
++int bcmsdh_set_get_wake(bcmsdh_info_t *bcmsdh, int flag)
++{
++	bcmsdh_os_info_t *bcmsdh_osinfo = bcmsdh->os_cxt;
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&bcmsdh_osinfo->oob_irq_spinlock, flags);
++
++	ret = bcmsdh->pkt_wake;
++	if (flag)
++		bcmsdh->total_wake_count++;
++	bcmsdh->pkt_wake = flag;
++
++	spin_unlock_irqrestore(&bcmsdh_osinfo->oob_irq_spinlock, flags);
++	return ret;
++}
++#endif
++
+ int bcmsdh_suspend(bcmsdh_info_t *bcmsdh)
+ {
+ 	bcmsdh_os_info_t *bcmsdh_osinfo = bcmsdh->os_cxt;
+@@ -224,6 +246,11 @@ int bcmsdh_resume(bcmsdh_info_t *bcmsdh)
+ {
+ 	bcmsdh_os_info_t *bcmsdh_osinfo = bcmsdh->os_cxt;
+ 
++#ifdef DHD_WAKE_STATUS
++	if (check_wakeup_reason(bcmsdh_osinfo->oob_irq_num))
++		bcmsdh_set_get_wake(bcmsdh, 1);
++#endif
++
+ 	if (drvinfo.resume)
+ 		return drvinfo.resume(bcmsdh_osinfo->context);
+ 	return 0;
+diff --git a/drivers/net/wireless/bcmdhd/dhd_sdio.c b/drivers/net/wireless/bcmdhd/dhd_sdio.c
+index 033a1ac..1f674ae 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_sdio.c
++++ b/drivers/net/wireless/bcmdhd/dhd_sdio.c
+@@ -350,6 +350,11 @@ typedef struct dhd_bus {
+ 	uint		f2rxdata;		/* Number of frame data reads */
+ 	uint		f2txdata;		/* Number of f2 frame writes */
+ 	uint		f1regdata;		/* Number of f1 register accesses */
++#ifdef DHD_WAKE_STATUS
++	uint		rxwake;
++	uint		rcwake;
++	uint		glomwake;
++#endif
+ #ifdef DHDENABLE_TAILPAD
+ 	uint		tx_tailpad_chain;	/* Number of tail padding by chaining pad_pkt */
+ 	uint		tx_tailpad_pktget;	/* Number of tail padding by new PKTGET */
+@@ -2573,6 +2578,10 @@ dhd_bus_dump(dhd_pub_t *dhdp, struct bcmstrbuf *strbuf)
+ 	            bus->rxlen, bus->rx_seq);
+ 	bcm_bprintf(strbuf, "intr %d intrcount %u lastintrs %u spurious %u\n",
+ 	            bus->intr, bus->intrcount, bus->lastintrs, bus->spurious);
++#ifdef DHD_WAKE_STATUS
++	bcm_bprintf(strbuf, "wake %u rxwake %u glomwake %u readctrlwake %u\n",
++	            bus->sdh->total_wake_count, bus->rxwake, bus->glomwake, bus->rcwake);
++#endif
+ 	bcm_bprintf(strbuf, "pollrate %u pollcnt %u regfails %u\n",
+ 	            bus->pollrate, bus->pollcnt, bus->regfails);
+ 
+@@ -5089,6 +5098,9 @@ dhdsdio_readframes(dhd_bus_t *bus, uint maxframes, bool *finished)
+ 	uchar reorder_info_buf[WLHOST_REORDERDATA_TOTLEN];
+ 	uint reorder_info_len;
+ 	uint pkt_count;
++#ifdef DHD_WAKE_STATUS
++	int pkt_wake = bcmsdh_set_get_wake(bus->sdh, 0);
++#endif
+ 
+ #if defined(DHD_DEBUG) || defined(SDTEST)
+ 	bool sdtest = FALSE;	/* To limit message spew from test mode */
+@@ -5120,7 +5132,11 @@ dhdsdio_readframes(dhd_bus_t *bus, uint maxframes, bool *finished)
+ 
+ 	for (rxseq = bus->rx_seq, rxleft = maxframes;
+ 	     !bus->rxskip && rxleft && bus->dhd->busstate != DHD_BUS_DOWN;
++#ifdef DHD_WAKE_STATUS
++	     rxseq++, rxleft--, pkt_wake=0) {
++#else
+ 	     rxseq++, rxleft--) {
++#endif
+ #ifdef DHDTCPACK_SUP_DBG
+ 		if (bus->dhd->tcpack_sup_mode != TCPACK_SUP_DELAYTX) {
+ 			if (bus->dotxinrx == FALSE)
+@@ -5156,6 +5172,9 @@ dhdsdio_readframes(dhd_bus_t *bus, uint maxframes, bool *finished)
+ 			uint8 cnt;
+ 			DHD_GLOM(("%s: calling rxglom: glomd %p, glom %p\n",
+ 			          __FUNCTION__, bus->glomd, bus->glom));
++#ifdef DHD_WAKE_STATUS
++			bus->glomwake += pkt_wake;
++#endif
+ 			cnt = dhdsdio_rxglom(bus, rxseq);
+ 			DHD_GLOM(("%s: rxglom returned %d\n", __FUNCTION__, cnt));
+ 			rxseq += cnt - 1;
+@@ -5545,6 +5564,9 @@ dhdsdio_readframes(dhd_bus_t *bus, uint maxframes, bool *finished)
+ 
+ 		/* Call a separate function for control frames */
+ 		if (chan == SDPCM_CONTROL_CHANNEL) {
++#ifdef DHD_WAKE_STATUS
++			bus->rcwake += pkt_wake;
++#endif
+ 			dhdsdio_read_control(bus, bus->rxhdr, len, doff);
+ 			continue;
+ 		}
+@@ -5683,6 +5705,9 @@ deliver:
+ 			pkt_count = 1;
+ 
+ 		/* Unlock during rx call */
++#ifdef DHD_WAKE_STATUS
++		bus->rxwake += pkt_wake;
++#endif
+ 		dhd_os_sdunlock(bus->dhd);
+ 		dhd_rx_frame(bus->dhd, ifidx, pkt, pkt_count, chan);
+ 		dhd_os_sdlock(bus->dhd);
+diff --git a/drivers/net/wireless/bcmdhd/include/bcmsdh.h b/drivers/net/wireless/bcmdhd/include/bcmsdh.h
+index 8986b0b..c5835e6 100644
+--- a/drivers/net/wireless/bcmdhd/include/bcmsdh.h
++++ b/drivers/net/wireless/bcmdhd/include/bcmsdh.h
+@@ -62,6 +62,10 @@ struct bcmsdh_info
+ 	bool	regfail;	/* Save status of last reg_read/reg_write call */
+ 	uint32	sbwad;		/* Save backplane window address */
+ 	void	*os_cxt;        /* Pointer to per-OS private data */
++#ifdef DHD_WAKE_STATUS
++	unsigned int	total_wake_count;
++	int	pkt_wake;
++#endif
+ };
+ 
+ /* Detach - freeup resources allocated in attach */
+@@ -85,6 +89,10 @@ extern void bcmsdh_intr_forward(void *sdh, bool pass);
+ extern bool bcmsdh_intr_pending(void *sdh);
+ #endif
+ 
++#ifdef DHD_WAKE_STATUS
++int bcmsdh_set_get_wake(bcmsdh_info_t *bcmsdh, int flag);
++#endif
++
+ /* Register a callback to be called if and when bcmsdh detects
+  * device removal. No-op in the case of non-removable/hardwired devices.
+  */
+-- 
+1.9.1
+

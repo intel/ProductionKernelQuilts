@@ -1,0 +1,140 @@
+From c624a1a548c9bac49647052a42d05e50fcdc9645 Mon Sep 17 00:00:00 2001
+From: Vinil Cheeramvelil <vinil.cheeramvelil@intel.com>
+Date: Wed, 8 Jul 2015 10:35:06 +0800
+Subject: [PATCH 624/634] ion: Handle the memory mapping correctly on x86
+
+This patch modifies the ion page pool code to address
+limitation in x86 PAT. When one physical page is mapped
+to multiple virtual pages, the same cache policy
+should be used. Add set_memory_wc/uc call to avoid aliases.
+If not, all mappings will be cached(write back).
+
+Change-Id: I98ee8902df0c80135dddfa998c4ca4c2bb44e40e
+Signed-off-by: Zhebin Jin <zhebin.jin@intel.com>
+Signed-off-by: Vinil Cheeramvelil <vinil.cheeramvelil@intel.com>
+---
+ drivers/staging/android/ion/Kconfig           |  7 ++++++
+ drivers/staging/android/ion/ion_page_pool.c   |  8 +++++++
+ drivers/staging/android/ion/ion_priv.h        | 34 +++++++++++++++++++++++++++
+ drivers/staging/android/ion/ion_system_heap.c |  5 +++-
+ 4 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/android/ion/Kconfig b/drivers/staging/android/ion/Kconfig
+index 0f8fec1..9ce6c36 100644
+--- a/drivers/staging/android/ion/Kconfig
++++ b/drivers/staging/android/ion/Kconfig
+@@ -33,3 +33,10 @@ config ION_TEGRA
+ 	help
+ 	  Choose this option if you wish to use ion on an nVidia Tegra.
+ 
++config ION_POOL_CACHE_POLICY
++	bool "Ion set page pool cache policy"
++	depends on ION
++	default y if X86
++	help
++	  Choose this option if need to explicity set cache policy of the
++	  pages in the page pool.
+diff --git a/drivers/staging/android/ion/ion_page_pool.c b/drivers/staging/android/ion/ion_page_pool.c
+index fa693c2..06ba9a2 100644
+--- a/drivers/staging/android/ion/ion_page_pool.c
++++ b/drivers/staging/android/ion/ion_page_pool.c
+@@ -34,6 +34,8 @@ static void *ion_page_pool_alloc_pages(struct ion_page_pool *pool)
+ 
+ 	if (!page)
+ 		return NULL;
++	ion_page_pool_alloc_set_cache_policy(pool, page);
++
+ 	ion_pages_sync_for_device(NULL, page, PAGE_SIZE << pool->order,
+ 						DMA_BIDIRECTIONAL);
+ 	return page;
+@@ -42,6 +44,7 @@ static void *ion_page_pool_alloc_pages(struct ion_page_pool *pool)
+ static void ion_page_pool_free_pages(struct ion_page_pool *pool,
+ 				     struct page *page)
+ {
++	ion_page_pool_free_set_cache_policy(pool, page);
+ 	__free_pages(page, pool->order);
+ }
+ 
+@@ -117,6 +120,11 @@ void ion_page_pool_free(struct ion_page_pool *pool, struct page *page)
+ 		ion_page_pool_free_pages(pool, page);
+ }
+ 
++void ion_page_pool_free_immediate(struct ion_page_pool *pool, struct page *page)
++{
++	ion_page_pool_free_pages(pool, page);
++}
++
+ static int ion_page_pool_total(struct ion_page_pool *pool, bool high)
+ {
+ 	int total = 0;
+diff --git a/drivers/staging/android/ion/ion_priv.h b/drivers/staging/android/ion/ion_priv.h
+index fc2e4fc..6dfa0a0 100644
+--- a/drivers/staging/android/ion/ion_priv.h
++++ b/drivers/staging/android/ion/ion_priv.h
+@@ -26,6 +26,9 @@
+ #include <linux/sched.h>
+ #include <linux/shrinker.h>
+ #include <linux/types.h>
++#ifdef CONFIG_ION_POOL_CACHE_POLICY
++#include <asm/cacheflush.h>
++#endif
+ 
+ #include "ion.h"
+ 
+@@ -336,6 +339,37 @@ struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order);
+ void ion_page_pool_destroy(struct ion_page_pool *);
+ void *ion_page_pool_alloc(struct ion_page_pool *);
+ void ion_page_pool_free(struct ion_page_pool *, struct page *);
++void ion_page_pool_free_immediate(struct ion_page_pool *, struct page *);
++
++#ifdef CONFIG_ION_POOL_CACHE_POLICY
++static inline void ion_page_pool_alloc_set_cache_policy
++				(struct ion_page_pool *pool,
++				struct page *page){
++	void *va = page_address(page);
++
++	if (va)
++		set_memory_wc((unsigned long)va, 1 << pool->order);
++}
++
++static inline void ion_page_pool_free_set_cache_policy
++				(struct ion_page_pool *pool,
++				struct page *page){
++	void *va = page_address(page);
++
++	if (va)
++		set_memory_wb((unsigned long)va, 1 << pool->order);
++
++}
++#else
++static inline void ion_page_pool_alloc_set_cache_policy
++				(struct ion_page_pool *pool,
++				struct page *page){ }
++
++static inline void ion_page_pool_free_set_cache_policy
++				(struct ion_page_pool *pool,
++				struct page *page){ }
++#endif
++
+ 
+ /** ion_page_pool_shrink - shrinks the size of the memory cached in the pool
+  * @pool:		the pool
+diff --git a/drivers/staging/android/ion/ion_system_heap.c b/drivers/staging/android/ion/ion_system_heap.c
+index 9849f39..d9afd8b 100644
+--- a/drivers/staging/android/ion/ion_system_heap.c
++++ b/drivers/staging/android/ion/ion_system_heap.c
+@@ -92,7 +92,10 @@ static void free_buffer_page(struct ion_system_heap *heap,
+ 
+ 	if (!cached) {
+ 		struct ion_page_pool *pool = heap->pools[order_to_index(order)];
+-		ion_page_pool_free(pool, page);
++		if (buffer->private_flags & ION_PRIV_FLAG_SHRINKER_FREE)
++			ion_page_pool_free_immediate(pool, page);
++		else
++			ion_page_pool_free(pool, page);
+ 	} else {
+ 		__free_pages(page, order);
+ 	}
+-- 
+1.9.1
+

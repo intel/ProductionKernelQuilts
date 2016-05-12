@@ -1,0 +1,148 @@
+From 513fcc114ccb1777f5aacac535de1731deec18c9 Mon Sep 17 00:00:00 2001
+Message-Id: <513fcc114ccb1777f5aacac535de1731deec18c9.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Fri, 28 Mar 2014 15:34:06 -0700
+Subject: [PATCH 22/68] FROM_UPSTREAM [VPG]: drm/i915/bdw: Update pdp switch
+ and point unused PDPs to scratch page
+
+One important part of this patch is we now write a scratch page
+directory into any unused PDP descriptors. This matters for 2 reasons,
+first, we're not allowed to just use 0, or an invalid pointer, and second,
+we must wipe out any previous contents from the last context.
+
+The latter point only matters with full PPGTT. The former point only
+effect platforms with less than 4GB memory.
+
+v2: Updated commit message to point that we must set unused PDPs to the
+scratch page.
+
+v3: Unmap scratch_pd and scratch_pt in gen8_ppgtt_free.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com> (v2)
+
+GMIN tree still has synchronous argument due to the lack of forklifts.
+This is a backport of v4 of "PPGTT dynamic page allocations" posted in
+intel-gfx.
+Fixed correct param order in gen8_write_pdp, also do not unmap
+scratch_pt in gen8_ppgtt_free, it isn't in use until a later patch.
+
+Change-Id: Id09503214aa71404b863a6de79be9d071e2f3c9c
+Upstream-repo: https://www.mail-archive.com/intel-gfx@lists.freedesktop.org/msg51919.html
+Upstream-commit: none
+Upstream-as-of-tag: none
+For: GMINL-5449
+For: VIZ-4619
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_gtt.c |   35 ++++++++++++++++++++++-------------
+ drivers/gpu/drm/i915/i915_gem_gtt.h |    5 ++++-
+ 2 files changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index ab42332..10de302 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -371,8 +371,9 @@ static struct i915_page_directory_entry *alloc_pd_single(void)
+ }
+ 
+ /* Broadwell Page Directory Pointer Descriptors */
+-static int gen8_write_pdp(struct intel_engine_cs *ring, unsigned entry,
+-			   uint64_t val, bool synchronous)
++static int gen8_write_pdp(struct intel_engine_cs *ring,
++			  unsigned entry, dma_addr_t addr,
++			  bool synchronous)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	int ret;
+@@ -380,8 +381,8 @@ static int gen8_write_pdp(struct intel_engine_cs *ring, unsigned entry,
+ 	BUG_ON(entry >= 4);
+ 
+ 	if (synchronous) {
+-		I915_WRITE(GEN8_RING_PDP_UDW(ring, entry), val >> 32);
+-		I915_WRITE(GEN8_RING_PDP_LDW(ring, entry), (u32)val);
++		I915_WRITE(GEN8_RING_PDP_UDW(ring, entry), upper_32_bits(addr));
++		I915_WRITE(GEN8_RING_PDP_LDW(ring, entry), lower_32_bits(addr));
+ 		return 0;
+ 	}
+ 
+@@ -391,10 +392,10 @@ static int gen8_write_pdp(struct intel_engine_cs *ring, unsigned entry,
+ 
+ 	intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
+ 	intel_ring_emit(ring, GEN8_RING_PDP_UDW(ring, entry));
+-	intel_ring_emit(ring, (u32)(val >> 32));
++	intel_ring_emit(ring, upper_32_bits(addr));
+ 	intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
+ 	intel_ring_emit(ring, GEN8_RING_PDP_LDW(ring, entry));
+-	intel_ring_emit(ring, (u32)(val));
++	intel_ring_emit(ring, lower_32_bits(addr));
+ 	intel_ring_advance(ring);
+ 
+ 	return 0;
+@@ -406,12 +407,12 @@ static int gen8_mm_switch(struct i915_hw_ppgtt *ppgtt,
+ {
+ 	int i, ret;
+ 
+-	/* bit of a hack to find the actual last used pd */
+-	int used_pd = ppgtt->num_pd_entries / GEN8_PDES_PER_PAGE;
+-
+-	for (i = used_pd - 1; i >= 0; i--) {
+-		dma_addr_t addr = ppgtt->pdp.page_directory[i]->daddr;
+-		ret = gen8_write_pdp(ring, i, addr, synchronous);
++	for (i = GEN8_LEGACY_PDPES - 1; i >= 0; i--) {
++		struct i915_page_directory_entry *pd = ppgtt->pdp.page_directory[i];
++		dma_addr_t pd_daddr = pd ? pd->daddr : ppgtt->scratch_pd->daddr;
++		/* The page directory might be NULL, but we need to clear out
++		 * whatever the previous context might have used. */
++		ret = gen8_write_pdp(ring, i, pd_daddr, synchronous);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -588,6 +589,8 @@ static void gen8_ppgtt_free(struct i915_hw_ppgtt *ppgtt)
+ 		gen8_free_page_tables(ppgtt->pdp.page_directory[i], ppgtt->base.dev);
+ 		unmap_and_free_pd(ppgtt->pdp.page_directory[i]);
+ 	}
++
++	unmap_and_free_pt(ppgtt->scratch_pd, ppgtt->base.dev);
+ }
+ 
+ static void gen8_ppgtt_cleanup(struct i915_address_space *vm)
+@@ -755,10 +758,16 @@ static int gen8_ppgtt_init(struct i915_hw_ppgtt *ppgtt, uint64_t size)
+ 	ppgtt->base.start = 0;
+ 	ppgtt->base.total = size;
+ 
++	ppgtt->scratch_pd = alloc_pt_scratch(ppgtt->base.dev);
++	if (IS_ERR(ppgtt->scratch_pd))
++		return PTR_ERR(ppgtt->scratch_pd);
++
+ 	/* 1. Do all our allocations for page directories and page tables. */
+ 	ret = gen8_ppgtt_alloc(ppgtt, ppgtt->base.start, ppgtt->base.total);
+-	if (ret)
++	if (ret) {
++		unmap_and_free_pt(ppgtt->scratch_pd, ppgtt->base.dev);
+ 		return ret;
++	}
+ 
+ 	/*
+ 	 * 2. Create DMA mappings for the page directories and page tables.
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index 56759e2..ad5f351 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -286,7 +286,10 @@ struct i915_hw_ppgtt {
+ 
+ 	struct list_head vma_list;
+ 
+-	struct i915_page_table_entry *scratch_pt;
++	union {
++		struct i915_page_table_entry *scratch_pt;
++		struct i915_page_table_entry *scratch_pd; /* Just need the daddr */
++	};
+ 
+ 	struct drm_i915_file_private *file_priv;
+ 
+-- 
+1.7.9.5
+

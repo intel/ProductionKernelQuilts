@@ -1,0 +1,577 @@
+From fef30d94e35900d8adecb828402af78649651f68 Mon Sep 17 00:00:00 2001
+From: Sourab Gupta <sourab.gupta@intel.com>
+Date: Tue, 18 Nov 2014 19:32:55 +0530
+Subject: [PATCH 4/4] SQUASHME! [VPG]: drm/i915: New memtracker sysfs
+ interface design for collecting object stats
+
+SQUASHME! - This patch should be squashed into the following existing patch:
+Author: Sourab Gupta <sourab.gupta@intel.com>
+Date:   Mon Aug 11 13:12:04 2014 +0530
+Change-Id: I02552d54a753fcfb94b5bdd9bc9c82702bbf514d
+	MUST_REBASE [VPG]: drm/i915: Sysfs interface to get GFX shmem usage
+	stats per process
+
+This patch introduces new design for exposing the object stats via sysfs
+interface.
+
+Previously, we used to have a single sysfs file for exposing the cumulative
+data of all the processes which have gfx buffers allocated.
+This leads to overhead for userspace in parsing this file everytime
+(even for non-gfx processes), even to find out whether that process is the
+consumer of GFX resources or not.
+
+In this patch, we've introduced a new design whereby there will be a
+seperate sysfs file created per each process (which has gfx resources
+allocated).
+This file can then be queried to retrieve the buffer stats for that process.
+
+v2: Protect the read function of sysfs file using mutex, to protect against
+    concurrent access by two processes accessing the same obj state buf.
+
+v3: Changes for
+    * Handling the case of multiple concurrent reads for same sysfs tgid file
+       w.r.t different drm open file instances (of same tgid).
+    * Synchronizing the sysfs file remove function with corrensponding read
+       functions.
+
+v4: Changes for
+    * Checking for tgid ptr itself instead of extracting pid num for comparison.
+    * Resetting the obj state buf parameters when a fresh read call lands up
+      on an already populated obj state buffer.
+
+Issue: GMINL-3834
+Change-Id: I7900401595bf96fd88a9d6f2a3e762b5780d1481
+Signed-off-by: Sourab Gupta <sourab.gupta@intel.com>
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h       |   13 +-
+ drivers/gpu/drm/i915/i915_gem.c       |    7 +
+ drivers/gpu/drm/i915/i915_gem_debug.c |   32 ++--
+ drivers/gpu/drm/i915/i915_gpu_error.c |   19 +++
+ drivers/gpu/drm/i915/i915_sysfs.c     |  278 +++++++++++++++++++++++++++++----
+ 5 files changed, 297 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 42fd1f7..5a1d5af 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1583,6 +1583,7 @@ struct drm_i915_private {
+ 	struct intel_opregion opregion;
+ 	struct intel_vbt_data vbt;
+ 
++	struct kobject memtrack_kobj;
+ 	/* overlay */
+ 	struct intel_overlay *overlay;
+ 
+@@ -2070,6 +2071,7 @@ struct drm_i915_file_private {
+ 
+ 	atomic_t rps_wait_boost;
+ 	struct  intel_engine_cs *bsd_ring;
++	struct bin_attribute *obj_attr;
+ };
+ 
+ /*
+@@ -2752,8 +2754,8 @@ int i915_obj_insert_virt_addr(struct drm_i915_gem_object *obj,
+ 				bool is_mutex_locked);
+ int i915_get_drm_clients_info(struct drm_i915_error_state_buf *m,
+ 				struct drm_device *dev);
+-int i915_gem_get_all_obj_info(struct drm_i915_error_state_buf *m,
+-				struct drm_device *dev);
++int i915_gem_get_obj_info(struct drm_i915_error_state_buf *m,
++			struct drm_device *dev, struct pid *tgid);
+ 
+ /* i915_debugfs.c */
+ int i915_debugfs_init(struct drm_minor *minor);
+@@ -2769,10 +2771,13 @@ __printf(2, 3)
+ void i915_error_printf(struct drm_i915_error_state_buf *e, const char *f, ...);
+ void i915_error_puts(struct drm_i915_error_state_buf *e,
+ 			    const char *str);
++bool i915_error_ok(struct drm_i915_error_state_buf *e);
+ int i915_error_state_to_str(struct drm_i915_error_state_buf *estr,
+ 			    const struct i915_error_state_file_priv *error);
+ int i915_error_state_buf_init(struct drm_i915_error_state_buf *eb,
+ 			      size_t count, loff_t pos);
++int i915_obj_state_buf_init(struct drm_i915_error_state_buf *eb,
++			      size_t count);
+ static inline void i915_error_state_buf_release(
+ 	struct drm_i915_error_state_buf *eb)
+ {
+@@ -2812,6 +2817,10 @@ void i915_restore_display_reg(struct drm_device *dev);
+ /* i915_sysfs.c */
+ void i915_setup_sysfs(struct drm_device *dev_priv);
+ void i915_teardown_sysfs(struct drm_device *dev_priv);
++int i915_gem_create_sysfs_file_entry(struct drm_device *dev,
++					struct drm_file *file);
++void i915_gem_remove_sysfs_file_entry(struct drm_device *dev,
++			struct drm_file *file);
+ 
+ /* intel_i2c.c */
+ extern int intel_setup_gmbus(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 07692cc..de74a73 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5207,6 +5207,7 @@ void i915_gem_release(struct drm_device *dev, struct drm_file *file)
+ {
+ 	struct drm_i915_file_private *file_priv = file->driver_priv;
+ 
++	i915_gem_remove_sysfs_file_entry(dev, file);
+ 	put_pid(file_priv->tgid);
+ 
+ 	cancel_delayed_work_sync(&file_priv->mm.idle_work);
+@@ -5274,6 +5275,12 @@ int i915_gem_open(struct drm_device *dev, struct drm_file *file)
+ 	if (ret)
+ 		goto out_free_name;
+ 
++	ret = i915_gem_create_sysfs_file_entry(dev, file);
++	if (ret) {
++		i915_gem_context_close(dev, file);
++		goto out_free_name;
++	}
++
+ 	return 0;
+ 
+ out_free_name:
+diff --git a/drivers/gpu/drm/i915/i915_gem_debug.c b/drivers/gpu/drm/i915/i915_gem_debug.c
+index db4ebd5..ea6728d 100644
+--- a/drivers/gpu/drm/i915/i915_gem_debug.c
++++ b/drivers/gpu/drm/i915/i915_gem_debug.c
+@@ -873,18 +873,19 @@ out:
+ }
+ 
+ static int
+-__i915_gem_get_all_obj_info(struct drm_i915_error_state_buf *m,
+-			struct drm_device *dev)
++__i915_gem_get_obj_info(struct drm_i915_error_state_buf *m,
++			struct drm_device *dev, struct pid *tgid)
+ {
+ 	struct drm_file *file;
+ 	int pid_num, ret = 0;
+ 
+ 	list_for_each_entry(file, &dev->filelist, lhead) {
+-		struct pid *tgid;
+ 		struct drm_i915_file_private *file_priv = file->driver_priv;
+ 
+-		tgid = file_priv->tgid;
+-		pid_num = pid_nr(tgid);
++		pid_num = pid_nr(file_priv->tgid);
++
++		if (file_priv->tgid != tgid)
++			continue;
+ 
+ 		err_puts(m, "\n\n  PID  process\n");
+ 
+@@ -932,31 +933,18 @@ int i915_get_drm_clients_info(struct drm_i915_error_state_buf *m,
+ 	return ret;
+ }
+ 
+-int i915_gem_get_all_obj_info(struct drm_i915_error_state_buf *m,
+-			struct drm_device *dev)
++int i915_gem_get_obj_info(struct drm_i915_error_state_buf *m,
++			struct drm_device *dev, struct pid *tgid)
+ {
+ 	int ret = 0;
+ 
+-	/*
+-	 * Protect the access to global drm resources such as filelist. Protect
+-	 * against their removal under our noses, while in use.
+-	 */
+-	mutex_lock(&drm_global_mutex);
+ 	ret = i915_mutex_lock_interruptible(dev);
+-	if (ret) {
+-		mutex_unlock(&drm_global_mutex);
+-		return ret;
+-	}
+-
+-	ret = __i915_gem_get_all_obj_info(m, dev);
+ 	if (ret)
+-		goto out_unlock;
++		return ret;
+ 
+-	ret = __i915_get_drm_clients_info(m, dev);
++	ret = __i915_gem_get_obj_info(m, dev, tgid);
+ 
+-out_unlock:
+ 	mutex_unlock(&dev->struct_mutex);
+-	mutex_unlock(&drm_global_mutex);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 20e651d..fe236d2 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -91,6 +91,11 @@ static bool __i915_error_ok(struct drm_i915_error_state_buf *e)
+ 	return true;
+ }
+ 
++bool i915_error_ok(struct drm_i915_error_state_buf *e)
++{
++	return __i915_error_ok(e);
++}
++
+ static bool __i915_error_seek(struct drm_i915_error_state_buf *e,
+ 			      unsigned len)
+ {
+@@ -490,6 +495,20 @@ int i915_error_state_buf_init(struct drm_i915_error_state_buf *ebuf,
+ 	return 0;
+ }
+ 
++int i915_obj_state_buf_init(struct drm_i915_error_state_buf *ebuf,
++				size_t count)
++{
++	memset(ebuf, 0, sizeof(*ebuf));
++
++	ebuf->buf = kmalloc(count, GFP_KERNEL);
++
++	if (ebuf->buf == NULL)
++		return -ENOMEM;
++
++	ebuf->size = count;
++	return 0;
++}
++
+ static void i915_error_object_free(struct drm_i915_error_object *obj)
+ {
+ 	int page;
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.c b/drivers/gpu/drm/i915/i915_sysfs.c
+index a841b46..b1375b6 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -603,10 +603,11 @@ static ssize_t error_state_write(struct file *file, struct kobject *kobj,
+ }
+ 
+ static ssize_t i915_gem_clients_state_read(struct file *filp,
+-				struct kobject *kobj,
++				struct kobject *memtrack_kobj,
+ 				struct bin_attribute *attr,
+ 				char *buf, loff_t off, size_t count)
+ {
++	struct kobject *kobj = memtrack_kobj->parent;
+ 	struct device *kdev = container_of(kobj, struct device, kobj);
+ 	struct drm_minor *minor = dev_to_drm_minor(kdev);
+ 	struct drm_device *dev = minor->dev;
+@@ -631,35 +632,239 @@ out:
+ 	return ret ?: ret_count;
+ }
+ 
+-static ssize_t i915_gem_objects_state_read(struct file *filp,
+-				struct kobject *kobj,
++#define GEM_OBJ_STAT_BUF_SIZE (4*1024) /* 4KB */
++#define GEM_OBJ_STAT_BUF_SIZE_MAX (1024*1024) /* 1MB */
++
++struct i915_gem_file_attr_priv {
++	char tgid_str[16];
++	struct pid *tgid;
++	struct drm_i915_error_state_buf buf;
++};
++
++static ssize_t i915_gem_read_objects(struct file *filp,
++				struct kobject *memtrack_kobj,
+ 				struct bin_attribute *attr,
+ 				char *buf, loff_t off, size_t count)
+ {
++	struct kobject *kobj = memtrack_kobj->parent;
+ 	struct device *kdev = container_of(kobj, struct device, kobj);
+ 	struct drm_minor *minor = dev_to_drm_minor(kdev);
+ 	struct drm_device *dev = minor->dev;
+-	struct drm_i915_error_state_buf error_str;
++	struct i915_gem_file_attr_priv *attr_priv;
++	struct pid *tgid;
+ 	ssize_t ret_count = 0;
+-	int ret;
++	long bytes_available;
++	int ret = 0, buf_size = GEM_OBJ_STAT_BUF_SIZE;
++	unsigned long timeout = msecs_to_jiffies(500) + 1;
++
++	/*
++	 * There may arise a scenario where syfs file entry is being removed,
++	 * and may race against sysfs read. Sysfs file remove function would
++	 * have taken the drm_global_mutex and would wait for read to finish,
++	 * which is again waiting to acquire drm_global_mutex, leading to
++	 * deadlock. To avoid this, use mutex_trylock here with a timeout.
++	 */
++	while (!mutex_trylock(&drm_global_mutex) && --timeout)
++		schedule_timeout_killable(1);
++	if (timeout == 0) {
++		DRM_DEBUG_DRIVER("Unable to acquire drm global mutex.\n");
++		return -EBUSY;
++	}
+ 
+-	ret = i915_error_state_buf_init(&error_str, count, off);
+-	if (ret)
+-		return ret;
++	if (!attr || !attr->private) {
++		DRM_ERROR("attr | attr->private pointer is NULL\n");
++		return -EINVAL;
++	}
++	attr_priv = attr->private;
++	tgid = attr_priv->tgid;
+ 
+-	ret = i915_gem_get_all_obj_info(&error_str, dev);
+-	if (ret)
++	if (off && !attr_priv->buf.buf) {
++		ret = -EINVAL;
++		DRM_ERROR(
++			"Buf not allocated during read with non-zero offset\n");
+ 		goto out;
++	}
+ 
+-	ret_count = count < error_str.bytes ? count : error_str.bytes;
++	if (off == 0) {
++retry:
++		if (!attr_priv->buf.buf) {
++			ret = i915_obj_state_buf_init(&attr_priv->buf,
++				buf_size);
++			if (ret) {
++				DRM_ERROR(
++					"obj state buf init failed. buf_size=%d\n",
++					buf_size);
++				goto out;
++			}
++		} else {
++			/* Reset the buf parameters before filling data */
++			attr_priv->buf.pos = 0;
++			attr_priv->buf.bytes = 0;
++		}
++
++		/* Read the gfx device stats */
++		ret = i915_gem_get_obj_info(&attr_priv->buf, dev, tgid);
++		if (ret)
++			goto out;
++
++		ret = i915_error_ok(&attr_priv->buf);
++		if (ret) {
++			ret = 0;
++			goto copy_data;
++		}
++		if (buf_size >= GEM_OBJ_STAT_BUF_SIZE_MAX) {
++			DRM_DEBUG_DRIVER("obj stat buf size limit reached\n");
++			ret = -ENOMEM;
++			goto out;
++		} else {
++			/* Try to reallocate buf of larger size */
++			i915_error_state_buf_release(&attr_priv->buf);
++			buf_size *= 2;
++
++			ret = i915_obj_state_buf_init(&attr_priv->buf,
++						buf_size);
++			if (ret) {
++				DRM_ERROR(
++					"obj stat buf init failed. buf_size=%d\n",
++					buf_size);
++				goto out;
++			}
++			goto retry;
++		}
++	}
++copy_data:
++
++	bytes_available = (long)attr_priv->buf.bytes - (long)off;
++
++	if (bytes_available > 0) {
++		ret_count = count < bytes_available ? count : bytes_available;
++		memcpy(buf, attr_priv->buf.buf + off, ret_count);
++	} else
++		ret_count = 0;
+ 
+-	memcpy(buf, error_str.buf, ret_count);
+ out:
+-	i915_error_state_buf_release(&error_str);
++	mutex_unlock(&drm_global_mutex);
+ 
+ 	return ret ?: ret_count;
+ }
+ 
++int i915_gem_create_sysfs_file_entry(struct drm_device *dev,
++					struct drm_file *file)
++{
++	struct drm_i915_file_private *file_priv = file->driver_priv;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct i915_gem_file_attr_priv *attr_priv;
++	struct bin_attribute *obj_attr;
++	struct drm_file *file_local;
++	int ret;
++
++	if (!i915.memtrack_debug)
++		return 0;
++
++	/*
++	 * Check for multiple drm files having same tgid. If found, copy the
++	 * bin attribute into the new file priv. Otherwise allocate a new
++	 * copy of bin attribute, and create its corresponding sysfs file.
++	 */
++	mutex_lock(&dev->struct_mutex);
++	list_for_each_entry(file_local, &dev->filelist, lhead) {
++		struct drm_i915_file_private *file_priv_local =
++				file_local->driver_priv;
++
++		if (file_priv->tgid == file_priv_local->tgid) {
++			file_priv->obj_attr = file_priv_local->obj_attr;
++			mutex_unlock(&dev->struct_mutex);
++			return 0;
++		}
++	}
++	mutex_unlock(&dev->struct_mutex);
++
++	obj_attr = kzalloc(sizeof(*obj_attr), GFP_KERNEL);
++	if (!obj_attr) {
++		DRM_ERROR("Alloc failed. Out of memory\n");
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	attr_priv = kzalloc(sizeof(*attr_priv), GFP_KERNEL);
++	if (!attr_priv) {
++		DRM_ERROR("Alloc failed. Out of memory\n");
++		ret = -ENOMEM;
++		goto out_obj_attr;
++	}
++
++	snprintf(attr_priv->tgid_str, 16, "%d", task_tgid_nr(current));
++	obj_attr->attr.name = attr_priv->tgid_str;
++	obj_attr->attr.mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
++	obj_attr->size = 0;
++	obj_attr->read = i915_gem_read_objects;
++
++	attr_priv->tgid = file_priv->tgid;
++	obj_attr->private = attr_priv;
++
++	ret = sysfs_create_bin_file(&dev_priv->memtrack_kobj,
++				   obj_attr);
++	if (ret) {
++		DRM_ERROR(
++			"sysfs tgid file setup failed. tgid=%d, process:%s, ret:%d\n",
++			pid_nr(file_priv->tgid), file_priv->process_name, ret);
++
++		goto out_attr_priv;
++	}
++
++	file_priv->obj_attr = obj_attr;
++	return 0;
++
++out_attr_priv:
++	kfree(attr_priv);
++out_obj_attr:
++	kfree(obj_attr);
++out:
++	return ret;
++}
++
++void i915_gem_remove_sysfs_file_entry(struct drm_device *dev,
++			struct drm_file *file)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_i915_file_private *file_priv = file->driver_priv;
++	struct drm_file *file_local;
++	int open_count = 0;
++
++	if (!i915.memtrack_debug)
++		return;
++
++	/*
++	 * Check if drm file being removed is the last one for that
++	 * particular tgid. If so, remove the corresponding sysfs
++	 * file entry also
++	 */
++	list_for_each_entry(file_local, &dev->filelist, lhead) {
++		struct drm_i915_file_private *file_priv_local =
++				file_local->driver_priv;
++
++		if (pid_nr(file_priv->tgid) == pid_nr(file_priv_local->tgid))
++			open_count++;
++	}
++
++	WARN_ON(open_count == 0);
++
++	if (open_count == 1) {
++		struct i915_gem_file_attr_priv *attr_priv;
++
++		if (WARN_ON(file_priv->obj_attr == NULL))
++			return;
++		attr_priv = file_priv->obj_attr->private;
++
++		sysfs_remove_bin_file(&dev_priv->memtrack_kobj,
++				file_priv->obj_attr);
++
++		i915_error_state_buf_release(&attr_priv->buf);
++		kfree(file_priv->obj_attr->private);
++		kfree(file_priv->obj_attr);
++	}
++}
++
+ static struct bin_attribute error_state_attr = {
+ 	.attr.name = "error",
+ 	.attr.mode = S_IRUSR | S_IWUSR,
+@@ -675,11 +880,12 @@ static struct bin_attribute i915_gem_client_state_attr = {
+ 	.read = i915_gem_clients_state_read,
+ };
+ 
+-static struct bin_attribute i915_gem_objects_state_attr = {
+-	.attr.name = "i915_gem_objinfo",
+-	.attr.mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH,
+-	.size = 0,
+-	.read = i915_gem_objects_state_read,
++static struct attribute *memtrack_kobj_attrs[] = {NULL};
++
++static struct kobj_type memtrack_kobj_type = {
++	.release = NULL,
++	.sysfs_ops = NULL,
++	.default_attrs = memtrack_kobj_attrs,
+ };
+ 
+ void i915_setup_sysfs(struct drm_device *dev)
+@@ -721,19 +927,27 @@ void i915_setup_sysfs(struct drm_device *dev)
+ 		DRM_ERROR("error_state sysfs setup failed\n");
+ 
+ 	if (i915.memtrack_debug) {
+-		ret = sysfs_create_bin_file(&dev->primary->kdev->kobj,
+-					    &i915_gem_client_state_attr);
+-		if (ret)
++		struct drm_i915_private *dev_priv = dev->dev_private;
++
++		/*
++		 * Create the gfx_memtrack directory for memtrack sysfs files
++		 */
++		ret = kobject_init_and_add(
++			&dev_priv->memtrack_kobj, &memtrack_kobj_type,
++			&dev->primary->kdev->kobj, "gfx_memtrack");
++		if (unlikely(ret != 0)) {
+ 			DRM_ERROR(
+-			"i915_gem_client_state sysfs setup failed\n"
++				"i915 sysfs setup memtrack directory failed\n"
+ 				);
+-
+-		ret = sysfs_create_bin_file(&dev->primary->kdev->kobj,
+-					    &i915_gem_objects_state_attr);
+-		if (ret)
+-			DRM_ERROR(
+-				"i915_gem_objects_state sysfs setup failed\n"
++			kobject_put(&dev_priv->memtrack_kobj);
++		} else {
++			ret = sysfs_create_bin_file(&dev_priv->memtrack_kobj,
++					    &i915_gem_client_state_attr);
++			if (ret)
++				DRM_ERROR(
++					  "i915_gem_client_state sysfs setup failed\n"
+ 				);
++		}
+ 	}
+ }
+ 
+@@ -749,4 +963,12 @@ void i915_teardown_sysfs(struct drm_device *dev)
+ #ifdef CONFIG_PM
+ 	sysfs_unmerge_group(&dev->primary->kdev->kobj, &rc6_attr_group);
+ #endif
++	if (i915.memtrack_debug) {
++		struct drm_i915_private *dev_priv = dev->dev_private;
++
++		sysfs_remove_bin_file(&dev_priv->memtrack_kobj,
++					&i915_gem_client_state_attr);
++		kobject_del(&dev_priv->memtrack_kobj);
++		kobject_put(&dev_priv->memtrack_kobj);
++	}
+ }
+-- 
+1.7.9.5
+

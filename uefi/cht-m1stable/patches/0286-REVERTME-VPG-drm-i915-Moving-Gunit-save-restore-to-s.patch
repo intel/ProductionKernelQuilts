@@ -1,0 +1,164 @@
+From d6f2e51388ad4387a779974dd98c184000dcc7fe Mon Sep 17 00:00:00 2001
+Message-Id: <d6f2e51388ad4387a779974dd98c184000dcc7fe.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Sagar Kamble <sagar.a.kamble@intel.com>
+Date: Thu, 18 Sep 2014 21:39:04 +0530
+Subject: [PATCH 286/312] REVERTME [VPG]: drm/i915: Moving Gunit save/restore
+ to suspend/resume routines
+
+v2: Conditionally running init code in __i915_drm_thaw
+v3: thaw_early_done false to be unconditionally in __i915_drm_thaw
+
+Issue: IRDA-804
+Issue: IRDA-918
+Change-Id: I300d7b86141d17c19416c2eb8dda69d075a21775
+Signed-off-by: Sagar Kamble <sagar.a.kamble@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.c |   58 ++++++++++++++++++++++++---------------
+ drivers/gpu/drm/i915/i915_drv.h |    1 +
+ 2 files changed, 37 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index c91b7d0..532b53d 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -502,6 +502,7 @@ static int i915_drm_freeze(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_crtc *crtc;
++	int ret;
+ 
+ 	/* ignore lid events during suspend */
+ 	mutex_lock(&dev_priv->modeset_restore_lock);
+@@ -557,6 +558,11 @@ static int i915_drm_freeze(struct drm_device *dev)
+ 
+ 	dev_priv->suspend_count++;
+ 
++	ret = intel_suspend_complete(dev_priv);
++
++	if (ret)
++		WARN(1, "Suspend complete failed: %d\n", ret);
++
+ 	intel_display_set_init_power(dev_priv, false);
+ 
+ 	return 0;
+@@ -607,22 +613,32 @@ void intel_console_resume(struct work_struct *work)
+ static int i915_drm_thaw_early(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	int ret = 0;
+-
+-	ret = intel_resume_prepare(dev_priv, false);
+-	if (ret)
+-		DRM_ERROR("Resume prep failed: %d, continuing resume\n", ret);
+ 
+ 	intel_uncore_early_sanitize(dev);
+ 	intel_uncore_sanitize(dev);
+ 	intel_power_domains_init_hw(dev_priv);
+ 
+-	return ret;
++	dev_priv->thaw_early_done = true;
++
++	return 0;
+ }
+ 
+ static int __i915_drm_thaw(struct drm_device *dev, bool restore_gtt_mappings)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	int ret;
++
++	if (!dev_priv->thaw_early_done) {
++		intel_uncore_early_sanitize(dev);
++		intel_uncore_sanitize(dev);
++		intel_power_domains_init_hw(dev_priv);
++	}
++
++	dev_priv->thaw_early_done = false;
++
++	ret = intel_resume_prepare(dev_priv, false);
++	if (ret)
++		WARN(1, "Resume prepare failed: %d,Continuing resume\n", ret);
+ 
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET) &&
+ 	    restore_gtt_mappings) {
+@@ -894,8 +910,6 @@ static int i915_pm_suspend_late(struct device *dev)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct drm_device *drm_dev = pci_get_drvdata(pdev);
+-	struct drm_i915_private *dev_priv = drm_dev->dev_private;
+-	int ret;
+ 
+ 	/*
+ 	 * We have a suspedn ordering issue with the snd-hda driver also
+@@ -909,16 +923,10 @@ static int i915_pm_suspend_late(struct device *dev)
+ 	if (drm_dev->switch_power_state == DRM_SWITCH_POWER_OFF)
+ 		return 0;
+ 
+-	ret = intel_suspend_complete(dev_priv);
++	pci_disable_device(pdev);
++	pci_set_power_state(pdev, PCI_D3hot);
+ 
+-	if (ret)
+-		DRM_ERROR("Suspend complete failed: %d\n", ret);
+-	else {
+-		pci_disable_device(pdev);
+-		pci_set_power_state(pdev, PCI_D3hot);
+-	}
+-
+-	return ret;
++	return 0;
+ }
+ 
+ static int i915_pm_resume_early(struct device *dev)
+@@ -1334,14 +1342,18 @@ static int vlv_resume_prepare(struct drm_i915_private *dev_priv,
+ {
+ 	struct drm_device *dev = dev_priv->dev;
+ 	int err;
+-	int ret;
++	int ret = 0;
+ 
+ 	/*
+ 	 * If any of the steps fail just try to continue, that's the best we
+ 	 * can do at this point. Return the first error code (which will also
+ 	 * leave RPM permanently disabled).
+ 	 */
+-	ret = vlv_force_gfx_clock(dev_priv, true);
++	if (!rpm_resume)
++		WARN_ON(I915_READ(GEN6_RC_CONTROL));
++
++	if (rpm_resume)
++		ret = vlv_force_gfx_clock(dev_priv, true);
+ 
+ 	vlv_restore_gunit_s0ix_state(dev_priv);
+ 
+@@ -1349,9 +1361,11 @@ static int vlv_resume_prepare(struct drm_i915_private *dev_priv,
+ 	if (!ret)
+ 		ret = err;
+ 
+-	err = vlv_force_gfx_clock(dev_priv, false);
+-	if (!ret)
+-		ret = err;
++	if (rpm_resume) {
++		err = vlv_force_gfx_clock(dev_priv, false);
++		if (!ret)
++			ret = err;
++	}
+ 
+ 	vlv_check_no_gt_access(dev_priv);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 2a9e9cf..d2a5568 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1725,6 +1725,7 @@ struct drm_i915_private {
+ 	} wm;
+ 
+ 	struct i915_runtime_pm pm;
++	bool thaw_early_done;
+ 
+ 	/* Old dri1 support infrastructure, beware the dragons ya fools entering
+ 	 * here! */
+-- 
+1.7.9.5
+

@@ -1,0 +1,73 @@
+From a6f03468d8c1b836b573d7794d5b36e5a1a4e3d3 Mon Sep 17 00:00:00 2001
+From: Johan Mossberg <johan.mossberg@intel.com>
+Date: Thu, 14 Aug 2014 10:49:37 +0200
+Subject: [PATCH 090/117] atomisp_gmin_platform: Send correct buffer size to
+ efi.get_variable
+
+Currently we send an uninitialized variable as the buffer size to
+efi.get_variable which can lead to spurious failures and potential
+overruns.  But the function rewrites the in/out length parameter when
+it returns, and thus "works" the second time, resulting in the earlier
+retry voodoo.
+
+Change-Id: I56abd313cd25c660ff929b0538b944727285122a
+Signed-off-by: Johan Mossberg <johan.mossberg@intel.com>
+---
+ .../x86/platform/intel-mid/atomisp_gmin_platform.c | 24 +++++++++-------------
+ 1 file changed, 10 insertions(+), 14 deletions(-)
+
+diff --git a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+index db4921d..faae8b0 100644
+--- a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
++++ b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+@@ -553,7 +553,7 @@ int gmin_get_config_var(struct device *dev, const char *var, char *out, size_t *
+ {
+ 	struct device *adev;
+ 	char var8[CFG_VAR_NAME_MAX];
+-	unsigned short var16[CFG_VAR_NAME_MAX];
++	efi_char16_t var16[CFG_VAR_NAME_MAX];
+ 	struct efivar_entry *ev;
+ 	u32 efiattr_dummy;
+ 	int i, j, ret;
+@@ -600,7 +600,8 @@ int gmin_get_config_var(struct device *dev, const char *var, char *out, size_t *
+ 	for (i=0; var8[i] && i < sizeof(var8); i++)
+ 		var16[i] = var8[i];
+ 
+-	if (!efi.get_variable)
++	/* To avoid owerflows when calling the efivar API */
++	if (*out_len > ULONG_MAX)
+ 		return -EINVAL;
+ 
+ 	/* Not sure this API usage is kosher; efivar_entry_get()'s
+@@ -614,21 +615,16 @@ int gmin_get_config_var(struct device *dev, const char *var, char *out, size_t *
+ 	memcpy(&ev->var.VariableName, var16, sizeof(var16));
+ 	ev->var.VendorGuid = GMIN_CFG_VAR_EFI_GUID;
+ 
+-	/* Frustratingly, existing hardware doesn't like seeing EFI
+-	 * variable requests arrive in quick succession.  They will
+-	 * fail spuriously (but more or less deterministically),
+-	 * returning EFI_NOT_FOUND (which becomes -ENOENT as seen
+-	 * here) unless we retry with delays. */
+-	for (i=0; i<10; i++) {
+-		ret = efivar_entry_get(ev, &efiattr_dummy, &efilen, out);
+-		if (!ret)
+-			break;
+-		msleep(10);
+-	}
++	efilen = *out_len;
++	ret = efivar_entry_get(ev, &efiattr_dummy, &efilen, out);
++
+ 	kfree(ev);
+ 	*out_len = efilen;
+ 
+-	return ret == EFI_SUCCESS ? 0 : -EINVAL;
++	if (ret)
++ 		dev_warn(dev, "Failed to find gmin variable %s\n", var8);
++
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(gmin_get_config_var);
+ 
+-- 
+1.9.3
+

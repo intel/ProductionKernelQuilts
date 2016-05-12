@@ -1,0 +1,104 @@
+From 83c30ca2a13c4eb6705a86c7bc7702999f009702 Mon Sep 17 00:00:00 2001
+From: Tianshu Qiu <tian.shu.qiu@intel.com>
+Date: Sat, 28 Feb 2015 11:21:20 +0800
+Subject: [PATCH 282/284] atomisp2: Fix stream creation issue for dual camera
+ case
+
+In dual stream case, if one camera calls stream_off
+while the other camera is in the stage after set_format
+but before stream_on, atomisp driver needs to force
+destroy all the css streams and reset ISP.
+The css streams are re-created for the working camera
+during its following stream_on.
+But HAL may call set_parameter or queue buffers to the
+camera between set_format and stream_on. This will
+cause the operation failed because of no css streams
+created.
+This patch fixes this issue by recreating the css
+streams just after ISP reset instead of postpone
+to the next stream on.
+
+Change-Id: I3974e8fc29256232b6f00c158f0d6c6120a5978d
+Fixes-Issue: #H1503921242
+Signed-off-by: Tianshu Qiu <tian.shu.qiu@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/44115
+Build: viefandr
+Integrator: Wei Tao <wei.tao@intel.com>
+Approver: Wei Tao <wei.tao@intel.com>
+Build: Wei Tao <wei.tao@intel.com>
+Reviewed-by: Wei Tao <wei.tao@intel.com>
+Maintainer: Wei Tao <wei.tao@intel.com>
+---
+ .../drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat.h   | 1 +
+ .../media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c     | 6 ++++++
+ .../drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c    | 9 ++++++++-
+ 3 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat.h
+index 68cfcff..8a5748ad 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat.h
+@@ -369,6 +369,7 @@ int atomisp_css_allocate_continuous_frames(bool init_time,
+ 
+ void atomisp_css_update_continuous_frames(struct atomisp_sub_device *asd);
+ 
++void atomisp_create_pipes_stream(struct atomisp_sub_device *asd);
+ void atomisp_destroy_pipes_stream_force(struct atomisp_sub_device *asd);
+ 
+ int atomisp_css_stop(struct atomisp_sub_device *asd,
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+index c7587db..ef6cdc0 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_compat_css20.c
+@@ -895,6 +895,12 @@ pipe_err:
+ 	return -EINVAL;
+ }
+ 
++void atomisp_create_pipes_stream(struct atomisp_sub_device *asd)
++{
++	__create_pipes(asd);
++	__create_streams(asd);
++}
++
+ int atomisp_css_update_stream(struct atomisp_sub_device *asd)
+ {
+ 	int ret;
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index 7b8a53a..a125b9f 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -2080,6 +2080,7 @@ stopsensor:
+ 	 */
+ 	if (isp->sw_contex.power_state == ATOM_ISP_POWER_UP) {
+ 		unsigned int i;
++		bool recreate_streams[MAX_STREAM_NUM] = {0};
+ 		if (isp->isp_timeout)
+ 			dev_err(isp->dev, "%s: Resetting with WA activated",
+ 				__func__);
+@@ -2092,9 +2093,11 @@ stopsensor:
+ 		 * So force stream destroy here.
+ 		 */
+ 		for (i = 0; i < isp->num_of_streams; i++) {
+-			if (isp->asd[i].stream_prepared)
++			if (isp->asd[i].stream_prepared) {
+ 				atomisp_destroy_pipes_stream_force(&isp->
+ 						asd[i]);
++				recreate_streams[i] = true;
++			}
+ 		}
+ 
+ 		/* disable  PUNIT/ISP acknowlede/handshake - SRSE=3 */
+@@ -2102,6 +2105,10 @@ stopsensor:
+ 				MRFLD_PCI_I_CONTROL_SRSE_RESET_MASK);
+ 		dev_err(isp->dev, "atomisp_reset");
+ 		atomisp_reset(isp);
++		for (i = 0; i < isp->num_of_streams; i++) {
++			if (recreate_streams[i])
++				atomisp_create_pipes_stream(&isp->asd[i]);
++		}
+ 		isp->isp_timeout = false;
+ 	}
+ 	return ret;
+-- 
+1.9.1
+

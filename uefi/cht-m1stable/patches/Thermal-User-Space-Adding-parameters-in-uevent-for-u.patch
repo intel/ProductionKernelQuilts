@@ -1,0 +1,111 @@
+From 7cc1239a0f87c507a97ecd3d17ae13cb8b0a428d Mon Sep 17 00:00:00 2001
+From: ysiyer <yegnesh.s.iyer@intel.com>
+Date: Wed, 15 Apr 2015 12:16:15 +0530
+Subject: [PATCH] Thermal User Space: Adding parameters in uevent for user
+ space processing
+
+Issue Description: Previous implementation provided just the object change
+code in the uevent to the user space. Hence user space has to re-read the
+temperature and determine the thermal state and take the action. This
+sometimes caused error when the temperature is hovering around the trip
+point temperature.
+
+Solution: To avoid this, more info like zone temperature, crossed trip point,
+and the high/low event detail is passed to the user space so as to avoid the
+re-read of the paramters to determine the thermal state of the zone.
+
+Change-Id: I7d2f60ba9e87ed8217e1520a140cd048a2e777c0
+Tracked-On: https://jira01.devtools.intel.com/browse/AKP-1411
+Signed-off-by: ysiyer <yegnesh.s.iyer@intel.com>
+---
+ drivers/thermal/pmic_thermal.c |  5 ++++-
+ drivers/thermal/thermal_core.c |  2 ++
+ drivers/thermal/user_space.c   | 19 ++++++++++++++++++-
+ include/linux/thermal.h        |  2 ++
+ 4 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/thermal/pmic_thermal.c b/drivers/thermal/pmic_thermal.c
+index 5bfcf6c..b94e1b2 100644
+--- a/drivers/thermal/pmic_thermal.c
++++ b/drivers/thermal/pmic_thermal.c
+@@ -68,8 +68,11 @@ static irqreturn_t pmic_thermal_irq_handler(int irq, void *data)
+ 				trip = td->maps[i].trip_config[j].trip_num;
+ 				tzd = thermal_zone_get_zone_by_name(
+ 						td->maps[i].handle);
+-				if (!IS_ERR(tzd))
++				if (!IS_ERR(tzd)) {
++					tzd->crossed_trip = trip;
++					tzd->event = event ? 1 : 0;
+ 					thermal_zone_device_update(tzd);
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/drivers/thermal/thermal_core.c b/drivers/thermal/thermal_core.c
+index 284733e..db26297 100644
+--- a/drivers/thermal/thermal_core.c
++++ b/drivers/thermal/thermal_core.c
+@@ -1486,6 +1486,8 @@ struct thermal_zone_device *thermal_zone_device_register(const char *type,
+ 	tz->trips = trips;
+ 	tz->passive_delay = passive_delay;
+ 	tz->polling_delay = polling_delay;
++	tz->crossed_trip = -1;
++	tz->event = -1;
+ 
+ 	dev_set_name(&tz->device, "thermal_zone%d", tz->id);
+ 	result = device_register(&tz->device);
+diff --git a/drivers/thermal/user_space.c b/drivers/thermal/user_space.c
+index 10adcdd..4181ae2 100644
+--- a/drivers/thermal/user_space.c
++++ b/drivers/thermal/user_space.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include <linux/thermal.h>
++#include <linux/slab.h>
+ 
+ #include "thermal_core.h"
+ 
+@@ -34,9 +35,25 @@
+  */
+ static int notify_user_space(struct thermal_zone_device *tz, int trip)
+ {
++	char *thrm_event[5];
++
+ 	mutex_lock(&tz->lock);
+-	kobject_uevent(&tz->device.kobj, KOBJ_CHANGE);
++	if (trip == tz->crossed_trip) {
++		thrm_event[0] = kasprintf(GFP_KERNEL, "NAME=%s", tz->type);
++		thrm_event[1] = kasprintf(GFP_KERNEL, "TEMP=%d",
++				tz->temperature);
++		thrm_event[2] = kasprintf(GFP_KERNEL, "TRIP=%d",
++				tz->crossed_trip);
++		thrm_event[3] = kasprintf(GFP_KERNEL, "EVENT=%d", tz->event);
++		thrm_event[4] = NULL;
++		kobject_uevent_env(&tz->device.kobj, KOBJ_CHANGE, thrm_event);
++		kfree(thrm_event[0]);
++		kfree(thrm_event[1]);
++		kfree(thrm_event[2]);
++		kfree(thrm_event[3]);
++	}
+ 	mutex_unlock(&tz->lock);
++
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/thermal.h b/include/linux/thermal.h
+index 8b5dc65..15a8b4d 100644
+--- a/include/linux/thermal.h
++++ b/include/linux/thermal.h
+@@ -184,6 +184,8 @@ struct thermal_zone_device {
+ 	struct mutex lock; /* protect thermal_instances list */
+ 	struct list_head node;
+ 	struct delayed_work poll_queue;
++	int crossed_trip;
++	int event;
+ };
+ 
+ /* Structure that holds thermal governor information */
+-- 
+1.9.1
+

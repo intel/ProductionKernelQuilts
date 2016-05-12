@@ -1,0 +1,104 @@
+From 9d1a784eab2a5d2306acdf15668dcb905da315a8 Mon Sep 17 00:00:00 2001
+From: "Thulasimani,Sivakumar" <sivakumar.thulasimani@intel.com>
+Date: Wed, 20 Jan 2016 11:35:37 +0530
+Subject: [PATCH 09/19] FOR_UPSTREAM [VPG]: drm/i915: Optimize CD clock change
+ for CHT
+
+Current logic that tracks CD clock requirement changes
+the clock value whenever a plug in or plug out a new
+display. CD clock change during plug in is a must to
+support new display if the panel requires it but
+the change back to lower CD clock value during unplug
+can be avoided. Since the display is bound to be
+entering suspend state anytime later we can lower
+the cd clock to the required value during suspend.
+This also helps in better user experience by avoiding
+blanks (disable - enable) of local display.
+
+Change-Id: I5bf52af0af5d49185474d308cb7962b4aca0c3ac
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-30099
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Reviewed-on: https://android.intel.com:443/498184
+---
+ drivers/gpu/drm/i915/i915_drv.h      |  1 +
+ drivers/gpu/drm/i915/intel_display.c | 30 +++++++++++++++++++++++++-----
+ 2 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 489bb9c..0a27a85 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1760,6 +1760,7 @@ struct drm_i915_private {
+ 
+ 	unsigned int fsb_freq, mem_freq, is_ddr3;
+ 	unsigned int vlv_cdclk_freq;
++	unsigned int req_cdclk_freq; /* requested value, can be < current */
+ 	u16 stepping_id;
+ 
+ 	/**
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index f0e259e..e1abb81 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5467,8 +5467,8 @@ static void valleyview_modeset_global_pipes(struct drm_device *dev,
+ 	struct intel_crtc *intel_crtc;
+ 	int max_pixclk = intel_mode_max_pixclk(dev_priv);
+ 
+-	if (valleyview_calc_cdclk(dev_priv, max_pixclk) ==
+-	    dev_priv->vlv_cdclk_freq)
++	dev_priv->req_cdclk_freq = valleyview_calc_cdclk(dev_priv, max_pixclk);
++	if (dev_priv->req_cdclk_freq <= dev_priv->vlv_cdclk_freq)
+ 		return;
+ 
+ 	/* disable/enable all currently active pipes while we change cdclk */
+@@ -5480,10 +5480,9 @@ static void valleyview_modeset_global_pipes(struct drm_device *dev,
+ static void valleyview_modeset_global_resources(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	int max_pixclk = intel_mode_max_pixclk(dev_priv);
+-	int req_cdclk = valleyview_calc_cdclk(dev_priv, max_pixclk);
++	int req_cdclk = dev_priv->req_cdclk_freq;
+ 
+-	if (req_cdclk != dev_priv->vlv_cdclk_freq) {
++	if (dev_priv->vlv_cdclk_freq < dev_priv->req_cdclk_freq) {
+ 		if (IS_CHERRYVIEW(dev))
+ 			cherryview_set_cdclk(dev, req_cdclk);
+ 		else
+@@ -6133,6 +6132,9 @@ void intel_encoder_destroy(struct drm_encoder *encoder)
+ static void intel_encoder_dpms(struct intel_encoder *encoder, int mode)
+ {
+ 	struct drm_device *dev = encoder->base.dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_crtc *crtc;
++
+ 	if (mode == DRM_MODE_DPMS_ON) {
+ 		encoder->connectors_active = true;
+ 		intel_crtc_update_dpms(encoder->base.crtc);
+@@ -6147,6 +6149,24 @@ static void intel_encoder_dpms(struct intel_encoder *encoder, int mode)
+ 		intel_save_clr_mgr_status(dev);
+ 
+ 		intel_crtc_update_dpms(encoder->base.crtc);
++
++		if (!IS_VALLEYVIEW(dev))
++			return;
++
++		for_each_crtc(dev, crtc) {
++			if (!crtc || !to_intel_crtc(crtc))
++				continue;
++			if (to_intel_crtc(crtc)->active)
++				return;
++		}
++
++		/*HACK: force cdclock change by setting current to 0 */
++		if (dev_priv->vlv_cdclk_freq != dev_priv->req_cdclk_freq) {
++			dev_priv->vlv_cdclk_freq = 0;
++			DRM_DEBUG_KMS("Lowering CD clock to %d\n",
++				dev_priv->req_cdclk_freq);
++			valleyview_modeset_global_resources(dev);
++		}
+ 	}
+ }
+ 
+-- 
+1.9.1
+

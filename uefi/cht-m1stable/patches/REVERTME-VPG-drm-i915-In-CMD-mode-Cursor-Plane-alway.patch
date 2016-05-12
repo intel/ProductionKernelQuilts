@@ -1,0 +1,211 @@
+From 6316f99eb80c4b9f00956609b9a0d2fd96131f8a Mon Sep 17 00:00:00 2001
+From: Megha Aggarwal <megha.aggarwal@intel.com>
+Date: Fri, 16 Oct 2015 23:42:56 +0530
+Subject: [PATCH] REVERTME [VPG]: drm/i915: In CMD mode, Cursor Plane always
+ enable
+
+In Command mode, the shift screen issue observed with multi plane
+enable/disable flip request. As per HW, one plane always need to be
+enabled in command mode. For this the cursor plane of size 64*64
+is always enable in command mode.
+This is REVERTME patch, as the scenarios where cursor plane request come
+from HWC are not addressed.
+
+Change-Id: I993c0ea822fa25e2a4a08aed1b84c5607ead4ad3
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-7482
+Signed-off-by: Megha Aggarwal <megha.aggarwal@intel.com>
+Signed-off-by: Ramalingam C <ramalingam.c@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c | 27 ++++++++++++-
+ drivers/gpu/drm/i915/intel_dsi.c     | 76 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_dsi.h     |  3 ++
+ 3 files changed, 104 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 7ff0d61..8beb93b 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5598,6 +5598,30 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
+ 		if (encoder->type != INTEL_OUTPUT_DSI)
+ 			encoder->enable(encoder);
+ 
++	/* If Intel DSI and CMd mode create buffer for cursor plane */
++	for_each_encoder_on_crtc(dev, crtc, encoder) {
++		if (encoder->pre_enable) {
++			intel_dsi = enc_to_intel_dsi(&encoder->base);
++			if (encoder->type == INTEL_OUTPUT_DSI &&
++						is_cmd_mode(intel_dsi)) {
++				intel_crtc->cursor_x = 0;
++				intel_crtc->cursor_y = 0;
++				intel_crtc->cursor_height = 64;
++				intel_crtc->cursor_width = 64;
++
++				if (intel_dsi->cursor_buff[0] != NULL) {
++					intel_crtc->cursor_bo =
++							intel_dsi->cursor_obj;
++					intel_crtc->cursor_addr =
++						i915_gem_obj_ggtt_offset(
++							intel_dsi->cursor_obj);
++					DRM_DEBUG("Cursor base address 0x%x\n",
++						intel_crtc->cursor_addr);
++				}
++			}
++		}
++	}
++
+ 	intel_crtc_enable_planes(crtc);
+ 
+ 	for_each_encoder_on_crtc(dev, crtc, encoder) {
+@@ -5644,6 +5668,7 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
+ 		}
+ 		break;
+ 	}
++
+ }
+ 
+ static void i9xx_set_pll_dividers(struct intel_crtc *crtc)
+@@ -5807,12 +5832,10 @@ static void i9xx_crtc_disable(struct drm_crtc *crtc)
+ 			 * frame.
+ 			 */
+ 			msleep(40);
+-
+ 			if (intel_crtc->hw_frm_cnt_at_enable ==
+ 					I915_READ(PIPEFRAME(pipe)))
+ 				DRM_ERROR("Pipe is stuck for DSI cmd mode.");
+ 		}
+-
+ 		break;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 4cd869d..23d1d62 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -372,6 +372,9 @@ static void intel_dsi_pre_enable(struct intel_encoder *encoder)
+ 	u32 val;
+ 	u32 count = 1;
+ 	int ret;
++	int i = 0;
++	struct sg_page_iter sg_iter;
++	struct scatterlist *sg_temp;
+ 
+ 	DRM_DEBUG_KMS("\n");
+ 
+@@ -396,6 +399,49 @@ static void intel_dsi_pre_enable(struct intel_encoder *encoder)
+ 		intel_dsi->cmd_buff_phy_addr = page_to_phys(
+ 				sg_page(intel_dsi->gem_obj->pages->sgl));
+ 	}
++	if (intel_dsi->cursor_obj == NULL && is_cmd_mode(intel_dsi)) {
++		mutex_lock(&dev->struct_mutex);
++		intel_dsi->cursor_obj = i915_gem_alloc_object(dev, 64 * 64 * 4);
++		if (intel_dsi->cursor_obj == NULL) {
++			DRM_ERROR("Failed to allocate seqno page\n");
++			return;
++		}
++
++		ret = i915_gem_object_set_cache_level(intel_dsi->cursor_obj,
++				HAS_WT(intel_dsi->cursor_obj->base.dev) ?
++					I915_CACHE_WT : I915_CACHE_NONE);
++		if (ret)
++			goto err_unref_cursor;
++
++		ret =  i915_gem_obj_ggtt_pin(intel_dsi->cursor_obj,
++						PAGE_SIZE, PIN_MAPPABLE);
++		if (ret) {
++			ret = i915_gem_obj_ggtt_pin(intel_dsi->cursor_obj,
++								PAGE_SIZE, 0);
++			if (ret)
++				goto err_unref_cursor;
++	       }
++
++		ret = i915_gem_object_set_to_gtt_domain(intel_dsi->cursor_obj,
++									true);
++		if (ret) {
++			DRM_ERROR("failed to move cursor obj into the GTT\n");
++			goto err_unref_cursor;
++		}
++
++		sg_temp = intel_dsi->cursor_obj->pages->sgl;
++		for_each_sg_page(intel_dsi->cursor_obj->pages->sgl, &sg_iter,
++				intel_dsi->cursor_obj->pages->nents, 0) {
++			if (sg_temp != NULL) {
++				intel_dsi->cursor_buff[i] =
++							kmap(sg_page(sg_temp));
++				sg_temp = sg_next(sg_temp);
++			}
++			i++;
++		}
++		mutex_unlock(&dev->struct_mutex);
++	}
++
+ 
+ 	/* Panel Enable */
+ 	if (intel_dsi->dev.dev_ops->power_on)
+@@ -504,6 +550,10 @@ static void intel_dsi_pre_enable(struct intel_encoder *encoder)
+ err_unref:
+ 	drm_gem_object_unreference(&intel_dsi->gem_obj->base);
+ 	return;
++
++err_unref_cursor:
++	drm_gem_object_unreference(&intel_dsi->cursor_obj->base);
++	return;
+ }
+ 
+ static void intel_dsi_enable(struct intel_encoder *encoder)
+@@ -765,6 +815,25 @@ static void intel_dsi_post_disable(struct intel_encoder *encoder)
+ 		mutex_unlock(&dev->struct_mutex);
+ 		intel_dsi->gem_obj = NULL;
+ 	}
++	if (intel_dsi->cursor_obj != NULL) {
++		if (intel_dsi->cursor_buff[3] != NULL)
++			kunmap(intel_dsi->cursor_buff[3]);
++		 if (intel_dsi->cursor_buff[2] != NULL)
++			kunmap(intel_dsi->cursor_buff[2]);
++		 if (intel_dsi->cursor_buff[1] != NULL)
++			kunmap(intel_dsi->cursor_buff[1]);
++		 if (intel_dsi->cursor_buff[0] != NULL)
++			kunmap(intel_dsi->cursor_buff[0]);
++		intel_dsi->cursor_buff[0] = NULL;
++		intel_dsi->cursor_buff[1] = NULL;
++		intel_dsi->cursor_buff[2] = NULL;
++		intel_dsi->cursor_buff[3] = NULL;
++		i915_gem_object_ggtt_unpin(intel_dsi->cursor_obj);
++		mutex_lock(&dev->struct_mutex);
++		drm_gem_object_unreference(&intel_dsi->cursor_obj->base);
++		mutex_unlock(&dev->struct_mutex);
++		intel_dsi->cursor_obj = NULL;
++	}
+ }
+ 
+ static bool intel_dsi_get_hw_state(struct intel_encoder *encoder,
+@@ -1400,6 +1469,13 @@ bool intel_dsi_init(struct drm_device *dev)
+ 	intel_dsi->cmd_buff_phy_addr = 0;
+ 	intel_dsi->gem_obj = NULL;
+ 
++	intel_dsi->cursor_buff[0] = NULL;
++	intel_dsi->cursor_buff[1] = NULL;
++	intel_dsi->cursor_buff[2] = NULL;
++	intel_dsi->cursor_buff[3] = NULL;
++	intel_dsi->cursor_obj = NULL;
++
++
+ 	intel_encoder->cloneable = 0;
+ 	drm_connector_init(dev, connector, &intel_dsi_connector_funcs,
+ 			   DRM_MODE_CONNECTOR_DSI);
+diff --git a/drivers/gpu/drm/i915/intel_dsi.h b/drivers/gpu/drm/i915/intel_dsi.h
+index 95d341d..e03c93e 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.h
++++ b/drivers/gpu/drm/i915/intel_dsi.h
+@@ -525,6 +525,9 @@ struct intel_dsi {
+ 	struct drm_i915_gem_object *gem_obj;
+ 	void *cmd_buff;
+ 	dma_addr_t cmd_buff_phy_addr;
++
++	struct drm_i915_gem_object *cursor_obj;
++	void *cursor_buff[4];
+ };
+ 
+ static inline struct intel_dsi *enc_to_intel_dsi(struct drm_encoder *encoder)
+-- 
+1.9.1
+

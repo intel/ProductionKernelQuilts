@@ -1,0 +1,105 @@
+From b5c6c1a1c9b4dce64a4996c7505f06e837f98b6a Mon Sep 17 00:00:00 2001
+Message-Id: <b5c6c1a1c9b4dce64a4996c7505f06e837f98b6a.1427265330.git.chang-joon.lee@intel.com>
+In-Reply-To: <b4c66aa6a04d2be0fca9fa4448c7188a581a57a5.1427265330.git.chang-joon.lee@intel.com>
+References: <b4c66aa6a04d2be0fca9fa4448c7188a581a57a5.1427265330.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 16 Mar 2015 14:28:54 +0000
+Subject: [PATCH 19/22] SQUASHME! [VPG]: drm/i915: Fix for TDR kernel panic
+ when querying requests
+
+The TDR code needs to do a reverse lookup to convert a seqno value
+into a request structure. A facility was added to the driver to do
+this. Unfortunately, it didn't cope with not finding the request and
+would return the list sentinel. The TDR could would then kernel panic
+trying to use this invalid request object.
+
+This patch adds the missing test for running off the end of the for
+loop and an appropriate null return.
+
+This patch could be squashed in to the one that originally added the
+reverse lookup function:
+  commit 7b04cfcfcb08fa5f33d61a0870cf0337f5cc2259
+  Author: John Harrison <John.C.Harrison@Intel.com>
+  Date:   Fri Jan 9 13:32:36 2015 +0000
+
+  REVERTME [VPG]: drm/i915: Make native sync work with scheduler
+
+  The native sync implementation fundamentally requires a sequentially
+  incrementing integer timeline. The underlying code does arithmetic
+  comparisons and automatically merges points that compare in the
+  right direction. Thus there is no way to convert the sync points to
+  use request structures instead of seqno values. This causes a
+  problem when the GPU scheduler arrives as it causes batch buffers to
+  complete out of order.
+
+  The solution is to create a per context timeline for the native sync
+  points. Batch buffers within a single context will not be
+  re-ordered. Thus such a timeline is guaranteed to remain sequential.
+  The ultimate intention is to have the seqno values themselves be per
+  context. However, that requires quite a lot of extra infrastructure
+  to be implemented first.
+
+  Instead, this patch creates a private per context timeline just for
+  native sync points to use. Rather than the timeline using seqno
+  values, it has its own internal counter that is incremented for each
+  new sync point. This sync value is saved away in the request
+  structure for which the sync point was created. When that request
+  completes, a call is made back to the native sync code to advance
+  the timeline to the saved value (and thus signal any sync points
+  along the way).
+
+  The 'active seqno' value is still recorded as before for the TDR
+  watchdog code. If this kicks in and kills a batch buffer, the
+  'active seqno' value is read and looked up in the request list to
+  find the matching request structure. The native sync code clean up
+  is then called with the sync point value for that structure to force
+  any sync point associated with it to be marked as bad.
+
+  Note: The native sync code is not yet upstream and was added in the
+  following patch:
+    REVERTME [VPG]: drm/i915: Refactored native sync code for better file splits
+    commit id: 7f6f43d460784c9d86cb334c35b2ebdd15f7a850
+
+  Therefore this patch could be squashed into that one and/or
+  dropped when that patch is dropped.
+
+  Change-Id: Ia80f332a25c2a3dfcaaadcf4c8bfcf718f24cf64
+  For: VIZ-1587
+  For: VIZ-4741
+  For: GMIN-3638
+  Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+
+Change-Id: I2e82a881fb4c30e8416bd25cd7ad43c3b6b38f8f
+For: VIZ-1587
+For: VIZ-4741
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c |    5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index cc778ce..d99503d 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2935,6 +2935,7 @@ struct drm_i915_gem_request *i915_gem_request_find_by_seqno(struct intel_engine_
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&ring->reqlist_lock, flags);
++
+ 	list_for_each_entry(req, &ring->request_list, list) {
+ 		if (req->seqno == seqno)
+ 			break;
+@@ -2944,6 +2945,10 @@ struct drm_i915_gem_request *i915_gem_request_find_by_seqno(struct intel_engine_
+ 			break;
+ 		}
+ 	}
++
++	if (&req->list == &ring->request_list)
++		req = NULL;
++
+ 	spin_unlock_irqrestore(&ring->reqlist_lock, flags);
+ 
+ 	return req;
+-- 
+1.7.9.5
+

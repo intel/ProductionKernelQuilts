@@ -1,0 +1,112 @@
+From fe0deb632f304f50f82c979898b2e02bef42a902 Mon Sep 17 00:00:00 2001
+Message-Id: <fe0deb632f304f50f82c979898b2e02bef42a902.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Wed, 29 Oct 2014 12:22:38 +0530
+Subject: [PATCH 71/75] MUST_REBASE [VPG]: adf/intel/vlv: check if we are
+ close to vblank
+
+while doing a flip check if are close to vblank and if so wait
+for a vblabnk and do the commit/flip in next vblank.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I1b8ffc52a1767d04a1d6e52c201d68acc22a35b2
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+---
+ .../video/adf/intel/core/common/dsi/gen_dsi_pipe.c |   41 ++++++++++++++++++++
+ drivers/video/adf/intel/intel_adf_device.c         |    8 ++--
+ 2 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+index 0a9b8e6..01ef1e4 100644
+--- a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
++++ b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+@@ -226,6 +226,46 @@ out_err:
+ 	return err;
+ }
+ 
++static unsigned int usecs_to_scanlines(struct drm_display_mode *hwmode,
++				       unsigned int usecs)
++{
++	/* paranoia */
++	if (!hwmode->crtc_htotal)
++		return 1;
++
++	return DIV_ROUND_UP(usecs * hwmode->clock,
++			    1000 * hwmode->crtc_htotal);
++}
++
++static void intel_pipe_vblank_evade(struct intel_pipe *intel_pipe)
++{
++	u32 val;
++	struct dsi_pipe *dsi_pipe = to_dsi_pipe(intel_pipe);
++	struct drm_display_mode *hwmode = &dsi_pipe->config.vbt_mode;
++	int pipe = intel_pipe->base.idx;
++	/* FIXME needs to be calibrated sensibly */
++	u32 min = hwmode->crtc_vdisplay - usecs_to_scanlines(hwmode, 50);
++	u32 max = hwmode->crtc_vdisplay - 1;
++	long timeout = msecs_to_jiffies(3);
++
++	local_irq_disable();
++	val = REG_READ(PIPEDSL(pipe));
++	local_irq_enable();
++
++	while (val >= min && val <= max && timeout > 0) {
++
++		vlv_wait_for_vblank(pipe);
++		local_irq_disable();
++		val = REG_READ(PIPEDSL(pipe));
++		local_irq_enable();
++		intel_pipe->status.wait_vblank = false;
++	}
++
++	if (val >= min && val <= max)
++		pr_warn("ADF: Page flipping close to vblank start (DSL=%u, VBL=%u)\n",
++			 val, hwmode->crtc_vdisplay);
++}
++
+ static void dsi_on_post(struct intel_pipe *pipe)
+ {
+ 	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
+@@ -238,6 +278,7 @@ static void dsi_on_post(struct intel_pipe *pipe)
+ 	}
+ 	if (dsi_pipe->ops.on_post)
+ 		dsi_pipe->ops.on_post(dsi_pipe);
++	intel_pipe_vblank_evade(pipe);
+ }
+ 
+ static void dsi_pre_validate(struct intel_pipe *pipe,
+diff --git a/drivers/video/adf/intel/intel_adf_device.c b/drivers/video/adf/intel/intel_adf_device.c
+index 1f5f5ae..99395e3 100644
+--- a/drivers/video/adf/intel/intel_adf_device.c
++++ b/drivers/video/adf/intel/intel_adf_device.c
+@@ -503,6 +503,10 @@ static void intel_adf_device_post(struct adf_device *dev,
+ 			intf->pipe->ops->pre_post(intf->pipe);
+ 	}
+ 
++	/*disable unused overlay engines*/
++	disable_unused_overlay_engines(&i_dev->active_engs,
++		&state->post_engs);
++
+ 	/*flip planes*/
+ 	list_for_each_entry(f, &state->post_flips, list) {
+ 		eng = f->eng;
+@@ -513,10 +517,6 @@ static void intel_adf_device_post(struct adf_device *dev,
+ 		eng->plane->ops->flip(eng->plane, &f->buf, &f->config);
+ 	}
+ 
+-	/*disable unused overlay engines*/
+-	disable_unused_overlay_engines(&i_dev->active_engs,
+-		&state->post_engs);
+-
+ 	/*trigger pipe processing, if necessary*/
+ 	for_each_post_obj(po, &state->post_intfs) {
+ 		intf = po->obj;
+-- 
+1.7.9.5
+

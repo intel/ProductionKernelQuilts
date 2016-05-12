@@ -1,0 +1,99 @@
+From 9595c2802c3841ab3a7aebd61dc9499b5be3226f Mon Sep 17 00:00:00 2001
+From: "Subhransu S. Prusty" <subhransu.s.prusty@intel.com>
+Date: Mon, 25 Aug 2014 15:18:54 +0530
+Subject: [PATCH 06/12] Audio: Handle stream recovery DAPM and state change
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+All the DAPM widgets are disabled and enabled for stream
+recovery.Enabling the DAPM widgets will trigger the
+firmware download. Also, a new state SST_RECOVERY has been
+introduced to handle calls to the LPE during recovery.
+
+Change-Id: I3e250c67663f5acb72837d8fa78c1ed9e50d7187
+Signed-off-by: Subhransu S. Prusty <subhransu.s.prusty@intel.com>
+---
+ sound/soc/intel/sst/sst.h               |  1 +
+ sound/soc/intel/sst/sst_drv_interface.c |  7 +++++++
+ sound/soc/intel/sst/sst_pvt.c           | 17 +++++++++++++++--
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/intel/sst/sst.h b/sound/soc/intel/sst/sst.h
+index 3abd0dd..888d8ff 100644
+--- a/sound/soc/intel/sst/sst.h
++++ b/sound/soc/intel/sst/sst.h
+@@ -61,6 +61,7 @@ enum sst_states {
+ 	SST_FW_RUNNING,
+ 	SST_RESET,
+ 	SST_SHUTDOWN,
++	SST_RECOVERY,
+ };
+ 
+ enum sst_algo_ops {
+diff --git a/sound/soc/intel/sst/sst_drv_interface.c b/sound/soc/intel/sst/sst_drv_interface.c
+index 56ad1c9..1e6673a 100644
+--- a/sound/soc/intel/sst/sst_drv_interface.c
++++ b/sound/soc/intel/sst/sst_drv_interface.c
+@@ -383,6 +383,13 @@ int intel_sst_check_device(void)
+ 
+ 	mutex_lock(&sst_drv_ctx->sst_lock);
+ 
++	if (sst_drv_ctx->sst_state == SST_RECOVERY) {
++		pr_debug("LPE is in recovery state\n");
++		mutex_unlock(&sst_drv_ctx->sst_lock);
++		sst_pm_runtime_put(sst_drv_ctx);
++		return -EAGAIN;
++	}
++
+ 	if (sst_drv_ctx->sst_state == SST_RESET) {
+ 
+ 		/* FW is not downloaded */
+diff --git a/sound/soc/intel/sst/sst_pvt.c b/sound/soc/intel/sst/sst_pvt.c
+index 404c774..5970508 100644
+--- a/sound/soc/intel/sst/sst_pvt.c
++++ b/sound/soc/intel/sst/sst_pvt.c
+@@ -357,6 +357,8 @@ void sst_do_recovery_mrfld(struct intel_sst_drv *sst)
+ 	char iram_event[30], dram_event[30], ddr_imr_event[65], event_type[30];
+ 	char *envp[5];
+ 	int env_offset = 0;
++	bool reset_dapm;
++	struct sst_platform_cb_params cb_params;
+ 
+ 	/*
+ 	 * setting firmware state as RESET so that the firmware will get
+@@ -367,12 +369,15 @@ void sst_do_recovery_mrfld(struct intel_sst_drv *sst)
+ 	pr_err("Audio: trying to reset the dsp now\n");
+ 
+ 	mutex_lock(&sst->sst_lock);
+-	sst->sst_state = SST_RESET;
+-	sst_stream_recovery(sst);
++	sst->sst_state = SST_RECOVERY;
+ 	mutex_unlock(&sst->sst_lock);
+ 
+ 	dump_stack();
+ 	dump_sst_shim(sst);
++	cb_params.params = &reset_dapm;
++	cb_params.event = SST_PLATFORM_TRIGGER_RECOVERY;
++	reset_dapm = true;
++	sst_platform_cb(&cb_params);
+ 
+ 	sst_stall_lpe_n_wait(sst);
+ 
+@@ -424,6 +429,14 @@ void sst_do_recovery_mrfld(struct intel_sst_drv *sst)
+ 		kfree(sst_drv_ctx->fw_in_mem);
+ 		sst_drv_ctx->fw_in_mem = NULL;
+ 	}
++
++	mutex_lock(&sst->sst_lock);
++	sst->sst_state = SST_RESET;
++	sst_stream_recovery(sst);
++	mutex_unlock(&sst->sst_lock);
++
++	reset_dapm = false;
++	sst_platform_cb(&cb_params);
+ }
+ 
+ void sst_do_recovery(struct intel_sst_drv *sst)
+-- 
+1.8.3.2
+

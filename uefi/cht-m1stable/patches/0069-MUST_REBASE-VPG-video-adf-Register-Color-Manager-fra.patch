@@ -1,0 +1,596 @@
+From ce7a92ae3e41173628e85d51d404262ba05925ef Mon Sep 17 00:00:00 2001
+Message-Id: <ce7a92ae3e41173628e85d51d404262ba05925ef.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: Kausal Malladi <Kausal.Malladi@intel.com>
+Date: Sat, 31 Jan 2015 16:15:42 +0530
+Subject: [PATCH 69/95] MUST_REBASE [VPG]: video/adf: Register Color Manager
+ framework
+
+This patch :
+* Creates the basic Color Manager framework with
+  initialization and registration functions.
+* Updates Intel Pipe init and Plane init
+  accordingly to register respective color properties.
+* Updates Makefile to add Color Manager for compilation.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-4163
+Change-Id: Idf684d575339f10f9d3d37e84f83ca181e5ab55a
+Signed-off-by: Kausal Malladi <Kausal.Malladi@intel.com>
+---
+ drivers/video/adf/intel/core/Makefile              |    3 +-
+ drivers/video/adf/intel/core/intel_color_manager.c |  284 ++++++++++++++++++++
+ drivers/video/adf/intel/core/intel_pipe.c          |   15 ++
+ drivers/video/adf/intel/core/intel_plane.c         |   13 +
+ .../adf/intel/include/core/intel_color_manager.h   |  152 +++++++++++
+ .../video/adf/intel/include/core/intel_dc_config.h |   11 +
+ 6 files changed, 477 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/video/adf/intel/core/intel_color_manager.c
+ create mode 100644 drivers/video/adf/intel/include/core/intel_color_manager.h
+
+diff --git a/drivers/video/adf/intel/core/Makefile b/drivers/video/adf/intel/core/Makefile
+index 39929f0..d31c816 100644
+--- a/drivers/video/adf/intel/core/Makefile
++++ b/drivers/video/adf/intel/core/Makefile
+@@ -6,7 +6,8 @@ obj-$(CONFIG_ADF_INTEL) += intel_adf_drv.o \
+ 	intel_pipe.o \
+ 	intel_dc_power.o \
+ 	intel_dc_memory.o \
+-	intel_dc_config.o
++	intel_dc_config.o \
++	intel_color_manager.o
+ 
+ obj-$(CONFIG_ADF_INTEL) += common/
+ obj-$(CONFIG_ADF_INTEL_VLV)	+= vlv/
+diff --git a/drivers/video/adf/intel/core/intel_color_manager.c b/drivers/video/adf/intel/core/intel_color_manager.c
+new file mode 100644
+index 0000000..f6b90ec
+--- /dev/null
++++ b/drivers/video/adf/intel/core/intel_color_manager.c
+@@ -0,0 +1,284 @@
++/*
++ * Copyright © 2014 Intel Corporation
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Author:
++ * Shashank Sharma <shashank.sharma@intel.com>
++ * Ramalingam C <Ramalingam.c@intel.com>
++ */
++
++#include <linux/uaccess.h>
++#include <core/intel_color_manager.h>
++
++/*
++ * Array of function pointers, holding functions which loads
++ * color correction capabilities of a platform. This function
++ * will get all the color correction capabilities of a platfrom
++ * to register with color manager
++ */
++typedef bool (*get_color_capabilities)(void *props_data, int object_type);
++get_color_capabilities platform_color_capabilities[] = {
++};
++
++/* Allocate an LUT for any color property to copy data from userspace */
++u64 *intel_color_manager_create_lut(int size)
++{
++	u64 *lut;
++	lut = kzalloc(size * sizeof(uint64_t), GFP_KERNEL);
++	if (!lut)
++		pr_err("ADF: CM: OOM in create LUT\n");
++	return lut;
++}
++
++/* Get the color correction capabilities of a platform */
++bool intel_get_color_capabilities(int platform_id,
++	void *props_data, int object_type)
++{
++	/* Get the platform specific init data */
++	if (platform_color_capabilities[platform_id]) {
++		if (!platform_color_capabilities[platform_id](props_data,
++								object_type)) {
++			pr_err("ADF: CM: Getting color correction capabilities failed\n");
++			return false;
++		}
++		pr_info("ADF: CM: Got platform color correction data\n");
++	} else {
++		pr_err("ADF: CM: No platform init function for platform id %d\n",
++				platform_id);
++		return false;
++	}
++
++	/* Check data validity */
++	if (!props_data) {
++		pr_err("ADF: CM: Invalid platform color correction capabilities\n");
++		return false;
++	}
++
++	pr_info("ADF: CM: Got color correction capabilities for platform %d\n",
++		platform_id);
++	return true;
++}
++
++/*
++ * intel_color_manager_register_pipe_props
++ * Register Pipe level color properties by getting from pipe_props struct
++ * Returns :
++ *	Number of pipe properties registered
++ *	-1 if any error
++ */
++int intel_color_manager_register_pipe_props(struct intel_pipe *pipe,
++					struct pipe_properties *pipe_props)
++{
++	int no_of_properties = pipe_props->no_of_pipe_props;
++	int count = 0;
++
++	struct color_property *cp;
++
++	while (count < no_of_properties) {
++		cp = kzalloc(sizeof(struct color_property), GFP_KERNEL);
++		if (!cp) {
++			pr_err("ADF: CM: OOM whie loading %d property\n",
++					count);
++
++			goto OOM;
++		}
++
++		memcpy((void *) cp, (const void *)(pipe_props->props[count]),
++				sizeof(struct color_property));
++
++		pr_info("ADF: CM: CP[%d] len=%u prop(%s,%d)\n",
++			count, cp->len,
++				cp->name, cp->prop_id);
++
++		cp->lut = intel_color_manager_create_lut(cp->len);
++		if (!cp->lut) {
++			pr_err("ADF: CM: Cant create LUT for prop %s\n",
++					cp->name);
++
++			kfree(cp);
++			goto OOM;
++		}
++
++		pipe->color_ctx->props[count++] = cp;
++		pr_info("ADF: CM: Registered %d property for Pipe\n", count);
++	}
++
++	pipe->color_ctx->no_of_props = count;
++
++	return count;
++OOM:
++	while (count--) {
++		kfree(pipe_props->props[count]->lut);
++		kfree(pipe_props->props[count]);
++	}
++
++	pr_err("ADF: CM: Error loading pipe level color property\n");
++	return -1;
++}
++
++
++/*
++ * intel_color_manager_register_plane_props
++ * Register Plane level color properties by getting from plane_properties struct
++ * Returns :
++ *	Number of plane properties registered
++ *	-1 if any error
++ */
++int intel_color_manager_register_plane_props(struct intel_plane *plane,
++					struct plane_properties *plane_props)
++{
++	int no_of_properties = plane_props->no_of_plane_props;
++	int count = 0;
++
++	struct color_property *cp;
++
++	while (count < no_of_properties) {
++		cp = kzalloc(sizeof(struct color_property), GFP_KERNEL);
++		if (!cp) {
++			pr_err("ADF: CM: OOM whie loading %d property\n",
++					count);
++
++			goto OOM;
++		}
++
++		memcpy((void *) cp,
++			(const void *)(plane_props->props[count]),
++				sizeof(struct color_property));
++
++		pr_info("ADF: CM: CP[%d] len=%u prop(%s,%d)\n",
++			count, cp->len,
++				cp->name, cp->prop_id);
++
++		cp->lut = intel_color_manager_create_lut(cp->len);
++		if (!cp->lut) {
++			pr_err("ADF: CM: Cant create LUT for prop %s\n",
++					cp->name);
++			kfree(cp);
++			goto OOM;
++		}
++
++		plane->color_ctx->props[count++] = cp;
++		pr_info("ADF: CM: Registered %d property for Plane\n", count);
++	}
++	plane->color_ctx->no_of_props = count;
++
++	return count;
++
++OOM:
++	while (count--) {
++		kfree(plane_props->props[count]->lut);
++		kfree(plane_props->props[count]);
++	}
++
++	pr_err("ADF: CM: Error loading plane level color property\n");
++	return -1;
++}
++
++bool intel_color_manager_pipe_init(struct intel_pipe *pipe, int platform_id)
++{
++	struct pipe_properties *pipe_props;
++
++	/* Sanity */
++	if (platform_id < 0 || !pipe) {
++		pr_err("ADF: CM: Color correction init for pipe failed, %s\n",
++			pipe ? " Invalid platform_id" : "Null pipe");
++		return false;
++	}
++
++	pipe_props = kzalloc(sizeof(struct pipe_properties), GFP_KERNEL);
++
++	if (!pipe_props) {
++		pr_err("ADF: CM: No memory available for initializing pipe properties\n");
++		return false;
++	}
++
++	pipe->color_ctx = kzalloc(sizeof(struct color_capabilities),
++							GFP_KERNEL);
++	if (!pipe->color_ctx) {
++		pr_err("ADF: CM: No memory available for pipe Color Context\n");
++		kfree(pipe_props);
++		return false;
++	}
++
++	/* Get the color correction capabilites of a platform's pipe */
++	if (!intel_get_color_capabilities(platform_id, (void *) pipe_props,
++					CLRMGR_REQUEST_FROM_PIPE)) {
++		pr_err("ADF: CM: Color correction init failed, no valid capabilities found\n");
++		kfree(pipe_props);
++		return false;
++	}
++
++	/* Got the pipe capabilities, Now register it */
++	if (!intel_color_manager_register_pipe_props(pipe, pipe_props)) {
++		pr_err("ADF: CM: Registering pipe color correction capabilities failed\n");
++		kfree(pipe_props);
++		return false;
++	}
++
++	pr_info("ADF: CM: Color correction init success\n");
++	kfree(pipe_props);
++	return true;
++}
++
++bool intel_color_manager_plane_init(struct intel_plane *plane, int platform_id)
++{
++	struct plane_properties *plane_props;
++
++	/* Sanity */
++	if (platform_id < 0 || !plane) {
++		pr_err("ADF: CM: Color correction init for plane failed, %s\n",
++			plane ? " Invalid platform_id" : "Null plane");
++		return false;
++	}
++
++	plane_props = kzalloc(sizeof(struct plane_properties), GFP_KERNEL);
++
++	if (!plane_props) {
++		pr_err("ADF: CM: No memory available for initializing plane properties\n");
++		return false;
++	}
++
++	plane->color_ctx = kzalloc(sizeof(struct color_capabilities),
++							GFP_KERNEL);
++	if (!plane->color_ctx) {
++		pr_err("ADF: CM: No memory available for plane color context\n");
++		kfree(plane_props);
++		return false;
++	}
++
++	/* Get the color correction capabilites of a platform's plane */
++	if (!intel_get_color_capabilities(platform_id, (void *) plane_props,
++					CLRMGR_REQUEST_FROM_PLANE)) {
++		pr_err("ADF: CM: Color correction init failed, no valid capabilities found\n");
++		kfree(plane_props);
++		return false;
++	}
++
++	/* Got the plane capabilities, Now register it */
++	if (!intel_color_manager_register_plane_props(plane, plane_props)) {
++		pr_err("ADF: CM: Registering plane color correction capabilities failed\n");
++		kfree(plane_props);
++		return false;
++	}
++
++	pr_info("ADF: CM: Color correction init success\n");
++	kfree(plane_props);
++	return true;
++}
+diff --git a/drivers/video/adf/intel/core/intel_pipe.c b/drivers/video/adf/intel/core/intel_pipe.c
+index 9ac3800..3732b76 100644
+--- a/drivers/video/adf/intel/core/intel_pipe.c
++++ b/drivers/video/adf/intel/core/intel_pipe.c
+@@ -12,6 +12,7 @@
+  *
+  */
+ 
++#include <drm/i915_adf.h>
+ #include "core/intel_dc_config.h"
+ 
+ int intel_pipe_init(struct intel_pipe *pipe, struct device *dev,
+@@ -19,6 +20,16 @@ int intel_pipe_init(struct intel_pipe *pipe, struct device *dev,
+ 	const struct intel_plane *primary_plane,
+ 	const struct intel_pipe_ops *ops, const char *name)
+ {
++	int platform_color_id;
++
++	/* If platform is CHV, ID is 1 else 0 (for VLV) */
++	if (IS_CHERRYVIEW())
++		platform_color_id = CHV_COLOR_ID;
++	else if (IS_VALLEYVIEW())
++		platform_color_id = VLV_COLOR_ID;
++	else
++		platform_color_id = INVALID_PLATFORM_COLOR_ID;
++
+ 	pr_debug("ADF: %s\n", __func__);
+ 
+ 	if (!pipe || !primary_plane || !ops)
+@@ -29,6 +40,10 @@ int intel_pipe_init(struct intel_pipe *pipe, struct device *dev,
+ 	pipe->primary_plane = primary_plane;
+ 	pipe->ops = ops;
+ 
++	/* Register color properties for the pipe */
++	if (!intel_color_manager_pipe_init(pipe, platform_color_id))
++		pr_err("ADF: CM: Error registering Pipe Color properties\n");
++
+ 	return intel_dc_component_init(&pipe->base, dev, idx, name);
+ }
+ 
+diff --git a/drivers/video/adf/intel/core/intel_plane.c b/drivers/video/adf/intel/core/intel_plane.c
+index be457a1..6ee9225 100644
+--- a/drivers/video/adf/intel/core/intel_plane.c
++++ b/drivers/video/adf/intel/core/intel_plane.c
+@@ -18,12 +18,25 @@ int intel_adf_plane_init(struct intel_plane *plane, struct device *dev,
+ 	u8 idx, const struct intel_plane_capabilities *caps,
+ 	const struct intel_plane_ops *ops, const char *name)
+ {
++	int platform_color_id;
++
++	/* If platform is CHV, ID is 1 else 0 (for VLV) */
++	if (IS_CHERRYVIEW())
++		platform_color_id = CHV_COLOR_ID;
++	else if (IS_VALLEYVIEW())
++		platform_color_id = VLV_COLOR_ID;
++	else
++		platform_color_id = INVALID_PLATFORM_COLOR_ID;
++
+ 	if (!plane || !caps || !ops)
+ 		return -EINVAL;
+ 
+ 	plane->caps = caps;
+ 	plane->ops = ops;
+ 
++	if (!intel_color_manager_plane_init(plane, platform_color_id))
++		pr_err("ADF: CM: Error registering plane color properties");
++
+ 	return intel_dc_component_init(&plane->base, dev, idx, name);
+ }
+ 
+diff --git a/drivers/video/adf/intel/include/core/intel_color_manager.h b/drivers/video/adf/intel/include/core/intel_color_manager.h
+new file mode 100644
+index 0000000..7addf00
+--- /dev/null
++++ b/drivers/video/adf/intel/include/core/intel_color_manager.h
+@@ -0,0 +1,152 @@
++/* Copyright © 2014 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Author:
++ * Shashank Sharma <shashank.sharma@intel.com>
++ * Ramalingam C <Ramalingam.c@intel.com>
++ */
++
++#ifndef _ADF_CLR_MNGR_H_
++#define _ADF_CLR_MNGR_H_
++
++#include <linux/types.h>
++#include <intel_adf.h>
++
++/* Color manager framework data structures */
++#define COLOR_MANAGER_MAX_PROPERTIES		40
++#define COLOR_MANAGER_MAX_PIPE_PROPERTIES	20
++#define COLOR_MANAGER_MAX_PLANE_PROPERTIES	20
++#define COLOR_MANAGER_PROP_NAME_MAX		50
++#define COLOR_MANAGER_SIZE_MIN			1
++
++/* Platform gamma correction */
++#define CLRMGR_GAMMA_PARSER_SHIFT_BLUE		0
++#define CLRMGR_GAMMA_PARSER_SHIFT_GREEN		16
++#define CLRMGR_GAMMA_PARSER_SHIFT_RED		32
++#define CLRMGR_GAMMA_TOTAL_GCMAX_REGS		3
++#define CLRMGR_GAMMA_GCMAX_VAL			1
++#define CLRMGR_GAMMA_MAX_SAMPLES		1024
++
++/* Pipe/plane Object types */
++#define CLRMGR_REQUEST_FROM_PIPE 1
++#define CLRMGR_REQUEST_FROM_PLANE 2
++
++/* Color manager features (all platforms) */
++enum color_correction {
++	csc = 0,
++	gamma,
++	degamma,
++	contrast,
++	brightness,
++	hue,
++	saturation
++};
++
++/*
++ * ===============
++ * Color EDID (4 bytes + pointer to u64)
++ *===============
++ * Byte 0		: Property id for the property to modify
++ * Byte 1		: Enable/Disable property
++ * Bytes 2-3		: These total 16 bits define the no of correction data
++ *			blocks coming up
++ * Bytes 4-7		: Pointer to raw data
++ *<<=======> <===========> <========><=============>
++ *	<1Byte>		<1Byte>		<2Byte>
++ *<<=property=>,<=enable/disable=>,<=No of data blocks=>,
++ * <<==============================================>
++ *<0xdata>,<0xdata>,<0xdata> ..... <0xdata>
++ */
++
++/* Current status of color property */
++struct color_status {
++	bool enabled;
++	u64 *lut;
++};
++
++/* Possible operations on color properties */
++enum color_actions {
++	color_get = 0,
++	color_set,
++	color_disable
++};
++
++/*
++ * Color property structure
++ * Encapsulates status of a color property at any instant
++ * for this particular identifier (plane, pipe)
++ * len = no of color correction coeffs
++ * status = current status of correction
++ * prop_id = unique id for a correction
++ * lut = current color correction values, valid only when
++ *		correction enabled
++ * set_property = fptr to platfrom specific set call
++ * get_property = fptr to platfrom specific get call
++ * disable_prop = guess what ?
++ * validate = fptr to platfrom validation of args
++ */
++struct color_property {
++	/* status of color prop enabled/disabled */
++	bool status;
++
++	/* Len: no of coeffs */
++	u32 len;
++
++	enum color_correction prop_id;
++
++	char name[COLOR_MANAGER_PROP_NAME_MAX];
++	u64 *lut;
++
++	bool (*set_property)(struct color_property *property,
++				u64 *data, u8 idx);
++
++	bool (*disable_property)(struct color_property *property, u8 idx);
++
++	bool (*validate)(u8 prop_id);
++};
++
++struct pipe_properties {
++	u8 no_of_pipe_props;
++	struct color_property *props[COLOR_MANAGER_MAX_PIPE_PROPERTIES];
++};
++
++struct plane_properties {
++	u8 no_of_plane_props;
++	struct color_property *props[COLOR_MANAGER_MAX_PLANE_PROPERTIES];
++};
++
++/*
++ * color_capabilities structure
++ * holds the number of properties
++ * and a pointer to an array of color property structures
++ * can be used generically for both pipe and plane
++ */
++struct color_capabilities {
++	u8 no_of_props;
++	struct color_property *props[COLOR_MANAGER_MAX_PROPERTIES];
++};
++
++/* Platform color correction register functions */
++extern bool
++vlv_get_color_correction(void *props_data, int object_type);
++extern bool
++chv_get_color_correction(void *props_data, int object_type);
++#endif
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 24c6f78..88d86d9 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -163,6 +163,11 @@ enum pipe {
+ #define IS_CHERRYVIEW() (intel_adf_get_platform_id() == gen_cherryview)
+ #define IS_VALLEYVIEW() (intel_adf_get_platform_id() == gen_valleyview)
+ 
++/* Platform Color IDs to be used by Color Manager */
++#define CHV_COLOR_ID 1
++#define VLV_COLOR_ID 0
++#define INVALID_PLATFORM_COLOR_ID -1
++
+ enum port {
+ 	PORT_A = 0,
+ 	PORT_B,
+@@ -694,4 +699,10 @@ extern int intel_adf_set_event(struct intel_pipe *pipe, u16 event,
+ 		bool enabled);
+ extern int intel_adf_get_events(struct intel_pipe *pipe, u32 *events);
+ 
++/* From intel pipe, plane and color manager */
++extern bool intel_color_manager_plane_init(struct intel_plane *plane,
++						int platform_id);
++extern bool intel_color_manager_pipe_init(struct intel_pipe *pipe,
++						int platform_id);
++
+ #endif /* INTEL_DC_CONFIG_H_ */
+-- 
+1.7.9.5
+

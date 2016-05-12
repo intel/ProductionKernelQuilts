@@ -1,0 +1,113 @@
+From 8d9b1ec37a30bc627b90bf841ad4c9457ad35f82 Mon Sep 17 00:00:00 2001
+From: "johan.bohlin" <johan.bohlin@intel.com>
+Date: Fri, 22 Aug 2014 12:56:17 +0200
+Subject: [PATCH 1/1] hdmi-audio: Fix error handling on bad probe sequence
+
+BZ: 168420
+
+There are some error handling paths that are incorrectly handled,
+specially when mid_hdmi_audio_setup fails, which goes to an error
+handling section which assumes intelhaddata->dev has an actual
+struct device pointer, but that doesn't happen until later on
+in the init.
+
+Clean up the sequence and fix this potential null pointer
+dereference.
+
+Issue: GMIN-3240
+
+Change-Id: I13e972dfdc534d72290282dfe0596318b7528f84
+Signed-off-by: johan.bohlin <johan.bohlin@intel.com>
+---
+ sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c |   28 +++++++++++++----------
+ 1 file changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c b/sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c
+index 045c33380504..f756b6e330f4 100644
+--- a/sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c
++++ b/sound/drivers/intel_hdmi/intel_mid_hdmi_audio.c
+@@ -1782,7 +1782,7 @@ static int hdmi_audio_probe(struct platform_device *devptr)
+ 	retval = snd_pcm_new(card, INTEL_HAD, PCM_INDEX, MAX_PB_STREAMS,
+ 						MAX_CAP_STREAMS, &pcm);
+ 	if (retval)
+-		goto err;
++		goto free_card;
+ 
+ 	/* setup private data which can be retrieved when required */
+ 	pcm->private_data = intelhaddata;
+@@ -1800,34 +1800,34 @@ static int hdmi_audio_probe(struct platform_device *devptr)
+ 			SNDRV_DMA_TYPE_DEV, card->dev,
+ 			HAD_MAX_BUFFER, HAD_MAX_BUFFER);
+ 	if (retval)
+-		goto err;
++		goto free_card;
+ 
+ 	/* internal function call to register device with ALSA */
+ 	retval = snd_intelhad_create(intelhaddata, card);
+ 	if (retval)
+-		goto err;
++		goto free_prealloc;
+ 
+ 	card->private_data = &intelhaddata;
+ 	retval = snd_card_register(card);
+ 	if (retval)
+-		goto err;
++		goto free_prealloc;
+ 
+ 	/* IEC958 controls */
+ 	retval = snd_ctl_add(card, snd_ctl_new1(&had_control_iec958_mask,
+ 						intelhaddata));
+ 	if (retval < 0)
+-		goto err;
++		goto free_prealloc;
+ 	retval = snd_ctl_add(card, snd_ctl_new1(&had_control_iec958,
+ 						intelhaddata));
+ 	if (retval < 0)
+-		goto err;
++		goto free_prealloc;
+ 
+ 	init_channel_allocations();
+ 
+ 	/* Register channel map controls */
+ 	retval = had_register_chmap_ctls(intelhaddata, pcm);
+ 	if (retval < 0)
+-		goto err;
++		goto free_prealloc;
+ 
+ 	intelhaddata->dev = &devptr->dev;
+ 	pm_runtime_set_active(intelhaddata->dev);
+@@ -1837,22 +1837,26 @@ static int hdmi_audio_probe(struct platform_device *devptr)
+ 	retval = mid_hdmi_audio_register(&had_interface, intelhaddata);
+ 	if (retval) {
+ 		pr_err("registering with display driver failed %#x\n", retval);
+-		snd_card_free(card);
+-		goto free_hadstream;
++		goto err;
+ 	}
+ 	intelhaddata->hw_silence = 1;
+ 	/* PIPE B is used for HDMI*/
+ 	intelhaddata->audio_reg_base = 0x65800;
+ 	intelhaddata->ops = &had_ops_v2;
+ 	return retval;
++
+ err:
++	pm_runtime_disable(intelhaddata->dev);
++	intelhaddata->dev = NULL;
++free_prealloc:
++	snd_pcm_lib_preallocate_free_for_all(pcm);
++free_card:
+ 	snd_card_free(card);
+ unlock_mutex:
+-	mutex_unlock(&had_mutex);
++	if (mutex_is_locked(&had_mutex))
++		mutex_unlock(&had_mutex);
+ free_hadstream:
+ 	kfree(had_stream);
+-	pm_runtime_disable(intelhaddata->dev);
+-	intelhaddata->dev = NULL;
+ free_haddata:
+ 	kfree(intelhaddata);
+ 	intelhaddata = NULL;
+-- 
+1.7.9.5
+

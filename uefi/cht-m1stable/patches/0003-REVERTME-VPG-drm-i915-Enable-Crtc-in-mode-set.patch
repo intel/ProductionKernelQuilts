@@ -1,0 +1,118 @@
+From 09292c3fc14fd0eca21dace8def7bd514c9be472 Mon Sep 17 00:00:00 2001
+Message-Id: <09292c3fc14fd0eca21dace8def7bd514c9be472.1432314923.git.chang-joon.lee@intel.com>
+In-Reply-To: <7faf8aeff66f21d5f967a1a95177386ec39f5187.1432314923.git.chang-joon.lee@intel.com>
+References: <7faf8aeff66f21d5f967a1a95177386ec39f5187.1432314923.git.chang-joon.lee@intel.com>
+From: Akashdeep Sharma <akashdeep.sharma@intel.com>
+Date: Tue, 19 May 2015 23:32:57 +0530
+Subject: [PATCH 3/5] REVERTME [VPG]: drm/i915: Enable Crtc in mode set
+
+Enable Crtc in mode set if it is not active irrespective of
+connector's dpms state. This is required to avoid unecessary rpm
+gets due to series of setCrtc/ DPMS calls from user space. Also,
+supress connector/ encoder's state check if Crtc is enabled before
+DPMS ON.
+
+REVERTME: Design in upstream is different and we need these
+changes only till forklift.
+
+Change-Id: I7fb277294a1df9d890984d3f05670ac12a4090ba
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-31068
+Signed-off-by: Akashdeep Sharma <akashdeep.sharma@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |   32 ++++++++++++++++++++++++++------
+ drivers/gpu/drm/i915/intel_drv.h     |    1 +
+ 2 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 8d51ae2..0cbdcc1 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5978,8 +5978,11 @@ static void intel_connector_check_state(struct intel_connector *connector)
+ 			      connector->base.base.id,
+ 			      connector->base.name);
+ 
+-		WARN(connector->base.dpms == DRM_MODE_DPMS_OFF,
+-		     "wrong connector dpms state\n");
++		if ((encoder->base.crtc) && (!to_intel_crtc(
++			encoder->base.crtc)->skip_check_state)) {
++			WARN(connector->base.dpms == DRM_MODE_DPMS_OFF,
++			     "wrong connector dpms state\n");
++		}
+ 		WARN(connector->base.encoder != &encoder->base,
+ 		     "active connector not linked to encoder\n");
+ 		WARN(!encoder->connectors_active,
+@@ -12074,9 +12077,12 @@ check_encoder_state(struct drm_device *dev)
+ 		WARN(active && !encoder->base.crtc,
+ 		     "active encoder with no crtc\n");
+ 
+-		WARN(encoder->connectors_active != active,
+-		     "encoder's computed active state doesn't match tracked active state "
+-		     "(expected %i, found %i)\n", active, encoder->connectors_active);
++		if ((encoder->base.crtc) && (!to_intel_crtc(
++			encoder->base.crtc)->skip_check_state)) {
++			WARN(encoder->connectors_active != active,
++	"encoder's computed active state doesn't match tracked one (%i, %i)\n",
++			     active, encoder->connectors_active);
++		}
+ 
+ 		active = encoder->get_hw_state(encoder, &pipe);
+ 		WARN(active != encoder->connectors_active,
+@@ -12415,7 +12421,7 @@ static int __intel_set_mode(struct drm_crtc *crtc,
+ 
+ 		intel_crtc = to_intel_crtc(connector->encoder->crtc);
+ 
+-		if ((connector->dpms != DRM_MODE_DPMS_OFF)
++		if ((!intel_crtc->active)
+ 			&& (prepare_pipes & (1 << (intel_crtc)->pipe))) {
+ 			/*
+ 			 * Now enable the clocks, plane, pipe, and
+@@ -12435,6 +12441,16 @@ static int __intel_set_mode(struct drm_crtc *crtc,
+ 			update_scanline_offset(intel_crtc);
+ 			to_intel_encoder(connector->encoder)->connectors_active = true;
+ 			dev_priv->display.crtc_enable(&intel_crtc->base);
++
++			/*
++			 * As we are updating crtc active state before
++			 * connector's DPMS state (which will be done by
++			 * subsequent DPMS ON call), hence we can ignore
++			 * conenctor's dpms state and encoder's active state
++			 * checks after crtc mode set.
++			 */
++			if (connector->dpms != DRM_MODE_DPMS_ON)
++				intel_crtc->skip_check_state = true;
+ 		}
+ 	}
+ 
+@@ -12465,6 +12481,8 @@ static int intel_set_mode(struct drm_crtc *crtc,
+ 	if (ret == 0)
+ 		intel_modeset_check_state(crtc->dev);
+ 
++	(to_intel_crtc(crtc))->skip_check_state = false;
++
+ 	return ret;
+ }
+ 
+@@ -13049,6 +13067,8 @@ static void intel_crtc_init(struct drm_device *dev, int pipe)
+ 	intel_attach_pipe_color_correction(intel_crtc);
+ 
+ 	intel_crtc->rotate180 = false;
++	intel_crtc->skip_check_state = false;
++
+ 	/* Flag for wake from sleep */
+ 	dev_priv->is_resuming = false;
+ 	intel_crtc->enableprimary = false;
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 71e3f29..710d56d 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -532,6 +532,7 @@ struct intel_crtc {
+ 	 * been sent before disable sequence.
+ 	 */
+ 	u32 hw_frm_cnt_at_enable;
++	bool skip_check_state;
+ };
+ 
+ struct intel_plane_wm_parameters {
+-- 
+1.7.9.5
+

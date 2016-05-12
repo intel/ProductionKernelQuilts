@@ -1,0 +1,100 @@
+From a99a4192ef227ac71779b8f21259e096c1210949 Mon Sep 17 00:00:00 2001
+Message-Id: <a99a4192ef227ac71779b8f21259e096c1210949.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 11 Jun 2014 11:03:19 +0100
+Subject: [PATCH 33/61] FOR_UPSTREAM [VPG]: drm/i915: Hook scheduler into
+ intel_ring_idle()
+
+The code to wait for a ring to be idle ends by calling __wait_seqno() on the
+value in the last request structure. However, with a scheduler, there may be
+work queued up but not yet submitted. There is also the possiblity of
+pre-emption re-ordering work after it has been submitted. Thus the last request
+structure at the current moment is not necessarily the last piece of work by the
+time that particular seqno has completed.
+
+It is not possible to force the scheduler to submit all work from inside the
+ring idle function as it might not be a safe place to do so. Instead, it must
+simply return early if the scheduler has outstanding work and roll back as far
+as releasing the driver mutex lock and the returning the system to a consistent
+state.
+
+Change-Id: Ic231dda1b28965a713f0530c132c42e72f01634d
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_scheduler.c   |   25 +++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.h   |    1 +
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    8 ++++++++
+ 3 files changed, 34 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index de7a3ce..8c8c344 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -1185,3 +1185,28 @@ int i915_scheduler_closefile(struct drm_device *dev, struct drm_file *file)
+ 
+ 	return 0;
+ }
++
++bool i915_scheduler_is_ring_idle(struct intel_engine_cs *ring)
++{
++	struct i915_scheduler_queue_entry *node;
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	struct i915_scheduler   *scheduler = dev_priv->scheduler;
++	unsigned long   flags;
++	bool            idle = true;
++
++	if (!scheduler)
++		return true;
++
++	spin_lock_irqsave(&scheduler->lock, flags);
++
++	list_for_each_entry(node, &scheduler->node_queue[ring->id], link) {
++		if (!I915_SQS_IS_COMPLETE(node)) {
++			idle = false;
++			break;
++		}
++	}
++
++	spin_unlock_irqrestore(&scheduler->lock, flags);
++
++	return idle;
++}
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 219903c..e72cf49 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -95,6 +95,7 @@ int         i915_scheduler_closefile(struct drm_device *dev,
+ 				     struct drm_file *file);
+ int         i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe);
+ int         i915_scheduler_handle_irq(struct intel_engine_cs *ring);
++bool        i915_scheduler_is_ring_idle(struct intel_engine_cs *ring);
+ void        i915_gem_scheduler_work_handler(struct work_struct *work);
+ int         i915_scheduler_flush(struct intel_engine_cs *ring, bool is_locked);
+ int         i915_scheduler_flush_request(struct drm_i915_gem_request *req,
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 4e1b38a..b13ff1c 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2466,6 +2466,14 @@ int intel_ring_idle(struct intel_engine_cs *ring)
+ 			return ret;
+ 	}
+ 
++	/* If there is anything outstanding within the scheduler then give up
++	 * now as the submission of such work requires the mutex lock. While
++	 * the lock is definitely held at this point (i915_wait_seqno will BUG
++	 * if called without), the driver is not necessarily at a safe point
++	 * to start submitting ring work. */
++	if (!i915_scheduler_is_ring_idle(ring))
++		return -EAGAIN;
++
+ 	/* Wait upon the last request to be completed */
+ 	if (list_empty(&ring->request_list))
+ 		return 0;
+-- 
+1.7.9.5
+

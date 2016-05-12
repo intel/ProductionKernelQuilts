@@ -1,0 +1,156 @@
+From 95de3c3672b6cb455f768034c91bf179db5ed9e2 Mon Sep 17 00:00:00 2001
+From: Dimitris Papastamos <dp@opensource.wolfsonmicro.com>
+Date: Tue, 29 Oct 2013 13:43:07 +0000
+Subject: [PATCH 031/351] ASoC: wm_adsp: Add support for grouped ALSA binary
+ controls
+
+Currently the ALSA ABI imposes a hard limit of 512 bytes per binary
+control.  To support coefficient data blocks of larger sizes we carve up
+this space into multiple alsa controls.  All of these controls are
+identified by a common prefix and suffix of the form ":<blk id>".
+
+Control groupings can also consist of a single block in which case the
+suffix ":0" is used.
+
+Change-Id: Ib8560bbd98425b1732b2ccf372a53102bdeb7d7f
+Signed-off-by: Dimitris Papastamos <dp@opensource.wolfsonmicro.com>
+Signed-off-by: Nikesh Oswal <Nikesh.Oswal@wolfsonmicro.com>
+---
+ sound/soc/codecs/wm_adsp.c |   59 ++++++++++++++++++++++++++++++++++++++------
+ sound/soc/codecs/wm_adsp.h |    1 +
+ 2 files changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/sound/soc/codecs/wm_adsp.c b/sound/soc/codecs/wm_adsp.c
+index 4c56c8e..1df064f 100644
+--- a/sound/soc/codecs/wm_adsp.c
++++ b/sound/soc/codecs/wm_adsp.c
+@@ -905,7 +905,6 @@ static void wm_adsp_ctl_work(struct work_struct *work)
+ 
+ static int wm_adsp_create_control(struct wm_adsp *dsp,
+ 				  const struct wm_adsp_alg_region *region)
+-
+ {
+ 	struct wm_coeff_ctl *ctl;
+ 	struct wmfw_ctl_work *ctl_work;
+@@ -938,8 +937,8 @@ static int wm_adsp_create_control(struct wm_adsp *dsp,
+ 		goto err_name;
+ 	}
+ 
+-	snprintf(name, PAGE_SIZE, "DSP%d %s %x",
+-		 dsp->num, region_name, region->alg);
++	snprintf(name, PAGE_SIZE, "DSP%d %s %x:%d",
++		 dsp->num, region_name, region->alg, region->block);
+ 
+ 	list_for_each_entry(ctl, &dsp->ctl_list,
+ 			    list) {
+@@ -1001,6 +1000,50 @@ err_name:
+ 	return ret;
+ }
+ 
++static int wm_adsp_create_grouped_control(struct wm_adsp *dsp,
++					  struct wm_adsp_alg_region *region)
++{
++	size_t len = region->len, offset = 0;
++	struct wm_adsp_alg_region *r;
++	int ret;
++
++	region->block = 0;
++	/* This is the quick case for control groups of a single block */
++	if (region->len <= 512)
++		return wm_adsp_create_control(dsp, region);
++
++	/* The passed `region' is already in the list
++	 * of algorithm regions so just create the control for it and don't
++	 * add it to the list */
++	region->len = 512;
++	ret = wm_adsp_create_control(dsp, region);
++	if (ret < 0)
++		return ret;
++	offset += 512;
++
++	/* Carve up the entire region into 512-byte chunks */
++	do {
++		r = kzalloc(sizeof(*r), GFP_KERNEL);
++		if (!r)
++			return -ENOMEM;
++		r->block = offset / 512;
++		r->type = region->type;
++		r->alg = region->alg;
++		r->base = region->base + offset / 4;
++		if (len - offset > 512)
++			r->len = 512;
++		else
++			r->len = len - offset;
++		offset += r->len;
++		list_add_tail(&r->list, &dsp->alg_regions);
++		ret = wm_adsp_create_control(dsp, r);
++		if (ret < 0)
++			return ret;
++	} while (offset < len);
++
++	return 0;
++}
++
+ static int wm_adsp_setup_algs(struct wm_adsp *dsp)
+ {
+ 	struct regmap *regmap = dsp->regmap;
+@@ -1188,7 +1231,7 @@ static int wm_adsp_setup_algs(struct wm_adsp *dsp)
+ 				region->len = be32_to_cpu(adsp1_alg[i + 1].dm);
+ 				region->len -= be32_to_cpu(adsp1_alg[i].dm);
+ 				region->len *= 4;
+-				wm_adsp_create_control(dsp, region);
++				wm_adsp_create_grouped_control(dsp, region);
+ 			} else {
+ 				adsp_warn(dsp, "Missing length info for region DM with ID %x\n",
+ 					  be32_to_cpu(adsp1_alg[i].alg.id));
+@@ -1206,7 +1249,7 @@ static int wm_adsp_setup_algs(struct wm_adsp *dsp)
+ 				region->len = be32_to_cpu(adsp1_alg[i + 1].zm);
+ 				region->len -= be32_to_cpu(adsp1_alg[i].zm);
+ 				region->len *= 4;
+-				wm_adsp_create_control(dsp, region);
++				wm_adsp_create_grouped_control(dsp, region);
+ 			} else {
+ 				adsp_warn(dsp, "Missing length info for region ZM with ID %x\n",
+ 					  be32_to_cpu(adsp1_alg[i].alg.id));
+@@ -1236,7 +1279,7 @@ static int wm_adsp_setup_algs(struct wm_adsp *dsp)
+ 				region->len = be32_to_cpu(adsp2_alg[i + 1].xm);
+ 				region->len -= be32_to_cpu(adsp2_alg[i].xm);
+ 				region->len *= 4;
+-				wm_adsp_create_control(dsp, region);
++				wm_adsp_create_grouped_control(dsp, region);
+ 			} else {
+ 				adsp_warn(dsp, "Missing length info for region XM with ID %x\n",
+ 					  be32_to_cpu(adsp2_alg[i].alg.id));
+@@ -1254,7 +1297,7 @@ static int wm_adsp_setup_algs(struct wm_adsp *dsp)
+ 				region->len = be32_to_cpu(adsp2_alg[i + 1].ym);
+ 				region->len -= be32_to_cpu(adsp2_alg[i].ym);
+ 				region->len *= 4;
+-				wm_adsp_create_control(dsp, region);
++				wm_adsp_create_grouped_control(dsp, region);
+ 			} else {
+ 				adsp_warn(dsp, "Missing length info for region YM with ID %x\n",
+ 					  be32_to_cpu(adsp2_alg[i].alg.id));
+@@ -1272,7 +1315,7 @@ static int wm_adsp_setup_algs(struct wm_adsp *dsp)
+ 				region->len = be32_to_cpu(adsp2_alg[i + 1].zm);
+ 				region->len -= be32_to_cpu(adsp2_alg[i].zm);
+ 				region->len *= 4;
+-				wm_adsp_create_control(dsp, region);
++				wm_adsp_create_grouped_control(dsp, region);
+ 			} else {
+ 				adsp_warn(dsp, "Missing length info for region ZM with ID %x\n",
+ 					  be32_to_cpu(adsp2_alg[i].alg.id));
+diff --git a/sound/soc/codecs/wm_adsp.h b/sound/soc/codecs/wm_adsp.h
+index 82796fe..f289923 100644
+--- a/sound/soc/codecs/wm_adsp.h
++++ b/sound/soc/codecs/wm_adsp.h
+@@ -29,6 +29,7 @@ struct wm_adsp_region {
+ 
+ struct wm_adsp_alg_region {
+ 	struct list_head list;
++	unsigned int block;
+ 	unsigned int alg;
+ 	int type;
+ 	unsigned int base;
+-- 
+1.7.9.5
+

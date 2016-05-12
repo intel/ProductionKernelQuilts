@@ -1,0 +1,310 @@
+From 5f37bf46cf9ef5806cad3391360dfc72e7516fab Mon Sep 17 00:00:00 2001
+From: "R, Kannappan" <r.kannappan@intel.com>
+Date: Wed, 10 Sep 2014 19:38:13 +0530
+Subject: [PATCH 1/1] EM: initialize em_config as module
+
+initialize OEM0 table during early init and register
+the battery profile with battery id. consumers can
+use get_batt_prop to get the charging profile and
+can battery validity. The consumer drivers dollar cove,
+bq24192 and intel fuel gauge drivers use get_batt_prop
+to retrieve the battery charging capabilities from
+oem0 table.
+
+Issue: GMINL-1367
+Change-Id: Ia6d3da807c1c1190ef0401a3d95b1c317ab3fa61
+Signed-off-by: R, Kannappan <r.kannappan@intel.com>
+---
+ arch/x86/include/asm/intel_em_config.h |   29 +--------------
+ drivers/mfd/intel_soc_pmic_dc.c        |   22 +++++++----
+ drivers/platform/x86/intel_em_config.c |   64 +++++++++++++++++++++++---------
+ drivers/power/bq24192_charger.c        |    9 +----
+ drivers/power/intel_fuel_gauge.c       |   10 ++---
+ 5 files changed, 67 insertions(+), 67 deletions(-)
+
+diff --git a/arch/x86/include/asm/intel_em_config.h b/arch/x86/include/asm/intel_em_config.h
+index 02d0e3e79ce8..0b385a86dbcf 100644
+--- a/arch/x86/include/asm/intel_em_config.h
++++ b/arch/x86/include/asm/intel_em_config.h
+@@ -55,15 +55,6 @@ struct em_config_oem1_data {
+ 
+ #ifdef CONFIG_ACPI
+ /*
+- * em_config_get_oem0_data - This function fetches OEM0 table .
+- * @data : Pointer to OEM0 data structure in which data should be filled.
+- *
+- * Returns number bytes fetched (+ve) on success or 0 on error.
+- *
+- */
+-int em_config_get_oem0_data(struct em_config_oem0_data *data);
+-
+-/*
+  * em_config_get_oem1_data - This function fetches OEM1 table .
+  * @data : Pointer to OEM1 data structure in which data should be filled.
+  *
+@@ -72,31 +63,13 @@ int em_config_get_oem0_data(struct em_config_oem0_data *data);
+  */
+ int em_config_get_oem1_data(struct em_config_oem1_data *data);
+ 
+-/*
+- * em_config_get_charge_profile - This function fetches
+- *				charger profile for connected battery.
+- * @chrg_prof : Pointer to charger profile structure in
+- *				which profile should be filled.
+- *
+- * Returns number bytes fetched (+ve) on success or 0 on error.
+- *
+- */
+-int em_config_get_charge_profile(struct ps_pse_mod_prof *chrg_prof);
+-
+ #else
+ 
+-static int em_config_get_oem0_data(struct em_config_oem0_data *data)
+-{
+-	return 0;
+-}
+ static int em_config_get_oem1_data(struct em_config_oem1_data *data)
+ {
+ 	return 0;
+ }
+-static int em_config_get_charge_profile(struct ps_pse_mod_prof *chrg_prof)
+-{
+-	return 0;
+-}
++
+ #endif /* CONFIG_ACPI */
+ 
+ #endif /*_INTEL_EM_CONFIG_H */
+diff --git a/drivers/mfd/intel_soc_pmic_dc.c b/drivers/mfd/intel_soc_pmic_dc.c
+index d32cd5495904..3827470c57bd 100644
+--- a/drivers/mfd/intel_soc_pmic_dc.c
++++ b/drivers/mfd/intel_soc_pmic_dc.c
+@@ -299,7 +299,7 @@ struct intel_pmic_irqregmap dollar_cove_irqregmap[] = {
+ #define DC_CHRG_CHRG_CUR_LOW		1000
+ 
+ static struct ps_batt_chg_prof ps_batt_chrg_prof;
+-static struct ps_pse_mod_prof batt_chg_profile;
++static struct ps_pse_mod_prof *pse_mod_prof;
+ static struct power_supply_throttle dc_chrg_throttle_states[] = {
+ 	{
+ 		.throttle_action = PSY_THROTTLE_CC_LIMIT,
+@@ -324,13 +324,14 @@ static char *dc_chrg_supplied_to[] = {
+ 
+ static void *platform_get_batt_charge_profile(void)
+ {
+-	if (!em_config_get_charge_profile(&batt_chg_profile))
+-		ps_batt_chrg_prof.chrg_prof_type = CHRG_PROF_NONE;
+-	else
+-		ps_batt_chrg_prof.chrg_prof_type = PSE_MOD_CHRG_PROF;
++	int ret;
++
++	ret = get_batt_prop(&ps_batt_chrg_prof);
++	pse_mod_prof = (struct ps_pse_mod_prof *)
++					ps_batt_chrg_prof.batt_prof;
++	if (ret < 0 && pse_mod_prof)
++		strcpy(pse_mod_prof->batt_id, "UNKNOWNB");
+ 
+-	ps_batt_chrg_prof.batt_prof = &batt_chg_profile;
+-	battery_prop_changed(POWER_SUPPLY_BATTERY_INSERTED, &ps_batt_chrg_prof);
+ 	return &ps_batt_chrg_prof;
+ }
+ 
+@@ -418,7 +419,12 @@ static void dc_xpwr_fg_pdata(void)
+ 	int i;
+ 	int scaled_capacity;
+ 
+-	memcpy(pdata.battid, "INTN0001", strlen("INTN0001"));
++	if (pse_mod_prof)
++		memcpy(pdata.battid, pse_mod_prof->batt_id,
++				strlen(pse_mod_prof->batt_id));
++	else
++		memcpy(pdata.battid, "INTN0001", strlen("INTN0001"));
++
+ 	platform_set_battery_data(&pdata, &ps_batt_chrg_prof);
+ 	pdata.max_temp = 55;
+ 	pdata.min_temp = 0;
+diff --git a/drivers/platform/x86/intel_em_config.c b/drivers/platform/x86/intel_em_config.c
+index 92e857c38973..f81546db2f3c 100644
+--- a/drivers/platform/x86/intel_em_config.c
++++ b/drivers/platform/x86/intel_em_config.c
+@@ -17,6 +17,10 @@
+ 
+ static void dump_chrg_profile(const struct ps_pse_mod_prof *chrg_prof);
+ 
++
++static struct ps_pse_mod_prof chrg_prof;
++static struct ps_batt_chg_prof batt_chrg_prof;
++
+ static int em_config_get_acpi_table(char *name, void *data, int data_size)
+ {
+ 	struct acpi_table_header *acpi_tbl = NULL;
+@@ -42,12 +46,11 @@ static int em_config_get_acpi_table(char *name, void *data, int data_size)
+ 	return ret;
+ }
+ 
+-int em_config_get_oem0_data(struct em_config_oem0_data *data)
++static int em_config_get_oem0_data(struct em_config_oem0_data *data)
+ {
+ 	return em_config_get_acpi_table(EM_CONFIG_OEM0_NAME,
+ 				data, sizeof(struct em_config_oem0_data));
+ }
+-EXPORT_SYMBOL(em_config_get_oem0_data);
+ 
+ int em_config_get_oem1_data(struct em_config_oem1_data *data)
+ {
+@@ -56,18 +59,19 @@ int em_config_get_oem1_data(struct em_config_oem1_data *data)
+ }
+ EXPORT_SYMBOL(em_config_get_oem1_data);
+ 
+-int em_config_get_charge_profile(struct ps_pse_mod_prof *chrg_prof)
++static int em_config_get_charge_profile(struct ps_pse_mod_prof *chrg_prof)
+ {
+-	struct em_config_oem0_data oem0_data;
+ 	int ret = 0;
+ 
+ 	if (chrg_prof == NULL)
+ 		return 0;
+ 	ret = em_config_get_oem0_data((struct em_config_oem0_data *)chrg_prof);
+ 	if (ret > 0) {
+-		/* battery_type field contains 2 bytes, and upper byte
+-		 * contains battery_type & lower byte used for turbo,
+-		 * which is discarded */
++		/*
++		 * battery_type field contains 2 bytes, and upper byte
++		 * contains * battery_type & lower byte used for turbo,
++		 * which is discarded
++		 */
+ 		chrg_prof->battery_type = chrg_prof->battery_type >> 8;
+ #ifdef DEBUG
+ 		dump_chrg_profile(chrg_prof);
+@@ -75,10 +79,8 @@ int em_config_get_charge_profile(struct ps_pse_mod_prof *chrg_prof)
+ 	}
+ 	return ret;
+ }
+-EXPORT_SYMBOL(em_config_get_charge_profile);
+-
+-
+ 
++#ifdef DEBUG
+ static void dump_chrg_profile(const struct ps_pse_mod_prof *chrg_prof)
+ {
+ 	u16 i = 0;
+@@ -94,17 +96,43 @@ static void dump_chrg_profile(const struct ps_pse_mod_prof *chrg_prof)
+ 	pr_info("OEM0:temp_mon_ranges = %d\n", chrg_prof->temp_mon_ranges);
+ 	for (i = 0; i < chrg_prof->temp_mon_ranges; i++) {
+ 		pr_info("OEM0:temp_mon_range[%d].up_lim = %d\n",
+-			i, chrg_prof->temp_mon_range[i].temp_up_lim);
++				i, chrg_prof->temp_mon_range[i].temp_up_lim);
+ 		pr_info("OEM0:temp_mon_range[%d].full_chrg_vol = %d\n",
+-			i, chrg_prof->temp_mon_range[i].full_chrg_vol);
++				i, chrg_prof->temp_mon_range[i].full_chrg_vol);
+ 		pr_info("OEM0:temp_mon_range[%d].full_chrg_cur = %d\n",
+-			i, chrg_prof->temp_mon_range[i].full_chrg_cur);
+-		pr_info("OEM0:temp_mon_range[%d].maint_chrg_vol_ll = %d\n",
+-			i, chrg_prof->temp_mon_range[i].maint_chrg_vol_ll);
+-		pr_info("OEM0:temp_mon_range[%d].main_chrg_vol_ul = %d\n",
+-			i, chrg_prof->temp_mon_range[i].maint_chrg_vol_ul);
++				i, chrg_prof->temp_mon_range[i].full_chrg_cur);
++		pr_info("OEM0:temp_mon_range[%d].maint_chrg_vol_ll = %d\n", i,
++				chrg_prof->temp_mon_range[i].maint_chrg_vol_ll);
++		pr_info("OEM0:temp_mon_range[%d].main_chrg_vol_ul = %d\n", i,
++				chrg_prof->temp_mon_range[i].maint_chrg_vol_ul);
+ 		pr_info("OEM0:temp_mon_range[%d].main_chrg_cur = %d\n",
+-			i, chrg_prof->temp_mon_range[i].maint_chrg_cur);
++				i, chrg_prof->temp_mon_range[i].maint_chrg_cur);
+ 	}
+ 	pr_info("OEM0:temp_low_lim = %d\n", chrg_prof->temp_low_lim);
+ }
++#endif
++
++static int __init em_config_init(void)
++{
++	int ret;
++
++	ret = em_config_get_charge_profile(&chrg_prof);
++
++	if (ret)
++		batt_chrg_prof.chrg_prof_type = PSE_MOD_CHRG_PROF;
++	else
++		batt_chrg_prof.chrg_prof_type = CHRG_PROF_NONE;
++
++	batt_chrg_prof.batt_prof = &chrg_prof;
++
++	battery_prop_changed(POWER_SUPPLY_BATTERY_INSERTED, &batt_chrg_prof);
++	return 0;
++}
++early_initcall(em_config_init);
++
++static void __exit em_config_exit(void)
++{
++	batt_chrg_prof.chrg_prof_type = CHRG_PROF_NONE;
++	battery_prop_changed(POWER_SUPPLY_BATTERY_INSERTED, &batt_chrg_prof);
++}
++module_exit(em_config_exit);
+diff --git a/drivers/power/bq24192_charger.c b/drivers/power/bq24192_charger.c
+index 551ab1af3bbe..5513e6583e2b 100644
+--- a/drivers/power/bq24192_charger.c
++++ b/drivers/power/bq24192_charger.c
+@@ -309,7 +309,6 @@ static enum power_supply_property bq24192_usb_props[] = {
+ #define BYTCR_CHRG_CUR_LOW      1000
+ 
+ static struct ps_batt_chg_prof byt_ps_batt_chrg_prof;
+-static struct ps_pse_mod_prof byt_batt_chg_profile;
+ static struct power_supply_throttle byt_throttle_states[] = {
+ 	{
+ 		.throttle_action = PSY_THROTTLE_CC_LIMIT,
+@@ -330,14 +329,8 @@ static struct power_supply_throttle byt_throttle_states[] = {
+ 
+ static void *platform_byt_get_batt_charge_profile(void)
+ {
+-	if (!em_config_get_charge_profile(&byt_batt_chg_profile))
+-		byt_ps_batt_chrg_prof.chrg_prof_type = CHRG_PROF_NONE;
+-	else
+-		byt_ps_batt_chrg_prof.chrg_prof_type = PSE_MOD_CHRG_PROF;
++	get_batt_prop(&byt_ps_batt_chrg_prof);
+ 
+-	byt_ps_batt_chrg_prof.batt_prof = &byt_batt_chg_profile;
+-	battery_prop_changed(POWER_SUPPLY_BATTERY_INSERTED,
+-				&byt_ps_batt_chrg_prof);
+ 	return &byt_ps_batt_chrg_prof;
+ }
+ 
+diff --git a/drivers/power/intel_fuel_gauge.c b/drivers/power/intel_fuel_gauge.c
+index 14a4e8d0ca78..9d17b24e26c8 100644
+--- a/drivers/power/intel_fuel_gauge.c
++++ b/drivers/power/intel_fuel_gauge.c
+@@ -43,7 +43,7 @@
+ #include <linux/reboot.h>
+ #include <linux/notifier.h>
+ #include <linux/power/intel_fuel_gauge.h>
+-#include <asm/intel_em_config.h>
++#include <linux/power/battery_id.h>
+ 
+ #define DRIVER_NAME	"intel_fuel_gauge"
+ 
+@@ -595,7 +595,7 @@ EXPORT_SYMBOL(intel_fg_unregister_algo);
+ static int intel_fuel_gauge_probe(struct platform_device *pdev)
+ {
+ 	struct intel_fg_info *fg_info;
+-	struct em_config_oem0_data oem0_data;
++	struct ps_batt_chg_prof bat_prof;
+ 
+ 	fg_info = devm_kzalloc(&pdev->dev, sizeof(*fg_info), GFP_KERNEL);
+ 	if (!fg_info) {
+@@ -611,10 +611,10 @@ static int intel_fuel_gauge_probe(struct platform_device *pdev)
+ 	INIT_DELAYED_WORK(&fg_info->fg_worker, &intel_fg_worker);
+ 	fg_info->batt_params.status = POWER_SUPPLY_STATUS_DISCHARGING;
+ 
+-	if (em_config_get_oem0_data(&oem0_data))
+-		fg_info->batt_params.is_valid_battery = true;
+-	else
++	if (get_batt_prop(&bat_prof) < 0)
+ 		fg_info->batt_params.is_valid_battery = false;
++	else
++		fg_info->batt_params.is_valid_battery = true;
+ 
+ 	wake_lock_init(&fg_info->wake_ui.wakelock, WAKE_LOCK_SUSPEND,
+ 				"intel_fg_wakelock");
+-- 
+1.7.9.5
+

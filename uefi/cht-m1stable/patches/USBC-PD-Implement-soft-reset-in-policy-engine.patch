@@ -1,0 +1,249 @@
+From 03af98c8825630938357fde34576708dae628a01 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Tue, 29 Dec 2015 15:13:19 +0530
+Subject: [PATCH] USBC/PD: Implement soft reset in policy engine.
+
+Policy enigne should issue soft reset on failed to get gcrc for
+sent packets. Also on soft reset receive from port partner,
+pe should respond with accept. This patch implements soft reset
+handling in policy engine and protocol.
+
+Change-Id: I2d8a579b7bd29c794ec17fafb0b3523df8b60525
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-14944
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Reviewed-on: https://android.intel.com:443/452920
+---
+ drivers/usb/typec/pd/policy_engine.c | 80 +++++++++++++++++++++++++++++++++++-
+ drivers/usb/typec/pd/protocol.c      | 27 ++++++------
+ 2 files changed, 91 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 8221852..dccce6e 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -256,6 +256,8 @@ static void pe_handle_gcrc_received(struct policy_engine *pe)
+ 	case PE_DRS_UFP_DFP_SEND_DR_SWAP:
+ 	case PE_PRS_SRC_SNK_SEND_PR_SWAP:
+ 	case PE_PRS_SNK_SRC_SEND_PR_SWAP:
++	case PE_SNK_SEND_SOFT_RESET:
++	case PE_SRC_SEND_SOFT_RESET:
+ 		/* Start sender response timer */
+ 		pe_start_timer(pe, SENDER_RESPONSE_TIMER,
+ 					PE_TIME_SENDER_RESPONSE);
+@@ -349,6 +351,12 @@ static void pe_handle_gcrc_received(struct policy_engine *pe)
+ 		pe_start_timer(pe, VMD_RESPONSE_TIMER,
+ 				PE_TIME_VDM_SENDER_RESPONSE);
+ 		break;
++	case PE_SNK_SOFT_RESET:
++		pe_change_state(pe, PE_SNK_WAIT_FOR_CAPABILITIES);
++		break;
++	case PE_SRC_SOFT_RESET:
++		pe_change_state(pe, PE_SRC_SEND_CAPABILITIES);
++		break;
+ 	default:
+ 		log_warn("GCRC received in wrong state=%d",
+ 					pe->cur_state);
+@@ -394,6 +402,14 @@ static int policy_engine_process_ctrl_msg(struct policy *p,
+ 			pe_cancel_timer(pe, SENDER_RESPONSE_TIMER);
+ 			pe_change_state(pe, PE_PRS_SNK_SRC_TRANSITION_TO_OFF);
+ 
++		} else if (pe->cur_state == PE_SRC_SEND_SOFT_RESET) {
++			pe_cancel_timer(pe, SENDER_RESPONSE_TIMER);
++			pe_change_state(pe, PE_SRC_SEND_CAPABILITIES);
++
++		} else if (pe->cur_state == PE_SNK_SEND_SOFT_RESET) {
++			pe_cancel_timer(pe, SENDER_RESPONSE_TIMER);
++			pe_change_state(pe, PE_SNK_WAIT_FOR_CAPABILITIES);
++
+ 		} else {
+ 			log_warn("Accept received in wrong state=%d",
+ 					pe->cur_state);
+@@ -543,6 +559,15 @@ static int policy_engine_process_ctrl_msg(struct policy *p,
+ 					PD_CTRL_MSG_WAIT, PE_EVT_SEND_WAIT);
+ 		break;
+ 
++	case PE_EVT_RCVD_SOFT_RESET:
++		if (pe->cur_prole == POWER_ROLE_SOURCE)
++			pe_change_state(pe, PE_SRC_SOFT_RESET);
++		else if (pe->cur_prole == POWER_ROLE_SINK)
++			pe_change_state(pe, PE_SNK_SOFT_RESET);
++		else
++			pe_change_state(pe, PE_ERROR_RECOVERY);
++		break;
++
+ 	case PE_EVT_RCVD_GOTOMIN:
+ 	case PE_EVT_RCVD_PING:
+ 	case PE_EVT_RCVD_VCONN_SWAP:
+@@ -700,6 +725,18 @@ static void pe_change_state_to_snk_or_src_reset(struct policy_engine *pe)
+ 	}
+ }
+ 
++static void pe_change_state_to_soft_reset(struct policy_engine *pe)
++{
++	if (pe->cur_prole == POWER_ROLE_SOURCE)
++		pe_change_state(pe, PE_SRC_SEND_SOFT_RESET);
++	else if (pe->cur_prole == POWER_ROLE_SINK)
++		pe_change_state(pe, PE_SNK_SEND_SOFT_RESET);
++	else {
++		log_err("Unexpected power role %d!!", pe->cur_prole);
++		pe_change_state(pe, ERROR_RECOVERY);
++	}
++}
++
+ static inline void policy_prot_update_data_role(struct policy_engine *pe,
+ 				enum data_role drole)
+ {
+@@ -1298,6 +1335,10 @@ static void pe_timer_expire_worker(struct work_struct *work)
+ 		} else if (pe->cur_state == PE_DR_SNK_GET_SINK_CAP) {
+ 			pe_change_state(pe, PE_SNK_READY);
+ 			break;
++		} else if (pe->cur_state == PE_SRC_SEND_SOFT_RESET
++				|| pe->cur_state == PE_SNK_SEND_SOFT_RESET) {
++			log_info("Soft_Reset failed, Issue hard reset");
++			pe_change_state_to_snk_or_src_reset(pe);
+ 		}
+ 
+ 		log_warn("%s expired move to hard reset",
+@@ -1384,13 +1425,24 @@ static void pe_timer_expire_worker(struct work_struct *work)
+ 			log_err("PS_RDY Sent fail during pr_swap");
+ 			pe_change_state(pe, PE_ERROR_RECOVERY);
+ 			break;
++		} else if (pe->cur_state == PE_PRS_SNK_SRC_SOURCE_ON) {
++			log_err("PS_RDY Sent fail during pr_swap");
++			pe_change_state(pe, PE_ERROR_RECOVERY);
++			break;
++		} else if (pe->cur_state == PE_SRC_SEND_SOFT_RESET
++				|| pe->cur_state == PE_SNK_SEND_SOFT_RESET
++				|| pe->cur_state == PE_SNK_SOFT_RESET
++				||  pe->cur_state == PE_SRC_SOFT_RESET) {
++			log_info("SOFT_RESET failed!!");
++			/* Issue Hard Reset */
++			pe_change_state_to_snk_or_src_reset(pe);
++			break;
+ 		}
+ 		if (pe_is_timer_pending(pe, SENDER_RESPONSE_TIMER))
+ 			pe_cancel_timer(pe, SENDER_RESPONSE_TIMER);
+-		/* TODO: Trigger SoftReset before HardReset */
+ 		log_warn("%s expired in state=%d",
+ 				timer_to_str(type), pe->cur_state);
+-		pe_change_state_to_snk_or_src_reset(pe);
++		pe_change_state_to_soft_reset(pe);
+ 		break;
+ 
+ 	case DISCOVER_IDENTITY_TIMER:
+@@ -2198,6 +2250,20 @@ pe_process_state_pe_dfp_vdm_modes_request(struct policy_engine *pe)
+ 	pe_send_discover_mode(pe);
+ }
+ 
++static void pe_process_state_pe_send_soft_reset(struct policy_engine *pe)
++{
++	/* Send Soft Reset */
++	pe_send_packet(pe, NULL, 0, PD_CTRL_MSG_SOFT_RESET,
++					PE_EVT_SEND_SOFT_RESET);
++}
++
++static void pe_process_state_pe_accept_soft_reset(struct policy_engine *pe)
++{
++	/* Send Accept for Soft Reset */
++	pe_send_packet(pe, NULL, 0, PD_CTRL_MSG_ACCEPT,
++					PE_EVT_SEND_ACCEPT);
++}
++
+ /* Error Recovery state handlers */
+ 
+ static void
+@@ -2452,6 +2518,16 @@ static void pe_state_change_worker(struct work_struct *work)
+ 		pe_process_state_pe_dr_snk_give_source_cap(pe);
+ 		break;
+ 
++	case PE_SRC_SEND_SOFT_RESET:
++	case PE_SNK_SEND_SOFT_RESET:
++		pe_process_state_pe_send_soft_reset(pe);
++		break;
++
++	case PE_SRC_SOFT_RESET:
++	case PE_SNK_SOFT_RESET:
++		pe_process_state_pe_accept_soft_reset(pe);
++		break;
++
+ 	default:
+ 		log_info("Cannot process unknown state %d", state);
+ 	}
+diff --git a/drivers/usb/typec/pd/protocol.c b/drivers/usb/typec/pd/protocol.c
+index 44e34ad..0cc3669 100644
+--- a/drivers/usb/typec/pd/protocol.c
++++ b/drivers/usb/typec/pd/protocol.c
+@@ -187,11 +187,11 @@ static void pd_prot_tx_work(struct pd_prot *prot)
+ 
+ }
+ 
+-static inline int prot_rx_reset(struct pd_prot *pd)
++static void pd_prot_reset_protocol(struct pd_prot *prot)
+ {
+-	pd_reset_counters(pd);
+-	/* Reset the phy */
+-	return pd_prot_reset_phy(pd);
++	pd_prot_flush_fifo(prot, FIFO_TYPE_RX | FIFO_TYPE_TX);
++	pd_reset_counters(prot);
++	prot_clear_rx_msg_list(prot);
+ }
+ 
+ static int pd_prot_rcv_pkt_from_policy(struct pd_prot *prot, u8 msg_type,
+@@ -200,14 +200,13 @@ static int pd_prot_rcv_pkt_from_policy(struct pd_prot *prot, u8 msg_type,
+ 	struct pd_packet *pkt;
+ 
+ 	if (msg_type == PD_CMD_HARD_RESET) {
+-		pd_prot_flush_fifo(prot, FIFO_TYPE_RX);
+-		prot_clear_rx_msg_list(prot);
+-		return prot_rx_reset(prot);
++		pd_prot_reset_protocol(prot);
++		return pd_prot_reset_phy(prot);
+ 	} else if (msg_type == PD_CMD_PROTOCOL_RESET) {
+-		pd_prot_flush_fifo(prot, FIFO_TYPE_RX);
+-		pd_reset_counters(prot);
+-		prot_clear_rx_msg_list(prot);
++		pd_prot_reset_protocol(prot);
+ 		return pd_tx_fsm_state(prot, PROT_TX_PHY_LAYER_RESET);
++	} else if (msg_type == PD_CTRL_MSG_SOFT_RESET) {
++		pd_prot_reset_protocol(prot);
+ 	}
+ 
+ 	pkt = &prot->tx_buf;
+@@ -466,7 +465,7 @@ static void pd_prot_phy_rcv(struct pd_prot *pd)
+ 			goto phy_rcv_end;
+ 
+ 		if (msg_type == PD_CTRL_MSG_SOFT_RESET)
+-			prot_rx_reset(pd);
++			pd_prot_reset_protocol(pd);
+ 		else if (msg_type == PD_CTRL_MSG_GOODCRC) {
+ 			send_good_crc = 0;
+ 			if (msg_id == pd->tx_msg_id) {
+@@ -533,7 +532,6 @@ static void pd_notify_protocol(struct typec_phy *phy, unsigned long event)
+ 		pd_prot_phy_rcv(pd);
+ 		break;
+ 	case PROT_PHY_EVENT_HARD_RST: /* recv HRD_RST */
+-	case PROT_PHY_EVENT_SOFT_RST:
+ 		dev_dbg(phy->dev, "%s: PROT_PHY_EVENT_SOFT/HARD_RST\n",
+ 				__func__);
+ 		pd_prot_handle_reset(pd, event);
+@@ -546,14 +544,15 @@ static void pd_notify_protocol(struct typec_phy *phy, unsigned long event)
+ 		mutex_unlock(&pd->tx_lock);
+ 		complete(&pd->tx_complete);
+ 		break;
+-	case PROT_PHY_EVENT_SOFT_RST_FAIL:
+-		break;
+ 	case PROT_PHY_EVENT_TX_HARD_RST: /* sent HRD_RST */
+ 		dev_dbg(phy->dev, "%s: PROT_PHY_EVENT_TX_HARD_RST\n",
+ 				__func__);
+ 		/* Hard reset complete signaling */
+ 		pe_process_cmd(pd->p, PE_EVT_RCVD_HARD_RESET_COMPLETE);
+ 		break;
++	case PROT_PHY_EVENT_SOFT_RST_FAIL:
++	case PROT_PHY_EVENT_SOFT_RST:
++		/* Soft reset will be handled from received packet */
+ 	default:
+ 		break;
+ 	}
+-- 
+1.9.1
+

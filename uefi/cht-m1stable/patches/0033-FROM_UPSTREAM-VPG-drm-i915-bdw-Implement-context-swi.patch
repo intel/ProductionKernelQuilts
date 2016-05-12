@@ -1,0 +1,230 @@
+From 554c33850e030edeb72963ccb40b5322e0ca1f73 Mon Sep 17 00:00:00 2001
+Message-Id: <554c33850e030edeb72963ccb40b5322e0ca1f73.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Thu, 24 Jul 2014 17:04:36 +0100
+Subject: [PATCH 33/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Implement context
+ switching (somewhat)
+
+A context switch occurs by submitting a context descriptor to the
+ExecList Submission Port. Given that we can now initialize a context,
+it's possible to begin implementing the context switch by creating the
+descriptor and submitting it to ELSP (actually two, since the ELSP
+has two ports).
+
+The context object must be mapped in the GGTT, which means it must exist
+in the 0-4GB graphics VA range.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+
+v2: This code has changed quite a lot in various rebases. Of particular
+importance is that now we use the globally unique Submission ID to send
+to the hardware. Also, context pages are now pinned unconditionally to
+GGTT, so there is no need to bind them.
+
+v3: Use LRCA[31:12] as hwCtxId[19:0]. This guarantees that the HW context
+ID we submit to the ELSP is globally unique and != 0 (Bspec requirements
+of the software use-only bits of the Context ID in the Context Descriptor
+Format) without the hassle of the previous submission Id construction.
+Also, re-add the ELSP porting read (it was dropped somewhere during the
+rebases).
+
+v4:
+- Squash with "drm/i915/bdw: Add forcewake lock around ELSP writes" (BSPEC
+  says: "SW must set Force Wakeup bit to prevent GT from entering C6 while
+  ELSP writes are in progress") as noted by Thomas Daniel
+  (thomas.daniel@intel.com).
+- Rename functions and use an execlists/intel_execlists_ namespace.
+- The BUG_ON only checked that the LRCA was <32 bits, but it didn't make
+  sure that it was properly aligned. Spotted by Alistair Mcaulay
+  <alistair.mcaulay@intel.com>.
+
+v5:
+- Improved source code comments as suggested by Chris Wilson.
+- No need to abstract submit_ctx away, as pointed by Brad Volkin.
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+[danvet: Checkpatch. Sigh.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 84b790f80e5153d8d54074aa4eae49ff3070f2f1)
+
+Change-Id: I6f9b4ba183777bd0e57abb1e0e4d852150535a35
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 84b790f80e5153d8d54074aa4eae49ff3070f2f1
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/intel_lrc.c |  116 +++++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_lrc.h |    1 +
+ 2 files changed, 115 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 5b8e93a..cfed7c1 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -47,6 +47,7 @@
+ #define GEN8_LR_CONTEXT_ALIGN 4096
+ 
+ #define RING_ELSP(ring)			((ring)->mmio_base+0x230)
++#define RING_EXECLIST_STATUS(ring)	((ring)->mmio_base+0x234)
+ #define RING_CONTEXT_CONTROL(ring)	((ring)->mmio_base+0x244)
+ 
+ #define CTX_LRI_HEADER_0		0x01
+@@ -78,6 +79,26 @@
+ #define CTX_R_PWR_CLK_STATE		0x42
+ #define CTX_GPGPU_CSR_BASE_ADDRESS	0x44
+ 
++#define GEN8_CTX_VALID (1<<0)
++#define GEN8_CTX_FORCE_PD_RESTORE (1<<1)
++#define GEN8_CTX_FORCE_RESTORE (1<<2)
++#define GEN8_CTX_L3LLC_COHERENT (1<<5)
++#define GEN8_CTX_PRIVILEGE (1<<8)
++enum {
++	ADVANCED_CONTEXT = 0,
++	LEGACY_CONTEXT,
++	ADVANCED_AD_CONTEXT,
++	LEGACY_64B_CONTEXT
++};
++#define GEN8_CTX_MODE_SHIFT 3
++enum {
++	FAULT_AND_HANG = 0,
++	FAULT_AND_HALT, /* Debug only */
++	FAULT_AND_STREAM,
++	FAULT_AND_CONTINUE /* Unsupported */
++};
++#define GEN8_CTX_ID_SHIFT 32
++
+ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists)
+ {
+ 	if (enable_execlists == 0)
+@@ -90,6 +111,93 @@ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists
+ 	return 0;
+ }
+ 
++u32 intel_execlists_ctx_id(struct drm_i915_gem_object *ctx_obj)
++{
++	u32 lrca = i915_gem_obj_ggtt_offset(ctx_obj);
++
++	/* LRCA is required to be 4K aligned so the more significant 20 bits
++	 * are globally unique */
++	return lrca >> 12;
++}
++
++static uint64_t execlists_ctx_descriptor(struct drm_i915_gem_object *ctx_obj)
++{
++	uint64_t desc;
++	uint64_t lrca = i915_gem_obj_ggtt_offset(ctx_obj);
++	BUG_ON(lrca & 0xFFFFFFFF00000FFFULL);
++
++	desc = GEN8_CTX_VALID;
++	desc |= LEGACY_CONTEXT << GEN8_CTX_MODE_SHIFT;
++	desc |= GEN8_CTX_L3LLC_COHERENT;
++	desc |= GEN8_CTX_PRIVILEGE;
++	desc |= lrca;
++	desc |= (u64)intel_execlists_ctx_id(ctx_obj) << GEN8_CTX_ID_SHIFT;
++
++	/* TODO: WaDisableLiteRestore when we start using semaphore
++	 * signalling between Command Streamers */
++	/* desc |= GEN8_CTX_FORCE_RESTORE; */
++
++	return desc;
++}
++
++static void execlists_elsp_write(struct intel_engine_cs *ring,
++				 struct drm_i915_gem_object *ctx_obj0,
++				 struct drm_i915_gem_object *ctx_obj1)
++{
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	uint64_t temp = 0;
++	uint32_t desc[4];
++
++	/* XXX: You must always write both descriptors in the order below. */
++	if (ctx_obj1)
++		temp = execlists_ctx_descriptor(ctx_obj1);
++	else
++		temp = 0;
++	desc[1] = (u32)(temp >> 32);
++	desc[0] = (u32)temp;
++
++	temp = execlists_ctx_descriptor(ctx_obj0);
++	desc[3] = (u32)(temp >> 32);
++	desc[2] = (u32)temp;
++
++	/* Set Force Wakeup bit to prevent GT from entering C6 while
++	 * ELSP writes are in progress */
++	gen6_gt_force_wake_get(dev_priv, FORCEWAKE_ALL);
++
++	I915_WRITE(RING_ELSP(ring), desc[1]);
++	I915_WRITE(RING_ELSP(ring), desc[0]);
++	I915_WRITE(RING_ELSP(ring), desc[3]);
++	/* The context is automatically loaded after the following */
++	I915_WRITE(RING_ELSP(ring), desc[2]);
++
++	/* ELSP is a wo register, so use another nearby reg for posting instead */
++	POSTING_READ(RING_EXECLIST_STATUS(ring));
++
++	gen6_gt_force_wake_put(dev_priv, FORCEWAKE_ALL);
++}
++
++static int execlists_submit_context(struct intel_engine_cs *ring,
++				    struct intel_context *to0, u32 tail0,
++				    struct intel_context *to1, u32 tail1)
++{
++	struct drm_i915_gem_object *ctx_obj0;
++	struct drm_i915_gem_object *ctx_obj1 = NULL;
++
++	ctx_obj0 = to0->engine[ring->id].state;
++	BUG_ON(!ctx_obj0);
++	BUG_ON(!i915_gem_obj_is_pinned(ctx_obj0));
++
++	if (to1) {
++		ctx_obj1 = to1->engine[ring->id].state;
++		BUG_ON(!ctx_obj1);
++		BUG_ON(!i915_gem_obj_is_pinned(ctx_obj1));
++	}
++
++	execlists_elsp_write(ring, ctx_obj0, ctx_obj1);
++
++	return 0;
++}
++
+ static int logical_ring_invalidate_all_caches(struct intel_ringbuffer *ringbuf)
+ {
+ 	struct intel_engine_cs *ring = ringbuf->ring;
+@@ -268,12 +376,16 @@ int logical_ring_flush_all_caches(struct intel_ringbuffer *ringbuf)
+ 
+ void intel_logical_ring_advance_and_submit(struct intel_ringbuffer *ringbuf)
+ {
++	struct intel_engine_cs *ring = ringbuf->ring;
++	struct intel_context *ctx = ringbuf->FIXME_lrc_ctx;
++
+ 	intel_logical_ring_advance(ringbuf);
+ 
+-	if (intel_ring_stopped(ringbuf->ring))
++	if (intel_ring_stopped(ring))
+ 		return;
+ 
+-	/* TODO: how to submit a context to the ELSP is not here yet */
++	/* FIXME: too cheeky, we don't even check if the ELSP is ready */
++	execlists_submit_context(ring, ctx, ringbuf->tail, NULL, 0);
+ }
+ 
+ static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index 460e1af..69605b1 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -57,5 +57,6 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 			       struct list_head *vmas,
+ 			       struct drm_i915_gem_object *batch_obj,
+ 			       u64 exec_start, u32 flags);
++u32 intel_execlists_ctx_id(struct drm_i915_gem_object *ctx_obj);
+ 
+ #endif /* _INTEL_LRC_H_ */
+-- 
+1.7.9.5
+

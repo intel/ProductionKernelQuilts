@@ -1,0 +1,238 @@
+From e56e5e4fab1a1326c429fd49507609696dc50896 Mon Sep 17 00:00:00 2001
+From: Lorenzo Colitti <lorenzo@google.com>
+Date: Wed, 26 Mar 2014 13:03:12 +0900
+Subject: [PATCH 386/634] net: support marking accepting TCP sockets
+
+When using mark-based routing, sockets returned from accept()
+may need to be marked differently depending on the incoming
+connection request.
+
+This is the case, for example, if different socket marks identify
+different networks: a listening socket may want to accept
+connections from all networks, but each connection should be
+marked with the network that the request came in on, so that
+subsequent packets are sent on the correct network.
+
+This patch adds a sysctl to mark TCP sockets based on the fwmark
+of the incoming SYN packet. If enabled, and an unmarked socket
+receives a SYN, then the SYN packet's fwmark is written to the
+connection's inet_request_sock, and later written back to the
+accepted socket when the connection is established.  If the
+socket already has a nonzero mark, then the behaviour is the same
+as it is today, i.e., the listening socket's fwmark is used.
+
+Black-box tested using user-mode linux:
+
+- IPv4/IPv6 SYN+ACK, FIN, etc. packets are routed based on the
+  mark of the incoming SYN packet.
+- The socket returned by accept() is marked with the mark of the
+  incoming SYN packet.
+- Tested with syncookies=1 and syncookies=2.
+
+Change-Id: I26bc1eceefd2c588d73b921865ab70e4645ade57
+Signed-off-by: Lorenzo Colitti <lorenzo@google.com>
+---
+ Documentation/networking/ip-sysctl.txt | 10 ++++++++++
+ include/net/inet_sock.h                |  9 +++++++++
+ include/net/netns/ipv4.h               |  1 +
+ net/ipv4/inet_connection_sock.c        |  6 ++++--
+ net/ipv4/syncookies.c                  |  3 ++-
+ net/ipv4/sysctl_net_ipv4.c             |  7 +++++++
+ net/ipv4/tcp_ipv4.c                    |  1 +
+ net/ipv6/inet6_connection_sock.c       |  2 +-
+ net/ipv6/syncookies.c                  |  4 +++-
+ net/ipv6/tcp_ipv6.c                    |  1 +
+ 10 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index 03c4bde..6a6267a 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -514,6 +514,16 @@ tcp_fastopen - INTEGER
+ 
+ 	See include/net/tcp.h and the code for more details.
+ 
++tcp_fwmark_accept - BOOLEAN
++	If set, incoming connections to listening sockets that do not have a
++	socket mark will set the mark of the accepting socket to the fwmark of
++	the incoming SYN packet. This will cause all packets on that connection
++	(starting from the first SYNACK) to be sent with that fwmark. The
++	listening socket's mark is unchanged. Listening sockets that already
++	have a fwmark set via setsockopt(SOL_SOCKET, SO_MARK, ...) are
++	unaffected.
++	Default: 0
++
+ tcp_syn_retries - INTEGER
+ 	Number of times initial SYNs for an active TCP connection attempt
+ 	will be retransmitted. Should not be higher than 255. Default value
+diff --git a/include/net/inet_sock.h b/include/net/inet_sock.h
+index 1833c3f..adb0fbe 100644
+--- a/include/net/inet_sock.h
++++ b/include/net/inet_sock.h
+@@ -88,6 +88,7 @@ struct inet_request_sock {
+ 				acked	   : 1,
+ 				no_srccheck: 1;
+ 	kmemcheck_bitfield_end(flags);
++	u32                     ir_mark;
+ 	struct ip_options_rcu	*opt;
+ 	struct sk_buff		*pktopts;
+ };
+@@ -97,6 +98,14 @@ static inline struct inet_request_sock *inet_rsk(const struct request_sock *sk)
+ 	return (struct inet_request_sock *)sk;
+ }
+ 
++static inline u32 inet_request_mark(struct sock *sk, struct sk_buff *skb)
++{
++	if (!sk->sk_mark && sock_net(sk)->ipv4.sysctl_tcp_fwmark_accept)
++		return skb->mark;
++
++	return sk->sk_mark;
++}
++
+ struct inet_cork {
+ 	unsigned int		flags;
+ 	__be32			addr;
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index 303070f..5fdc946 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -74,6 +74,7 @@ struct netns_ipv4 {
+ 	int sysctl_ip_fwd_use_pmtu;
+ 
+ 	int sysctl_fwmark_reflect;
++	int sysctl_tcp_fwmark_accept;
+ 
+ 	kgid_t sysctl_ping_group_range[2];
+ 
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+index 0d1e2cb..5ae71ec 100644
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -408,7 +408,7 @@ struct dst_entry *inet_csk_route_req(struct sock *sk,
+ 	struct net *net = sock_net(sk);
+ 	int flags = inet_sk_flowi_flags(sk);
+ 
+-	flowi4_init_output(fl4, sk->sk_bound_dev_if, sk->sk_mark,
++	flowi4_init_output(fl4, sk->sk_bound_dev_if, ireq->ir_mark,
+ 			   RT_CONN_FLAGS(sk), RT_SCOPE_UNIVERSE,
+ 			   sk->sk_protocol,
+ 			   flags,
+@@ -445,7 +445,7 @@ struct dst_entry *inet_csk_route_child_sock(struct sock *sk,
+ 
+ 	rcu_read_lock();
+ 	opt = rcu_dereference(newinet->inet_opt);
+-	flowi4_init_output(fl4, sk->sk_bound_dev_if, sk->sk_mark,
++	flowi4_init_output(fl4, sk->sk_bound_dev_if, inet_rsk(req)->ir_mark,
+ 			   RT_CONN_FLAGS(sk), RT_SCOPE_UNIVERSE,
+ 			   sk->sk_protocol, inet_sk_flowi_flags(sk),
+ 			   (opt && opt->opt.srr) ? opt->opt.faddr : ireq->ir_rmt_addr,
+@@ -680,6 +680,8 @@ struct sock *inet_csk_clone_lock(const struct sock *sk,
+ 		inet_sk(newsk)->inet_sport = htons(inet_rsk(req)->ir_num);
+ 		newsk->sk_write_space = sk_stream_write_space;
+ 
++		newsk->sk_mark = inet_rsk(req)->ir_mark;
++
+ 		newicsk->icsk_retransmits = 0;
+ 		newicsk->icsk_backoff	  = 0;
+ 		newicsk->icsk_probes_out  = 0;
+diff --git a/net/ipv4/syncookies.c b/net/ipv4/syncookies.c
+index f2ed13c..c86624b 100644
+--- a/net/ipv4/syncookies.c
++++ b/net/ipv4/syncookies.c
+@@ -303,6 +303,7 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
+ 	ireq->ir_rmt_port	= th->source;
+ 	ireq->ir_loc_addr	= ip_hdr(skb)->daddr;
+ 	ireq->ir_rmt_addr	= ip_hdr(skb)->saddr;
++	ireq->ir_mark		= inet_request_mark(sk, skb);
+ 	ireq->ecn_ok		= ecn_ok;
+ 	ireq->snd_wscale	= tcp_opt.snd_wscale;
+ 	ireq->sack_ok		= tcp_opt.sack_ok;
+@@ -339,7 +340,7 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
+ 	 * hasn't changed since we received the original syn, but I see
+ 	 * no easy way to do this.
+ 	 */
+-	flowi4_init_output(&fl4, sk->sk_bound_dev_if, sk->sk_mark,
++	flowi4_init_output(&fl4, sk->sk_bound_dev_if, ireq->ir_mark,
+ 			   RT_CONN_FLAGS(sk), RT_SCOPE_UNIVERSE, IPPROTO_TCP,
+ 			   inet_sk_flowi_flags(sk),
+ 			   (opt && opt->srr) ? opt->faddr : ireq->ir_rmt_addr,
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 0c9b6fa..07bcc2f 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -867,6 +867,13 @@ static struct ctl_table ipv4_net_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec,
+ 	},
++	{
++		.procname	= "tcp_fwmark_accept",
++		.data		= &init_net.ipv4.sysctl_tcp_fwmark_accept,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
+ 	{ }
+ };
+ 
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index e2f8bd0..ed04620 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -1510,6 +1510,7 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+ 	ireq->ir_rmt_addr = saddr;
+ 	ireq->no_srccheck = inet_sk(sk)->transparent;
+ 	ireq->opt = tcp_v4_save_options(skb);
++	ireq->ir_mark = inet_request_mark(sk, skb);
+ 
+ 	if (security_inet_conn_request(sk, skb, req))
+ 		goto drop_and_free;
+diff --git a/net/ipv6/inet6_connection_sock.c b/net/ipv6/inet6_connection_sock.c
+index c913818..7da6b5f 100644
+--- a/net/ipv6/inet6_connection_sock.c
++++ b/net/ipv6/inet6_connection_sock.c
+@@ -81,7 +81,7 @@ struct dst_entry *inet6_csk_route_req(struct sock *sk,
+ 	final_p = fl6_update_dst(fl6, np->opt, &final);
+ 	fl6->saddr = ireq->ir_v6_loc_addr;
+ 	fl6->flowi6_oif = ireq->ir_iif;
+-	fl6->flowi6_mark = sk->sk_mark;
++	fl6->flowi6_mark = inet_rsk(req)->ir_mark;
+ 	fl6->fl6_dport = ireq->ir_rmt_port;
+ 	fl6->fl6_sport = htons(ireq->ir_num);
+ 	security_req_classify_flow(req, flowi6_to_flowi(fl6));
+diff --git a/net/ipv6/syncookies.c b/net/ipv6/syncookies.c
+index bb53a5e7..a822b88 100644
+--- a/net/ipv6/syncookies.c
++++ b/net/ipv6/syncookies.c
+@@ -216,6 +216,8 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
+ 	    ipv6_addr_type(&ireq->ir_v6_rmt_addr) & IPV6_ADDR_LINKLOCAL)
+ 		ireq->ir_iif = inet6_iif(skb);
+ 
++	ireq->ir_mark = inet_request_mark(sk, skb);
++
+ 	req->expires = 0UL;
+ 	req->num_retrans = 0;
+ 	ireq->ecn_ok		= ecn_ok;
+@@ -242,7 +244,7 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
+ 		final_p = fl6_update_dst(&fl6, np->opt, &final);
+ 		fl6.saddr = ireq->ir_v6_loc_addr;
+ 		fl6.flowi6_oif = sk->sk_bound_dev_if;
+-		fl6.flowi6_mark = sk->sk_mark;
++		fl6.flowi6_mark = ireq->ir_mark;
+ 		fl6.fl6_dport = ireq->ir_rmt_port;
+ 		fl6.fl6_sport = inet_sk(sk)->inet_sport;
+ 		security_req_classify_flow(req, flowi6_to_flowi(&fl6));
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index da3a6ee..fb6b5d6 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -1013,6 +1013,7 @@ static int tcp_v6_conn_request(struct sock *sk, struct sk_buff *skb)
+ 		TCP_ECN_create_request(req, skb, sock_net(sk));
+ 
+ 	ireq->ir_iif = sk->sk_bound_dev_if;
++	inet_rsk(req)->ir_mark = inet_request_mark(sk, skb);
+ 
+ 	/* So that link locals have meaning */
+ 	if (!sk->sk_bound_dev_if &&
+-- 
+1.9.1
+

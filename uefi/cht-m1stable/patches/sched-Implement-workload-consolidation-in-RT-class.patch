@@ -1,0 +1,164 @@
+From 3dd22eaa6c937651a38bab49581f93e0fbf3c638 Mon Sep 17 00:00:00 2001
+From: Yuyang Du <yuyang.du@intel.com>
+Date: Thu, 20 Mar 2014 23:02:53 -0400
+Subject: [PATCH] sched: Implement workload consolidation in RT class
+
+Shield the CPUs in the RT scheduler when nonshielded CPUs can handle the
+workload. This is definitely tedious, but it is indeed beneficial to power
+in real-world mobile workloads.
+
+Change-Id: I6b690dfdccb4d6080ad37c6693300a91369e0e59
+Orig-Change-Id: I446de52be1d108ed142db635d2e7b4e450684081
+Orig-Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-20603
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9774
+Signed-off-by: Yuyang Du <yuyang.du@intel.com>
+Signed-off-by: Srinidhi Kasagar <srinidhi.kasagar@intel.com>
+---
+ kernel/sched/fair.c  | 26 +++++++++++++++++++-------
+ kernel/sched/rt.c    | 18 ++++++++++++++++--
+ kernel/sched/sched.h |  4 ++++
+ 3 files changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index f3223e4..8e6196b 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2400,7 +2400,7 @@ void update_cpu_concurrency(struct rq *rq);
+ static struct sched_group *wc_find_group(struct sched_domain *sd,
+ 	struct task_struct *p, int this_cpu);
+ static void wc_unload(struct cpumask *nonshielded, struct sched_domain *sd);
+-static void wc_nonshielded_mask(struct sched_domain *sd, struct cpumask *mask);
++void wc_nonshielded_mask(struct sched_domain *sd, struct cpumask *mask);
+ static int cpu_cc_capable(int cpu);
+ 
+ /*
+@@ -7693,8 +7693,14 @@ struct sched_group *wc_find_group(struct sched_domain *sd,
+  *
+  * We assume (1) every sched_group has the same weight, and (2) SMP only
+  */
+-int wc_cpu_shielded(struct sched_domain *sd)
++int wc_cpu_shielded(int cpu)
+ {
++	struct sched_domain *sd;
++	int shielded = 0;
++
++	rcu_read_lock();
++	sd = rcu_dereference(per_cpu(sd_wc, cpu));
++
+ 	while (sd) {
+ 		int half, sg_weight, this_sg_nr;
+ 		unsigned long sd_cc;
+@@ -7717,11 +7723,15 @@ int wc_cpu_shielded(struct sched_domain *sd)
+ 				sd->consolidating_coeff);
+ 
+ 			if (!__can_consolidate_cc(sd_cc, sd->span_weight,
+-				threshold, cpus))
+-				return 0;
++				threshold, cpus)) {
++				shielded = 0;
++				goto ret;
++			}
+ 
+-			if (this_sg_nr >= half)
+-				return 1;
++			if (this_sg_nr >= half) {
++				shielded = 1;
++				goto ret;
++			}
+ 
+ 			half /= 2;
+ 		}
+@@ -7729,7 +7739,9 @@ int wc_cpu_shielded(struct sched_domain *sd)
+ 		sd = sd->child;
+ 	}
+ 
+-	return 0;
++ret:
++	rcu_read_unlock();
++	return shielded;
+ }
+ 
+ static inline int __nonshielded_groups(struct sched_domain *sd)
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 27b8e83..3d5c44f 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1197,6 +1197,7 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
+ {
+ 	struct task_struct *curr;
+ 	struct rq *rq;
++	int do_find = 0;
+ 
+ 	if (p->nr_cpus_allowed == 1)
+ 		goto out;
+@@ -1210,6 +1211,9 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
+ 	rcu_read_lock();
+ 	curr = ACCESS_ONCE(rq->curr); /* unlocked access */
+ 
++	if (wc_cpu_shielded(cpu))
++		do_find = 1;
++
+ 	/*
+ 	 * If the current task on @p's runqueue is an RT task, then
+ 	 * try to see if we can wake this RT task up on another
+@@ -1232,9 +1236,9 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
+ 	 * This test is optimistic, if we get it wrong the load-balancer
+ 	 * will have to sort it out.
+ 	 */
+-	if (curr && unlikely(rt_task(curr)) &&
++	if (do_find || (curr && unlikely(rt_task(curr)) &&
+ 	    (curr->nr_cpus_allowed < 2 ||
+-	     curr->prio <= p->prio)) {
++	     curr->prio <= p->prio))) {
+ 		int target = find_lowest_rq(p);
+ 
+ 		if (target != -1)
+@@ -1423,6 +1427,13 @@ static int find_lowest_rq(struct task_struct *task)
+ 	if (!cpupri_find(&task_rq(task)->rd->cpupri, task, lowest_mask))
+ 		return -1; /* No targets found */
+ 
++	rcu_read_lock();
++	sd = rcu_dereference(per_cpu(sd_wc, this_cpu));
++	wc_nonshielded_mask(sd, lowest_mask);
++	rcu_read_unlock();
++	if (!cpumask_weight(lowest_mask))
++		return -1;
++
+ 	/*
+ 	 * At this point we have built a mask of cpus representing the
+ 	 * lowest priority tasks in the system.  Now we want to elect
+@@ -1656,6 +1667,9 @@ static int pull_rt_task(struct rq *this_rq)
+ 	 */
+ 	smp_rmb();
+ 
++	if (wc_cpu_shielded(this_cpu))
++		return 0;
++
+ 	for_each_cpu(cpu, this_rq->rd->rto_mask) {
+ 		if (this_cpu == cpu)
+ 			continue;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 0711d8f..2215221 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1196,6 +1196,8 @@ extern void idle_exit_fair(struct rq *this_rq);
+ 
+ extern void update_cpu_concurrency(struct rq *rq);
+ extern void init_workload_consolidation(struct rq *rq);
++extern void wc_nonshielded_mask(struct sched_domain *sd, struct cpumask *mask);
++extern int wc_cpu_shielded(int cpu);
+ 
+ #else	/* CONFIG_SMP */
+ 
+@@ -1205,6 +1207,8 @@ static inline void idle_balance(int cpu, struct rq *rq)
+ 
+ static inline void update_cpu_concurrency(struct rq *rq) {}
+ static inline void init_workload_consolidation(struct rq *rq) {}
++static inline void wc_nonshielded_mask(struct sched_domain *sd, struct cpumask *mask) {}
++static inline int wc_cpu_shielded(struct sched_domain *sd) {}
+ 
+ #endif
+ 
+-- 
+1.9.1
+

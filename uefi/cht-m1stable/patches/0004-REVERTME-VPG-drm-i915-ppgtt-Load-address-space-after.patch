@@ -1,0 +1,118 @@
+From 721f72205f2017642bf8dea4a6916dd596a62feb Mon Sep 17 00:00:00 2001
+Message-Id: <721f72205f2017642bf8dea4a6916dd596a62feb.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Tue, 1 Jul 2014 11:17:38 -0700
+Subject: [PATCH 04/68] REVERTME [VPG]: drm/i915/ppgtt: Load address space
+ after mi_set_context
+
+The simple explanation is, the docs say to do this for GEN8. Perhaps we
+want to do this for GEN7 too, I am not certain.
+
+PDPs are saved and restored with context. Contexts (without execlists)
+only exist on the render ring. The docs say that PDPs are not power
+context save/restored.  I've learned that this actually means something
+which SW doesn't care about. So pretend the statement doesn't exist.
+For non RCS, nothing changes.
+
+All this patch now does is change the ordering of LRI vs MI_SET_CONTEXT
+for the initialization of the context. I do this because the docs say to
+do it, and frankly, I cannot reason why it is necessary. I've thought
+about it a lot, and tried, without success, to get a reason from design.
+The answer I got more or less says, "gen7 is different than gen8." I've
+given up, and am adding this little bit of code to make it in sync with
+the docs.
+
+v2: Completely rewritten commit message that addresses the requests
+Ville made for v1
+Only load PDPs for initial context load (Ville)
+
+v3: Rebased after ppgtt clean-up rules, and apply only for render
+ring. This is needed to boot to desktop with full ppgtt in legacy mode
+(without execlists).
+
+v4: Clean up the pre/post load logic (Ville).
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com> (v3-4)
+
+This patch is necessary to run ppgtt in legacy submission mode (i.e.
+execlists  disabled), as there's no plan to run ppgtt without execlists
+in gen8, this patch has not been merged upstream. Nevertheless, it reduces
+the changes needed while porting the next patches in this series.
+
+Change-Id: Iae45ae0b4c69b0a74f6b9167ed3ec75f276c336f
+For: GMINL-5449
+For: VIZ-4619
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |   32 +++++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 590d687..7a39d68 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -654,6 +654,9 @@ static int do_switch(struct intel_engine_cs *ring,
+ 	struct intel_context *from = ring->last_context;
+ 	u32 hw_flags = 0;
+ 	bool uninitialized = false;
++	bool needs_pd_load_pre = ((INTEL_INFO(ring->dev)->gen < 8) ||
++			(ring != &dev_priv->ring[RCS])) && to->ppgtt;
++	bool needs_pd_load_post = false;
+ 	int ret, i;
+ 
+ 	if (from != NULL && ring == &dev_priv->ring[RCS]) {
+@@ -679,7 +682,11 @@ static int do_switch(struct intel_engine_cs *ring,
+ 	 */
+ 	from = ring->last_context;
+ 
+-	if (to->ppgtt) {
++	if (needs_pd_load_pre) {
++		/* Older GENs and non render rings still want the load first,
++		 * "PP_DCLV followed by PP_DIR_BASE register through Load
++		 * Register Immediate commands in Ring Buffer before submitting
++		 * a context."*/
+ 		ret = to->ppgtt->switch_mm(to->ppgtt, ring, false);
+ 		if (ret)
+ 			goto unpin_out;
+@@ -709,13 +716,34 @@ static int do_switch(struct intel_engine_cs *ring,
+ 		vma->bind_vma(vma, to->legacy_hw_ctx.rcs_state->cache_level, GLOBAL_BIND);
+ 	}
+ 
+-	if (!to->legacy_hw_ctx.initialized || i915_gem_context_is_default(to))
++	/* GEN8 does *not* require an explicit reload if the PDPs have been
++	 * setup, and we do not wish to move them.
++	 *
++	 * XXX: If we implemented page directory eviction code, this
++	 * optimization needs to be removed.
++	 */
++	if (!to->legacy_hw_ctx.initialized || i915_gem_context_is_default(to)) {
+ 		hw_flags |= MI_RESTORE_INHIBIT;
++		needs_pd_load_post = to->ppgtt && IS_GEN8(ring->dev);
++	}
+ 
+ 	ret = mi_set_context(ring, to, hw_flags);
+ 	if (ret)
+ 		goto unpin_out;
+ 
++	if (needs_pd_load_post) {
++		ret = to->ppgtt->switch_mm(to->ppgtt, ring, false);
++		/* The hardware context switch is emitted, but we haven't
++		 * actually changed the state - so it's probably safe to bail
++		 * here. Still, let the user know something dangerous has
++		 * happened.
++		 */
++		if (ret) {
++			DRM_ERROR("Failed to change address space on context switch\n");
++			goto unpin_out;
++		}
++	}
++
+ 	for (i = 0; i < MAX_L3_SLICES; i++) {
+ 		if (!(to->remap_slice & (1<<i)))
+ 			continue;
+-- 
+1.7.9.5
+

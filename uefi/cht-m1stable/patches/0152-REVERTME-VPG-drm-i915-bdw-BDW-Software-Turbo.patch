@@ -1,0 +1,322 @@
+From 39906513964e11c0965481b487e92c87656d88a4 Mon Sep 17 00:00:00 2001
+Message-Id: <39906513964e11c0965481b487e92c87656d88a4.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Daisy Sun <daisy.sun@intel.com>
+Date: Mon, 16 Jun 2014 13:13:38 -0700
+Subject: [PATCH 152/312] REVERTME [VPG]: drm/i915/bdw: BDW Software Turbo
+
+BDW supports GT C0 residency reporting in constant time unit. Driver calculates
+GT utilization based on C0 residency and adjusts RP frequency up/down
+accordingly.
+
+REVERTME to replace with newer version from upstream when
+available.  This patch was sent upstream; modifications
+are expected during upstream code review.
+
+Issue: VIZ-3818
+Change-Id: Ia93115fb73ca1b76a01dfe1dcd64a720c1be12e8
+Signed-off-by: Daisy Sun <daisy.sun@intel.com>
+[torourke: rebased on latest and resolved conflict]
+Signed-off-by: Tom O'Rourke <Tom.O'Rourke@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |   17 +++++
+ drivers/gpu/drm/i915/i915_irq.c      |   10 +++
+ drivers/gpu/drm/i915/i915_reg.h      |    4 ++
+ drivers/gpu/drm/i915/intel_display.c |    2 +
+ drivers/gpu/drm/i915/intel_drv.h     |    1 +
+ drivers/gpu/drm/i915/intel_pm.c      |  131 +++++++++++++++++++++++++++++++---
+ 6 files changed, 155 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 31c8aa4..7a3534b 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -921,6 +921,19 @@ struct debugfs_vars {
+ };
+ #endif
+ 
++struct intel_rps_bdw_cal {
++	u32 it_threshold_pct; /* interrupt, in percentage */
++	u32 eval_interval; /* evaluation interval, in us */
++	u32 last_ts;
++	u32 last_c0;
++	bool is_up;
++};
++
++struct intel_rps_bdw_turbo {
++	struct intel_rps_bdw_cal up;
++	struct intel_rps_bdw_cal down;
++};
++
+ struct intel_gen6_power_mgmt {
+ 	/* work and pm_iir are protected by dev_priv->irq_lock */
+ 	struct work_struct work;
+@@ -968,6 +981,9 @@ struct intel_gen6_power_mgmt {
+ 
+ 	struct delayed_work delayed_resume_work;
+ 
++	bool is_bdw_sw_turbo;	/* Switch of BDW software turbo */
++	struct intel_rps_bdw_turbo sw_turbo; /* Calculate RP interrupt timing */
++
+ 	/*
+ 	 * Protects RPS/RC6 register access and PCU communication.
+ 	 * Must be taken after struct_mutex if nested.
+@@ -2774,6 +2790,7 @@ extern void vlv_set_rc6_mode(struct drm_device *dev, bool disable);
+ extern void gen6_set_rps_mode(struct drm_device *dev, bool manual);
+ extern void vlv_set_rps_mode(struct drm_device *dev, bool disable);
+ extern void gen6_set_rps(struct drm_device *dev, u8 val);
++extern void bdw_software_turbo(struct drm_device *dev);
+ extern void valleyview_set_rps(struct drm_device *dev, u8 val);
+ extern int valleyview_rps_max_freq(struct drm_i915_private *dev_priv);
+ extern int valleyview_rps_min_freq(struct drm_i915_private *dev_priv);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index ede3e99..bb0ef84 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1863,6 +1863,16 @@ static void i9xx_pipe_crc_irq_handler(struct drm_device *dev, enum pipe pipe)
+ 				     res1, res2);
+ }
+ 
++void gen8_flip_interrupt(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (!dev_priv->rps.is_bdw_sw_turbo)
++		return;
++
++	bdw_software_turbo(dev);
++}
++
+ /* The RPS events need forcewake, so we add them to a work queue and mask their
+  * IMR bits until the work is done. Other interrupts can be processed without
+  * the work queue. */
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 930c2c7..4506d77 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -5505,6 +5505,10 @@ enum punit_power_well {
+ #define GEN8_UCGCTL6				0x9430
+ #define   GEN8_SDEUNIT_CLOCK_GATE_DISABLE	(1<<14)
+ 
++#define TIMESTAMP_CTR		0x44070
++#define FREQ_1_28_US(us)	(((us) * 100) >> 7)
++#define MCHBAR_PCU_C0		(MCHBAR_MIRROR_BASE_SNB + 0x5960)
++
+ #define GEN6_GFXPAUSE				0xA000
+ #define GEN6_RPNSWREQ				0xA008
+ #define   GEN6_TURBO_DISABLE			(1<<31)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index a92fa6c..1d9f4ca 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10344,6 +10344,8 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 	unsigned long flags;
+ 	int ret;
+ 
++	gen8_flip_interrupt(dev);
++
+ 	/* Can't change pixel format via MI display flips. */
+ 	if (fb->pixel_format != crtc->primary->fb->pixel_format) {
+ 		if (IS_HASWELL(dev) || IS_VALLEYVIEW(dev))
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 7beaca1..ecd6bab 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1035,6 +1035,7 @@ void ironlake_teardown_rc6(struct drm_device *dev);
+ void gen6_update_ring_freq(struct drm_device *dev);
+ void gen6_rps_idle(struct drm_i915_private *dev_priv);
+ void gen6_rps_boost(struct drm_i915_private *dev_priv);
++void gen8_flip_interrupt(struct drm_device *dev);
+ void intel_aux_display_runtime_get(struct drm_i915_private *dev_priv);
+ void intel_aux_display_runtime_put(struct drm_i915_private *dev_priv);
+ void intel_runtime_pm_get(struct drm_i915_private *dev_priv);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 5b9d2b6..149996a 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3327,6 +3327,9 @@ static void gen6_set_rps_thresholds(struct drm_i915_private *dev_priv, u8 val)
+ {
+ 	int new_power;
+ 
++	if (dev_priv->rps.is_bdw_sw_turbo)
++		return;
++
+ 	new_power = dev_priv->rps.power;
+ 	switch (dev_priv->rps.power) {
+ 	case LOW_POWER:
+@@ -3546,6 +3549,14 @@ void gen6_set_rps_mode(struct drm_device *dev, bool manual)
+ 		I915_WRITE(GEN6_RP_CONTROL,
+ 			   GEN6_RP_MEDIA_HW_NORMAL_MODE);
+ 		delay = (I915_READ(GEN6_GT_PERF_STATUS) & 0xff00) >> 8;
++	} else if (dev_priv->rps.is_bdw_sw_turbo) {
++		I915_WRITE(GEN6_RP_CONTROL,
++			   GEN6_RP_MEDIA_TURBO |
++			   GEN6_RP_MEDIA_HW_NORMAL_MODE |
++			   GEN6_RP_MEDIA_IS_GFX |
++			   GEN6_RP_UP_BUSY_AVG |
++			   GEN6_RP_DOWN_IDLE_AVG);
++		delay = (I915_READ(GEN6_GT_PERF_STATUS) & 0xff00) >> 8;
+ 	} else if (IS_BROADWELL(dev)) {
+ 		I915_WRITE(GEN6_RP_CONTROL,
+ 			   GEN6_RP_MEDIA_TURBO |
+@@ -3870,13 +3881,86 @@ static void parse_rp_state_cap(struct drm_i915_private *dev_priv, u32 rp_state_c
+ 		dev_priv->rps.min_freq_softlimit = dev_priv->rps.min_freq;
+ }
+ 
++static void bdw_sw_calculate_freq(struct drm_device *dev,
++		struct intel_rps_bdw_cal *c, u32 *cur_time, u32 *c0)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u64 busy = 0;
++	u32 busyness_pct = 0;
++	u32 elapsed_time = 0;
++	u16 new_freq = 0;
++
++	if (!c || !cur_time || !c0)
++		return;
++
++	if (0 == c->last_c0)
++		goto out;
++
++	/* Check Evaluation interval */
++	elapsed_time = *cur_time - c->last_ts;
++	if (elapsed_time < c->eval_interval)
++		return;
++
++	mutex_lock(&dev_priv->rps.hw_lock);
++
++	/*
++	 * c0 unit in 32*1.28 usec, elapsed_time unit in 1 usec.
++	 * Whole busyness_pct calculation should be
++	 *     busy = ((u64)(*c0 - c->last_c0) << 5 << 7) / 100;
++	 *     busyness_pct = (u32)(busy * 100 / elapsed_time);
++	 * The final formula is to simplify CPU calculation
++	 */
++	busy = (u64)(*c0 - c->last_c0) << 12;
++	do_div(busy, elapsed_time);
++	busyness_pct = (u32)busy;
++
++	if (c->is_up && busyness_pct >= c->it_threshold_pct)
++		new_freq = (u16)dev_priv->rps.cur_freq + 3;
++	if (!c->is_up && busyness_pct <= c->it_threshold_pct)
++		new_freq = (u16)dev_priv->rps.cur_freq - 1;
++
++	/* Adjust to new frequency busyness and compare with threshold */
++	if (0 != new_freq) {
++		if (new_freq > dev_priv->rps.max_freq_softlimit)
++			new_freq = dev_priv->rps.max_freq_softlimit;
++		else if (new_freq < dev_priv->rps.min_freq_softlimit)
++			new_freq = dev_priv->rps.min_freq_softlimit;
++
++		gen6_set_rps(dev, new_freq);
++	}
++
++	mutex_unlock(&dev_priv->rps.hw_lock);
++
++out:
++	c->last_c0 = *c0;
++	c->last_ts = *cur_time;
++}
++
++void bdw_software_turbo(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	u32 current_time = I915_READ(TIMESTAMP_CTR); /* unit in usec */
++	u32 current_c0 = I915_READ(MCHBAR_PCU_C0); /* unit in 32*1.28 usec */
++
++	bdw_sw_calculate_freq(dev, &dev_priv->rps.sw_turbo.up,
++			&current_time, &current_c0);
++	bdw_sw_calculate_freq(dev, &dev_priv->rps.sw_turbo.down,
++			&current_time, &current_c0);
++}
++
+ static void gen8_enable_rps(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_engine_cs *ring;
+ 	uint32_t rc6_mask = 0, rp_state_cap;
++	uint32_t threshold_up_pct, threshold_down_pct;
++	uint32_t ei_up, ei_down; /* up and down evaluation interval */
+ 	int unused;
+ 
++	/* Use software Turbo for BDW */
++	dev_priv->rps.is_bdw_sw_turbo = IS_BROADWELL(dev);
++
+ 	/* 1a: Software RC state - RC0 */
+ 	I915_WRITE(GEN6_RC_STATE, 0);
+ 
+@@ -3915,25 +3999,50 @@ static void gen8_enable_rps(struct drm_device *dev)
+ 		   HSW_FREQUENCY(dev_priv->rps.rp1_freq));
+ 	I915_WRITE(GEN6_RC_VIDEO_FREQ,
+ 		   HSW_FREQUENCY(dev_priv->rps.rp1_freq));
+-	/* NB: Docs say 1s, and 1000000 - which aren't equivalent */
+-	I915_WRITE(GEN6_RP_DOWN_TIMEOUT, 100000000 / 128); /* 1 second timeout */
++	ei_up = 84480; /* 84.48ms */
++	ei_down = 448000;
++	threshold_up_pct = 90; /* x percent busy */
++	threshold_down_pct = 70;
++
++	if (dev_priv->rps.is_bdw_sw_turbo) {
++		dev_priv->rps.sw_turbo.up.it_threshold_pct = threshold_up_pct;
++		dev_priv->rps.sw_turbo.up.eval_interval = ei_up;
++		dev_priv->rps.sw_turbo.up.is_up = true;
++		dev_priv->rps.sw_turbo.up.last_ts = 0;
++		dev_priv->rps.sw_turbo.up.last_c0 = 0;
++
++		dev_priv->rps.sw_turbo.down.it_threshold_pct =
++			threshold_down_pct;
++		dev_priv->rps.sw_turbo.down.eval_interval = ei_down;
++		dev_priv->rps.sw_turbo.down.is_up = false;
++		dev_priv->rps.sw_turbo.down.last_ts = 0;
++		dev_priv->rps.sw_turbo.down.last_c0 = 0;
++	} else {
++		/* NB: Docs say 1s, and 1000000 - which aren't equivalent */
++		I915_WRITE(GEN6_RP_DOWN_TIMEOUT, 100000000 / 128); /* 1 second timeout */
+ 
+-	/* Docs recommend 900MHz, and 300 MHz respectively */
+-	I915_WRITE(GEN6_RP_INTERRUPT_LIMITS,
++		/* Docs recommend 900MHz, and 300 MHz respectively */
++		I915_WRITE(GEN6_RP_INTERRUPT_LIMITS,
+ 		   dev_priv->rps.max_freq_softlimit << 24 |
+ 		   dev_priv->rps.min_freq_softlimit << 16);
+ 
+-	I915_WRITE(GEN6_RP_UP_THRESHOLD, 7600000 / 128); /* 76ms busyness per EI, 90% */
+-	I915_WRITE(GEN6_RP_DOWN_THRESHOLD, 31300000 / 128); /* 313ms busyness per EI, 70%*/
+-	I915_WRITE(GEN6_RP_UP_EI, 66000); /* 84.48ms, XXX: random? */
+-	I915_WRITE(GEN6_RP_DOWN_EI, 350000); /* 448ms, XXX: random? */
++		I915_WRITE(GEN6_RP_UP_THRESHOLD,
++			FREQ_1_28_US(ei_up * threshold_up_pct / 100));
++		I915_WRITE(GEN6_RP_DOWN_THRESHOLD,
++			FREQ_1_28_US(ei_down * threshold_down_pct / 100));
++		I915_WRITE(GEN6_RP_UP_EI,
++			FREQ_1_28_US(ei_up));
++		I915_WRITE(GEN6_RP_DOWN_EI,
++			FREQ_1_28_US(ei_down));
+ 
+-	I915_WRITE(GEN6_RP_IDLE_HYSTERSIS, 10);
++		I915_WRITE(GEN6_RP_IDLE_HYSTERSIS, 10);
++	}
+ 
+ 	/* 5: Enable RPS and 6: set ring frequency */
+ 	gen6_set_rps_mode(dev, dev_priv->rps.manual_mode);
+ 
+-	gen8_enable_rps_interrupts(dev);
++	if (!dev_priv->rps.is_bdw_sw_turbo)
++		gen8_enable_rps_interrupts(dev);
+ 
+ 	gen6_gt_force_wake_put(dev_priv, FORCEWAKE_ALL);
+ }
+@@ -5154,6 +5263,8 @@ static void intel_gen6_powersave_work(struct work_struct *work)
+ 			     rps.delayed_resume_work.work);
+ 	struct drm_device *dev = dev_priv->dev;
+ 
++	dev_priv->rps.is_bdw_sw_turbo = false;
++
+ 	mutex_lock(&dev_priv->rps.hw_lock);
+ 
+ 	if (IS_VALLEYVIEW(dev)) {
+-- 
+1.7.9.5
+

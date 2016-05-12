@@ -1,0 +1,194 @@
+From 06a7deaf9f31d507d1776fad05f53cc5f6b3cff8 Mon Sep 17 00:00:00 2001
+Message-Id: <06a7deaf9f31d507d1776fad05f53cc5f6b3cff8.1421886431.git.chang-joon.lee@intel.com>
+In-Reply-To: <2a59efb195329ac28200fa6e68e1170a4cf8d03c.1421886431.git.chang-joon.lee@intel.com>
+References: <2a59efb195329ac28200fa6e68e1170a4cf8d03c.1421886431.git.chang-joon.lee@intel.com>
+From: sudheer gurram <sudheer.gurram@intel.com>
+Date: Wed, 19 Nov 2014 14:36:32 +0530
+Subject: [PATCH 07/11] SQUASHME! [VPG]: drm/i915/vlv: Enable DPST only on
+ video playback scenarios
+
+SQUASHME! - This patch should be squashed into the following existing patch:
+Author: sudheer gurram <sudheer.gurram@intel.com>
+Change-Id: I30a18d01f5735546c80ac5660b45c0419771ed98
+MUST_REBASE [VPG]: drm/i915: Fix for the gamma curve issue
+
+Following patch enables DPST in video playback scenarios based on a setting,
+which is passed from user mode process(CoreU)
+
+Issue: GMINL-4922
+Change-Id: Id502157ba136d97a150adabfe94853735eeb7c79
+Signed-off-by: sudheer gurram <sudheer.gurram@intel.com>
+---
+ drivers/gpu/drm/i915/i915_dpst.c  |   26 ++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h   |    3 ++
+ drivers/gpu/drm/i915/i915_sysfs.c |   61 ++++++++++++++++++++++++++++++++++---
+ 3 files changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dpst.c b/drivers/gpu/drm/i915/i915_dpst.c
+index d0679fa..6dda127 100644
+--- a/drivers/gpu/drm/i915/i915_dpst.c
++++ b/drivers/gpu/drm/i915/i915_dpst.c
+@@ -94,6 +94,10 @@ i915_dpst_enable_hist_interrupt(struct drm_device *dev)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	u32 blm_hist_ctl;
+ 
++	if (dev_priv->dpst.is_video_mode_enabled &&
++			!dev_priv->is_video_playing)
++		return 0;
++
+ 	dev_priv->dpst.enabled = true;
+ 	dev_priv->dpst.blc_adjustment = DPST_MAX_FACTOR ;
+ 
+@@ -494,6 +498,12 @@ i915_dpst_init(struct drm_device *dev,
+ 	ioctl_data->init_data.image_res = i915_dpst_get_resolution(dev);
+ 	dev_priv->dpst.init_image_res = ioctl_data->init_data.image_res;
+ 
++	/* Re-using the hist_reg_values variable for sending the
++	 * video-mode status to kernel from user mode process */
++	if (IS_VALLEYVIEW(dev))
++		dev_priv->dpst.is_video_mode_enabled =
++					ioctl_data->init_data.hist_reg_values;
++
+ 	if (!i915_dpst_update_context(dev))
+ 		return -EINVAL;
+ 
+@@ -665,3 +675,19 @@ i915_dpst_set_kernel_disable(struct drm_device *dev, bool disable)
+ 
+ 	return ret;
+ }
++
++int i915_dpst_enable_disable(struct drm_device *dev, unsigned int val)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (val == 1 && !dev_priv->dpst.enabled &&
++			!dev_priv->dpst.kernel_disable)
++		i915_dpst_enable_hist_interrupt(dev);
++	else if (val == 0 && (dev_priv->dpst.enabled))
++		i915_dpst_disable_hist_interrupt(dev);
++
++	/* Send a fake signal to start the process */
++	i915_dpst_irq_handler(dev, dev_priv->dpst.pipe);
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9f3ee5a..87b5fe5 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1666,6 +1666,7 @@ struct drm_i915_private {
+ 		bool enabled;		/* actual functional state */
+ 		bool pipe_mismatch;	/* Indicates pipe mismatch between user mode and kernel */
+ 		bool display_off;	/* Indicates that Display is off (could be power gated also) */
++		bool is_video_mode_enabled;
+ 		struct {
+ 			bool is_valid;
+ 			u32 blc_adjustment;
+@@ -1698,6 +1699,7 @@ struct drm_i915_private {
+ 	bool gamma_enabled[I915_MAX_PIPES];
+ 	bool csc_enabled[I915_MAX_PIPES];
+ 	bool is_resuming;
++	bool is_video_playing;  /* Indicates enabling only in videomode */
+ 
+ 	/* Indicates currently enabled planes */
+ 	unsigned int plane_stat;
+@@ -2989,6 +2991,7 @@ void i915_dpst_irq_handler(struct drm_device *dev, enum pipe);
+ void intel_panel_actually_set_backlight(struct intel_connector *conn, u32 level);
+ void i915_dpst_display_on(struct drm_device *dev);
+ void i915_dpst_display_off(struct drm_device *dev);
++int i915_dpst_enable_disable(struct drm_device *dev, unsigned int val);
+ 
+ /* intel_acpi.c */
+ #ifdef CONFIG_ACPI
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.c b/drivers/gpu/drm/i915/i915_sysfs.c
+index 1d30f1f..815ca66 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -185,6 +185,52 @@ static struct attribute_group rc6_attr_group = {
+ };
+ #endif
+ 
++static ssize_t
++show_i915_videostatus(struct device *kdev, struct device_attribute *attr,
++		char *buf)
++{
++	/* This sysfs function return video status known to i915 */
++	struct drm_minor *minor = dev_to_drm_minor(kdev);
++	struct drm_device *dev = minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	return snprintf(buf, PAGE_SIZE, "%d\n",
++			(dev_priv->is_video_playing ? 1 : 0));
++
++}
++static ssize_t
++store_i915_videostatus(struct device *kdev, struct device_attribute *attr,
++		const char *buf, size_t n)
++{
++	struct drm_minor *minor = dev_to_drm_minor(kdev);
++	struct drm_device *dev = minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u32 ret, val;
++
++	ret = kstrtou32(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	if (dev_priv->dpst.is_video_mode_enabled) {
++		dev_priv->is_video_playing = val;
++		ret = i915_dpst_enable_disable(dev, val);
++		DRM_DEBUG_DRIVER("\nVideo Status : %d\n", val);
++	} else
++		n = -EINVAL;
++	return n;
++}
++
++static DEVICE_ATTR(i915_videostatus, (S_IRUGO | S_IWOTH),
++		show_i915_videostatus, store_i915_videostatus);
++static struct attribute *i915_videostatus_attrs[] = {
++	&dev_attr_i915_videostatus.attr,
++	NULL
++};
++static struct attribute_group i915_videostatus_attr_group = {
++	.name = power_group_name,
++	.attrs = i915_videostatus_attrs
++};
++
+ static int l3_access_valid(struct drm_device *dev, loff_t offset)
+ {
+ 	if (!HAS_L3_DPF(dev))
+@@ -1500,11 +1546,14 @@ void i915_setup_sysfs(struct drm_device *dev)
+ 				DRM_ERROR("l3 parity slice 1 setup failed\n");
+ 		}
+ 	}
+-
+ 	ret = 0;
+-	if (IS_VALLEYVIEW(dev))
++	if (IS_VALLEYVIEW(dev)) {
++		ret = sysfs_merge_group(&dev->primary->kdev->kobj,
++				&i915_videostatus_attr_group);
++		if (ret)
++			DRM_ERROR("video status sysfs setup failed\n");
+ 		ret = sysfs_create_files(&dev->primary->kdev->kobj, vlv_attrs);
+-	else if (INTEL_INFO(dev)->gen >= 6)
++	} else if (INTEL_INFO(dev)->gen >= 6)
+ 		ret = sysfs_create_files(&dev->primary->kdev->kobj, gen6_attrs);
+ 	if (ret)
+ 		DRM_ERROR("RPS sysfs setup failed\n");
+@@ -1542,9 +1591,11 @@ void i915_setup_sysfs(struct drm_device *dev)
+ void i915_teardown_sysfs(struct drm_device *dev)
+ {
+ 	sysfs_remove_bin_file(&dev->primary->kdev->kobj, &error_state_attr);
+-	if (IS_VALLEYVIEW(dev))
++	if (IS_VALLEYVIEW(dev)) {
+ 		sysfs_remove_files(&dev->primary->kdev->kobj, vlv_attrs);
+-	else
++		sysfs_unmerge_group(&dev->primary->kdev->kobj,
++				&i915_videostatus_attr_group);
++	} else
+ 		sysfs_remove_files(&dev->primary->kdev->kobj, gen6_attrs);
+ 	device_remove_bin_file(dev->primary->kdev,  &dpf_attrs_1);
+ 	device_remove_bin_file(dev->primary->kdev,  &dpf_attrs);
+-- 
+1.7.9.5
+

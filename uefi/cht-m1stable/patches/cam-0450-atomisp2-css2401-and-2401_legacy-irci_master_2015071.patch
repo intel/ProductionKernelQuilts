@@ -1,0 +1,406 @@
+From 67c2d4c1a693546de3034dfc0b71fc3db22ff440 Mon Sep 17 00:00:00 2001
+From: Pengpeng Cui <pengpengx.cui@intel.com>
+Date: Thu, 16 Jul 2015 15:51:15 +0800
+Subject: [PATCH 450/462] atomisp2: css2401 and
+ 2401_legacy-irci_master_20150715_0200
+
+Merge CSS2.1 for css2401 and 2401_legacy
+for irci_master_20150715_0200 firmware tag
+
+Change-Id: I82dd82d390e2253aa96f8b1fbd84271152270c4f
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-41727
+Signed-off-by: Pengpeng Cui <pengpengx.cui@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/65292
+Approver: WeiX Meng <weix.meng@intel.com>
+Build: IMIN (SC)
+Integrator: WeiX Meng <weix.meng@intel.com>
+Build: WeiX Meng <weix.meng@intel.com>
+Reviewed-by: WeiX Meng <weix.meng@intel.com>
+Maintainer: WeiX Meng <weix.meng@intel.com>
+---
+ .../drivers/media/pci/atomisp2/css/css_trace.h     | 84 +++++++++++++++-------
+ .../atomisp2/css/hive_isp_css_common/isp_global.h  |  1 +
+ .../camera/drivers/media/pci/atomisp2/css/ia_css.h |  2 +-
+ .../media/pci/atomisp2/css/ia_css_host_data.h      |  2 +-
+ .../drivers/media/pci/atomisp2/css/ia_css_types.h  |  2 +-
+ .../media/pci/atomisp2/css/ia_css_version_data.h   |  2 +-
+ .../atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.c |  2 +-
+ .../atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.h |  2 +-
+ .../css/isp/kernels/hdr/ia_css_hdr_param.h         |  2 +-
+ .../css/isp/kernels/hdr/ia_css_hdr_types.h         |  2 +-
+ .../atomisp2/css/runtime/debug/src/ia_css_debug.c  | 48 +++++++++----
+ .../media/pci/atomisp2/css/sh_css_firmware.c       |  4 +-
+ 12 files changed, 102 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/css_trace.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/css_trace.h
+index f047449..3668e10 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/css_trace.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/css_trace.h
+@@ -17,6 +17,7 @@
+ #define __CSS_TRACE_H_
+ 
+ #include <type_support.h>
++#include "sh_css_internal.h"	/* for SH_CSS_MAX_SP_THREADS */
+ 
+ /*
+ 	structs and constants for tracing
+@@ -29,22 +30,52 @@ struct trace_item_t {
+ 	uint16_t  counter;
+ };
+ 
++#define MAX_SCRATCH_DATA	4
++#define MAX_CMD_DATA		2
++
+ /* trace header: holds the version and the topology of the tracer. */
+ struct trace_header_t {
+-	/* 1st dword */
++	/* 1st dword: descriptor */
+ 	uint8_t   version;
+ 	uint8_t   max_threads;
+ 	uint16_t  max_tracer_points;
++	/* 2nd field: command + data */
+ 	/* 2nd dword */
+ 	uint32_t  command;
+ 	/* 3rd & 4th dword */
+-	uint32_t  data[2];
++	uint32_t  data[MAX_CMD_DATA];
++	/* 3rd field: debug pointer */
+ 	/* 5th & 6th dword: debug pointer mechanism */
+ 	uint32_t  debug_ptr_signature;
+ 	uint32_t  debug_ptr_value;
++	/* Rest of the header: status & scratch data */
++	uint8_t   thr_status_byte[SH_CSS_MAX_SP_THREADS];
++	uint16_t  thr_status_word[SH_CSS_MAX_SP_THREADS];
++	uint32_t  thr_status_dword[SH_CSS_MAX_SP_THREADS];
++	uint32_t  scratch_debug[MAX_SCRATCH_DATA];
+ };
+ 
+-#define TRACER_VER			3
++/* offsets for master_port read/write */
++#define HDR_HDR_OFFSET              0	/* offset of the header */
++#define HDR_COMMAND_OFFSET          offsetof(struct trace_header_t, command)
++#define HDR_DATA_OFFSET             offsetof(struct trace_header_t, data)
++#define HDR_DEBUG_SIGNATURE_OFFSET  offsetof(struct trace_header_t, debug_ptr_signature)
++#define HDR_DEBUG_POINTER_OFFSET    offsetof(struct trace_header_t, debug_ptr_value)
++#define HDR_STATUS_OFFSET           offsetof(struct trace_header_t, thr_status_byte)
++#define HDR_STATUS_OFFSET_BYTE      offsetof(struct trace_header_t, thr_status_byte)
++#define HDR_STATUS_OFFSET_WORD      offsetof(struct trace_header_t, thr_status_word)
++#define HDR_STATUS_OFFSET_DWORD     offsetof(struct trace_header_t, thr_status_dword)
++#define HDR_STATUS_OFFSET_SCRATCH   offsetof(struct trace_header_t, scratch_debug)
++
++/*
++Trace version history:
++ 1: initial version, hdr = descr, command & ptr.
++ 2: added ISP + 24-bit fields.
++ 3: added thread ID.
++ 4: added status in header.
++*/
++#define TRACER_VER			4
++
+ #define TRACE_BUFF_ADDR       0xA000
+ #define TRACE_BUFF_SIZE       0x1000	/* 4K allocated */
+ 
+@@ -58,20 +89,20 @@ struct trace_header_t {
+ #define TRACE_ENABLE_ISP 0
+ #endif
+ 
+-typedef enum {
++enum TRACE_CORE_ID {
+ 	TRACE_SP0_ID,
+ 	TRACE_SP1_ID,
+ 	TRACE_ISP_ID
+-} TRACE_CORE_ID;
++};
+ 
+ /* TODO: add timing format? */
+-typedef enum {
++enum TRACE_DUMP_FORMAT {
+ 	TRACE_DUMP_FORMAT_POINT_NO_TID,
+ 	TRACE_DUMP_FORMAT_VALUE24,
+ 	TRACE_DUMP_FORMAT_VALUE24_TIMING,
+ 	TRACE_DUMP_FORMAT_VALUE24_TIMING_DELTA,
+ 	TRACE_DUMP_FORMAT_POINT
+-} TRACE_DUMP_FORMAT;
++};
+ 
+ 
+ /* currently divided as follows:*/
+@@ -129,32 +160,25 @@ typedef enum {
+ 
+ #define TRACE_SP0_HEADER_ADDR (TRACE_SP0_ADDR)
+ #define TRACE_SP0_HEADER_SIZE (sizeof(struct trace_header_t))
+-#define TRACE_SP0_ITEM_SIZE (sizeof(struct trace_item_t))
+-#define TRACE_SP0_DATA_ADDR (TRACE_SP0_HEADER_ADDR + TRACE_SP0_HEADER_SIZE)
+-#define TRACE_SP0_DATA_SIZE (TRACE_SP0_SIZE - TRACE_SP0_HEADER_SIZE)
+-#define TRACE_SP0_MAX_POINTS (TRACE_SP0_DATA_SIZE / TRACE_SP0_ITEM_SIZE)
++#define TRACE_SP0_ITEM_SIZE   (sizeof(struct trace_item_t))
++#define TRACE_SP0_DATA_ADDR   (TRACE_SP0_HEADER_ADDR + TRACE_SP0_HEADER_SIZE)
++#define TRACE_SP0_DATA_SIZE   (TRACE_SP0_SIZE - TRACE_SP0_HEADER_SIZE)
++#define TRACE_SP0_MAX_POINTS  (TRACE_SP0_DATA_SIZE / TRACE_SP0_ITEM_SIZE)
+ 
+ #define TRACE_SP1_HEADER_ADDR (TRACE_SP1_ADDR)
+ #define TRACE_SP1_HEADER_SIZE (sizeof(struct trace_header_t))
+-#define TRACE_SP1_ITEM_SIZE (sizeof(struct trace_item_t))
+-#define TRACE_SP1_DATA_ADDR (TRACE_SP1_HEADER_ADDR + TRACE_SP1_HEADER_SIZE)
+-#define TRACE_SP1_DATA_SIZE (TRACE_SP1_SIZE - TRACE_SP1_HEADER_SIZE)
+-#define TRACE_SP1_MAX_POINTS (TRACE_SP1_DATA_SIZE / TRACE_SP1_ITEM_SIZE)
++#define TRACE_SP1_ITEM_SIZE   (sizeof(struct trace_item_t))
++#define TRACE_SP1_DATA_ADDR   (TRACE_SP1_HEADER_ADDR + TRACE_SP1_HEADER_SIZE)
++#define TRACE_SP1_DATA_SIZE   (TRACE_SP1_SIZE - TRACE_SP1_HEADER_SIZE)
++#define TRACE_SP1_MAX_POINTS  (TRACE_SP1_DATA_SIZE / TRACE_SP1_ITEM_SIZE)
+ 
+ #define TRACE_ISP_HEADER_ADDR (TRACE_ISP_ADDR)
+ #define TRACE_ISP_HEADER_SIZE (sizeof(struct trace_header_t))
+-#define TRACE_ISP_ITEM_SIZE (sizeof(struct trace_item_t))
+-#define TRACE_ISP_DATA_ADDR (TRACE_ISP_HEADER_ADDR + TRACE_ISP_HEADER_SIZE)
+-#define TRACE_ISP_DATA_SIZE (TRACE_ISP_SIZE - TRACE_ISP_HEADER_SIZE)
+-#define TRACE_ISP_MAX_POINTS (TRACE_ISP_DATA_SIZE / TRACE_ISP_ITEM_SIZE)
+-
++#define TRACE_ISP_ITEM_SIZE   (sizeof(struct trace_item_t))
++#define TRACE_ISP_DATA_ADDR   (TRACE_ISP_HEADER_ADDR + TRACE_ISP_HEADER_SIZE)
++#define TRACE_ISP_DATA_SIZE   (TRACE_ISP_SIZE - TRACE_ISP_HEADER_SIZE)
++#define TRACE_ISP_MAX_POINTS  (TRACE_ISP_DATA_SIZE / TRACE_ISP_ITEM_SIZE)
+ 
+-/* offsets for master_port read/write */
+-#define HDR_HDR_OFFSET              0	/* offset of the header */
+-#define HDR_COMMAND_OFFSET          4	/* offset of the command */
+-#define HDR_DATA_OFFSET             8	/* offset of the command data */
+-#define HDR_DEBUG_SIGNATURE_OFFSET  16	/* offset of the param debug signature in trace_header_t */
+-#define HDR_DEBUG_POINTER_OFFSET    20	/* offset of the param debug pointer in trace_header_t */
+ 
+ /* common majors */
+ #define MAJOR_MAIN              1
+@@ -203,6 +227,11 @@ typedef enum {
+ #define FIELD_MAJOR_PACK(f)		FIELD_PACK(f,FIELD_MAJOR_MASK,FIELD_MAJOR_OFFSET)
+ #define FIELD_MAJOR_UNPACK(f)		FIELD_UNPACK(f,FIELD_MAJOR_MASK,FIELD_MAJOR_OFFSET)
+ 
++/* for quick traces - only insertion, compatible with the regular point */
++#define FIELD_FULL_MAJOR_WIDTH		(8)
++#define FIELD_FULL_MAJOR_MASK		FIELD_MASK(FIELD_FULL_MAJOR_WIDTH)
++#define FIELD_FULL_MAJOR_PACK(f)	FIELD_PACK(f,FIELD_FULL_MAJOR_MASK,FIELD_MAJOR_OFFSET)
++
+ /* The following 2 fields are used only when FIELD_TID value is 111b.
+  * it means we don't want to use thread id, but format. In this case,
+  * the last 2 MSB bits of the major field will indicates the format
+@@ -236,6 +265,9 @@ typedef enum {
+ #define PACK_TRACEPOINT(tid, major, minor, value)	\
+ 	(FIELD_TID_PACK(tid) | FIELD_MAJOR_PACK(major) | FIELD_MINOR_PACK(minor) | FIELD_VALUE_PACK(value))
+ 
++#define PACK_QUICK_TRACEPOINT(major, minor)	\
++	(FIELD_FULL_MAJOR_PACK(major) | FIELD_MINOR_PACK(minor))
++
+ #define PACK_FORMATTED_TRACEPOINT(format, major, minor, value)	\
+ 	(FIELD_TID_PACK(FIELD_TID_SEL_FORMAT_PAT) | FIELD_FORMAT_PACK(format) | FIELD_MAJOR_PACK(major) | FIELD_MINOR_PACK(minor) | FIELD_VALUE_PACK(value))
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/hive_isp_css_common/isp_global.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/hive_isp_css_common/isp_global.h
+index aa46add..ce4e91d 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/hive_isp_css_common/isp_global.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/hive_isp_css_common/isp_global.h
+@@ -38,6 +38,7 @@
+ 
+ #ifdef PIPE_GENERATION
+ #define PIPEMEM(x) MEM(x)
++#define ISP_NWAY   (1<<ISP_NWAY_LOG2)
+ #else
+ #define PIPEMEM(x)
+ #endif
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css.h
+index 7f39ad4..9e85ed3 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css.h
+@@ -1,4 +1,4 @@
+-/* Release Version: irci_master_20150711_0200 */
++/* Release Version: irci_master_20150715_0200 */
+ /*
+  * Support for Intel Camera Imaging ISP subsystem.
+  * Copyright (c) 2010 - 2015, Intel Corporation.
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_host_data.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_host_data.h
+index 0c6ac36..615f1df 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_host_data.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_host_data.h
+@@ -1,4 +1,4 @@
+-/* Release Version: irci_master_20150711_0200 */
++/* Release Version: irci_master_20150715_0200 */
+ /*
+  * Support for Intel Camera Imaging ISP subsystem.
+  * Copyright (c) 2010 - 2015, Intel Corporation.
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_types.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_types.h
+index 1714b50..b9dae7b 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_types.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_types.h
+@@ -1,4 +1,4 @@
+-/* Release Version: irci_master_20150711_0200 */
++/* Release Version: irci_master_20150715_0200 */
+ /*
+  * Support for Intel Camera Imaging ISP subsystem.
+  * Copyright (c) 2010 - 2015, Intel Corporation.
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_version_data.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_version_data.h
+index 95a9dd3..48b4989 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_version_data.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/ia_css_version_data.h
+@@ -23,7 +23,7 @@
+ #define __IA_CSS_VERSION_DATA_H
+ 
+ 
+-#define CSS_VERSION_STRING "REL:20150711_28.6_0644; API:2.1.20.5; GIT:scci_20150709_1800_#bc45558ef177470ac522d82ef3124d61b1422f1f; SDK:; USER:viedifw; "
++#define CSS_VERSION_STRING "REL:20150715_29.3_0630; API:2.1.20.5; GIT:scci_20150713_1800_#60f5f313f5584d831837617a61b40fefd5a6e3f6; SDK:; USER:viedifw; "
+ 
+ 
+ #endif
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.c
+index 2135673..777490e 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.c
+@@ -1,4 +1,4 @@
+-/* Release Version: irci_master_20150711_0200 */
++/* Release Version: irci_master_20150715_0200 */
+ /*
+  * Support for Intel Camera Imaging ISP subsystem.
+  * Copyright (c) 2010 - 2015, Intel Corporation.
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.h
+index b33ff06..a91fd16 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr.host.h
+@@ -1,4 +1,4 @@
+-/* Release Version: irci_master_20150711_0200 */
++/* Release Version: irci_master_20150715_0200 */
+ /*
+  * Support for Intel Camera Imaging ISP subsystem.
+  * Copyright (c) 2010 - 2015, Intel Corporation.
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr_param.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr_param.h
+index fbeb271..9c53656 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr_param.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr_param.h
+@@ -1,4 +1,4 @@
+-/* Release Version: irci_master_20150711_0200 */
++/* Release Version: irci_master_20150715_0200 */
+ /*
+  * Support for Intel Camera Imaging ISP subsystem.
+  * Copyright (c) 2010 - 2015, Intel Corporation.
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr_types.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr_types.h
+index 10db63f..615d2fa 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr_types.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/isp/kernels/hdr/ia_css_hdr_types.h
+@@ -1,4 +1,4 @@
+-/* Release Version: irci_master_20150711_0200 */
++/* Release Version: irci_master_20150715_0200 */
+ /*
+  * Support for Intel Camera Imaging ISP subsystem.
+  * Copyright (c) 2010 - 2015, Intel Corporation.
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/runtime/debug/src/ia_css_debug.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/runtime/debug/src/ia_css_debug.c
+index 526a782..3eb0541 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/runtime/debug/src/ia_css_debug.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/runtime/debug/src/ia_css_debug.c
+@@ -3352,18 +3352,19 @@ ia_css_debug_dump_stream_config(
+ 	byte 2-3: data
+ */
+ #if TRACE_ENABLE_SP0 || TRACE_ENABLE_SP1 || TRACE_ENABLE_ISP
+-static void debug_dump_one_trace(TRACE_CORE_ID proc_id)
++static void debug_dump_one_trace(enum TRACE_CORE_ID proc_id)
+ {
+ #if defined(HAS_TRACER_V2)
+ 	uint32_t start_addr;
+ 	uint32_t start_addr_data;
+ 	uint32_t item_size;
+-	uint32_t tmp;
+ 	uint8_t tid_val;
+-	TRACE_DUMP_FORMAT dump_format;
++	enum TRACE_DUMP_FORMAT dump_format;
+ 	int i, j, max_trace_points, point_num, limit = -1;
+ 	/* using a static buffer here as the driver has issues allocating memory */
+ 	static uint32_t trace_read_buf[TRACE_BUFF_SIZE] = {0};
++	static struct trace_header_t header;
++	uint8_t *header_arr;
+ 
+ 	/* read the header and parse it */
+ 	ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, "~~~ Tracer ");
+@@ -3394,11 +3395,16 @@ static void debug_dump_one_trace(TRACE_CORE_ID proc_id)
+ 		ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, "\t\ttraces are not supported for this processor ID - exiting\n");
+ 		return;
+ 	}
+-	tmp = ia_css_device_load_uint32(start_addr);
+-	point_num = (tmp >> 16) & 0xFFFF;
+ 
+-	ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, " ver %d %d points\n", tmp & 0xFF, point_num);
+-	if ((tmp & 0xFF) != TRACER_VER) {
++	/* Loading byte-by-byte as using the master routine had issues */
++	header_arr = (uint8_t *)&header;
++	for (i = 0; i < (int)sizeof(struct trace_header_t); i++)
++		header_arr[i] = ia_css_device_load_uint8(start_addr + (i));
++
++	point_num = header.max_tracer_points;
++
++	ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, " ver %d %d points\n", header.version, point_num);
++	if ((header.version & 0xFF) != TRACER_VER) {
+ 		ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, "\t\tUnknown version - exiting\n");
+ 		return;
+ 	}
+@@ -3412,6 +3418,18 @@ static void debug_dump_one_trace(TRACE_CORE_ID proc_id)
+ 		if ((limit == (-1)) && (trace_read_buf[i] == 0))
+ 			limit = i;
+ 	}
++	ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, "Status:\n");
++	for (i = 0; i < SH_CSS_MAX_SP_THREADS; i++)
++		ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, "\tT%d: %3d (%02x)  %6d (%04x)  %10d (%08x)\n", i,
++				header.thr_status_byte[i], header.thr_status_byte[i],
++				header.thr_status_word[i], header.thr_status_word[i],
++				header.thr_status_dword[i], header.thr_status_dword[i]);
++	ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, "Scratch:\n");
++	for (i = 0; i < MAX_SCRATCH_DATA; i++)
++		ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, "%10d (%08x)  ",
++			header.scratch_debug[i], header.scratch_debug[i]);
++	ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, "\n");
++
+ 	/* two 0s in the beginning: empty buffer */
+ 	if ((trace_read_buf[0] == 0) && (trace_read_buf[1] == 0)) {
+ 		ia_css_debug_dtrace(IA_CSS_DEBUG_TRACE, "\t\tEmpty tracer - exiting\n");
+@@ -3589,21 +3607,21 @@ void ia_css_debug_dump_hang_status(
+ 	ia_css_debug_pc_dump(SP0_ID, 20);
+ 	ia_css_debug_pc_dump(SP1_ID, 20);
+ 
+-	reg = ia_css_device_load_uint32(GP_REGS_BASE[0] + SP0_STREAM_MON_STAT_OFFSET);
++	reg = ia_css_device_load_uint32(GP_DEVICE_BASE[0] + SP0_STREAM_MON_STAT_OFFSET);
+ 	ia_css_debug_dtrace(0, "=>=>=>=> SP0 streaming monitor status: 0x%X", reg);
+-	reg = ia_css_device_load_uint32(GP_REGS_BASE[0] + SP1_STREAM_MON_STAT_OFFSET);
++	reg = ia_css_device_load_uint32(GP_DEVICE_BASE[0] + SP1_STREAM_MON_STAT_OFFSET);
+ 	ia_css_debug_dtrace(0, "=>=>=>=> SP1 streaming monitor status: 0x%X", reg);
+-	reg = ia_css_device_load_uint32(GP_REGS_BASE[0] + ISP_STREAM_MON_STAT_OFFSET);
++	reg = ia_css_device_load_uint32(GP_DEVICE_BASE[0] + ISP_STREAM_MON_STAT_OFFSET);
+ 	ia_css_debug_dtrace(0, "=>=>=>=> ISP streaming monitor status: 0x%X", reg);
+-	reg = ia_css_device_load_uint32(GP_REGS_BASE[0] + MODULE_ISP_STREAM_MON_STAT_OFFSET);
++	reg = ia_css_device_load_uint32(GP_DEVICE_BASE[0] + MODULE_ISP_STREAM_MON_STAT_OFFSET);
+ 	ia_css_debug_dtrace(0, "=>=>=>=> Module ISP streaming monitor status: 0x%X", reg);
+-	reg = ia_css_device_load_uint32(GP_REGS_BASE[0] + ACC_STREAM_MON_STAT_OFFSET);
++	reg = ia_css_device_load_uint32(GP_DEVICE_BASE[0] + ACC_STREAM_MON_STAT_OFFSET);
+ 	ia_css_debug_dtrace(0, "=>=>=>=> ACC streaming monitor status: 0x%X", reg);
+-	reg = ia_css_device_load_uint32(GP_REGS_BASE[0] + ACC_SP0_STREAM_MON_STAT_OFFSET);
++	reg = ia_css_device_load_uint32(GP_DEVICE_BASE[0] + ACC_SP0_STREAM_MON_STAT_OFFSET);
+ 	ia_css_debug_dtrace(0, "=>=>=>=> ACC to SP0 streaming monitor status: 0x%X", reg);
+-	reg = ia_css_device_load_uint32(GP_REGS_BASE[0] + ACC_SP1_STREAM_MON_STAT_OFFSET);
++	reg = ia_css_device_load_uint32(GP_DEVICE_BASE[0] + ACC_SP1_STREAM_MON_STAT_OFFSET);
+ 	ia_css_debug_dtrace(0, "=>=>=>=> ACC to SP1 streaming monitor status: 0x%X", reg);
+-	reg = ia_css_device_load_uint32(GP_REGS_BASE[0] + MODULE_STREAM_MON_STAT_OFFSET);
++	reg = ia_css_device_load_uint32(GP_DEVICE_BASE[0] + MODULE_STREAM_MON_STAT_OFFSET);
+ 	ia_css_debug_dtrace(0, "=>=>=>=> Module streaming monitor status: 0x%X", reg);
+ }
+ #endif
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/sh_css_firmware.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/sh_css_firmware.c
+index 0c092bd..a8e8ff4 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/sh_css_firmware.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/css/sh_css_firmware.c
+@@ -48,10 +48,10 @@ struct fw_param {
+ /* Warning: same order as SH_CSS_BINARY_ID_* */
+ static struct firmware_header *firmware_header;
+ 
+-/* The string STR(irci_master_20150711_0200) is a place holder
++/* The string STR(irci_master_20150715_0200) is a place holder
+  * which will be replaced with the actual RELEASE_VERSION
+  * during package generation. Please do not modify  */
+-static const char *release_version = STR(irci_master_20150711_0200);
++static const char *release_version = STR(irci_master_20150715_0200);
+ 
+ #define MAX_FW_REL_VER_NAME	300
+ static char FW_rel_ver_name[MAX_FW_REL_VER_NAME] = "---";
+-- 
+1.9.1
+

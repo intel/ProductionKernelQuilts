@@ -1,0 +1,266 @@
+From 414431082968d2b5e226bf866fd4a5b3766250e6 Mon Sep 17 00:00:00 2001
+Message-Id: <414431082968d2b5e226bf866fd4a5b3766250e6.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 24 Jul 2014 17:04:29 +0100
+Subject: [PATCH 32/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Emission of
+ requests with logical rings
+
+On a previous iteration of this patch, I created an Execlists
+version of __i915_add_request and asbtracted it away as a
+vfunc. Daniel Vetter wondered then why that was needed:
+
+"with the clean split in command submission I expect every
+function to know wether it'll submit to an lrc (everything in
+intel_lrc.c) or wether it'll submit to a legacy ring (existing
+code), so I don't see a need for an add_request vfunc."
+
+The honest, hairy truth is that this patch is the glue keeping
+the whole logical ring puzzle together:
+
+- i915_add_request is used by intel_ring_idle, which in turn is
+  used by i915_gpu_idle, which in turn is used in several places
+  inside the eviction and gtt codes.
+- Also, it is used by i915_gem_check_olr, which is littered all
+  over i915_gem.c
+- ...
+
+If I were to duplicate all the code that directly or indirectly
+uses __i915_add_request, I'll end up creating a separate driver.
+
+To show the differences between the existing legacy version and
+the new Execlists one, this time I have special-cased
+__i915_add_request instead of adding an add_request vfunc. I
+hope this helps to untangle this Gordian knot.
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+[danvet: Adjust to ringbuf->FIXME_lrc_ctx per the discussion with
+Thomas Daniel.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 48e29f5535b9eb506c44bd8f41bd9348fd219435)
+
+Change-Id: I3072df2e15f393e29ac9a718f3f9758a4e73445d
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 48e29f5535b9eb506c44bd8f41bd9348fd219435
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c  |   72 ++++++++++++++++++++++++++++----------
+ drivers/gpu/drm/i915/intel_lrc.c |   30 +++++++++++++---
+ drivers/gpu/drm/i915/intel_lrc.h |    1 +
+ 3 files changed, 80 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 517029b..5e7fe17 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2344,10 +2344,21 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	struct drm_i915_gem_request *request;
++	struct intel_ringbuffer *ringbuf;
+ 	u32 request_ring_position, request_start;
+ 	int ret;
+ 
+-	request_start = intel_ring_get_tail(ring->buffer);
++	request = ring->preallocated_lazy_request;
++	if (WARN_ON(request == NULL))
++		return -ENOMEM;
++
++	if (i915.enable_execlists) {
++		struct intel_context *ctx = request->ctx;
++		ringbuf = ctx->engine[ring->id].ringbuf;
++	} else
++		ringbuf = ring->buffer;
++
++	request_start = intel_ring_get_tail(ringbuf);
+ 	/*
+ 	 * Emit any outstanding flushes - execbuf can fail to emit the flush
+ 	 * after having emitted the batchbuffer command. Hence we need to fix
+@@ -2355,24 +2366,32 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	 * is that the flush _must_ happen before the next request, no matter
+ 	 * what.
+ 	 */
+-	ret = intel_ring_flush_all_caches(ring);
+-	if (ret)
+-		return ret;
+-
+-	request = ring->preallocated_lazy_request;
+-	if (WARN_ON(request == NULL))
+-		return -ENOMEM;
++	if (i915.enable_execlists) {
++		ret = logical_ring_flush_all_caches(ringbuf);
++		if (ret)
++			return ret;
++	} else {
++		ret = intel_ring_flush_all_caches(ring);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/* Record the position of the start of the request so that
+ 	 * should we detect the updated seqno part-way through the
+ 	 * GPU processing the request, we never over-estimate the
+ 	 * position of the head.
+ 	 */
+-	request_ring_position = intel_ring_get_tail(ring->buffer);
++	request_ring_position = intel_ring_get_tail(ringbuf);
+ 
+-	ret = ring->add_request(ring);
+-	if (ret)
+-		return ret;
++	if (i915.enable_execlists) {
++		ret = ring->emit_request(ringbuf);
++		if (ret)
++			return ret;
++	} else {
++		ret = ring->add_request(ring);
++		if (ret)
++			return ret;
++	}
+ 
+ 	request->seqno = intel_ring_get_seqno(ring);
+ 	request->ring = ring;
+@@ -2387,12 +2406,14 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	 */
+ 	request->batch_obj = obj;
+ 
+-	/* Hold a reference to the current context so that we can inspect
+-	 * it later in case a hangcheck error event fires.
+-	 */
+-	request->ctx = ring->last_context;
+-	if (request->ctx)
+-		i915_gem_context_reference(request->ctx);
++	if (!i915.enable_execlists) {
++		/* Hold a reference to the current context so that we can inspect
++		 * it later in case a hangcheck error event fires.
++		 */
++		request->ctx = ring->last_context;
++		if (request->ctx)
++			i915_gem_context_reference(request->ctx);
++	}
+ 
+ 	request->emitted_jiffies = jiffies;
+ 	list_add_tail(&request->list, &ring->request_list);
+@@ -2647,6 +2668,7 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ 
+ 	while (!list_empty(&ring->request_list)) {
+ 		struct drm_i915_gem_request *request;
++		struct intel_ringbuffer *ringbuf;
+ 
+ 		request = list_first_entry(&ring->request_list,
+ 					   struct drm_i915_gem_request,
+@@ -2656,12 +2678,24 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ 			break;
+ 
+ 		trace_i915_gem_request_retire(ring, request->seqno);
++
++		/* This is one of the few common intersection points
++		 * between legacy ringbuffer submission and execlists:
++		 * we need to tell them apart in order to find the correct
++		 * ringbuffer to which the request belongs to.
++		 */
++		if (i915.enable_execlists) {
++			struct intel_context *ctx = request->ctx;
++			ringbuf = ctx->engine[ring->id].ringbuf;
++		} else
++			ringbuf = ring->buffer;
++
+ 		/* We know the GPU must have read the request to have
+ 		 * sent us the seqno + interrupt, so use the position
+ 		 * of tail of the request to update the last known position
+ 		 * of the GPU head.
+ 		 */
+-		ring->buffer->last_retired_head = request->tail;
++		ringbuf->last_retired_head = request->tail;
+ 
+ 		i915_gem_free_request(request);
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 5511a12..5b8e93a 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -250,6 +250,22 @@ void intel_logical_ring_stop(struct intel_engine_cs *ring)
+ 	I915_WRITE_MODE(ring, _MASKED_BIT_DISABLE(STOP_RING));
+ }
+ 
++int logical_ring_flush_all_caches(struct intel_ringbuffer *ringbuf)
++{
++	struct intel_engine_cs *ring = ringbuf->ring;
++	int ret;
++
++	if (!ring->gpu_caches_dirty)
++		return 0;
++
++	ret = ring->emit_flush(ringbuf, 0, I915_GEM_GPU_DOMAINS);
++	if (ret)
++		return ret;
++
++	ring->gpu_caches_dirty = false;
++	return 0;
++}
++
+ void intel_logical_ring_advance_and_submit(struct intel_ringbuffer *ringbuf)
+ {
+ 	intel_logical_ring_advance(ringbuf);
+@@ -260,7 +276,8 @@ void intel_logical_ring_advance_and_submit(struct intel_ringbuffer *ringbuf)
+ 	/* TODO: how to submit a context to the ELSP is not here yet */
+ }
+ 
+-static int logical_ring_alloc_seqno(struct intel_engine_cs *ring)
++static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
++				    struct intel_context *ctx)
+ {
+ 	if (ring->outstanding_lazy_seqno)
+ 		return 0;
+@@ -272,6 +289,13 @@ static int logical_ring_alloc_seqno(struct intel_engine_cs *ring)
+ 		if (request == NULL)
+ 			return -ENOMEM;
+ 
++		/* Hold a reference to the context this request belongs to
++		 * (we will need it when the time comes to emit/retire the
++		 * request).
++		 */
++		request->ctx = ctx;
++		i915_gem_context_reference(request->ctx);
++
+ 		ring->preallocated_lazy_request = request;
+ 	}
+ 
+@@ -310,8 +334,6 @@ static int logical_ring_wait_request(struct intel_ringbuffer *ringbuf,
+ 	if (ret)
+ 		return ret;
+ 
+-	/* TODO: make sure we update the right ringbuffer's last_retired_head
+-	 * when retiring requests */
+ 	i915_gem_retire_requests_ring(ring);
+ 	ringbuf->head = ringbuf->last_retired_head;
+ 	ringbuf->last_retired_head = -1;
+@@ -431,7 +453,7 @@ int intel_logical_ring_begin(struct intel_ringbuffer *ringbuf, int num_dwords)
+ 		return ret;
+ 
+ 	/* Preallocate the olr before touching the ring */
+-	ret = logical_ring_alloc_seqno(ring);
++	ret = logical_ring_alloc_seqno(ring, ringbuf->FIXME_lrc_ctx);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index 4e03287..460e1af 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -29,6 +29,7 @@ void intel_logical_ring_stop(struct intel_engine_cs *ring);
+ void intel_logical_ring_cleanup(struct intel_engine_cs *ring);
+ int intel_logical_rings_init(struct drm_device *dev);
+ 
++int logical_ring_flush_all_caches(struct intel_ringbuffer *ringbuf);
+ void intel_logical_ring_advance_and_submit(struct intel_ringbuffer *ringbuf);
+ static inline void intel_logical_ring_advance(struct intel_ringbuffer *ringbuf)
+ {
+-- 
+1.7.9.5
+

@@ -1,0 +1,140 @@
+From 3bffa37b812c7ebf027191b31d299ae21eecc5b6 Mon Sep 17 00:00:00 2001
+Message-Id: <3bffa37b812c7ebf027191b31d299ae21eecc5b6.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: Akash Goel <akash.goel@intel.com>
+Date: Wed, 4 Feb 2015 14:47:26 +0530
+Subject: [PATCH 29/68] FOR_UPSTREAM [VPG]: drm/i915/gen8: Fix sporadic GFX
+ page fault issue
+
+After dynamic page allocation was enabled, page faults were observed in the
+OGL conformance test suite. After debugging, it was found that there was an out
+of bound access, caused by the 3D driver.
+
+This out of bound access no longer happened after resource streamer was enabled,
+but in the case CHV prefetches unmapped pages, it will trigger unrecoverable
+faults. Therefore, we must ensure the entire address space is mapped.
+
+This wasn't a problem before because in aliased and full PPGTT (before dynamic
+alloc) mode, we initialize all the PTEs with a scratch page. But with deferred
+allocation, we program only the used PTEs, so the unused entries remain
+uninitialized.
+
+As a failsafe solution, will allocate a scratch Page table also for each context,
+make all the entries of scratch PD point to it. And then make all entries of scratch
+page table point to the scratch page.
+
+v2: Do not leak scratch_pt.
+
+Change-Id: I74ccdcd497dc0676b1073faf5f2c1d5fdeb0b0e3
+Issue: GMINL-5449
+Issue: VIZ-4619
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_gtt.c |   47 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gem_gtt.h |    2 +-
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 5af6e3f..5a661cd 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -642,6 +642,7 @@ static void gen8_ppgtt_free(struct i915_hw_ppgtt *ppgtt)
+ 	}
+ 
+ 	unmap_and_free_pt(ppgtt->scratch_pd, ppgtt->base.dev);
++	unmap_and_free_pt(ppgtt->scratch_pt, ppgtt->base.dev);
+ }
+ 
+ static void gen8_ppgtt_cleanup(struct i915_address_space *vm)
+@@ -653,6 +654,42 @@ static void gen8_ppgtt_cleanup(struct i915_address_space *vm)
+ 	gen8_ppgtt_free(ppgtt);
+ }
+ 
++static void gen8_initialize_pt(struct i915_hw_ppgtt *ppgtt,
++			struct i915_page_table_entry *pt)
++{
++	gen8_gtt_pte_t *pt_vaddr, scratch_pte;
++	int i;
++
++	pt_vaddr = kmap_atomic(pt->page);
++	scratch_pte = gen8_pte_encode(ppgtt->base.scratch.addr,
++			I915_CACHE_LLC, true);
++
++	for (i = 0; i < GEN8_PTES_PER_PAGE; i++)
++		pt_vaddr[i] = scratch_pte;
++
++	if (!HAS_LLC(ppgtt->base.dev))
++		drm_clflush_virt_range(pt_vaddr, PAGE_SIZE);
++	kunmap_atomic(pt_vaddr);
++}
++
++static void gen8_initialize_pd(struct i915_hw_ppgtt *ppgtt,
++			struct i915_page_directory_entry *pd)
++{
++	gen8_ppgtt_pde_t *page_directory;
++	struct i915_page_table_entry *pt;
++	int i;
++
++	page_directory = kmap_atomic(pd->page);
++	pt = ppgtt->scratch_pt;
++	for (i = 0; i < GEN8_PDES_PER_PAGE; i++)
++		/* Map the PDE to the page table */
++		__gen8_do_map_pt(page_directory + i, pt, ppgtt->base.dev);
++
++	if (!HAS_LLC(ppgtt->base.dev))
++		drm_clflush_virt_range(page_directory, PAGE_SIZE);
++	kunmap_atomic(page_directory);
++}
++
+ /**
+  * gen8_ppgtt_alloc_pagetabs() - Allocate page tables for VA range.
+  * @ppgtt:	Master ppgtt structure.
+@@ -693,6 +730,7 @@ static int gen8_ppgtt_alloc_pagetabs(struct i915_hw_ppgtt *ppgtt,
+ 		if (IS_ERR(pt))
+ 			goto unwind_out;
+ 
++		gen8_initialize_pt(ppgtt, pt);
+ 		pd->page_tables[pde] = pt;
+ 		set_bit(pde, new_pts);
+ 	}
+@@ -752,6 +790,7 @@ static int gen8_ppgtt_alloc_page_directories(struct i915_hw_ppgtt *ppgtt,
+ 		if (IS_ERR(pd))
+ 			goto unwind_out;
+ 
++		gen8_initialize_pd(ppgtt, pd);
+ 		pdp->page_directory[pdpe] = pd;
+ 		set_bit(pdpe, new_pds);
+ 	}
+@@ -933,6 +972,14 @@ static int gen8_ppgtt_init_common(struct i915_hw_ppgtt *ppgtt, uint64_t size)
+ 	if (IS_ERR(ppgtt->scratch_pd))
+ 		return PTR_ERR(ppgtt->scratch_pd);
+ 
++	ppgtt->scratch_pt = alloc_pt_scratch(ppgtt->base.dev);
++	if (IS_ERR(ppgtt->scratch_pt))
++		return PTR_ERR(ppgtt->scratch_pt);
++
++	gen8_initialize_pt(ppgtt, ppgtt->scratch_pt);
++	gen8_initialize_pd(ppgtt,
++		(struct i915_page_directory_entry *)ppgtt->scratch_pd);
++
+ 	ppgtt->base.start = 0;
+ 	ppgtt->base.total = size;
+ 	ppgtt->base.cleanup = gen8_ppgtt_cleanup;
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index ae606b35..49e67cd 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -286,7 +286,7 @@ struct i915_hw_ppgtt {
+ 
+ 	struct list_head vma_list;
+ 
+-	union {
++	struct {
+ 		struct i915_page_table_entry *scratch_pt;
+ 		struct i915_page_table_entry *scratch_pd; /* Just need the daddr */
+ 	};
+-- 
+1.7.9.5
+

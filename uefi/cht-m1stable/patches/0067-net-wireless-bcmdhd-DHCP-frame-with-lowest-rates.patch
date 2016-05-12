@@ -1,0 +1,407 @@
+From b92b1821d8183473b509a6c7518314cb013b6281 Mon Sep 17 00:00:00 2001
+From: Ecco park <eccopark@broadcom.com>
+Date: Wed, 3 Sep 2014 10:10:18 -0700
+Subject: [PATCH 67/77] net: wireless: bcmdhd DHCP frame with lowest rates
+
+17214104 DHCP frames are not using lowest rates
+Signed-off-by: Ecco park <eccopark@broadcom.com>
+
+Change-Id: If8d1436586c7e2d9fa2a4621e775c95deb0069e7
+---
+ drivers/net/wireless/bcmdhd/Makefile             |  2 +-
+ drivers/net/wireless/bcmdhd/dhd_ip.c             | 70 ++++++++++++++++++++++--
+ drivers/net/wireless/bcmdhd/dhd_ip.h             |  7 ++-
+ drivers/net/wireless/bcmdhd/dhd_msgbuf.c         | 12 +++-
+ drivers/net/wireless/bcmdhd/dhd_wlfc.c           | 27 ++++-----
+ drivers/net/wireless/bcmdhd/include/bcmmsgbuf.h  | 11 ++--
+ drivers/net/wireless/bcmdhd/include/wlfc_proto.h | 13 ++---
+ drivers/net/wireless/bcmdhd/linux_osl.c          | 11 +---
+ 8 files changed, 106 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/net/wireless/bcmdhd/Makefile b/drivers/net/wireless/bcmdhd/Makefile
+index 924d8b377133..1d91d14b5dc0 100644
+--- a/drivers/net/wireless/bcmdhd/Makefile
++++ b/drivers/net/wireless/bcmdhd/Makefile
+@@ -115,7 +115,6 @@ ifneq ($(filter y, $(CONFIG_BCM4354) $(CONFIG_BCM4356)),)
+   DHDCFLAGS += -DUSE_WL_TXBF
+   DHDCFLAGS += -DUSE_WL_FRAMEBURST
+   DHDCFLAGS += -DCUSTOM_DPC_CPUCORE=0
+-  DHDCFLAGS += -DPROP_TXSTATUS_VSDB
+   DHDCFLAGS += -DMAX_AP_CLIENT_CNT=10
+   DHDCFLAGS += -DMAX_GO_CLIENT_CNT=5
+ 
+@@ -150,6 +149,7 @@ ifneq ($(CONFIG_BCMDHD_PCIE),)
+   DHDCFLAGS += -DCUSTOM_AMPDU_BA_WSIZE=64
+   DHDCFLAGS += -DCUSTOM_AMPDU_MPDU=32
+   DHDCFLAGS += -DCUSTOM_AMPDU_RELEASE=16
++  DHDCFLAGS += -DPROP_TXSTATUS_VSDB
+ # Disable watchdog thread
+   DHDCFLAGS += -DCUSTOM_DHD_WATCHDOG_MS=0
+ 
+diff --git a/drivers/net/wireless/bcmdhd/dhd_ip.c b/drivers/net/wireless/bcmdhd/dhd_ip.c
+index 3a7f46b7fd1b..55657c36752d 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_ip.c
++++ b/drivers/net/wireless/bcmdhd/dhd_ip.c
+@@ -2,13 +2,13 @@
+  * IP Packet Parser Module.
+  *
+  * Copyright (C) 1999-2014, Broadcom Corporation
+- * 
++ *
+  *      Unless you and Broadcom execute a separate written software license
+  * agreement governing use of this software, this software is licensed to you
+  * under the terms of the GNU General Public License version 2 (the "GPL"),
+  * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+  * following added to such license:
+- * 
++ *
+  *      As a special exception, the copyright holders of this software give you
+  * permission to link this software with independent modules, and to copy and
+  * distribute the resulting executable under terms of your choice, provided that
+@@ -16,7 +16,7 @@
+  * the license of that module.  An independent module is a module which is not
+  * derived from this software.  The special exception does not apply to any
+  * modifications of the software.
+- * 
++ *
+  *      Notwithstanding the above, under no circumstances may you combine this
+  * software in any way with any other Broadcom software provided under a license
+  * other than the GPL, without Broadcom's express prior written consent.
+@@ -31,7 +31,7 @@
+ #include <proto/802.3.h>
+ #include <proto/bcmip.h>
+ #include <bcmendian.h>
+-
++#include <bcmutils.h>
+ #include <dhd_dbg.h>
+ 
+ #include <dhd_ip.h>
+@@ -116,6 +116,68 @@ pkt_frag_t pkt_frag_info(osl_t *osh, void *p)
+ 	}
+ }
+ 
++bool pkt_is_dhcp(osl_t *osh, void *p)
++{
++	uint8 *frame;
++	int length;
++	uint8 *pt;			/* Pointer to type field */
++	uint16 ethertype;
++	struct ipv4_hdr *iph;		/* IP frame pointer */
++	int ipl;			/* IP frame length */
++	uint16 src_port;
++
++	frame = PKTDATA(osh, p);
++	length = PKTLEN(osh, p);
++
++	/* Process Ethernet II or SNAP-encapsulated 802.3 frames */
++	if (length < ETHER_HDR_LEN) {
++		DHD_INFO(("%s: short eth frame (%d)\n", __FUNCTION__, length));
++		return FALSE;
++	} else if (ntoh16(*(uint16 *)(frame + ETHER_TYPE_OFFSET)) >= ETHER_TYPE_MIN) {
++		/* Frame is Ethernet II */
++		pt = frame + ETHER_TYPE_OFFSET;
++	} else if (length >= ETHER_HDR_LEN + SNAP_HDR_LEN + ETHER_TYPE_LEN &&
++	           !bcmp(llc_snap_hdr, frame + ETHER_HDR_LEN, SNAP_HDR_LEN)) {
++		pt = frame + ETHER_HDR_LEN + SNAP_HDR_LEN;
++	} else {
++		DHD_INFO(("%s: non-SNAP 802.3 frame\n", __FUNCTION__));
++		return FALSE;
++	}
++
++	ethertype = ntoh16(*(uint16 *)pt);
++
++	/* Skip VLAN tag, if any */
++	if (ethertype == ETHER_TYPE_8021Q) {
++		pt += VLAN_TAG_LEN;
++
++		if (pt + ETHER_TYPE_LEN > frame + length) {
++			DHD_INFO(("%s: short VLAN frame (%d)\n", __FUNCTION__, length));
++			return FALSE;
++		}
++
++		ethertype = ntoh16(*(uint16 *)pt);
++	}
++
++	if (ethertype != ETHER_TYPE_IP) {
++		DHD_INFO(("%s: non-IP frame (ethertype 0x%x, length %d)\n",
++			__FUNCTION__, ethertype, length));
++		return FALSE;
++	}
++
++	iph = (struct ipv4_hdr *)(pt + ETHER_TYPE_LEN);
++	ipl = (uint)(length - (pt + ETHER_TYPE_LEN - frame));
++
++	/* We support IPv4 only */
++	if ((ipl < (IPV4_OPTIONS_OFFSET + 2)) || (IP_VER(iph) != IP_VER_4)) {
++		DHD_INFO(("%s: short frame (%d) or non-IPv4\n", __FUNCTION__, ipl));
++		return FALSE;
++	}
++
++	src_port = ntoh16(*(uint16 *)(pt + ETHER_TYPE_LEN + IPV4_OPTIONS_OFFSET));
++
++	return (src_port == 0x43 || src_port == 0x44);
++}
++
+ #ifdef DHDTCPACK_SUPPRESS
+ 
+ typedef struct {
+diff --git a/drivers/net/wireless/bcmdhd/dhd_ip.h b/drivers/net/wireless/bcmdhd/dhd_ip.h
+index bd3a8985ce0d..835046c026fb 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_ip.h
++++ b/drivers/net/wireless/bcmdhd/dhd_ip.h
+@@ -4,13 +4,13 @@
+  * Provides type definitions and function prototypes used to parse ip packet.
+  *
+  * Copyright (C) 1999-2014, Broadcom Corporation
+- * 
++ *
+  *      Unless you and Broadcom execute a separate written software license
+  * agreement governing use of this software, this software is licensed to you
+  * under the terms of the GNU General Public License version 2 (the "GPL"),
+  * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+  * following added to such license:
+- * 
++ *
+  *      As a special exception, the copyright holders of this software give you
+  * permission to link this software with independent modules, and to copy and
+  * distribute the resulting executable under terms of your choice, provided that
+@@ -18,7 +18,7 @@
+  * the license of that module.  An independent module is a module which is not
+  * derived from this software.  The special exception does not apply to any
+  * modifications of the software.
+- * 
++ *
+  *      Notwithstanding the above, under no circumstances may you combine this
+  * software in any way with any other Broadcom software provided under a license
+  * other than the GPL, without Broadcom's express prior written consent.
+@@ -44,6 +44,7 @@ typedef enum pkt_frag
+ } pkt_frag_t;
+ 
+ extern pkt_frag_t pkt_frag_info(osl_t *osh, void *p);
++extern bool pkt_is_dhcp(osl_t *osh, void *p);
+ 
+ #ifdef DHDTCPACK_SUPPRESS
+ #define	TCPACKSZMIN	(ETHER_HDR_LEN + IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN)
+diff --git a/drivers/net/wireless/bcmdhd/dhd_msgbuf.c b/drivers/net/wireless/bcmdhd/dhd_msgbuf.c
+index 1063b9f44c68..2803f8a42d05 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_msgbuf.c
++++ b/drivers/net/wireless/bcmdhd/dhd_msgbuf.c
+@@ -51,7 +51,8 @@
+ 
+ #include <pcie_core.h>
+ #include <bcmpcie.h>
+-
++#include <dhd_pcie.h>
++#include <dhd_ip.h>
+ #define RETRIES 2		/* # of retries to retrieve matching ioctl response */
+ #define IOCTL_HDR_LEN	12
+ 
+@@ -1896,6 +1897,7 @@ dhd_prot_txdata(dhd_pub_t *dhd, void *PKTBUF, uint8 ifidx)
+ 	uint16	headroom;
+ 
+ 	msgbuf_ring_t *msg_ring;
++	uint8 dhcp_pkt;
+ 
+ 	if (!dhd_bus_is_txmode_push(dhd->bus)) {
+ 		flow_ring_table_t *flow_ring_table;
+@@ -1939,7 +1941,11 @@ dhd_prot_txdata(dhd_pub_t *dhd, void *PKTBUF, uint8 ifidx)
+ 			pktlen);
+ 		goto err_no_res_pktfree;
+ 	}
+-
++	/* test if dhcp pkt */
++	dhcp_pkt = pkt_is_dhcp(dhd->osh, PKTBUF);
++	txdesc->flag2 = (txdesc->flag2 & ~(BCMPCIE_PKT_FLAGS2_FORCELOWRATE_MASK <<
++		BCMPCIE_PKT_FLAGS2_FORCELOWRATE_SHIFT)) | ((dhcp_pkt &
++		BCMPCIE_PKT_FLAGS2_FORCELOWRATE_MASK) << BCMPCIE_PKT_FLAGS2_FORCELOWRATE_SHIFT);
+ 	/* Extract the data pointer and length information */
+ 	pktdata = PKTDATA(dhd->osh, PKTBUF);
+ 	pktlen  = (uint16)PKTLEN(dhd->osh, PKTBUF);
+@@ -3743,4 +3749,4 @@ dhd_prot_clear(dhd_pub_t *dhd)
+ 	 */
+ 	dhd_flow_rings_deinit(dhd);
+ 	NATIVE_TO_PKTID_CLEAR(prot->pktid_map_handle);
+-}
+\ No newline at end of file
++}
+diff --git a/drivers/net/wireless/bcmdhd/dhd_wlfc.c b/drivers/net/wireless/bcmdhd/dhd_wlfc.c
+index 94a7afca7a3c..148cf62e9b24 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_wlfc.c
++++ b/drivers/net/wireless/bcmdhd/dhd_wlfc.c
+@@ -41,9 +41,7 @@
+ #include <wlfc_proto.h>
+ #include <dhd_wlfc.h>
+ #endif
+-#ifdef DHDTCPACK_SUPPRESS
+ #include <dhd_ip.h>
+-#endif /* DHDTCPACK_SUPPRESS */
+ 
+ 
+ /*
+@@ -995,7 +993,7 @@ _dhd_wlfc_pretx_pktprocess(athost_wl_status_info_t* ctx,
+ 	bool send_tim_update = FALSE;
+ 	uint32 htod = 0;
+ 	uint16 htodseq = 0;
+-	uint8 free_ctr;
++	uint8 free_ctr, flags = 0;
+ 	int gen = 0xff;
+ 	dhd_pub_t *dhdp = (dhd_pub_t *)ctx->dhdp;
+ 
+@@ -1049,22 +1047,25 @@ _dhd_wlfc_pretx_pktprocess(athost_wl_status_info_t* ctx,
+ 		return BCME_ERROR;
+ 	}
+ 
+-	WL_TXSTATUS_SET_FREERUNCTR(htod, free_ctr);
+-	WL_TXSTATUS_SET_HSLOT(htod, hslot);
+-	WL_TXSTATUS_SET_FIFO(htod, DHD_PKTTAG_FIFO(PKTTAG(p)));
+-	WL_TXSTATUS_SET_FLAGS(htod, WLFC_PKTFLAG_PKTFROMHOST);
+-	WL_TXSTATUS_SET_GENERATION(htod, gen);
+-	DHD_PKTTAG_SETPKTDIR(PKTTAG(p), 1);
+-
++	flags = WLFC_PKTFLAG_PKTFROMHOST;
+ 	if (!DHD_PKTTAG_CREDITCHECK(PKTTAG(p))) {
+ 		/*
+ 		Indicate that this packet is being sent in response to an
+ 		explicit request from the firmware side.
+ 		*/
+-		WLFC_PKTFLAG_SET_PKTREQUESTED(htod);
+-	} else {
+-		WLFC_PKTFLAG_CLR_PKTREQUESTED(htod);
++		flags |= WLFC_PKTFLAG_PKT_REQUESTED;
+ 	}
++	if (pkt_is_dhcp(ctx->osh, p)) {
++		flags |= WLFC_PKTFLAG_PKT_FORCELOWRATE;
++	}
++
++	WL_TXSTATUS_SET_FREERUNCTR(htod, free_ctr);
++	WL_TXSTATUS_SET_HSLOT(htod, hslot);
++	WL_TXSTATUS_SET_FIFO(htod, DHD_PKTTAG_FIFO(PKTTAG(p)));
++	WL_TXSTATUS_SET_FLAGS(htod, flags);
++	WL_TXSTATUS_SET_GENERATION(htod, gen);
++	DHD_PKTTAG_SETPKTDIR(PKTTAG(p), 1);
++
+ 
+ 	rc = _dhd_wlfc_pushheader(ctx, p, send_tim_update,
+ 		entry->traffic_lastreported_bmp, entry->mac_handle, htod, htodseq, FALSE);
+diff --git a/drivers/net/wireless/bcmdhd/include/bcmmsgbuf.h b/drivers/net/wireless/bcmdhd/include/bcmmsgbuf.h
+index ad532467a0f4..e4281b3925b3 100644
+--- a/drivers/net/wireless/bcmdhd/include/bcmmsgbuf.h
++++ b/drivers/net/wireless/bcmdhd/include/bcmmsgbuf.h
+@@ -5,13 +5,13 @@
+  * Definitions subject to change without notice.
+  *
+  * Copyright (C) 1999-2014, Broadcom Corporation
+- * 
++ *
+  *      Unless you and Broadcom execute a separate written software license
+  * agreement governing use of this software, this software is licensed to you
+  * under the terms of the GNU General Public License version 2 (the "GPL"),
+  * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+  * following added to such license:
+- * 
++ *
+  *      As a special exception, the copyright holders of this software give you
+  * permission to link this software with independent modules, and to copy and
+  * distribute the resulting executable under terms of your choice, provided that
+@@ -19,7 +19,7 @@
+  * the license of that module.  An independent module is a module which is not
+  * derived from this software.  The special exception does not apply to any
+  * modifications of the software.
+- * 
++ *
+  *      Notwithstanding the above, under no circumstances may you combine this
+  * software in any way with any other Broadcom software provided under a license
+  * other than the GPL, without Broadcom's express prior written consent.
+@@ -497,7 +497,7 @@ typedef struct host_txbuf_post {
+ 	uint16		metadata_buf_len;
+ 	/* provided data buffer len to receive data */
+ 	uint16		data_len;
+-	uint32		rsvd;
++	uint32		flag2;
+ } host_txbuf_post_t;
+ 
+ #define BCMPCIE_PKT_FLAGS_FRAME_802_3	0x01
+@@ -516,6 +516,9 @@ typedef struct host_txbuf_post {
+ #define BCMPCIE_TXPOST_FLAGS_PRIO_SHIFT		BCMPCIE_PKT_FLAGS_PRIO_SHIFT
+ #define BCMPCIE_TXPOST_FLAGS_PRIO_MASK		BCMPCIE_PKT_FLAGS_PRIO_MASK
+ 
++#define BCMPCIE_PKT_FLAGS2_FORCELOWRATE_MASK	0x01
++#define BCMPCIE_PKT_FLAGS2_FORCELOWRATE_SHIFT	0
++
+ /* H2D Txpost ring work items */
+ typedef union txbuf_submit_item {
+ 	host_txbuf_post_t	txpost;
+diff --git a/drivers/net/wireless/bcmdhd/include/wlfc_proto.h b/drivers/net/wireless/bcmdhd/include/wlfc_proto.h
+index 2f976235bad7..937b86dc8782 100644
+--- a/drivers/net/wireless/bcmdhd/include/wlfc_proto.h
++++ b/drivers/net/wireless/bcmdhd/include/wlfc_proto.h
+@@ -1,12 +1,12 @@
+ /*
+ * Copyright (C) 1999-2014, Broadcom Corporation
+-* 
++*
+ *      Unless you and Broadcom execute a separate written software license
+ * agreement governing use of this software, this software is licensed to you
+ * under the terms of the GNU General Public License version 2 (the "GPL"),
+ * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+ * following added to such license:
+-* 
++*
+ *      As a special exception, the copyright holders of this software give you
+ * permission to link this software with independent modules, and to copy and
+ * distribute the resulting executable under terms of your choice, provided that
+@@ -14,7 +14,7 @@
+ * the license of that module.  An independent module is a module which is not
+ * derived from this software.  The special exception does not apply to any
+ * modifications of the software.
+-* 
++*
+ *      Notwithstanding the above, under no circumstances may you combine this
+ * software in any way with any other Broadcom software provided under a license
+ * other than the GPL, without Broadcom's express prior written consent.
+@@ -127,6 +127,7 @@
+ 
+ #define WLFC_PKTFLAG_PKTFROMHOST	0x01
+ #define WLFC_PKTFLAG_PKT_REQUESTED	0x02
++#define WLFC_PKTFLAG_PKT_FORCELOWRATE	0x04 /* force low rate for this packet */
+ 
+ #define WL_TXSTATUS_STATUS_MASK			0xff /* allow 8 bits */
+ #define WL_TXSTATUS_STATUS_SHIFT		24
+@@ -217,12 +218,6 @@
+ /* b[7:5] -reuse guard, b[4:0] -value */
+ #define WLFC_MAC_DESC_GET_LOOKUP_INDEX(x) ((x) & 0x1f)
+ 
+-#define WLFC_PKTFLAG_SET_PKTREQUESTED(x)	(x) |= \
+-	(WLFC_PKTFLAG_PKT_REQUESTED << WL_TXSTATUS_FLAGS_SHIFT)
+-
+-#define WLFC_PKTFLAG_CLR_PKTREQUESTED(x)	(x) &= \
+-	~(WLFC_PKTFLAG_PKT_REQUESTED << WL_TXSTATUS_FLAGS_SHIFT)
+-
+ 
+ #define WLFC_MAX_PENDING_DATALEN	120
+ 
+diff --git a/drivers/net/wireless/bcmdhd/linux_osl.c b/drivers/net/wireless/bcmdhd/linux_osl.c
+index 335cb6f1d9ac..d39452b5e838 100644
+--- a/drivers/net/wireless/bcmdhd/linux_osl.c
++++ b/drivers/net/wireless/bcmdhd/linux_osl.c
+@@ -868,16 +868,7 @@ osl_pktfree(osl_t *osh, void *p, bool send)
+ 		} else
+ #endif
+ 		{
+-			if (skb->destructor)
+-				/* cannot kfree_skb() on hard IRQ (net/core/skbuff.c) if
+-				 * destructor exists
+-				 */
+-				dev_kfree_skb_any(skb);
+-			else
+-				/* can free immediately (even in_irq()) if destructor
+-				 * does not exist
+-				 */
+-				dev_kfree_skb(skb);
++			dev_kfree_skb_any(skb);
+ 		}
+ #ifdef CTFPOOL
+ next_skb:
+-- 
+2.0.3
+

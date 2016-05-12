@@ -1,0 +1,400 @@
+From 4da78d533d7fa5c76aac3a93ec00e1da10eaf169 Mon Sep 17 00:00:00 2001
+From: Per Persson <per.persson@intel.com>
+Date: Wed, 13 Apr 2016 16:43:09 +0200
+Subject: [PATCH 4/4] Camera: ov8858: Apply OTP
+
+Write wb and lenc otp data to sensor.
+
+Change-Id: I6472bf8982516d0626fc3217293f7ef7c130a3ce
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-28824
+Signed-off-by: Per Persson <per.persson@intel.com>
+Reviewed-on: https://android.intel.com:443/494247
+---
+ .../camera/drivers/media/i2c/ov8858.c              | 242 ++++++++++++++++++---
+ .../camera/drivers/media/i2c/ov8858.h              |  31 ++-
+ 2 files changed, 242 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov8858.c b/drivers/external_drivers/camera/drivers/media/i2c/ov8858.c
+index 7b2941d..e50c5ff 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov8858.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov8858.c
+@@ -374,6 +374,8 @@ static int __ov8858_set_exposure(struct v4l2_subdev *sd, int exposure, int gain,
+ 	if (strcmp(dmi_get_system_info(DMI_BOARD_NAME), CHT_HR_DEV_NAME) != 0)
+ 		msleep(5);
+ 
++	/* dig_gain is not applied to sensor. OTP WB data is used instead */
++
+ 	if (dev->limit_exposure_flag) {
+ 		if (exposure > *vts - OV8858_INTEGRATION_TIME_MARGIN)
+ 			exposure = *vts - OV8858_INTEGRATION_TIME_MARGIN;
+@@ -403,24 +405,6 @@ static int __ov8858_set_exposure(struct v4l2_subdev *sd, int exposure, int gain,
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Digital gain : to all MWB channel gains */
+-	if (dig_gain) {
+-		ret = ov8858_write_reg(client, OV8858_16BIT,
+-				OV8858_MWB_RED_GAIN_H, dig_gain);
+-		if (ret)
+-			return ret;
+-
+-		ret = ov8858_write_reg(client, OV8858_16BIT,
+-				OV8858_MWB_GREEN_GAIN_H, dig_gain);
+-		if (ret)
+-			return ret;
+-
+-		ret = ov8858_write_reg(client, OV8858_16BIT,
+-				OV8858_MWB_BLUE_GAIN_H, dig_gain);
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	ret = ov8858_write_reg(client, OV8858_16BIT, OV8858_LONG_GAIN,
+ 				gain & 0x07ff);
+ 	if (ret)
+@@ -500,10 +484,23 @@ static int ov8858_priv_int_data_init(struct v4l2_subdev *sd)
+ 	u32 size = OV8858_OTP_END_ADDR - OV8858_OTP_START_ADDR + 1;
+ 	int r;
+ 	u16 isp_ctrl2 = 0;
++	u16 checksum_exp = 0;
++	u16 checksum_read = 0;
++	u8 *lenc_data;
++	u16 temp1 = 0, temp2 = 0;
++	int rg_ratio;
++	int bg_ratio;
++	int i;
++
++	if (!dev->otp.otp_data) {
++		u16 otp_flag = 0;
++		u16 addr = 0;
+ 
+-	if (!dev->otp_data) {
+-		dev->otp_data = devm_kzalloc(&client->dev, size, GFP_KERNEL);
+-		if (!dev->otp_data) {
++		dev->otp.otp_lenc_en = 0;
++		dev->otp.otp_awb_en = 0;
++		dev->otp.otp_data = devm_kzalloc(&client->dev, size,
++							GFP_KERNEL);
++		if (!dev->otp.otp_data) {
+ 			dev_err(&client->dev, "%s: can't allocate memory",
+ 				__func__);
+ 			r = -ENOMEM;
+@@ -558,10 +555,113 @@ static int ov8858_priv_int_data_init(struct v4l2_subdev *sd)
+ 
+ 		/* Read the OTP data from the buffer */
+ 		r = ov8858_i2c_read(client, size, OV8858_OTP_START_ADDR,
+-				    dev->otp_data);
++				    dev->otp.otp_data);
+ 		if (r)
+ 			goto error1;
+ 
++		/* Check lenc data */
++		r = ov8858_read_reg(client, OV8858_8BIT,
++					OV8858_OTP_LENC_FLAG_ADDR, &otp_flag);
++		if (IS_ERR_VALUE(r)) {
++			dev_err(&client->dev, "otp lenc flag read failed\n");
++			goto error1;
++		}
++		if ((otp_flag & 0xc0) == 0x40) {
++			dev->otp.lenc_offset = OV8858_OTP_LENC_OFFSET1;
++		} else if ((otp_flag & 0x30) == 0x10) {
++			dev->otp.lenc_offset = OV8858_OTP_LENC_OFFSET2;
++		} else {
++			dev_err(&client->dev, "otp lenc unsupported flag\n");
++			goto error1;
++		}
++
++		lenc_data =  dev->otp.otp_data + dev->otp.lenc_offset;
++		for (i = 0; i < OV8858_OTP_LENC_SIZE; i++)
++			checksum_exp += *(lenc_data + i);
++		checksum_exp = checksum_exp % 255 + 1;
++
++		r = ov8858_read_reg(client, OV8858_8BIT,
++					OV8858_OTP_START_ADDR +
++					dev->otp.lenc_offset +
++					OV8858_OTP_LENC_SIZE,
++					&checksum_read);
++		if (IS_ERR_VALUE(r)) {
++			dev_err(&client->dev,
++				"otp lenc checksum read failed\n");
++			goto error1;
++		}
++
++		if (checksum_read != checksum_exp) {
++			dev_err(&client->dev,
++				"otp lenc checksum no match!\n");
++			goto error1;
++		}
++
++		dev_dbg(&client->dev, "otp chksum read:%02x exp:%02x",
++						checksum_read, checksum_exp);
++		dev->otp.otp_lenc_en = 1;
++
++		/* Calculate wb gain */
++		r = ov8858_read_reg(client, OV8858_8BIT, OV8858_OTP_START_ADDR,
++					&otp_flag);
++		if (IS_ERR_VALUE(r)) {
++			dev_err(&client->dev, "otp wb flag read failed\n");
++			goto error1;
++		}
++
++		if ((otp_flag & 0xc0) == 0x40) {
++			addr = OV8858_OTP_AWB_START_ADDR1;
++		} else if ((otp_flag & 0x30) == 0x10) {
++			addr = OV8858_OTP_AWB_START_ADDR2;
++		} else {
++			dev_err(&client->dev, "otp wb unsupported flag\n");
++			goto error1;
++		}
++
++		r = ov8858_read_reg(client, OV8858_8BIT, addr + 5, &temp1);
++		r |= ov8858_read_reg(client, OV8858_8BIT, addr + 7, &temp2);
++
++		if (IS_ERR_VALUE(r)) {
++			dev_err(&client->dev,
++				"otp awb read failed\n");
++			goto error1;
++		}
++
++		rg_ratio = (temp1 << 2) + (temp2 >> 6 & 0x03);
++
++		r |= ov8858_read_reg(client, OV8858_8BIT, addr + 6, &temp1);
++
++		if (IS_ERR_VALUE(r)) {
++			dev_err(&client->dev,
++				"otp awb read failed\n");
++			goto error1;
++		}
++
++		bg_ratio = (temp1 << 2) + (temp2 >> 4 & 0x03);
++
++		dev->otp.R_gain = (RG_Ratio_Typical * 1000) / rg_ratio;
++		dev->otp.B_gain = (BG_Ratio_Typical * 1000) / bg_ratio;
++		dev->otp.G_gain = 1000;
++
++		if (dev->otp.R_gain < 1000 || dev->otp.B_gain < 1000) {
++			if (dev->otp.R_gain < dev->otp.B_gain)
++				temp1 = dev->otp.R_gain;
++			else
++				temp1 = dev->otp.B_gain;
++		} else {
++			temp1 = dev->otp.G_gain;
++		}
++
++		dev->otp.R_gain = OV8858_WB_GAIN1 * dev->otp.R_gain / temp1;
++		dev->otp.B_gain = OV8858_WB_GAIN1 * dev->otp.B_gain / temp1;
++		dev->otp.G_gain = OV8858_WB_GAIN1 * dev->otp.G_gain / temp1;
++		dev->otp.otp_awb_en = 1;
++
++		dev_dbg(&client->dev, "OTP calcualted R:%d G:%d B:%d",
++					dev->otp.R_gain,
++					dev->otp.G_gain,
++					dev->otp.B_gain);
++
+ 		/* Turn on Dead Pixel Correction */
+ 		r = ov8858_write_reg(client, OV8858_8BIT, OV8858_OTP_ISP_CTRL2,
+ 				     isp_ctrl2 | OV8858_OTP_DPC_ENABLE);
+@@ -577,7 +677,6 @@ static int ov8858_priv_int_data_init(struct v4l2_subdev *sd)
+ 		}
+ 	}
+ 
+-
+ 	return 0;
+ 
+ error1:
+@@ -586,8 +685,8 @@ error1:
+ 			     isp_ctrl2 | OV8858_OTP_DPC_ENABLE);
+ 	ov8858_write_reg(client, 1, OV8858_STREAM_MODE, 0x00);
+ error2:
+-	devm_kfree(&client->dev, dev->otp_data);
+-	dev->otp_data = NULL;
++	devm_kfree(&client->dev, dev->otp.otp_data);
++	dev->otp.otp_data = NULL;
+ error3:
+ 	dev_err(&client->dev, "%s: OTP reading failed\n", __func__);
+ 	return r;
+@@ -603,13 +702,13 @@ static int ov8858_g_priv_int_data(struct v4l2_subdev *sd,
+ 
+ 	mutex_lock(&dev->input_lock);
+ 
+-	if (!dev->otp_data) {
++	if (!dev->otp.otp_data) {
+ 		dev_err(&client->dev, "%s: otp data is NULL\n", __func__);
+ 		mutex_unlock(&dev->input_lock);
+ 		return -EFAULT;
+ 	}
+ 
+-	if (copy_to_user(priv->data, dev->otp_data,
++	if (copy_to_user(priv->data, dev->otp.otp_data,
+ 			 min_t(__u32, priv->size, size))) {
+ 		r = -EFAULT;
+ 		dev_err(&client->dev, "%s: OTP reading failed\n", __func__);
+@@ -623,6 +722,85 @@ static int ov8858_g_priv_int_data(struct v4l2_subdev *sd,
+ 	return 0;
+ }
+ 
++static int update_awb_gain(struct v4l2_subdev *sd)
++{
++	struct ov8858_device *dev = to_ov8858_sensor(sd);
++	struct i2c_client *client = v4l2_get_subdevdata(sd);
++	int R_gain;
++	int G_gain;
++	int B_gain;
++	int ret = 0;
++
++	if (!dev->otp.otp_awb_en)
++		return -EINVAL;
++
++	R_gain = dev->otp.R_gain;
++	G_gain = dev->otp.G_gain;
++	B_gain = dev->otp.B_gain;
++
++	if (R_gain > 0x400)
++		ret |= ov8858_write_reg(client, OV8858_16BIT,
++						OV8858_MWB_RED_GAIN_H,
++						R_gain);
++	if (G_gain > 0x400)
++		ret |= ov8858_write_reg(client, OV8858_16BIT,
++						OV8858_MWB_GREEN_GAIN_H,
++						G_gain);
++	if (B_gain > 0x400)
++		ret |= ov8858_write_reg(client, OV8858_16BIT,
++						OV8858_MWB_BLUE_GAIN_H,
++						B_gain);
++
++	if (IS_ERR_VALUE(ret))
++		dev_err(&client->dev, "otp awb gain apply failed\n");
++	else
++		dev_dbg(&client->dev,
++				"%s, R_gain:%d G_gain %d B_gain %d\n",
++				__func__, R_gain, G_gain, B_gain);
++
++	return ret;
++}
++
++static int update_lenc(struct v4l2_subdev *sd)
++{
++	struct ov8858_device *dev = to_ov8858_sensor(sd);
++	struct i2c_client *client = v4l2_get_subdevdata(sd);
++	int ret = 0;
++	u16 temp = 0;
++	u8 lenc_data[OV8858_OTP_LENC_SIZE + 2];
++	struct i2c_msg lsc_msg;
++
++	if (!dev->otp.otp_data || !dev->otp.otp_lenc_en)
++		return -EINVAL;
++
++	ret |= ov8858_read_reg(client, OV8858_8BIT,
++					OV8858_ISP_CTRL00_REG, &temp);
++	temp |= 0x80;
++	ret |= ov8858_write_reg(client, OV8858_8BIT, OV8858_ISP_CTRL00_REG,
++					temp);
++
++	if (IS_ERR_VALUE(ret)) {
++		dev_err(&client->dev, "otp lenc apply failed at beginning\n");
++		return ret;
++	}
++
++	lenc_data[0] = (OV8858_LENC_G00_REG >> 8) & 0xff;
++	lenc_data[1] = OV8858_LENC_G00_REG & 0xff;
++	memcpy(&lenc_data[2], dev->otp.otp_data + dev->otp.lenc_offset,
++			OV8858_OTP_LENC_SIZE);
++
++	lsc_msg.addr  = client->addr;
++	lsc_msg.flags = 0;
++	lsc_msg.len   = sizeof(lenc_data) / sizeof(lenc_data[0]);
++	lsc_msg.buf   = &lenc_data[0];
++
++	ret = i2c_transfer(client->adapter, &lsc_msg, 1);
++
++	dev_dbg(&client->dev, "%s %d msg sent", __func__, ret);
++
++	return ret == 1 ? 0 : -EIO;
++}
++
+ static int __ov8858_init(struct v4l2_subdev *sd)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+@@ -660,7 +838,15 @@ static int __ov8858_init(struct v4l2_subdev *sd)
+ 	if (ret)
+ 		return ret;
+ 
+-	return ov8858_priv_int_data_init(sd);
++	ret = ov8858_priv_int_data_init(sd);
++
++	/* Apply otp awb gain */
++	update_awb_gain(sd);
++
++	/* Apply otp lenc data */
++	update_lenc(sd);
++
++	return ret;
+ }
+ 
+ static int ov8858_init(struct v4l2_subdev *sd, u32 val)
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov8858.h b/drivers/external_drivers/camera/drivers/media/i2c/ov8858.h
+index d7070440..04c3412 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov8858.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov8858.h
+@@ -42,8 +42,20 @@
+ #define OV8858_SUNNY		1
+ #define OV8858_MRD			2
+ 
+-#define OV8858_OTP_START_ADDR	0x7010
+-#define OV8858_OTP_END_ADDR	0x7186
++#define OV8858_OTP_START_ADDR		0x7010
++#define OV8858_OTP_END_ADDR		0x720A
++
++#define OV8858_OTP_LENC_FLAG_ADDR	0x7028
++#define OV8858_OTP_LENC_OFFSET1		0x19
++#define OV8858_OTP_LENC_OFFSET2		0x10A
++#define OV8858_OTP_LENC_SIZE		240
++#define OV8858_OTP_AWB_START_ADDR1	0x7011
++#define OV8858_OTP_AWB_START_ADDR2	0x7019
++#define OV8858_OTP_AWB_SIZE		8
++#define BG_Ratio_Typical		0x144
++#define RG_Ratio_Typical		0x117
++#define OV8858_WB_GAIN1			0x400
++
+ 
+ /*
+  * ov8858 System control registers
+@@ -164,6 +176,8 @@
+ 
+ #define OV8858_MAX_FOCUS_POS			1023
+ 
++#define OV8858_ISP_CTRL00_REG			0x5000
++#define OV8858_LENC_G00_REG			0x5800
+ #define OV8858_TEST_PATTERN_REG			0x5E00
+ 
+ char *CHT_HR_DEV_NAME  = "Cherry Trail FFD";
+@@ -243,6 +257,16 @@ struct ov8858_resolution {
+ 	const struct ov8858_fps_setting fps_options[MAX_FPS_OPTIONS_SUPPORTED];
+ };
+ 
++struct ov8858_otp_struct {
++	u8 *otp_data;
++	u16 lenc_offset;
++	int otp_lenc_en;
++	int R_gain;
++	int G_gain;
++	int B_gain;
++	int otp_awb_en;
++};
++
+ /*
+  * ov8858 device structure
+  * */
+@@ -265,7 +289,8 @@ struct ov8858_device {
+ 	u16 pixels_per_line;
+ 	u16 lines_per_frame;
+ 	u8 fps;
+-	u8 *otp_data;
++	struct ov8858_otp_struct otp;
++
+ 	/* Prevent the framerate from being lowered in low light scenes. */
+ 	int limit_exposure_flag;
+ 	bool hflip;
+-- 
+1.9.1
+

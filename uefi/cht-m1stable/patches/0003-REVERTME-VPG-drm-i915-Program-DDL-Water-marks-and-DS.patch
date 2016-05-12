@@ -1,0 +1,819 @@
+From a09685b40b1f5010e9806f6d071790de67a376c4 Mon Sep 17 00:00:00 2001
+Message-Id: <a09685b40b1f5010e9806f6d071790de67a376c4.1417465742.git.chang-joon.lee@intel.com>
+In-Reply-To: <664d811e547fec51f0453c5acda92012de288ecd.1417465742.git.chang-joon.lee@intel.com>
+References: <664d811e547fec51f0453c5acda92012de288ecd.1417465742.git.chang-joon.lee@intel.com>
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Tue, 23 Sep 2014 22:39:31 +0530
+Subject: [PATCH 03/11] REVERTME [VPG]: drm/i915: Program DDL, Water marks and
+ DSPARB as per atomicity
+
+DDL register is a single buffer register, hence any write to the
+register will get into affect immediately. So during calculation if
+there is a change in the calculated ddl value then write a value of '0'
+to the DDL register and program the proper calculated value on the next
+vblank, i.e in the flip done interrupt handler. Display arbitration control
+register is programmed as per atomicity. REVERTME as some more changes need
+to be done.
+
+Issue: GMIN-2035
+Change-Id: I459c46602297346418cb85c35779d3ec3a3e3071
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Signed-off-by: Vijay Purushothaman <vijay.a.purushothaman@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+Signed-off-by: Sangani, Suryanarayana R <suryanarayana.r.sangani@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    4 -
+ drivers/gpu/drm/i915/i915_irq.c      |   20 +--
+ drivers/gpu/drm/i915/i915_reg.h      |   16 +--
+ drivers/gpu/drm/i915/intel_display.c |   81 +++++++++---
+ drivers/gpu/drm/i915/intel_drv.h     |   14 ++-
+ drivers/gpu/drm/i915/intel_pm.c      |  230 ++++------------------------------
+ drivers/gpu/drm/i915/intel_sprite.c  |   75 ++++++++---
+ 7 files changed, 173 insertions(+), 267 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 6beb167..fc0ab99 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1486,9 +1486,6 @@ struct i915_dpst_registers {
+ #define DL_PRIMARY_MASK 0x000000ff
+ #define DL_SPRITEA_MASK 0x0000ff00
+ #define DL_SPRITEB_MASK 0x00ff0000
+-#define BPP_CHANGED_PRIMARY (1 << 24)
+-#define BPP_CHANGED_SPRITEA (1 << 25)
+-#define BPP_CHANGED_SPRITEB (1 << 26)
+ #define VLV_PLANES_PER_PIPE 4
+ #define VLV_UPDATEPLANE_STAT_PRIM_PER_PIPE(pipe) \
+ 	(1 << (VLV_PLANES_PER_PIPE * (pipe)))
+@@ -1657,7 +1654,6 @@ struct drm_i915_private {
+ 	bool csc_enabled;
+ 	bool gamma_enabled;
+ 	bool is_resuming;
+-	uint32_t pf_change_status[I915_MAX_PIPES];
+ 
+ 	/* Indicates currently enabled planes */
+ 	unsigned int plane_stat;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index bebfc68..422c112 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2096,26 +2096,8 @@ static void valleyview_pipestat_irq_handler(struct drm_device *dev, u32 iir)
+ 	spin_unlock(&dev_priv->irq_lock);
+ 
+ 	for_each_pipe(pipe) {
+-		if (pipe_stats[pipe] & PIPE_START_VBLANK_INTERRUPT_STATUS) {
+-			if (dev_priv->pf_change_status[pipe] &
+-					BPP_CHANGED_PRIMARY)
+-				I915_WRITE_BITS(VLV_DDL(pipe),
+-					dev_priv->pf_change_status[pipe],
+-						DL_PRIMARY_MASK);
+-			else if (dev_priv->pf_change_status[pipe] &
+-					BPP_CHANGED_SPRITEA)
+-				I915_WRITE_BITS(VLV_DDL(pipe),
+-					dev_priv->pf_change_status[pipe],
+-						DL_SPRITEA_MASK);
+-			else if (dev_priv->pf_change_status[pipe] &
+-					BPP_CHANGED_SPRITEB)
+-				I915_WRITE_BITS(VLV_DDL(pipe),
+-					dev_priv->pf_change_status[pipe],
+-						DL_SPRITEB_MASK);
+-			dev_priv->pf_change_status[pipe] = 0x0;
++		if (pipe_stats[pipe] & PIPE_START_VBLANK_INTERRUPT_STATUS)
+ 			intel_pipe_handle_vblank(dev, pipe);
+-		}
+-
+ 		if (pipe_stats[pipe] & PLANE_FLIP_DONE_INT_STATUS_VLV) {
+ 			crtc = intel_get_crtc_for_pipe(dev, pipe);
+ 			intel_crtc = to_intel_crtc(crtc);
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 4afb451..484722a 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -3977,13 +3977,14 @@ enum punit_power_well {
+ #define   DPINVGTT_STATUS_MASK			0xff
+ #define   DPINVGTT_STATUS_MASK_CHV		0xfff
+ 
+-#define DSPARB			0x70030
+-#define   DSPARB_CSTART_MASK	(0x7f << 7)
+-#define   DSPARB_CSTART_SHIFT	7
+-#define   DSPARB_BSTART_MASK	(0x7f)
+-#define   DSPARB_BSTART_SHIFT	0
+-#define   DSPARB_BEND_SHIFT	9 /* on 855 */
+-#define   DSPARB_AEND_SHIFT	0
++#define	DSPARB	(dev_priv->info.display_mmio_offset + 0x70030)
++#define	DSPARB_VLV_DEFAULT	0xc080c080
++#define	DSPARB_CSTART_MASK	(0x7f << 7)
++#define	DSPARB_CSTART_SHIFT	7
++#define	DSPARB_BSTART_MASK	(0x7f)
++#define	DSPARB_BSTART_SHIFT	0
++#define	DSPARB_BEND_SHIFT	9 /* on 855 */
++#define	DSPARB_AEND_SHIFT	0
+ 
+ #define DSPFW1			(dev_priv->info.display_mmio_offset + 0x70034)
+ #define   DSPFW_SR_SHIFT	23
+@@ -4057,6 +4058,7 @@ enum punit_power_well {
+ #define DDL_SPRITEB_PRECISION_H		(1<<23)
+ #define DDL_SPRITEB_PRECISION_L		(0<<23)
+ #define DDL_SPRITEA_SHIFT	8
++
+ #define DDL_PLANEA_PRECISION_H		(1<<7)
+ #define DDL_PLANEA_PRECISION_L		(0<<7)
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 5591486..fc671a96 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2482,6 +2482,36 @@ static void intel_find_plane_obj(struct intel_crtc *intel_crtc,
+ 	}
+ }
+ 
++static void vlv_update_watermarks(struct drm_i915_private *dev_priv)
++{
++	I915_WRITE(DSPFW1,
++		   (DSPFW_SR_VAL << DSPFW_SR_SHIFT) |
++		   (DSPFW_CURSORB_VAL << DSPFW_CURSORB_SHIFT) |
++		   (DSPFW_PLANEB_VAL << DSPFW_PLANEB_SHIFT) |
++		   DSPFW_PLANEA_VAL);
++	I915_WRITE(DSPFW2,
++		   (DSPFW2_RESERVED) |
++		   (DSPFW_CURSORA_VAL << DSPFW_CURSORA_SHIFT) |
++		   DSPFW_PLANEC_VAL);
++	I915_WRITE(DSPFW3,
++		   (I915_READ(DSPFW3) & ~DSPFW_CURSOR_SR_MASK) |
++		   (DSPFW3_VLV));
++	I915_WRITE(DSPFW4, (DSPFW4_SPRITEB_VAL << DSPFW4_SPRITEB_SHIFT) |
++			(DSPFW4_CURSORA_VAL << DSPFW4_CURSORA_SHIFT) |
++			DSPFW4_SPRITEA_VAL);
++	POSTING_READ(DSPFW4);
++	I915_WRITE(DSPFW5, (DSPFW5_DISPLAYB_VAL << DSPFW5_DISPLAYB_SHIFT) |
++			(DSPFW5_DISPLAYA_VAL << DSPFW5_DISPLAYA_SHIFT) |
++			(DSPFW5_CURSORB_VAL << DSPFW5_CURSORB_SHIFT) |
++			DSPFW5_CURSORSR_VAL);
++	I915_WRITE(DSPFW6, DSPFW6_DISPLAYSR_VAL);
++	I915_WRITE(DSPFW7, (DSPFW7_SPRITED1_VAL << DSPFW7_SPRITED1_SHIFT) |
++			(DSPFW7_SPRITED_VAL << DSPFW7_SPRITED_SHIFT) |
++			(DSPFW7_SPRITEC1_VAL << DSPFW7_SPRITEC1_SHIFT) |
++			DSPFW7_SPRITEC_VAL);
++	I915_WRITE(DSPARB, DSPARB_VLV_DEFAULT);
++}
++
+ int i915_set_plane_180_rotation(struct drm_device *dev, void *data,
+ 				struct drm_file *file)
+ {
+@@ -2542,23 +2572,24 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct intel_framebuffer *intel_fb;
+ 	struct drm_i915_gem_object *obj;
++	struct drm_display_mode *mode = &intel_crtc->config.requested_mode;
+ 	int plane = intel_crtc->plane;
+ 	int pipe = intel_crtc->pipe;
+ 	unsigned long linear_offset;
+ 	bool rotate = false;
+ 	u32 dspcntr;
+ 	u32 reg;
++	u32 mask;
+ 	int pixel_size;
+-	struct drm_display_mode *mode = &intel_crtc->config.requested_mode;
++	int plane_ddl, plane_prec_multi;
+ 
+ 	pixel_size = drm_format_plane_cpp(fb->pixel_format, 0);
+ 	intel_fb = to_intel_framebuffer(fb);
+ 	obj = intel_fb->obj;
+ 
+-	if (intel_crtc->last_pixel_size < pixel_size)
++	if (!dev_priv->atomic_update)
+ 		intel_update_watermarks(crtc);
+ 
+-
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+ 	if (IS_VALLEYVIEW(dev) && intel_pipe_has_type(crtc,
+ 		INTEL_OUTPUT_HDMI)) {
+@@ -2705,6 +2736,24 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 		dev_priv->vblcount =
+ 			atomic_read(&dev->vblank[intel_crtc->pipe].count);
+ 	}
++
++	/*
++	 * calculate the DDL and set to 0 is there is a change. Else cache
++	 * the value and wrrite on next vblank.
++	 */
++	mask = 0x000000ff;
++	vlv_calculate_ddl(crtc, pixel_size, &plane_prec_multi, &plane_ddl);
++	plane_ddl = plane_prec_multi | (plane_ddl);
++
++	intel_crtc->reg_ddl.plane_ddl = plane_ddl;
++	intel_crtc->reg_ddl.plane_ddl_mask = mask;
++	if (((plane_ddl & mask) != (I915_READ(VLV_DDL(pipe)) & mask)) ||
++			!(dspcntr & DISPLAY_PLANE_ENABLE)) {
++		I915_WRITE_BITS(VLV_DDL(pipe), 0x00, mask);
++		if (!(dspcntr & DISPLAY_PLANE_ENABLE))
++			intel_crtc->reg_ddl.plane_ddl = 0;
++	}
++
+ 	intel_crtc->reg.cntr = dspcntr;
+ 	if (!dev_priv->atomic_update)
+ 		I915_WRITE(reg, intel_crtc->reg.cntr);
+@@ -2760,12 +2809,8 @@ static void i9xx_update_primary_plane(struct drm_crtc *crtc,
+ 		I915_WRITE(DSPADDR(plane), i915_gem_obj_ggtt_offset(obj) + linear_offset);
+ 	POSTING_READ(reg);
+ 
+-	if (intel_crtc->last_pixel_size > pixel_size) {
+-		dev_priv->pf_change_status[plane] |= BPP_CHANGED_PRIMARY;
++	if (!dev_priv->atomic_update)
+ 		intel_update_watermarks(crtc);
+-	}
+-
+-	intel_crtc->last_pixel_size = pixel_size;
+ }
+ 
+ static void ironlake_update_primary_plane(struct drm_crtc *crtc,
+@@ -4547,6 +4592,7 @@ static void ironlake_crtc_enable(struct drm_crtc *crtc)
+ 	intel_crtc_load_lut(crtc);
+ 
+ 	intel_update_watermarks(crtc);
++
+ 	intel_enable_pipe(intel_crtc);
+ 
+ 	if (intel_crtc->config.has_pch_encoder)
+@@ -5270,7 +5316,10 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
+ 
+ 	intel_crtc_load_lut(crtc);
+ 
+-	intel_update_watermarks(crtc);
++	if (!dev_priv->atomic_update)
++		intel_update_watermarks(crtc);
++	else
++		vlv_update_watermarks(dev_priv);
+ 
+ 	if (IS_VALLEYVIEW(dev) &&
+ 			intel_pipe_has_type(crtc, INTEL_OUTPUT_HDMI)) {
+@@ -5470,7 +5519,8 @@ static void i9xx_crtc_disable(struct drm_crtc *crtc)
+ 		intel_set_cpu_fifo_underrun_reporting(dev, pipe, false);
+ 
+ 	intel_crtc->active = false;
+-	intel_update_watermarks(crtc);
++	if (!dev_priv->atomic_update)
++		intel_update_watermarks(crtc);
+ 
+ 	/*Reset lane for VLV platform*/
+ 	if (IS_VALLEYVIEW(dev)) {
+@@ -9663,6 +9713,13 @@ static void do_intel_finish_page_flip(struct drm_device *dev,
+ 		return;
+ 	}
+ 
++	/* Program the precalculated DDL value */
++	if (intel_crtc->reg_ddl.plane_ddl) {
++		I915_WRITE_BITS(VLV_DDL(intel_crtc->pipe),
++				intel_crtc->reg_ddl.plane_ddl,
++				intel_crtc->reg_ddl.plane_ddl_mask);
++		intel_crtc->reg_ddl.plane_ddl = 0;
++	}
+ 	/* and that the unpin work is consistent wrt ->pending. */
+ 	smp_rmb();
+ 
+@@ -12451,7 +12508,6 @@ static void intel_crtc_init(struct drm_device *dev, int pipe)
+ 	intel_crtc->primary_alpha = true;
+ 	intel_crtc->sprite0_alpha = true;
+ 	intel_crtc->sprite1_alpha = true;
+-	intel_crtc->last_pixel_size = 0;
+ 	intel_crtc->rotate180 = false;
+ 	/* Flag for wake from sleep */
+ 	dev_priv->is_resuming = false;
+@@ -13238,9 +13294,6 @@ void intel_modeset_init(struct drm_device *dev)
+ 					      pipe_name(pipe), sprite_name(pipe, sprite), ret);
+ 		}
+ 	}
+-	memset(&dev_priv->pf_change_status, 0,
+-			sizeof(dev_priv->pf_change_status));
+-
+ 	intel_init_dpio(dev);
+ 
+ 	intel_cpu_pll_init(dev);
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 7f2164d..44273bb 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -387,6 +387,15 @@ struct intel_disp_reg {
+ 	u32 spbcntr;
+ };
+ 
++struct intel_ddl_reg {
++	u32 plane_ddl;
++	u32 plane_ddl_mask;
++	u32 spritea_ddl;
++	u32 spritea_ddl_mask;
++	u32 spriteb_ddl;
++	u32 spriteb_ddl_mask;
++};
++
+ struct intel_crtc {
+ 	struct drm_crtc base;
+ 	enum pipe pipe;
+@@ -453,6 +462,7 @@ struct intel_crtc {
+ 	/* panel fitter status flag */
+ 	bool	pfit_en_status;
+ 	struct intel_disp_reg reg;
++	struct intel_ddl_reg reg_ddl;
+ 
+ 	/* per-pipe watermark state */
+ 	struct {
+@@ -492,7 +502,6 @@ struct intel_plane {
+ 	unsigned int crtc_w, crtc_h;
+ 	uint32_t src_x, src_y;
+ 	uint32_t src_w, src_h;
+-	int last_pixel_size;
+ 	bool last_plane_state;
+ 
+ 	/* Since we need to change the watermarks before/after
+@@ -1120,5 +1129,6 @@ void intel_update_maxfifo(struct drm_i915_private *dev_priv);
+ extern void intel_unpin_work_fn(struct work_struct *__work);
+ extern void intel_unpin_sprite_work_fn(struct work_struct *__work);
+ extern bool intel_pipe_has_type(struct drm_crtc *crtc, int type);
+-
++bool vlv_calculate_ddl(struct drm_crtc *crtc, int pixel_size,
++	int *prec_multi, int *ddl);
+ #endif /* __INTEL_DRV_H__ */
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 29f9979..bb4beadb 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -661,7 +661,8 @@ static void intel_drrs_work_fn(struct work_struct *__work)
+ 	intel_dp_set_drrs_state(work->crtc->dev,
+ 		dev_priv->drrs.connector->panel.downclock_mode->vrefresh);
+ 
+-	intel_update_watermarks(work->crtc);
++	if (!dev_priv->atomic_update)
++		intel_update_watermarks(work->crtc);
+ }
+ 
+ static void intel_cancel_drrs_work(struct drm_i915_private *dev_priv)
+@@ -719,8 +720,10 @@ void intel_disable_drrs(struct drm_device *dev)
+ 
+ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
+ 		if (crtc) {
+-			if (intel_pipe_has_type(crtc, INTEL_OUTPUT_EDP))
+-				intel_update_watermarks(crtc);
++			if (intel_pipe_has_type(crtc, INTEL_OUTPUT_EDP)) {
++				if (!dev_priv->atomic_update)
++					intel_update_watermarks(crtc);
++			}
+ 		}
+ 	}
+ }
+@@ -1487,8 +1490,7 @@ static bool g4x_compute_srwm(struct drm_device *dev,
+ }
+ 
+ 
+-static bool vlv_get_dl(struct drm_device *dev,
+-				struct drm_crtc *crtc,
++bool vlv_calculate_ddl(struct drm_crtc *crtc,
+ 				int pixel_size,
+ 				int *plane_prec_mult,
+ 				int *dl) {
+@@ -1496,9 +1498,18 @@ static bool vlv_get_dl(struct drm_device *dev,
+ 	int clock;
+ 	int h_precision;
+ 	int l_precision;
++	struct drm_device *dev = crtc->dev;
+ 
+ 	clock = to_intel_crtc(crtc)->config.adjusted_mode.crtc_clock;
+ 
++	/*
++	 * WAR (FIXME):
++	 * Sometimes in the resume path adjusted_mode clock is 0
++	 * Needs to be fixed - TODO
++	 */
++	if (clock == 0)
++		clock = crtc->mode.clock;
++
+ 	if (IS_CHERRYVIEW(dev)) {
+ 		h_precision = 32;
+ 		l_precision = 16;
+@@ -1510,10 +1521,14 @@ static bool vlv_get_dl(struct drm_device *dev,
+ 	if (!intel_crtc_active(crtc))
+ 		return false;
+ 
+-	*plane_prec_mult = h_precision;
++	/*
++	 * DDL_PLANEA_PRECISION_H,
++	 * DDL_PLANEB_PRECISION_H all have same values (1 << 7)
++	 */
++	*plane_prec_mult = DDL_PLANEA_PRECISION_H;
+ 	*dl = (64 * h_precision * 4 * 1000) / (clock * pixel_size);
+ 	if (*dl > 127) {
+-		*plane_prec_mult = l_precision;
++		*plane_prec_mult = DDL_PLANEA_PRECISION_L;
+ 		*dl = (64 * l_precision * 4 * 1000) / (clock * pixel_size);
+ 	}
+ 
+@@ -1525,153 +1540,6 @@ static bool vlv_get_dl(struct drm_device *dev,
+ 	return true;
+ }
+ 
+-static bool vlv_compute_drain_latency(struct drm_device *dev,
+-				int pipe,
+-				int *plane_prec_mult,
+-				int *plane_dl,
+-				int *cursor_prec_mult,
+-				int *cursor_dl,
+-				int *sprite_prec_mult, int *sprite_dl,
+-				int sprite_pixel_size,
+-				struct vlv_MA_component_enabled enable)
+-{
+-	struct drm_crtc *crtc;
+-	bool latencyprogrammed = false;
+-
+-	crtc = intel_get_crtc_for_pipe(dev, pipe);
+-	if (!intel_crtc_active(crtc))
+-		return false;
+-
+-	/* VESA DOT Clock */
+-	if (enable.plane_enabled) {
+-		vlv_get_dl(dev, crtc, crtc->primary->fb->bits_per_pixel / 8,
+-						plane_prec_mult, plane_dl);
+-		latencyprogrammed = true;
+-	}
+-
+-	if (enable.cursor_enabled) {
+-		/* BPP is always 4 for cursor */
+-		vlv_get_dl(dev, crtc, 4, cursor_prec_mult, cursor_dl);
+-		latencyprogrammed = true;
+-	}
+-
+-	if (enable.sprite_enabled) {
+-		vlv_get_dl(dev, crtc, sprite_pixel_size,
+-					sprite_prec_mult, sprite_dl);
+-		latencyprogrammed = true;
+-	}
+-
+-	return latencyprogrammed;
+-}
+-
+-static void vlv_update_drain_latency(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	int planea_prec = 0, planea_dl = 0, planeb_prec = 0, planeb_dl = 0;
+-	int cursora_prec = 0, cursora_dl = 0, cursorb_prec = 0, cursorb_dl = 0;
+-	int plane_prec_mult = 0, cursor_prec_mult = 0;
+-	/* Precision multiplier is either 64 or 32 */
+-	struct vlv_MA_component_enabled enable;
+-
+-	enable.plane_enabled = is_plane_enabled(dev_priv, 0);
+-	enable.cursor_enabled = false;
+-	enable.sprite_enabled = false;
+-
+-	/* For plane A */
+-	if (vlv_compute_drain_latency(dev, 0, &plane_prec_mult,
+-		&planea_dl, NULL, NULL, NULL, NULL, 0, enable)) {
+-
+-		if (IS_CHERRYVIEW(dev))
+-			planea_prec = (plane_prec_mult ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-					DDL_PLANEA_PRECISION_H :
+-					DDL_PLANEA_PRECISION_L;
+-		else
+-			planea_prec = (plane_prec_mult ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-					DDL_PLANEA_PRECISION_L :
+-					DDL_PLANEA_PRECISION_H;
+-
+-		if (dev_priv->pf_change_status[PIPE_A] & BPP_CHANGED_PRIMARY) {
+-			dev_priv->pf_change_status[PIPE_A] |=
+-				(planea_prec | planea_dl);
+-		} else {
+-			I915_WRITE_BITS(VLV_DDL1, planea_prec | planea_dl,
+-				0x000000ff);
+-		}
+-	} else
+-		I915_WRITE_BITS(VLV_DDL1, 0x0000, 0x000000ff);
+-
+-	/* Cursor A */
+-	enable.plane_enabled = false;
+-	enable.cursor_enabled = is_cursor_enabled(dev_priv, 0);
+-
+-	if (vlv_compute_drain_latency(dev, 0, NULL, NULL, &cursor_prec_mult,
+-			&cursora_dl, NULL, NULL, 0, enable)) {
+-		if (IS_CHERRYVIEW(dev))
+-			cursora_prec = (cursor_prec_mult ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-					DDL_CURSORA_PRECISION_H :
+-					DDL_CURSORA_PRECISION_L;
+-		else
+-			cursora_prec = (cursor_prec_mult ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-					DDL_CURSORA_PRECISION_L :
+-					DDL_CURSORA_PRECISION_H;
+-
+-		I915_WRITE_BITS(VLV_DDL1, cursora_prec |
+-			(cursora_dl << DDL_CURSORA_SHIFT), 0xff000000);
+-	} else
+-		I915_WRITE_BITS(VLV_DDL1, 0x0000, 0xff000000);
+-
+-	/* For plane B */
+-	enable.plane_enabled = is_plane_enabled(dev_priv, 1);
+-	enable.cursor_enabled = false;
+-	if (vlv_compute_drain_latency(dev, 1, &plane_prec_mult,
+-		&planeb_dl, NULL, NULL, NULL, NULL, 0, enable)) {
+-
+-		if (IS_CHERRYVIEW(dev))
+-			planeb_prec = (plane_prec_mult ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-					DDL_PLANEB_PRECISION_H :
+-					DDL_PLANEB_PRECISION_L;
+-		else
+-			planeb_prec = (plane_prec_mult ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-					DDL_PLANEB_PRECISION_L :
+-					DDL_PLANEB_PRECISION_H;
+-		if (dev_priv->pf_change_status[PIPE_B] & BPP_CHANGED_PRIMARY) {
+-			dev_priv->pf_change_status[PIPE_B] |=
+-				(planeb_prec | planeb_dl);
+-		} else {
+-			I915_WRITE_BITS(VLV_DDL2, planeb_prec |
+-					planeb_dl, 0x000000ff);
+-		}
+-	} else
+-		I915_WRITE_BITS(VLV_DDL2, 0x0000, 0x000000ff);
+-
+-	/* Cursor B */
+-	enable.plane_enabled = false;
+-	enable.cursor_enabled = is_cursor_enabled(dev_priv, 1);
+-	if (vlv_compute_drain_latency(dev, 1, NULL, NULL, &cursor_prec_mult,
+-			&cursorb_dl, NULL, NULL, 0, enable)) {
+-		if (IS_CHERRYVIEW(dev))
+-			cursorb_prec = (cursor_prec_mult ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-					DDL_CURSORB_PRECISION_H :
+-					DDL_CURSORB_PRECISION_L;
+-		else
+-			cursorb_prec = (cursor_prec_mult ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-					DDL_CURSORB_PRECISION_L :
+-					DDL_CURSORB_PRECISION_H;
+-
+-		I915_WRITE_BITS(VLV_DDL2, cursorb_prec | (cursorb_dl <<
+-				DDL_CURSORB_SHIFT), 0xff000000);
+-	} else
+-		I915_WRITE_BITS(VLV_DDL2, 0x0000, 0xff000000);
+-}
+-
+ #define single_plane_enabled(mask) is_power_of_2(mask)
+ 
+ void intel_update_maxfifo(struct drm_i915_private *dev_priv)
+@@ -1717,7 +1585,6 @@ static void valleyview_update_wm(struct drm_crtc *crtc)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int planea_wm, planeb_wm, cursora_wm, cursorb_wm;
+ 	unsigned int enabled = 0;
+-	vlv_update_drain_latency(dev);
+ 
+ 	if (g4x_compute_wm0(dev, PIPE_A,
+ 			    &valleyview_wm_info, latency_ns,
+@@ -1748,6 +1615,7 @@ static void valleyview_update_wm(struct drm_crtc *crtc)
+ 			(DSPFW5_CURSORB_VAL << DSPFW5_CURSORB_SHIFT) |
+ 			DSPFW5_CURSORSR_VAL);
+ 	I915_WRITE(DSPFW6, DSPFW6_DISPLAYSR_VAL);
++	I915_WRITE(DSPARB, DSPARB_VLV_DEFAULT);
+ }
+ 
+ static void g4x_update_wm(struct drm_crtc *crtc)
+@@ -3228,64 +3096,12 @@ static void valleyview_update_sprite_wm(struct drm_plane *plane,
+ {
+ 	struct drm_device *dev = plane->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_plane *intel_plane = to_intel_plane(plane);
+-	int sprite_prec = 0, sprite_dl = 0;
+-	int sprite_prec_mult = 0;
+-	u32 mask, shift;
+ 	struct vlv_MA_component_enabled enable;
+ 
+ 	enable.plane_enabled = false;
+ 	enable.cursor_enabled = false;
+ 	enable.sprite_enabled = enabled;
+ 
+-	if (intel_plane->plane == 0) {
+-		mask = 0x0000ff00;
+-		shift = DDL_SPRITEA_SHIFT;
+-	} else {
+-		mask = 0x00ff0000;
+-		shift = DDL_SPRITEB_SHIFT;
+-	}
+-
+-	if (enabled && vlv_compute_drain_latency(dev, intel_plane->pipe,
+-				NULL, NULL, NULL, NULL, &sprite_prec_mult,
+-				&sprite_dl, pixel_size, enable)) {
+-
+-		if (intel_plane->plane == 0)
+-			if (IS_CHERRYVIEW(dev))
+-				sprite_prec = (sprite_prec_mult ==
+-						DRAIN_LATENCY_PRECISION_32) ?
+-						DDL_SPRITEA_PRECISION_H :
+-						DDL_SPRITEA_PRECISION_L;
+-			else
+-				sprite_prec = (sprite_prec_mult ==
+-						DRAIN_LATENCY_PRECISION_32) ?
+-						DDL_SPRITEA_PRECISION_L :
+-						DDL_SPRITEA_PRECISION_H;
+-
+-		else
+-			if (IS_CHERRYVIEW(dev))
+-				sprite_prec = (sprite_prec_mult ==
+-						DRAIN_LATENCY_PRECISION_32) ?
+-						DDL_SPRITEB_PRECISION_H :
+-						DDL_SPRITEB_PRECISION_L;
+-			else
+-				sprite_prec = (sprite_prec_mult ==
+-						DRAIN_LATENCY_PRECISION_32) ?
+-						DDL_SPRITEB_PRECISION_L :
+-						DDL_SPRITEB_PRECISION_H;
+-
+-
+-		if (dev_priv->pf_change_status[intel_plane->pipe] &
+-			(BPP_CHANGED_SPRITEA | BPP_CHANGED_SPRITEB)) {
+-			dev_priv->pf_change_status[intel_plane->pipe] |=
+-					(sprite_prec | (sprite_dl << shift));
+-		} else {
+-			I915_WRITE_BITS(VLV_DDL(intel_plane->pipe),
+-				sprite_prec | (sprite_dl << shift), mask);
+-		}
+-	} else
+-		I915_WRITE_BITS(VLV_DDL(intel_plane->pipe), 0x00, mask);
+-
+ 	I915_WRITE(DSPFW4, (DSPFW4_SPRITEB_VAL << DSPFW4_SPRITEB_SHIFT) |
+ 			(DSPFW4_CURSORA_VAL << DSPFW4_CURSORA_SHIFT) |
+ 			DSPFW4_SPRITEA_VAL);
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 93ec310..0da5945 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -134,6 +134,7 @@ static void intel_update_primary_plane(struct drm_plane *dplane,
+ 	int plane = intel_crtc->plane;
+ 	int pipe = intel_crtc->pipe;
+ 	struct intel_plane *intel_plane = to_intel_plane(dplane);
++	int mask = 0x000000ff;
+ 
+ 	if (intel_crtc->primary_enabled) {
+ 		intel_crtc->reg.cntr = I915_READ(dspreg) | DISPLAY_PLANE_ENABLE;
+@@ -162,6 +163,7 @@ static void intel_update_primary_plane(struct drm_plane *dplane,
+ 		}
+ 		dev_priv->plane_stat &=
+ 				~VLV_UPDATEPLANE_STAT_PRIM_PER_PIPE(pipe);
++		I915_WRITE_BITS(VLV_DDL(pipe), 0x00, mask);
+ 	}
+ }
+ 
+@@ -415,6 +417,8 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	struct drm_display_mode *mode = &intel_crtc->config.requested_mode;
+ 	u32 start_vbl_count;
+ 	bool atomic_update = false;
++	int sprite_ddl, sp_prec_multi;
++	u32 mask, shift;
+ 
+ 	sprctl = I915_READ(SPCNTR(pipe, plane));
+ 
+@@ -525,7 +529,7 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	 */
+ 	intel_update_drrs(dev);
+ 
+-	if (intel_plane->last_pixel_size < pixel_size) {
++	if (!dev_priv->atomic_update) {
+ 		intel_update_sprite_watermarks(dplane, crtc, src_w, pixel_size,
+ 				true, src_w != crtc_w || src_h != crtc_h);
+ 	}
+@@ -626,6 +630,32 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 		dev_priv->vblcount =
+ 			atomic_read(&dev->vblank[intel_crtc->pipe].count);
+ 	}
++
++	/*
++	 * calculate the DDL and set to 0 is there is a change. Else cache
++	 * the value and wrrite on next vblank.
++	 */
++	if (intel_plane->plane == 0) {
++		mask = 0x0000ff00;
++		shift = DDL_SPRITEA_SHIFT;
++	} else {
++		mask = 0x00ff0000;
++		shift = DDL_SPRITEB_SHIFT;
++	}
++
++	vlv_calculate_ddl(crtc, pixel_size, &sp_prec_multi, &sprite_ddl);
++	sprite_ddl = (sp_prec_multi | sprite_ddl) << shift;
++
++	if (intel_plane->plane) {
++		intel_crtc->reg_ddl.spriteb_ddl = sprite_ddl;
++		intel_crtc->reg_ddl.spriteb_ddl_mask = mask;
++	} else {
++		intel_crtc->reg_ddl.spritea_ddl = sprite_ddl;
++		intel_crtc->reg_ddl.spritea_ddl_mask = mask;
++	}
++	if ((sprite_ddl & mask) != (I915_READ(VLV_DDL(pipe)) & mask))
++		I915_WRITE_BITS(VLV_DDL(pipe), 0x00, mask);
++
+ 	intel_plane->reg.cntr = sprctl;
+ 	intel_plane->reg.surf |= i915_gem_obj_ggtt_offset(obj) + sprsurf_offset;
+ 	if (!dev_priv->atomic_update) {
+@@ -644,16 +674,9 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	if (event == NULL)
+ 		POSTING_READ(SPSURF(pipe, plane));
+ 
+-	if (intel_plane->last_pixel_size > pixel_size) {
+-		if (plane == PLANE_A)
+-			dev_priv->pf_change_status[pipe] |= BPP_CHANGED_SPRITEA;
+-		else
+-			dev_priv->pf_change_status[pipe] |= BPP_CHANGED_SPRITEB;
+-
++	if (!dev_priv->atomic_update)
+ 		intel_update_sprite_watermarks(dplane, crtc, src_w, pixel_size,
+ 				true, src_w != crtc_w || src_h != crtc_h);
+-	}
+-	intel_plane->last_pixel_size = pixel_size;
+ 
+ 	if (!dev_priv->atomic_update) {
+ 		if (atomic_update)
+@@ -672,6 +695,7 @@ vlv_disable_plane(struct drm_plane *dplane, struct drm_crtc *crtc)
+ 	int plane = intel_plane->plane;
+ 	u32 start_vbl_count;
+ 	bool atomic_update = false;
++	u32 mask, shift;
+ 
+ 	if (!dev_priv->atomic_update) {
+ 		atomic_update = intel_pipe_update_start(intel_crtc,
+@@ -700,9 +724,20 @@ vlv_disable_plane(struct drm_plane *dplane, struct drm_crtc *crtc)
+ 			intel_pipe_update_end(intel_crtc, start_vbl_count);
+ 	}
+ 
+-	intel_update_sprite_watermarks(dplane, crtc, 0, 0, false, false);
++	if (!dev_priv->atomic_update)
++		intel_update_sprite_watermarks(dplane,
++			crtc, 0, 0, false, false);
+ 	intel_plane->last_plane_state = INTEL_PLANE_STATE_DISABLED;
+-	intel_plane->last_pixel_size = 0;
++
++	/* set to 0 as the plane is disabled */
++	if (intel_plane->plane == 0) {
++		mask = 0x0000ff00;
++		shift = DDL_SPRITEA_SHIFT;
++	} else {
++		mask = 0x00ff0000;
++		shift = DDL_SPRITEB_SHIFT;
++	}
++	I915_WRITE_BITS(VLV_DDL(pipe), 0x00, mask);
+ }
+ 
+ void intel_prepare_sprite_page_flip(struct drm_device *dev, int plane)
+@@ -736,6 +771,18 @@ void intel_finish_sprite_page_flip(struct drm_device *dev, int pipe)
+ 	if (intel_crtc == NULL)
+ 		return;
+ 
++	/* Program the precalculated DDL value */
++	if (intel_crtc->reg_ddl.spritea_ddl) {
++		I915_WRITE_BITS(VLV_DDL(pipe), intel_crtc->reg_ddl.spritea_ddl,
++			intel_crtc->reg_ddl.spritea_ddl_mask);
++		intel_crtc->reg_ddl.spritea_ddl = 0;
++	}
++	if (intel_crtc->reg_ddl.spriteb_ddl) {
++		I915_WRITE_BITS(VLV_DDL(pipe), intel_crtc->reg_ddl.spriteb_ddl,
++			intel_crtc->reg_ddl.spriteb_ddl_mask);
++		intel_crtc->reg_ddl.spriteb_ddl = 0;
++	}
++
+ 	spin_lock_irqsave(&dev->event_lock, flags);
+ 	work = intel_crtc->sprite_unpin_work;
+ 
+@@ -1195,6 +1242,7 @@ intel_post_enable_primary(struct drm_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->dev;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	/*
+ 	 * BDW signals flip done immediately if the plane
+@@ -1215,7 +1263,8 @@ intel_post_enable_primary(struct drm_crtc *crtc)
+ 	mutex_lock(&dev->struct_mutex);
+ 	intel_update_fbc(dev);
+ 	intel_update_drrs(dev);
+-	intel_update_watermarks(crtc);
++	if (!dev_priv->atomic_update)
++		intel_update_watermarks(crtc);
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
+@@ -1670,7 +1719,6 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 			/* Enable for non-VLV if required */
+ 			if (IS_VALLEYVIEW(dev)) {
+ 				intel_crtc->primary_enabled = false;
+-				intel_crtc->last_pixel_size = 0;
+ 				intel_pre_disable_primary(crtc);
+ 				if (dev_priv->atomic_update)
+ 					intel_update_primary_plane(plane,
+@@ -1983,7 +2031,6 @@ intel_plane_init(struct drm_device *dev, enum pipe pipe, int plane)
+ 	intel_plane->plane = plane;
+ 	intel_plane->rotate180 = false;
+ 	intel_plane->last_plane_state = INTEL_PLANE_STATE_DISABLED;
+-	intel_plane->last_pixel_size = 0;
+ 	possible_crtcs = (1 << pipe);
+ 	ret = drm_plane_init(dev, &intel_plane->base, possible_crtcs,
+ 			     &intel_plane_funcs,
+-- 
+1.7.9.5
+

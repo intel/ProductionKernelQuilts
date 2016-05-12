@@ -1,0 +1,71 @@
+From dbc4620ce412745578db25b7c5b882627c0f626c Mon Sep 17 00:00:00 2001
+From: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Date: Fri, 13 Feb 2015 11:13:12 +0800
+Subject: [PATCH] mmc: host: check power enable bit after set power
+
+Right now seems we need to check the power enable bit for
+Baytrail/Cherrytrail/Broxton after set power for SDHCI host
+controller. This due to the sighting Cherrytrail 5239766
+and BXT 1205373379.
+
+If a SOC doesn't have this kind of issue, this check will be bypassed
+and no additional overhead is involved.
+
+This check right now is added right after the set power, which can
+make it more commone no matter to ACPI enumeration and PCI enumeration.
+
+Also we find that, doing this check after set power can make the checking
+to be finished quickly (observed in Broxton)
+
+Change-Id: Iebdcb458369868839a5d12e0b6f3756b28484caa
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-22272
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+---
+ drivers/mmc/host/sdhci.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index cb8c0c2..faa1706 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -1524,6 +1524,37 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
+ 	else
+ 		vdd_bit = sdhci_set_power(host, ios->vdd);
+ 
++	/*
++	 * some controller is not able to set the power control register
++	 * after resuming from low power mode, and need some cycles to
++	 * make sure the bus power can be turned on.
++	 */
++	if (host->pwr) {
++		u32 timeout = 2000; /* 2s */
++		u8 pwr = sdhci_readb(host, SDHCI_POWER_CONTROL);
++		if (!(pwr & SDHCI_POWER_ON)) {
++			do {
++				pwr |= SDHCI_POWER_ON;
++				sdhci_writeb(host, pwr, SDHCI_POWER_CONTROL);
++				sdhci_readl(host, SDHCI_PRESENT_STATE),
++				spin_unlock_irqrestore(&host->lock, flags);
++				/*
++				 * breaking lock here so we can sleep is ok as
++				 * this happens only on startup and resume code
++				 * paths and the mmc cannot be reentered
++				 */
++				usleep_range(1000, 1100);
++				spin_lock_irqsave(&host->lock, flags);
++				timeout--;
++				pwr = sdhci_readb(host, SDHCI_POWER_CONTROL);
++			} while (!(pwr & SDHCI_POWER_ON) && timeout);
++			if (!timeout)
++				pr_warn("%s %s: bus power is not stable\n",
++						__func__,
++						mmc_hostname(host->mmc));
++		}
++	}
++
+ 	if (host->vmmc && vdd_bit != -1) {
+ 		spin_unlock_irqrestore(&host->lock, flags);
+ 		mmc_regulator_set_ocr(host->mmc, host->vmmc, vdd_bit);
+-- 
+1.9.1
+

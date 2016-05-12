@@ -1,0 +1,382 @@
+From 6cf48516c6bcfce9ada58a97896fd9df4aaef3aa Mon Sep 17 00:00:00 2001
+Message-Id: <6cf48516c6bcfce9ada58a97896fd9df4aaef3aa.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 8 May 2014 15:20:19 +0100
+Subject: [PATCH 47/61] FOR_UPSTREAM [VPG]: drm/i915: Added scheduler
+ statistic reporting to debugfs
+
+It is useful for know what the scheduler is doing for both debugging and
+performance analysis purposes. This change adds a bunch of counters and such
+that keep track of various scheduler operations (batches submitted, completed,
+flush requests, etc.). The data can then be read in userland via the debugfs
+mechanism.
+
+Change-Id: I3266c631cd70c9eeb2c235f88f493e60462f85d7
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c        |   73 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    2 +
+ drivers/gpu/drm/i915/i915_scheduler.c      |   57 ++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.h      |   32 ++++++++++++
+ 4 files changed, 164 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 0854a3f..6799094 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -2951,6 +2951,78 @@ static int i915_wa_registers(struct seq_file *m, void *unused)
+ 	return 0;
+ }
+ 
++static int i915_scheduler_info(struct seq_file *m, void *unused)
++{
++	struct drm_info_node *node = (struct drm_info_node *) m->private;
++	struct drm_device *dev = node->minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct i915_scheduler   *scheduler = dev_priv->scheduler;
++	struct i915_scheduler_stats *stats = scheduler->stats;
++	struct i915_scheduler_stats_nodes node_stats[I915_NUM_RINGS];
++	struct intel_engine_cs *ring;
++	char   str[50 * (I915_NUM_RINGS + 1)], name[50], *ptr;
++	int ret, i, r;
++
++	ret = mutex_lock_interruptible(&dev->mode_config.mutex);
++	if (ret)
++		return ret;
++
++#define PRINT_VAR(name, fmt, var)					\
++	do {								\
++		sprintf(str, "%-22s", name);				\
++		ptr = str + strlen(str);				\
++		for_each_ring(ring, dev_priv, r) {			\
++			sprintf(ptr, " %10" fmt, var);			\
++			ptr += strlen(ptr);				\
++		}							\
++		seq_printf(m, "%s\n", str);				\
++	} while (0)
++
++	PRINT_VAR("Ring name:",             "s", dev_priv->ring[r].name);
++	PRINT_VAR("  Ring seqno",           "d", ring->get_seqno(ring, false));
++	seq_putc(m, '\n');
++
++	seq_puts(m, "Batch submissions:\n");
++	PRINT_VAR("  Queued",               "u", stats[r].queued);
++	PRINT_VAR("  Submitted",            "u", stats[r].submitted);
++	PRINT_VAR("  Completed",            "u", stats[r].completed);
++	PRINT_VAR("  Expired",              "u", stats[r].expired);
++	seq_putc(m, '\n');
++
++	seq_puts(m, "Flush counts:\n");
++	PRINT_VAR("  By object",            "u", stats[r].flush_obj);
++	PRINT_VAR("  By request",           "u", stats[r].flush_req);
++	PRINT_VAR("  Blanket",              "u", stats[r].flush_all);
++	PRINT_VAR("  Entries bumped",       "u", stats[r].flush_bump);
++	PRINT_VAR("  Entries submitted",    "u", stats[r].flush_submit);
++	seq_putc(m, '\n');
++
++	seq_puts(m, "Miscellaneous:\n");
++	PRINT_VAR("  ExecEarly retry",      "u", stats[r].exec_early);
++	PRINT_VAR("  ExecFinal requeue",    "u", stats[r].exec_again);
++	PRINT_VAR("  ExecFinal killed",     "u", stats[r].exec_dead);
++	PRINT_VAR("  Fence wait",           "u", stats[r].fence_wait);
++	PRINT_VAR("  Hung flying",          "u", stats[r].kill_flying);
++	PRINT_VAR("  Hung queued",          "u", stats[r].kill_queued);
++	seq_putc(m, '\n');
++
++	seq_puts(m, "Queue contents:\n");
++	for_each_ring(ring, dev_priv, i)
++		i915_scheduler_query_stats(ring, node_stats + ring->id);
++
++	for (i = 0; i < (i915_sqs_MAX + 1); i++) {
++		sprintf(name, "  %s", i915_scheduler_queue_status_str(i));
++		PRINT_VAR(name, "d", node_stats[r].counts[i]);
++	}
++	seq_putc(m, '\n');
++
++#undef PRINT_VAR
++
++	mutex_unlock(&dev->mode_config.mutex);
++
++	return 0;
++}
++
+ struct pipe_crc_info {
+ 	const char *name;
+ 	struct drm_device *dev;
+@@ -4909,6 +4981,7 @@ static const struct drm_info_list i915_debugfs_list[] = {
+ 	{"i915_runtime_pm_info", i915_runtime_pm_info, 0},
+ 	{"i915_display_info", i915_display_info, 0},
+ 	{"i915_wa_registers", i915_wa_registers, 0},
++	{"i915_scheduler_info", i915_scheduler_info, 0},
+ };
+ #define I915_DEBUGFS_ENTRIES ARRAY_SIZE(i915_debugfs_list)
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 3999426..00df51f 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1784,6 +1784,8 @@ pre_mutex_err:
+ 	if (args->flags & I915_EXEC_REQUEST_FENCE)
+ 		args->rsvd2 = (__u64) -1;
+ 
++	dev_priv->scheduler->stats[ring->id].exec_early++;
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 8785925..a0dca79 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -117,6 +117,9 @@ const char *i915_scheduler_queue_status_str(
+ 	case i915_sqs_dead:
+ 	return "Dead";
+ 
++	case i915_sqs_MAX:
++	return "Invalid";
++
+ 	default:
+ 	break;
+ 	}
+@@ -212,11 +215,13 @@ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe)
+ 		int ret;
+ 
+ 		qe->scheduler_index = scheduler->index++;
++		scheduler->stats[qe->params.ring->id].queued++;
+ 
+ 		trace_i915_scheduler_queue(qe->params.ring, qe);
+ 
+ 		scheduler->flags[qe->params.ring->id] |= i915_sf_submitting;
+ 		ret = dev_priv->gt.do_execfinal(&qe->params);
++		scheduler->stats[qe->params.ring->id].submitted++;
+ 		scheduler->flags[qe->params.ring->id] &= ~i915_sf_submitting;
+ 
+ 		/* Need to release the objects: */
+@@ -245,6 +250,8 @@ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe)
+ 			sync_fence_put(qe->params.fence_wait);
+ #endif
+ 
++		scheduler->stats[qe->params.ring->id].expired++;
++
+ 		return ret;
+ 	}
+ 
+@@ -356,6 +363,8 @@ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe)
+ 		not_flying = i915_scheduler_count_flying(scheduler, ring) <
+ 							 scheduler->min_flying;
+ 
++	scheduler->stats[ring->id].queued++;
++
+ 	trace_i915_scheduler_queue(ring, node);
+ 	trace_i915_scheduler_node_state_change(ring, node);
+ 
+@@ -500,10 +509,12 @@ void i915_scheduler_kill_all(struct drm_device *dev)
+ 
+ 			case I915_SQS_CASE_FLYING:
+ 				i915_scheduler_node_kill(node);
++				scheduler->stats[r].kill_flying++;
+ 			break;
+ 
+ 			case I915_SQS_CASE_QUEUED:
+ 				i915_scheduler_node_kill_queued(node);
++				scheduler->stats[r].kill_queued++;
+ 			break;
+ 
+ 			default:
+@@ -574,6 +585,7 @@ static void i915_scheduler_seqno_complete(struct intel_engine_cs *ring, uint32_t
+ 		/* Node was in flight so mark it as complete. */
+ 		node->status = i915_sqs_complete;
+ 		trace_i915_scheduler_node_state_change(ring, node);
++		scheduler->stats[ring->id].completed++;
+ 		got_changes = true;
+ 	}
+ 
+@@ -689,6 +701,7 @@ static int i915_scheduler_remove(struct intel_engine_cs *ring)
+ 
+ 		list_del(&node->link);
+ 		list_add(&node->link, &remove);
++		scheduler->stats[ring->id].expired++;
+ 
+ 		/* Strip the dependency info while the mutex is still locked */
+ 		i915_scheduler_remove_dependent(scheduler, node);
+@@ -944,6 +957,35 @@ int i915_scheduler_dump_locked(struct intel_engine_cs *ring, const char *msg)
+ 	return 0;
+ }
+ 
++int i915_scheduler_query_stats(struct intel_engine_cs *ring,
++			       struct i915_scheduler_stats_nodes *stats)
++{
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	struct i915_scheduler   *scheduler = dev_priv->scheduler;
++	struct i915_scheduler_queue_entry  *node;
++	unsigned long   flags;
++
++	memset(stats, 0x00, sizeof(*stats));
++
++	spin_lock_irqsave(&scheduler->lock, flags);
++
++	list_for_each_entry(node, &scheduler->node_queue[ring->id], link) {
++		if (node->status >= i915_sqs_MAX) {
++			DRM_DEBUG_DRIVER("Invalid node state: %d! [uniq = %d, seqno = %d]\n",
++					 node->status, node->params.request->uniq, node->params.request->seqno);
++
++			stats->counts[i915_sqs_MAX]++;
++			continue;
++		}
++
++		stats->counts[node->status]++;
++	}
++
++	spin_unlock_irqrestore(&scheduler->lock, flags);
++
++	return 0;
++}
++
+ int i915_scheduler_flush_request(struct drm_i915_gem_request *req,
+ 				 bool is_locked)
+ {
+@@ -980,16 +1022,21 @@ int i915_scheduler_flush_request(struct drm_i915_gem_request *req,
+ 
+ 	spin_lock_irqsave(&scheduler->lock, flags);
+ 
++	scheduler->stats[ring_id].flush_req++;
++
+ 	i915_scheduler_priority_bump_clear(scheduler);
+ 
+ 	flush_count = i915_scheduler_priority_bump(scheduler,
+ 			    req->scheduler_qe, scheduler->priority_level_max);
++	scheduler->stats[ring_id].flush_bump += flush_count;
+ 
+ 	spin_unlock_irqrestore(&scheduler->lock, flags);
+ 
+ 	if (flush_count) {
+ 		DRM_DEBUG_DRIVER("<%s> Bumped %d entries\n", req->ring->name, flush_count);
+ 		flush_count = i915_scheduler_submit_max_priority(req->ring, is_locked);
++		if (flush_count > 0)
++			scheduler->stats[ring_id].flush_submit += flush_count;
+ 	}
+ 
+ 	return flush_count;
+@@ -1016,6 +1063,8 @@ int i915_scheduler_flush(struct intel_engine_cs *ring, bool is_locked)
+ 
+ 	BUG_ON(is_locked && (scheduler->flags[ring->id] & i915_sf_submitting));
+ 
++	scheduler->stats[ring->id].flush_all++;
++
+ 	do {
+ 		found = false;
+ 		spin_lock_irqsave(&scheduler->lock, flags);
+@@ -1030,6 +1079,7 @@ int i915_scheduler_flush(struct intel_engine_cs *ring, bool is_locked)
+ 
+ 		if (found) {
+ 			ret = i915_scheduler_submit(ring, is_locked);
++			scheduler->stats[ring->id].flush_submit++;
+ 			if (ret < 0)
+ 				return ret;
+ 
+@@ -1322,6 +1372,8 @@ static int i915_scheduler_pop_from_queue_locked(struct intel_engine_cs *ring,
+ 		spin_unlock_irqrestore(&scheduler->lock, *flags);
+ 		i915_scheduler_async_fence_wait(ring->dev, fence_wait);
+ 		spin_lock_irqsave(&scheduler->lock, *flags);
++
++		scheduler->stats[ring->id].fence_wait++;
+ #else
+ 		BUG_ON(true);
+ #endif
+@@ -1373,6 +1425,8 @@ int i915_scheduler_submit(struct intel_engine_cs *ring, bool was_locked)
+ 		 * list. So add it back in and mark it as in flight. */
+ 		i915_scheduler_fly_node(node);
+ 
++		scheduler->stats[ring->id].submitted++;
++
+ 		scheduler->flags[ring->id] |= i915_sf_submitting;
+ 		spin_unlock_irqrestore(&scheduler->lock, flags);
+ 		ret = dev_priv->gt.do_execfinal(&node->params);
+@@ -1391,6 +1445,7 @@ int i915_scheduler_submit(struct intel_engine_cs *ring, bool was_locked)
+ 			case ENOENT:
+ 				/* Fatal errors. Kill the node. */
+ 				requeue = -1;
++				scheduler->stats[ring->id].exec_dead++;
+ 			break;
+ 
+ 			case EAGAIN:
+@@ -1400,12 +1455,14 @@ int i915_scheduler_submit(struct intel_engine_cs *ring, bool was_locked)
+ 			case ERESTARTSYS:
+ 			case EINTR:
+ 				/* Supposedly recoverable errors. */
++				scheduler->stats[ring->id].exec_again++;
+ 			break;
+ 
+ 			default:
+ 				DRM_DEBUG_DRIVER("<%s> Got unexpected error from execfinal(): %d!\n",
+ 						 ring->name, ret);
+ 				/* Assume it is recoverable and hope for the best. */
++				scheduler->stats[ring->id].exec_again++;
+ 			break;
+ 			}
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index f530770..fe203be 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -80,6 +80,33 @@ const char *i915_qe_state_str(struct i915_scheduler_queue_entry *node);
+ #define I915_SCHEDULER_FLUSH_REQUEST(req, locked)                           \
+ 	i915_scheduler_flush_request(req, locked)
+ 
++struct i915_scheduler_stats_nodes {
++	uint32_t	counts[i915_sqs_MAX + 1];
++};
++
++struct i915_scheduler_stats {
++	/* Batch buffer counts: */
++	uint32_t            queued;
++	uint32_t            submitted;
++	uint32_t            completed;
++	uint32_t            expired;
++
++	/* Other stuff: */
++	uint32_t            flush_obj;
++	uint32_t            flush_req;
++	uint32_t            flush_all;
++	uint32_t            flush_bump;
++	uint32_t            flush_submit;
++
++	uint32_t            exec_early;
++	uint32_t            exec_again;
++	uint32_t            exec_dead;
++	uint32_t            kill_flying;
++	uint32_t            kill_queued;
++
++	uint32_t            fence_wait;
++};
++
+ struct i915_scheduler {
+ 	struct list_head    node_queue[I915_NUM_RINGS];
+ 	uint32_t            flags[I915_NUM_RINGS];
+@@ -91,6 +118,9 @@ struct i915_scheduler {
+ 	uint32_t            priority_level_preempt;
+ 	uint32_t            min_flying;
+ 	uint32_t            file_queue_max;
++
++	/* Statistics: */
++	struct i915_scheduler_stats     stats[I915_NUM_RINGS];
+ };
+ 
+ /* Flag bits for i915_scheduler::flags */
+@@ -129,6 +159,8 @@ int         i915_scheduler_dump(struct intel_engine_cs *ring,
+ int         i915_scheduler_dump_all(struct drm_device *dev, const char *msg);
+ bool        i915_scheduler_is_request_tracked(struct drm_i915_gem_request *req,
+ 					      bool *completed, bool *busy);
++int         i915_scheduler_query_stats(struct intel_engine_cs *ring,
++				       struct i915_scheduler_stats_nodes *stats);
+ bool        i915_scheduler_file_queue_is_full(struct drm_file *file);
+ 
+ #endif  /* _I915_SCHEDULER_H_ */
+-- 
+1.7.9.5
+

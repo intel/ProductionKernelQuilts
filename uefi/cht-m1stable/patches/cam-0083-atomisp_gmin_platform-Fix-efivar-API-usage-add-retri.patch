@@ -1,0 +1,65 @@
+From 14b611e29261c36adee119f46ed8b3b4665ef9bd Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Tue, 22 Jul 2014 14:13:46 -0700
+Subject: [PATCH 083/117] atomisp_gmin_platform: Fix efivar API usage, add
+ retries
+
+The get_variable call we were using is the raw EFI callback, which
+does no locking and is unsafe.  We're supposed to use
+efivar_entry_get() instead.
+
+Also: on at least current ECS firmware, rapid-fire reads of EFI
+variables fail pseudo-deterministically (i.e. once the variables are
+written, specific reads always fail -- but which reads those are
+change when you reprovision!), but retries with delays work reliably.
+So retry.
+
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ .../x86/platform/intel-mid/atomisp_gmin_platform.c | 23 ++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+index 3f0e95e..d99f7cf 100644
+--- a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
++++ b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+@@ -559,6 +559,7 @@ int gmin_get_config_var(struct device *dev, const char *var, char *out, size_t *
+ 	struct device *adev;
+ 	char var8[CFG_VAR_NAME_MAX];
+ 	unsigned short var16[CFG_VAR_NAME_MAX];
++	struct efivar_entry ev;
+ 	u32 efiattr_dummy;
+ 	int i, j, ret;
+ 	unsigned long efilen;
+@@ -607,8 +608,26 @@ int gmin_get_config_var(struct device *dev, const char *var, char *out, size_t *
+ 	if (!efi.get_variable)
+ 		return -EINVAL;
+ 
+-	ret = efi.get_variable(var16, &GMIN_CFG_VAR_EFI_GUID, &efiattr_dummy,
+-			       &efilen, out);
++	/* Not sure this API usage is kosher; efivar_entry_get()'s
++	 * implementation simply uses VariableName and VendorGuid from
++	 * the struct and ignores the rest, but it seems like there
++	 * ought to be an "official" efivar_entry registered
++	 * somewhere? */
++	memset(&ev, 0, sizeof(ev));
++	memcpy(&ev.var.VariableName, var16, sizeof(var16));
++	ev.var.VendorGuid = GMIN_CFG_VAR_EFI_GUID;
++
++	/* Frustratingly, existing hardware doesn't like seeing EFI
++	 * variable requests arrive in quick succession.  They will
++	 * fail spuriously (but more or less deterministically),
++	 * returning EFI_NOT_FOUND (which becomes -ENOENT as seen
++	 * here) unless we retry with delays. */
++	for (i=0; i<10; i++) {
++		ret = efivar_entry_get(&ev, &efiattr_dummy, &efilen, out);
++		if (!ret)
++			break;
++		msleep(10);
++	}
+ 	*out_len = efilen;
+ 
+ 	return ret == EFI_SUCCESS ? 0 : -EINVAL;
+-- 
+1.9.3
+

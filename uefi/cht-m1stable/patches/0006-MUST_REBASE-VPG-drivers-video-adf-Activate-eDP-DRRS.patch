@@ -1,0 +1,144 @@
+From dbd1bfb0242b6073405d4f89064830d8475469e4 Mon Sep 17 00:00:00 2001
+Message-Id: <dbd1bfb0242b6073405d4f89064830d8475469e4.1425610844.git.chang-joon.lee@intel.com>
+In-Reply-To: <6fa2ab23adf6d7de781e906d04a0224410262d9b.1425610844.git.chang-joon.lee@intel.com>
+References: <6fa2ab23adf6d7de781e906d04a0224410262d9b.1425610844.git.chang-joon.lee@intel.com>
+From: Durgadoss R <durgadoss.r@intel.com>
+Date: Wed, 18 Feb 2015 18:52:24 +0530
+Subject: [PATCH 06/27] MUST_REBASE [VPG]: drivers/video/adf: Activate eDP
+ DRRS
+
+This patch adds methods to activate DRRS in below conditions:
+* disable_drrs: Called during pipeline off and pre_post() before
+                a flip.
+* restart_drrs: Called in on_post() once a flip is completed.
+* init_drrs:    DRRS framework calls eDP DRRS init during
+                boot time. This encoder init in turn calls
+                VLV specific DRRS init.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5760
+Change-Id: I551635824f7a8f6805b30162a905f5de64198639
+Signed-off-by: Durgadoss R <durgadoss.r@intel.com>
+---
+ drivers/video/adf/intel/core/common/dp/edp_drrs.c  |    5 +++++
+ .../video/adf/intel/core/common/dp/gen_dp_pipe.c   |    7 +++++++
+ drivers/video/adf/intel/core/common/intel_drrs.c   |    3 +++
+ drivers/video/adf/intel/core/vlv/vlv_pipeline.c    |    7 +++++--
+ drivers/video/adf/intel/intel_adf.c                |    3 ++-
+ 5 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dp/edp_drrs.c b/drivers/video/adf/intel/core/common/dp/edp_drrs.c
+index 8587930..38c6b19 100644
+--- a/drivers/video/adf/intel/core/common/dp/edp_drrs.c
++++ b/drivers/video/adf/intel/core/common/dp/edp_drrs.c
+@@ -80,6 +80,11 @@ int intel_edp_drrs_init(struct intel_pipeline *pipeline)
+ 		return ret;
+ 	}
+ 
++	if (IS_VALLEYVIEW() || IS_CHERRYVIEW())
++		dp_pipe->drrs.platform_ops = get_vlv_edp_drrs_ops();
++	else
++		dp_pipe->drrs.platform_ops = NULL;
++
+ 	if (!dp_pipe->drrs.platform_ops ||
+ 			!dp_pipe->drrs.platform_ops->init ||
+ 			!dp_pipe->drrs.platform_ops->set_drrs_state) {
+diff --git a/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c b/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c
+index e8d52a5..5ec8080 100644
+--- a/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c
++++ b/drivers/video/adf/intel/core/common/dp/gen_dp_pipe.c
+@@ -16,6 +16,7 @@
+ 
+ #include <drm/i915_adf.h>
+ #include <core/common/dp/gen_dp_pipe.h>
++#include <core/common/intel_drrs.h>
+ #include <core/intel_platform_config.h>
+ #include <intel_adf.h>
+ #include <core/vlv/vlv_dc_config.h>
+@@ -464,6 +465,9 @@ static void dp_pipe_on_post(struct intel_pipe *pipe)
+ 
+ 	/* Re-enable PSR, if possible */
+ 	vlv_edp_psr_update(pipeline);
++
++	/* Resume DRRS */
++	intel_restart_idleness_drrs(pipeline);
+ }
+ 
+ static void dp_pipe_pre_validate(struct intel_pipe *pipe,
+@@ -487,6 +491,9 @@ static void dp_pipe_pre_post(struct intel_pipe *pipe)
+ 	/* Exit eDP PSR */
+ 	vlv_edp_psr_exit(pipeline, false);
+ 
++	/* Disable DRRS */
++	intel_disable_idleness_drrs(pipeline);
++
+ 	vlv_pm_pre_post(intel_config, pipeline, pipe);
+ }
+ 
+diff --git a/drivers/video/adf/intel/core/common/intel_drrs.c b/drivers/video/adf/intel/core/common/intel_drrs.c
+index b804196..5d1c072 100644
+--- a/drivers/video/adf/intel/core/common/intel_drrs.c
++++ b/drivers/video/adf/intel/core/common/intel_drrs.c
+@@ -18,6 +18,7 @@
+ #include <intel_adf_device.h>
+ #include <linux/delay.h>
+ #include <core/common/intel_drrs.h>
++#include <core/common/dp/gen_dp_pipe.h>
+ #include <core/common/drm_modeinfo_ops.h>
+ 
+ void intel_set_drrs_state(struct intel_pipeline *pipeline)
+@@ -351,6 +352,8 @@ int intel_drrs_init(struct intel_pipeline *pipeline)
+ 
+ 	if (pipe_type == INTEL_PIPE_DSI) {
+ 		drrs->encoder_ops = intel_drrs_dsi_encoder_ops_init();
++	} else if (pipe_type == INTEL_PIPE_EDP) {
++		drrs->encoder_ops = intel_get_edp_drrs_ops();
+ 	} else {
+ 		pr_err("ADF: %s: Unsupported PIPE Type\n", __func__);
+ 		ret = -EINVAL;
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+index 87a37a8..86d572b 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+@@ -24,6 +24,7 @@
+ #include <core/common/dsi/dsi_pipe.h>
+ #include <core/common/hdmi/gen_hdmi_pipe.h>
+ #include <core/common/dp/gen_dp_pipe.h>
++#include <core/common/intel_drrs.h>
+ #include <core/vlv/vlv_pm.h>
+ #include <core/vlv/vlv_pll.h>
+ #include <core/vlv/dpio.h>
+@@ -622,9 +623,11 @@ u32 chv_pipeline_off(struct intel_pipeline *pipeline)
+ 	/* Disable DPST */
+ 	/* FIXME: vlv_dpst_pipeline_off(); */
+ 
+-	/* Disable PSR */
+-	if (disp->type == INTEL_PIPE_EDP)
++	/* Disable PSR/DRRS */
++	if (disp->type == INTEL_PIPE_EDP) {
+ 		vlv_edp_psr_disable(pipeline);
++		intel_disable_idleness_drrs(pipeline);
++	}
+ 
+ 	for (i = 0; i < 2; i++) {
+ 		splane = &disp->splane[0];
+diff --git a/drivers/video/adf/intel/intel_adf.c b/drivers/video/adf/intel/intel_adf.c
+index 632c9c3..413184d 100644
+--- a/drivers/video/adf/intel/intel_adf.c
++++ b/drivers/video/adf/intel/intel_adf.c
+@@ -417,7 +417,8 @@ struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev)
+ 	}
+ 
+ 	for (cnt = 0; cnt < n_intfs; cnt++) {
+-		if (intfs[cnt].pipe->type == INTEL_PIPE_DSI)
++		if (intfs[cnt].pipe->type == INTEL_PIPE_DSI ||
++			intfs[cnt].pipe->type == INTEL_PIPE_EDP)
+ 			intel_drrs_init(intfs[cnt].pipe->pipeline);
+ 	}
+ 
+-- 
+1.7.9.5
+

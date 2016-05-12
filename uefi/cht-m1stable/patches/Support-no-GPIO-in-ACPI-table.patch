@@ -1,0 +1,455 @@
+From e29a86ffe9d3037f8f00a01cc8261c419ff65142 Mon Sep 17 00:00:00 2001
+From: Gwenn Bourree <gwenn.bourree@intel.com>
+Date: Mon, 23 Feb 2015 14:18:28 +0100
+Subject: [PATCH] Support no GPIO in ACPI table
+
+Because the new 7360 modem does not need any
+direct connections to AP to send events (RST_OUT
+and CORE DUMP) and to be powered on/off (POWER_ON,
+RESET_BB), the definitions of the usually used
+GPIO in the ACPI table are removed. This implies
+a modification in the modem control driver to
+support this, because so far, it returned an error
+and stopped in that case.
+This change will be implemented for the next modem
+releases, but we must ensure the compatibility with
+the former modems.
+
+Change-Id: Ie899fd9b2424d033486e81c58567d93b8a3dfa17
+Signed-off-by: Gwenn Bourree <gwenn.bourree@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-11538
+---
+ drivers/staging/modem_control/mcd_cpu.c  | 105 +++++++++++++++++++------------
+ drivers/staging/modem_control/mcd_cpu.h  |   6 +-
+ drivers/staging/modem_control/mdm_ctrl.c |  24 +++----
+ drivers/staging/modem_control/mdm_util.c |  81 +++++++++---------------
+ drivers/staging/modem_control/mdm_util.h |   4 ++
+ include/linux/mdm_ctrl.h                 |   3 +-
+ 6 files changed, 113 insertions(+), 110 deletions(-)
+
+diff --git a/drivers/staging/modem_control/mcd_cpu.c b/drivers/staging/modem_control/mcd_cpu.c
+index d987f1c..73b7ae4 100644
+--- a/drivers/staging/modem_control/mcd_cpu.c
++++ b/drivers/staging/modem_control/mcd_cpu.c
+@@ -74,26 +74,59 @@ int cpu_init_gpio(void *data)
+ 	pr_debug("cpu_init");
+ 
+ 	/* Configure the RESET_BB gpio */
+-	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_rst_bbn, 1, 0);
+-	if (ret)
+-		goto out;
++	if (cpu_data->gpio_rst_bbn) {
++		ret = mdm_ctrl_configure_gpio(cpu_data->gpio_rst_bbn, 1, 0);
++		if (ret) {
++			pr_err("Can't configure RST_BBN GPIO");
++			goto out;
++		}
++	} else
++		pr_info("No RST_BBN GPIO set");
+ 
+ 	/* Configure the ON gpio */
+-	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_pwr_on, 1, 0);
++	if (cpu_data->gpio_pwr_on) {
++		ret = mdm_ctrl_configure_gpio(cpu_data->gpio_pwr_on, 1, 0);
++		if (ret) {
++			pr_err("Can't configure Power ON GPIO");
++			goto out;
++		}
++	} else
++		pr_info("No PWR_ON GPIO set");
+ 
+ 	/* Configure the RESET_OUT gpio & irq */
+-	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_rst_out, 0, 0);
+-
+-	cpu_data->irq_reset = gpiod_to_irq(cpu_data->gpio_rst_out);
++	if (cpu_data->gpio_rst_out) {
++		ret = mdm_ctrl_configure_gpio(cpu_data->gpio_rst_out, 0, 0);
++		if (ret) {
++			pr_err("Can't configure RST_OUT GPIO");
++			goto clear_irq;
++		}
++		cpu_data->irq_reset = gpiod_to_irq(cpu_data->gpio_rst_out);
++		if (cpu_data->irq_reset < 0) {
++			pr_err("Fail to set GPIO RESET_OUT as interrupt");
++			goto clear_irq;
++		}
++	} else {
++		cpu_data->irq_reset = INVALID_GPIO;
++		pr_info("No RST_OUT GPIO set");
++	}
+ 
+ 	/* Configure the CORE_DUMP gpio & irq */
+-	ret = mdm_ctrl_configure_gpio(cpu_data->gpio_cdump, 0, 0);
+-	if (ret)
+-		goto free_ctx2;
+-
+-	cpu_data->irq_cdump = gpiod_to_irq(cpu_data->gpio_cdump);
+-	if (cpu_data->irq_cdump < 0)
+-		goto free_ctx2;
++	if (cpu_data->gpio_cdump) {
++		ret = mdm_ctrl_configure_gpio(cpu_data->gpio_cdump, 0, 0);
++		if (ret) {
++			pr_err("Can't configure CORE DUMP GPIO");
++			goto free_ctx2;
++		}
++
++		cpu_data->irq_cdump = gpiod_to_irq(cpu_data->gpio_cdump);
++		if (cpu_data->irq_cdump < 0) {
++			pr_err("Fail to set GPIO CORE DUMP as interrupt");
++			goto free_ctx2;
++		}
++	} else {
++		cpu_data->irq_cdump = INVALID_GPIO;
++		pr_info("No CORE_DUMP GPIO set");
++	}
+ 
+ 	pr_info(DRVNAME
+ 		": GPIO (rst_bbn: %d, pwr_on: %d, rst_out: %d, fcdp_rb: %d)\n",
+@@ -107,7 +140,9 @@ int cpu_init_gpio(void *data)
+  free_ctx2:
+ 	if (cpu_data->irq_reset > 0)
+ 		free_irq(cpu_data->irq_reset, cpu_data);
+-	cpu_data->irq_reset = 0;
++clear_irq:
++	cpu_data->irq_cdump = INVALID_GPIO;
++	cpu_data->irq_reset = INVALID_GPIO;
+  out:
+ 	return -ENODEV;
+ }
+@@ -116,8 +151,8 @@ int cpu_cleanup_gpio(void *data)
+ {
+ 	struct mdm_ctrl_cpu_data *cpu_data = data;
+ 
+-	cpu_data->irq_cdump = 0;
+-	cpu_data->irq_reset = 0;
++	cpu_data->irq_cdump = INVALID_GPIO;
++	cpu_data->irq_reset = INVALID_GPIO;
+ 
+ 	return 0;
+ }
+@@ -137,19 +172,28 @@ int get_gpio_irq_rst(void *data)
+ int get_gpio_mdm_state(void *data)
+ {
+ 	struct mdm_ctrl_cpu_data *cpu_data = data;
+-	return gpiod_get_value(cpu_data->gpio_rst_out);
++	if (cpu_data->gpio_rst_out)
++		return gpiod_get_value(cpu_data->gpio_rst_out);
++	else
++		return INVALID_GPIO;
+ }
+ 
+ int get_gpio_rst(void *data)
+ {
+ 	struct mdm_ctrl_cpu_data *cpu_data = data;
+-	return desc_to_gpio(cpu_data->gpio_rst_bbn);
++	if (cpu_data->gpio_rst_bbn)
++		return desc_to_gpio(cpu_data->gpio_rst_bbn);
++	else
++		return INVALID_GPIO;
+ }
+ 
+ int get_gpio_pwr(void *data)
+ {
+ 	struct mdm_ctrl_cpu_data *cpu_data = data;
+-	return desc_to_gpio(cpu_data->gpio_pwr_on);
++	if (cpu_data->gpio_pwr_on)
++		return desc_to_gpio(cpu_data->gpio_pwr_on);
++	else
++		return INVALID_GPIO;
+ }
+ 
+ int cpu_init_gpio_ngff(void *data)
+@@ -175,24 +219,3 @@ int cpu_init_gpio_ngff(void *data)
+  out:
+ 	return -ENODEV;
+ }
+-
+-int cpu_cleanup_gpio_ngff(void *data)
+-{
+-	return 0;
+-}
+-
+-int get_gpio_mdm_state_ngff(void *data)
+-{
+-	return 0;
+-}
+-
+-int get_gpio_irq_cdump_ngff(void *data)
+-{
+-	return 0;
+-}
+-
+-int get_gpio_irq_rst_ngff(void *data)
+-{
+-	return 0;
+-}
+-
+diff --git a/drivers/staging/modem_control/mcd_cpu.h b/drivers/staging/modem_control/mcd_cpu.h
+index 337cd3e..26b8c27 100644
+--- a/drivers/staging/modem_control/mcd_cpu.h
++++ b/drivers/staging/modem_control/mcd_cpu.h
+@@ -19,6 +19,7 @@
+ 
+ #ifndef _MDM_CPU_H
+ #define _MDM_CPU_H
++
+ int cpu_init_gpio(void *data);
+ int cpu_cleanup_gpio(void *data);
+ int get_gpio_irq_cdump(void *data);
+@@ -27,8 +28,5 @@ int get_gpio_mdm_state(void *data);
+ int get_gpio_rst(void *data);
+ int get_gpio_pwr(void *data);
+ int cpu_init_gpio_ngff(void *data);
+-int cpu_cleanup_gpio_ngff(void *data);
+-int get_gpio_mdm_state_ngff(void *data);
+-int get_gpio_irq_cdump_ngff(void *data);
+-int get_gpio_irq_rst_ngff(void *data);
++
+ #endif
+diff --git a/drivers/staging/modem_control/mdm_ctrl.c b/drivers/staging/modem_control/mdm_ctrl.c
+index 74c4c6a..e26bfbf 100644
+--- a/drivers/staging/modem_control/mdm_ctrl.c
++++ b/drivers/staging/modem_control/mdm_ctrl.c
+@@ -111,7 +111,7 @@ static int mdm_ctrl_cold_boot(struct mdm_info *mdm)
+ 	mdm_ctrl_launch_timer(mdm, cflash_delay, MDM_TIMER_FLASH_ENABLE);
+ 
+ 	/* If no IPC ready signal between modem and AP */
+-	if (!mdm->pdata->cpu.get_irq_rst(mdm->pdata->cpu_data)) {
++	if (cpu->get_irq_rst(cpu_data) == INVALID_GPIO) {
+ 		atomic_set(&mdm->rst_ongoing, 0);
+ 		mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_IPC_READY);
+ 	}
+@@ -390,6 +390,9 @@ static int mcd_init(struct mdm_info *mdm)
+ 		goto out;
+ 	}
+ 
++	if (mdm->pdata->pmic.init)
++		mdm->pdata->pmic.init(mdm->pdata->pmic_data);
++
+ 	if (mdm->pdata->cpu.init(mdm->pdata->cpu_data)) {
+ 		pr_err(DRVNAME ": CPU init failed...returning -ENODEV.");
+ 		ret = -ENODEV;
+@@ -411,6 +414,9 @@ static int mcd_init(struct mdm_info *mdm)
+ 			ret = -ENODEV;
+ 			goto del_cpu;
+ 		}
++	} else {
++		pr_info(DRVNAME ": No IRQ RST\n");
++		ret = -EIO;
+ 	}
+ 
+ 	if (mdm->pdata->cpu.get_irq_cdump(mdm->pdata->cpu_data) > 0) {
+@@ -426,7 +432,8 @@ static int mcd_init(struct mdm_info *mdm)
+ 			ret = -ENODEV;
+ 			goto free_irq;
+ 		}
+-	}
++	} else
++		pr_info(DRVNAME ": No IRQ COREDUMP\n");
+ 
+ 	/* Modem power off sequence */
+ 	if (mdm->pdata->pmic.get_early_pwr_off(mdm->pdata->pmic_data)) {
+@@ -445,7 +452,7 @@ static int mcd_init(struct mdm_info *mdm)
+ 	}
+ 
+ 	pr_info(DRVNAME ": %s initialization has succeed\n", __func__);
+-	return 0;
++	goto out;
+ 
+  free_all:
+ 	free_irq(mdm->pdata->cpu.get_irq_cdump(mdm->pdata->cpu_data), mdm);
+@@ -495,10 +502,11 @@ long mdm_ctrl_dev_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
+ 			mdm->pdata->board_type = cfg.board;
+ 
+ 			mdm_ctrl_set_mdm_cpu(mdm);
++			mdm_ctrl_set_pmic(mdm);
+ 			mcd_finalize_cpu_data(mdm->pdata);
+ 
+ 			ret = mcd_init(mdm);
+-			if (!ret)
++			if ((!ret) || (ret == -EIO))
+ 				pr_info(DRVNAME ": modem (board: %d, family: %d)",
+ 						cfg.board, cfg.type);
+ 			else
+@@ -880,14 +888,6 @@ static int mdm_ctrl_module_probe(struct platform_device *pdev)
+ 		wake_lock_init(&mdm->stay_awake, WAKE_LOCK_SUSPEND, name);
+ #endif
+ 
+-		if (mdm->pdata->mdm_ver != MODEM_2230) {
+-			if (mdm->pdata->pmic.init(mdm->pdata->pmic_data)) {
+-				pr_err(DRVNAME ": PMIC init failed...returning -ENODEV\n");
+-				ret = -ENODEV;
+-				goto del_mdms;
+-			}
+-		}
+-
+ 		mdm_ctrl_set_state(mdm, MDM_CTRL_STATE_OFF);
+ 		pr_info(DRVNAME " %s: Modem %d initialized\n", __func__, i);
+ 	}
+diff --git a/drivers/staging/modem_control/mdm_util.c b/drivers/staging/modem_control/mdm_util.c
+index 9b28259..62ab531 100644
+--- a/drivers/staging/modem_control/mdm_util.c
++++ b/drivers/staging/modem_control/mdm_util.c
+@@ -105,41 +105,29 @@ void mdm_ctrl_set_mdm_cpu(struct mdm_info *mdm)
+ 
+ 	pr_info(DRVNAME ": board type: %d", board_type);
+ 
++	pdata->mdm.init = mcd_mdm_init;
++	pdata->mdm.power_on = mcd_mdm_cold_boot;
++	pdata->mdm.warm_reset = mcd_mdm_warm_reset;
++	pdata->mdm.power_off = mcd_mdm_power_off;
++	pdata->mdm.cleanup = mcd_mdm_cleanup;
++	pdata->mdm.get_wflash_delay = mcd_mdm_get_wflash_delay;
++	pdata->mdm.get_cflash_delay = mcd_mdm_get_cflash_delay;
++	pdata->cpu.init = cpu_init_gpio;
++	pdata->cpu.cleanup = cpu_cleanup_gpio;
++	pdata->cpu.get_mdm_state = get_gpio_mdm_state;
++	pdata->cpu.get_irq_cdump = get_gpio_irq_cdump;
++	pdata->cpu.get_irq_rst = get_gpio_irq_rst;
++	pdata->cpu.get_gpio_rst = get_gpio_rst;
++	pdata->cpu.get_gpio_pwr = get_gpio_pwr;
++
+ 	switch (board_type) {
+ 	case BOARD_AOB:
+-		pdata->mdm.init = mcd_mdm_init;
+ 		if (mdm->pdata->mdm_ver == MODEM_2230)
+ 			pdata->mdm.power_on = mcd_mdm_cold_boot_2230;
+-		else
+-			pdata->mdm.power_on = mcd_mdm_cold_boot;
+-		pdata->mdm.warm_reset = mcd_mdm_warm_reset;
+-		pdata->mdm.power_off = mcd_mdm_power_off;
+-		pdata->mdm.cleanup = mcd_mdm_cleanup;
+-		pdata->mdm.get_wflash_delay = mcd_mdm_get_wflash_delay;
+-		pdata->mdm.get_cflash_delay = mcd_mdm_get_cflash_delay;
+-		pdata->cpu.init = cpu_init_gpio;
+-		pdata->cpu.cleanup = cpu_cleanup_gpio;
+-		pdata->cpu.get_mdm_state = get_gpio_mdm_state;
+-		pdata->cpu.get_irq_cdump = get_gpio_irq_cdump;
+-		pdata->cpu.get_irq_rst = get_gpio_irq_rst;
+-		pdata->cpu.get_gpio_rst = get_gpio_rst;
+-		pdata->cpu.get_gpio_pwr = get_gpio_pwr;
+ 		break;
+ 	case BOARD_NGFF:
+-		pdata->mdm.init = mcd_mdm_init;
+ 		pdata->mdm.power_on = mcd_mdm_cold_boot_ngff;
+-		pdata->mdm.warm_reset = mcd_mdm_warm_reset;
+-		pdata->mdm.power_off = mcd_mdm_power_off;
+-		pdata->mdm.cleanup = mcd_mdm_cleanup;
+-		pdata->mdm.get_wflash_delay = mcd_mdm_get_wflash_delay;
+-		pdata->mdm.get_cflash_delay = mcd_mdm_get_cflash_delay;
+ 		pdata->cpu.init = cpu_init_gpio_ngff;
+-		pdata->cpu.cleanup = cpu_cleanup_gpio_ngff;
+-		pdata->cpu.get_mdm_state = get_gpio_mdm_state_ngff;
+-		pdata->cpu.get_irq_cdump = get_gpio_irq_cdump_ngff;
+-		pdata->cpu.get_irq_rst = get_gpio_irq_rst_ngff;
+-		pdata->cpu.get_gpio_rst = get_gpio_rst;
+-		pdata->cpu.get_gpio_pwr = get_gpio_pwr;
+ 		break;
+ 	default:
+ 		pr_info(DRVNAME ": Can't retrieve conf specific functions");
+@@ -152,37 +140,28 @@ void mdm_ctrl_set_mdm_cpu(struct mdm_info *mdm)
+  * configures PMIC
+  * @drv: Reference to the driver structure
+  */
+-static void mdm_ctrl_set_pmic(struct mdm_info *mdm)
++int mdm_ctrl_set_pmic(struct mdm_info *mdm)
+ {
+-	int pmic_type = mdm->pdata->pmic_ver;
+ 	struct mcd_base_info *pdata = mdm->pdata;
+ 
+-	switch (pmic_type) {
+-	case PMIC_MFLD:
+-	case PMIC_MRFL:
+-	case PMIC_BYT:
+-	case PMIC_MOOR:
+-	case PMIC_CHT:
++	if (pdata->pmic_data) {
+ 		pdata->pmic.init = pmic_io_init;
+ 		pdata->pmic.power_on_mdm = pmic_io_power_on_mdm;
+ 		pdata->pmic.power_off_mdm = pmic_io_power_off_mdm;
+ 		pdata->pmic.cleanup = pmic_io_cleanup;
+ 		pdata->pmic.get_early_pwr_on = pmic_io_get_early_pwr_on;
+ 		pdata->pmic.get_early_pwr_off = pmic_io_get_early_pwr_off;
+-		break;
+-	case PMIC_CLVT:
+-		pdata->pmic.init = pmic_io_init;
+-		pdata->pmic.power_on_mdm = pmic_io_power_on_ctp_mdm;
+-		pdata->pmic.power_off_mdm = pmic_io_power_off_mdm;
+-		pdata->pmic.cleanup = pmic_io_cleanup;
+-		pdata->pmic.get_early_pwr_on = pmic_io_get_early_pwr_on;
+-		pdata->pmic.get_early_pwr_off = pmic_io_get_early_pwr_off;
+-		break;
+-	default:
+-		pr_info(DRVNAME ": Can't retrieve pmic specific functions");
+-		mdm->is_mdm_ctrl_disabled = true;
+-		break;
+-	}
++		switch (pdata->mdm_ver) {
++		case MODEM_6360:
++			pdata->pmic.init = NULL;
++			pdata->pmic.power_on_mdm = pmic_io_power_on_ctp_mdm;
++			break;
++		default:
++			break;
++		}
++		return 0;
++	} else
++		return -1;
+ }
+ 
+ /**
+@@ -244,8 +223,7 @@ struct mcd_base_info *modem_ctrl_get_dev_data(struct platform_device *pdev)
+ 
+ 	info = pdev->dev.platform_data;
+ 
+-	pr_err(DRVNAME ": cpu: %d pmic: %d.", info->cpu_ver, info->pmic_ver);
+-	if ((info->cpu_ver == CPU_UNSUP) || (info->pmic_ver == PMIC_UNSUP)) {
++	if ((!info->cpu_data) && (!info->pmic_data)) {
+ 		/* mdm_ctrl is disabled as some components */
+ 		/* of the platform are not supported */
+ 		kfree(info);
+@@ -298,7 +276,6 @@ int mdm_ctrl_get_modem_data(struct mdm_ctrl *drv, int minor)
+ 				__func__, minor);
+ 	} else {
+ 		drv->mdm[minor].pdata->board_type = BOARD_UNSUP;
+-		mdm_ctrl_set_pmic(&drv->mdm[minor]);
+ 		ret = 0;
+ 	}
+ 
+diff --git a/drivers/staging/modem_control/mdm_util.h b/drivers/staging/modem_control/mdm_util.h
+index 01d8535..e083637 100644
+--- a/drivers/staging/modem_control/mdm_util.h
++++ b/drivers/staging/modem_control/mdm_util.h
+@@ -47,6 +47,8 @@
+ #ifndef _MDM_UTIL_H
+ #define _MDM_UTIL_H
+ 
++#define INVALID_GPIO -1
++
+ /**
+  *
+  * @opened: This flag is used to allow only ONE instance of this driver
+@@ -136,4 +138,6 @@ int mdm_ctrl_get_device_info(struct mdm_ctrl *drv,
+ int mdm_ctrl_get_modem_data(struct mdm_ctrl *drv, int minor);
+ 
+ void mdm_ctrl_set_mdm_cpu(struct mdm_info *mdm);
++int mdm_ctrl_set_pmic(struct mdm_info *mdm);
++
+ #endif				/* _MDM_UTIL_H */
+diff --git a/include/linux/mdm_ctrl.h b/include/linux/mdm_ctrl.h
+index 4cac0a7..38590fa 100644
+--- a/include/linux/mdm_ctrl.h
++++ b/include/linux/mdm_ctrl.h
+@@ -57,7 +57,8 @@ enum mdm_ctrl_mdm_type {
+ 	MODEM_6268,
+ 	MODEM_6360,
+ 	MODEM_7160,
+-	MODEM_7260
++	MODEM_7260,
++	MODEM_7360
+ };
+ 
+ /* Type of modem board */
+-- 
+1.9.1
+

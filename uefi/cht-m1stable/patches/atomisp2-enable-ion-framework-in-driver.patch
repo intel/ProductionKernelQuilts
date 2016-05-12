@@ -1,0 +1,469 @@
+From 25ec51268fddd6b86af13571b71f3dad857bd9da Mon Sep 17 00:00:00 2001
+From: Pete Delaney <petex.delaney@intel.com>
+Date: Mon, 14 Sep 2015 18:32:57 -0700
+Subject: [PATCH] atomisp2: enable ion framework in driver
+
+Port from R6_legacy for BTNS
+
+change previous ION implementation.
+
+1. add ioctl for HAL to pass ION device fd to driver.
+   since GFX won't share a global ION device, HAL has to pass one
+   fd of ION device, /dev/ion.
+
+2. use 4th bit of v4l2_buffer.reserved to indicate this buffer is ION
+specific. new linux kernel added new checking for buffer type, it has
+to be one of the pre-defined. So previous implementation is not
+working any more.
+
+   reserved bit mapping:
+   * [0..3] flash status
+   * [4] ion buffer type
+   * [5..15] reserved
+   * [16..31] exp_id
+
+3. new buffer mapping ION API calls.
+
+4. Fix the camera-cannot-start issue, which is caused by that GFX
+   driver allocates one extra page in ION buffer.
+
+Change-Id: I56e278f84c127a98e6238080f345dcfb2a910ac2
+Original-Tracked-On: #H1504074607
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-7449
+Signed-off-by: Jianxu Zheng <jian.xu.zheng@intel.com>
+Signed-off-by: Michael Chen <yongsheng.chen@intel.com>
+Signed-off-by: Pete Delaney <petex.delaney@intel.com>
+Signed-off-by: Bin Han <bin.b.han@intel.com>
+Signed-off-by: Guoqing,Zhang <guoqingx.zhang@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/80839
+Build: Dessert M BXT RVP (SC)
+Build: Dessert M CHT FFD (SC)
+Build: Dessert M COHO (SC)
+Integrator: WeiX Meng <weix.meng@intel.com>
+Validation-Android: Wei Tao <wei.tao@intel.com>
+Reviewed-by: WeiX Meng <weix.meng@intel.com>
+---
+ .../drivers/media/pci/atomisp2/Makefile.common     |  4 +
+ .../pci/atomisp2/atomisp_driver/atomisp_internal.h |  5 ++
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.c    | 42 ++++++++--
+ .../pci/atomisp2/atomisp_driver/atomisp_subdev.c   | 26 ++++++
+ .../pci/atomisp2/atomisp_driver/atomisp_subdev.h   |  1 +
+ .../media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c | 95 +++++++++++++---------
+ .../pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c   | 25 ------
+ .../atomisp_driver/include/hmm/hmm_bo_dev.h        |  3 -
+ 8 files changed, 127 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/Makefile.common b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/Makefile.common
+index ca02407..93978e6 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/Makefile.common
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/Makefile.common
+@@ -58,6 +58,10 @@ INCLUDES +=	-I$(srctree)/$(src)/atomisp_driver/include \
+ 		-I$(srctree)/include/linux/ \
+ 		-I$(srctree)/drivers/staging/intel_media/bc_video
+ 
++ifeq ($(CONFIG_ION),y)
++INCLUDES += -I$(srctree)/drivers/staging/android/ion
++endif
++
+ DEFINES := -DHRT_HW -DHRT_ISP_CSS_CUSTOM_HOST -DHRT_USE_VIR_ADDRS -DHRT_KERNEL -D__HOST__
+ DEFINES += -DUSE_DYNAMIC_BIN
+ DEFINES += -DISP_POWER_GATING
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h
+index 4cac5da..f0fe413 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_internal.h
+@@ -175,6 +175,11 @@
+ #define ATOMISP_DEPTH_DEFAULT_MASTER_SENSOR 0
+ #define ATOMISP_DEPTH_DEFAULT_SLAVE_SENSOR 1
+ 
++#define ATOMISP_ION_DEVICE_FD_OFFSET   16
++#define ATOMISP_ION_SHARED_FD_MASK     (0xFFFF)
++#define ATOMISP_ION_DEVICE_FD_MASK     (~ATOMISP_ION_SHARED_FD_MASK)
++#define ION_FD_UNSET (-1)
++
+ #define DIV_NEAREST_STEP(n, d, step) \
+ 	round_down((2 * (n) + (d) * (step))/(2 * (d)), (step))
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index 61c3d4e..8488eb9 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -1292,8 +1292,35 @@ static int atomisp_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
+ 
+ 		attributes.pgnr = pgnr;
+ #ifdef CONFIG_ION
+-		attributes.type = buf->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_ION
+-					? HRT_USR_ION : HRT_USR_PTR;
++		if (buf->reserved & ATOMISP_BUFFER_TYPE_IS_ION) {
++			attributes.type = HRT_USR_ION;
++			if (asd->ion_dev_fd->val !=  ION_FD_UNSET) {
++				dev_dbg(isp->dev, "ION buffer queued, share_fd=%lddev_fd=%d.\n",
++				buf->m.userptr, asd->ion_dev_fd->val);
++				/*
++				 * Make sure the shared fd we just got
++				 * from user space isn't larger than
++				 * the space we have for it.
++				 */
++				if ((buf->m.userptr &
++				(ATOMISP_ION_DEVICE_FD_MASK)) != 0) {
++					dev_err(isp->dev,
++							"Error: v4l2 buffer fd:0X%0lX > 0XFFFF.\n",
++							buf->m.userptr);
++					ret = -EINVAL;
++					goto error;
++				}
++				buf->m.userptr |= asd->ion_dev_fd->val <<
++					ATOMISP_ION_DEVICE_FD_OFFSET;
++			} else {
++				dev_err(isp->dev, "v4l2 buffer type is ION, \
++						but no dev fd set from userspace.\n");
++				ret = -EINVAL;
++				goto error;
++			}
++		} else {
++			attributes.type = HRT_USR_PTR;
++		}
+ #else
+ 		attributes.type = HRT_USR_PTR;
+ #endif
+@@ -1333,8 +1360,9 @@ done:
+ 		/* this buffer will have a per-frame parameter */
+ 		pipe->frame_request_config_id[buf->index] = buf->reserved2 &
+ 					~ATOMISP_BUFFER_HAS_PER_FRAME_SETTING;
+-		dev_dbg(isp->dev, "This buffer requires per_frame setting which has isp_config_id %d\n",
+-			pipe->frame_request_config_id[buf->index]);
++		dev_dbg(isp->dev, "This buffer requires per_frame setting \
++				which has isp_config_id %d\n",
++				pipe->frame_request_config_id[buf->index]);
+ 	} else {
+ 		pipe->frame_request_config_id[buf->index] = 0;
+ 	}
+@@ -1508,7 +1536,8 @@ static int atomisp_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
+ 	buf->reserved2 = pipe->frame_config_id[buf->index];
+ 	rt_mutex_unlock(&isp->mutex);
+ 
+-	dev_dbg(isp->dev, "dqbuf buffer %d (%s) for asd%d with exp_id %d, isp_config_id %d\n",
++	dev_dbg(isp->dev, "dqbuf buffer %d (%s) for asd%d with exp_id %d, \
++			isp_config_id %d\n",
+ 		buf->index, vdev->name, asd->index, buf->reserved >> 16,
+ 		buf->reserved2);
+ 	return 0;
+@@ -1579,7 +1608,8 @@ static unsigned int atomisp_sensor_start_stream(struct atomisp_sub_device *asd)
+ 	else
+ 		return 1;
+ }
+-int atomisp_stream_on_master_slave_sensor(struct atomisp_device *isp, bool isp_timeout)
++int atomisp_stream_on_master_slave_sensor(struct atomisp_device *isp,
++	bool isp_timeout)
+ {
+ 	unsigned int master = -1, slave = -1, delay_slave = 0;
+ 	int i, ret;
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.c
+index 731144c..e67f6c6 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.c
+@@ -1033,6 +1033,25 @@ static const struct v4l2_ctrl_config ctrl_depth_mode = {
+ 	.def = 0,
+ };
+ 
++#ifdef CONFIG_ION
++/*
++ * Control for ISP ion device fd
++ *
++ * userspace will open ion device and pass the fd to kernel.
++ * this fd will be used to map shared fd to buffer.
++ */
++static const struct v4l2_ctrl_config ctrl_ion_dev_fd = {
++		.ops = &ctrl_ops,
++		.id = V4L2_CID_ATOMISP_ION_DEVICE_FD,
++		.type = V4L2_CTRL_TYPE_INTEGER,
++		.name = "Ion Device Fd",
++		.min = -1,
++		.max = 1024,
++		.step = 1,
++		.def = ION_FD_UNSET
++};
++#endif
++
+ static void atomisp_init_subdev_pipe(struct atomisp_sub_device *asd,
+ 		struct atomisp_video_pipe *pipe, enum v4l2_buf_type buf_type)
+ {
+@@ -1206,6 +1225,13 @@ static int isp_subdev_init_entities(struct atomisp_sub_device *asd)
+ 					     &ctrl_disable_dz,
+ 					     NULL);
+ 
++#ifdef CONFIG_ION
++	asd->ion_dev_fd =
++			v4l2_ctrl_new_custom(&asd->ctrl_handler,
++						&ctrl_ion_dev_fd,
++						 NULL);
++#endif
++
+ 	/* Make controls visible on subdev as well. */
+ 	asd->subdev.ctrl_handler = &asd->ctrl_handler;
+ 	spin_lock_init(&asd->raw_buffer_bitmap_lock);
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+index aa84aa5..5bbd49e 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_subdev.h
+@@ -316,6 +316,7 @@ struct atomisp_sub_device {
+ 	struct v4l2_ctrl *continuous_raw_buffer_size;
+ 	struct v4l2_ctrl *continuous_viewfinder;
+ 	struct v4l2_ctrl *enable_raw_buffer_lock;
++	struct v4l2_ctrl *ion_dev_fd;
+ 	struct v4l2_ctrl *disable_dz;
+ 
+ 	struct {
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c
+index 846d647..196c554 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo.c
+@@ -40,9 +40,10 @@
+ #include <linux/io.h>
+ #include <asm/current.h>
+ #include <linux/sched.h>
++#include <linux/file.h>
+ 
+ #ifdef CONFIG_ION
+-#include <linux/ion.h>
++#include "ion.h"
+ #endif
+ 
+ #include "atomisp_internal.h"
+@@ -378,26 +379,6 @@ int hmm_bo_device_init(struct hmm_bo_device *bdev,
+ 
+ 	spin_lock_init(&bdev->list_lock);
+ 	mutex_init(&bdev->rbtree_mutex);
+-#ifdef CONFIG_ION
+-	/*
+-	 * TODO:
+-	 * The ion_dev should be defined by ION driver. But ION driver does
+-	 * not implement it yet, will fix it when it is ready.
+-	 */
+-	if (!ion_dev) {
+-		isp_mmu_exit(&bdev->mmu);
+-		return -EINVAL;
+-	}
+-
+-	bdev->iclient = ion_client_create(ion_dev, "atomisp");
+-	if (IS_ERR_OR_NULL(bdev->iclient)) {
+-		ret = PTR_ERR(bdev->iclient);
+-		if (!bdev->iclient) {
+-			isp_mmu_exit(&bdev->mmu);
+-			return -EINVAL;
+-		}
+-	}
+-#endif
+ 
+ 	bdev->flag = HMM_BO_DEVICE_INITED;
+ 
+@@ -581,10 +562,6 @@ void hmm_bo_device_exit(struct hmm_bo_device *bdev)
+ 	kmem_cache_destroy(bdev->bo_cache);
+ 
+ 	isp_mmu_exit(&bdev->mmu);
+-#ifdef CONFIG_ION
+-	if (bdev->iclient != NULL)
+-		ion_client_destroy(bdev->iclient);
+-#endif
+ }
+ 
+ int hmm_bo_device_inited(struct hmm_bo_device *bdev)
+@@ -1007,11 +984,21 @@ static int get_pfnmap_pages(struct task_struct *tsk, struct mm_struct *mm,
+ 
+ #ifdef CONFIG_ION
+ static int alloc_ion_pages(struct hmm_buffer_object *bo,
+-			     unsigned int shared_fd)
++			     unsigned long shared_fd)
+ {
+ 	struct sg_table *sg_tbl;
+ 	struct scatterlist *sl;
+-	int ret, page_nr = 0;
++	struct ion_client *iclient;
++	struct file *ion_file;
++	int ret = 0, page_nr = 0, i, j;
++
++	int ion_dev_fd = shared_fd >> ATOMISP_ION_DEVICE_FD_OFFSET;
++	int ion_shared_fd = shared_fd & ATOMISP_ION_SHARED_FD_MASK;
++
++	if (ion_shared_fd == (ION_FD_UNSET & ATOMISP_ION_SHARED_FD_MASK)) {
++		dev_err(atomisp_dev, "ion device is not opened.\n");
++		return -EINVAL;
++	}
+ 
+ 	bo->page_obj = atomisp_kernel_malloc(
+ 			sizeof(struct hmm_page_object) * bo->pgnr);
+@@ -1020,7 +1007,22 @@ static int alloc_ion_pages(struct hmm_buffer_object *bo,
+ 		return -ENOMEM;
+ 	}
+ 
+-	bo->ihandle = ion_import_dma_buf(bo->bdev->iclient, shared_fd);
++	ion_file = fget(ion_dev_fd);
++	if (unlikely(!ion_file)) {
++		dev_err(atomisp_dev, "invalid fd for ion file struct.\n");
++		ret = -EINVAL;
++		goto error_nomem;
++	}
++
++	iclient = (struct ion_client *) ion_file->private_data;
++	if (unlikely(!iclient)) {
++		dev_err(atomisp_dev, "invalid ion file struct for iclient.\n");
++		ret = -EINVAL;
++		goto error;
++	}
++
++	bo->ihandle = ion_import_dma_buf(iclient, ion_shared_fd);
++
+ 	if (IS_ERR_OR_NULL(bo->ihandle)) {
+ 		dev_err(atomisp_dev, "invalid shared fd to ion.\n");
+ 		ret = PTR_ERR(bo->ihandle);
+@@ -1029,34 +1031,48 @@ static int alloc_ion_pages(struct hmm_buffer_object *bo,
+ 		goto error;
+ 	}
+ 
+-	sg_tbl = ion_sg_table(bo->bdev->iclient, bo->ihandle);
++	sg_tbl = ion_sg_table(iclient, bo->ihandle);
+ 	if (IS_ERR_OR_NULL(sg_tbl)) {
+ 		dev_err(atomisp_dev, "ion_sg_table error.\n");
+ 		ret = PTR_ERR(sg_tbl);
+ 		if (!sg_tbl)
+ 			ret = -EINVAL;
+-		goto error_unmap;
++		goto error;
+ 	}
+ 
+ 	sl = sg_tbl->sgl;
+-	do {
+-		bo->page_obj[page_nr++].page = sg_page(sl);
+-		sl = sg_next(sl);
+-	} while (sl && page_nr < bo->pgnr);
++	for_each_sg(sg_tbl->sgl, sl, sg_tbl->nents, i) {
++		struct page *page = sg_page(sl);
++		for (j = 0; j < sl->length / PAGE_SIZE; j++) {
++			bo->page_obj[page_nr++].page = page++;
++			/*
++			 * GFX driver allocates one extra page (actually one
++			 * extra byte) to work around some CTS failures. We
++			 * don't need to fill this page into page_obj since
++			 * it doesn't need to be mapped to the IPU address
++			 * space.
++			 */
++			if (page_nr == bo->pgnr)
++				goto sgl_iter_finished;
++		}
++	}
+ 
++sgl_iter_finished:
+ 	if (page_nr != bo->pgnr) {
+ 		dev_err(atomisp_dev,
+ 			 "get_ion_pages err: bo->pgnr = %d, "
+ 			 "pgnr actually pinned = %d.\n",
+ 			 bo->pgnr, page_nr);
+ 		ret = -EINVAL;
+-		goto error_unmap;
++		goto error;
+ 	}
+ 
++	fput(ion_file);
++
+ 	return 0;
+-error_unmap:
+-	ion_free(bo->bdev->iclient, bo->ihandle);
+ error:
++	fput(ion_file);
++error_nomem:
+ 	atomisp_kernel_free(bo->page_obj);
+ 	return ret;
+ }
+@@ -1151,7 +1167,6 @@ out_of_mem:
+ static void free_ion_pages(struct hmm_buffer_object *bo)
+ {
+ 	atomisp_kernel_free(bo->page_obj);
+-	ion_free(bo->bdev->iclient, bo->ihandle);
+ }
+ #endif
+ 
+@@ -1185,7 +1200,7 @@ int hmm_bo_alloc_pages(struct hmm_buffer_object *bo,
+ 		       enum hmm_bo_type type, int from_highmem,
+ 		       void *userptr, bool cached)
+ {
+-	int ret;
++	int ret = -EINVAL;
+ 
+ 	check_bo_null_return(bo, -EINVAL);
+ 
+@@ -1207,7 +1222,7 @@ int hmm_bo_alloc_pages(struct hmm_buffer_object *bo,
+ 		 * TODO:
+ 		 * Add cache flag when ION support it
+ 		 */
+-		ret = alloc_ion_pages(bo, userptr);
++		ret = alloc_ion_pages(bo, (unsigned long)userptr);
+ #endif
+ 	} else {
+ 		dev_err(atomisp_dev, "invalid buffer type.\n");
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c
+index 87090ce..304ba67 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/hmm/hmm_bo_dev.c
+@@ -31,10 +31,6 @@
+ #include <linux/list.h>
+ #include <linux/errno.h>
+ 
+-#ifdef CONFIG_ION
+-#include <linux/ion.h>
+-#endif
+-
+ #include "atomisp_internal.h"
+ #include "hmm/hmm_common.h"
+ #include "hmm/hmm_bo_dev.h"
+@@ -68,23 +64,6 @@ int hmm_bo_device_init(struct hmm_bo_device *bdev,
+ 	INIT_LIST_HEAD(&bdev->active_bo_list);
+ 
+ 	spin_lock_init(&bdev->list_lock);
+-#ifdef CONFIG_ION
+-	/*
+-	 * TODO:
+-	 * The ion_dev should be defined by ION driver. But ION driver does
+-	 * not implement it yet, will fix it when it is ready.
+-	 */
+-	if (!ion_dev)
+-		goto vm_init_err;
+-
+-	bdev->iclient = ion_client_create(ion_dev, "atomisp");
+-	if (IS_ERR_OR_NULL(bdev->iclient)) {
+-		ret = PTR_ERR(bdev->iclient);
+-		if (!bdev->iclient)
+-			ret = -EINVAL;
+-		goto vm_init_err;
+-	}
+-#endif
+ 	bdev->flag = HMM_BO_DEVICE_INITED;
+ 
+ 	return 0;
+@@ -120,10 +99,6 @@ void hmm_bo_device_exit(struct hmm_bo_device *bdev)
+ 
+ 	isp_mmu_exit(&bdev->mmu);
+ 	hmm_vm_clean(&bdev->vaddr_space);
+-#ifdef CONFIG_ION
+-	if (bdev->iclient != NULL)
+-		ion_client_destroy(bdev->iclient);
+-#endif
+ }
+ 
+ int hmm_bo_device_inited(struct hmm_bo_device *bdev)
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo_dev.h b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo_dev.h
+index a9446ad..f38c5359 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo_dev.h
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/include/hmm/hmm_bo_dev.h
+@@ -61,9 +61,6 @@ struct hmm_bo_device {
+ 
+ 	/* list lock is used to protect both of the buffer object lists */
+ 	spinlock_t		list_lock;
+-#ifdef CONFIG_ION
+-	struct ion_client	*iclient;
+-#endif
+ 	int			flag;
+ };
+ 
+-- 
+1.9.1
+

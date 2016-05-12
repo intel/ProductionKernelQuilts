@@ -1,0 +1,116 @@
+From 4f5320b8175b19019fec2467d000c40d533cc3ba Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Thu, 24 Apr 2014 09:50:53 +0200
+Subject: [PATCH 1/2] genirq: x86: Ensure that dynamic irq allocation does not
+ conflict
+
+On x86 the allocation of irq descriptors may allocate interrupts which
+are in the range of the GSI interrupts. That's wrong as those
+interrupts are hardwired and we don't have the irq domain translation
+like PPC. So one of these interrupts can be hooked up later to one of
+the devices which are hard wired to it and the io_apic init code for
+that particular interrupt line happily reuses that descriptor with a
+completely different configuration so hell breaks lose.
+
+Inside x86 we allocate dynamic interrupts from above nr_gsi_irqs,
+except for a few usage sites which have not yet blown up in our face
+for whatever reason. But for drivers which need an irq range, like the
+GPIO drivers, we have no limit in place and we don't want to expose
+such a detail to a driver.
+
+To cure this introduce a function which an architecture can implement
+to impose a lower bound on the dynamic interrupt allocations.
+
+Implement it for x86 and set the lower bound to nr_gsi_irqs, which is
+the end of the hardwired interrupt space, so all dynamic allocations
+happen above.
+
+That not only allows the GPIO driver to work sanely, it also protects
+the bogus callsites of create_irq_nr() in hpet, uv, irq_remapping and
+htirq code. They need to be cleaned up as well, but that's a separate
+issue.
+
+Reported-by: Jin Yao <yao.jin@linux.intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Cc: Mathias Nyman <mathias.nyman@linux.intel.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Grant Likely <grant.likely@linaro.org>
+Cc: H. Peter Anvin <hpa@linux.intel.com>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Cc: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Cc: Krogerus Heikki <heikki.krogerus@intel.com>
+Cc: Linus Walleij <linus.walleij@linaro.org>
+Link: http://lkml.kernel.org/r/alpine.DEB.2.02.1404241617360.28206@ionos.tec.linutronix.de
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 62a08ae2a5763aabeee98264605236b001503e0c)
+---
+ arch/x86/kernel/apic/io_apic.c | 5 +++++
+ include/linux/irq.h            | 2 ++
+ kernel/irq/irqdesc.c           | 7 +++++++
+ kernel/softirq.c               | 5 +++++
+ 4 files changed, 19 insertions(+)
+
+diff --git a/arch/x86/kernel/apic/io_apic.c b/arch/x86/kernel/apic/io_apic.c
+index 6ad4658..d23aa82 100644
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@ -3425,6 +3425,11 @@ int get_nr_irqs_gsi(void)
+ 	return nr_irqs_gsi;
+ }
+ 
++unsigned int arch_dynirq_lower_bound(unsigned int from)
++{
++	return from < nr_irqs_gsi ? nr_irqs_gsi : from;
++}
++
+ int __init arch_probe_nr_irqs(void)
+ {
+ 	int nr;
+diff --git a/include/linux/irq.h b/include/linux/irq.h
+index 7dc1003..ead802d 100644
+--- a/include/linux/irq.h
++++ b/include/linux/irq.h
+@@ -593,6 +593,8 @@ static inline u32 irq_get_trigger_type(unsigned int irq)
+ 	return d ? irqd_get_trigger_type(d) : 0;
+ }
+ 
++unsigned int arch_dynirq_lower_bound(unsigned int from);
++
+ int __irq_alloc_descs(int irq, unsigned int from, unsigned int cnt, int node,
+ 		struct module *owner);
+ 
+diff --git a/kernel/irq/irqdesc.c b/kernel/irq/irqdesc.c
+index 8ab8e93..b88dba1 100644
+--- a/kernel/irq/irqdesc.c
++++ b/kernel/irq/irqdesc.c
+@@ -363,6 +363,13 @@ __irq_alloc_descs(int irq, unsigned int from, unsigned int cnt, int node,
+ 		if (from > irq)
+ 			return -EINVAL;
+ 		from = irq;
++	} else {
++		/*
++		 * For interrupts which are freely allocated the
++		 * architecture can force a lower bound to the @from
++		 * argument. x86 uses this to exclude the GSI space.
++		 */
++		from = arch_dynirq_lower_bound(from);
+ 	}
+ 
+ 	mutex_lock(&sparse_irq_lock);
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index 490fcbb..3c8b4e7 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -778,3 +778,8 @@ int __init __weak arch_early_irq_init(void)
+ {
+ 	return 0;
+ }
++
++unsigned int __weak arch_dynirq_lower_bound(unsigned int from)
++{
++	return from;
++}
+-- 
+1.9.1
+

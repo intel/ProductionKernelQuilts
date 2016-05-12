@@ -1,0 +1,236 @@
+From d35acdb55ccb8d3ba545fe5cb90a6c6a558a07fb Mon Sep 17 00:00:00 2001
+From: Dawid Manikowski <dawid.manikowski@intel.com>
+Date: Tue, 11 Aug 2015 16:36:35 +0200
+Subject: [PATCH] Added the "disable stall" functionality to XHCI driver.
+
+1. On board boot up, set SSIC_CONFIG2 bit 24:21 to 0x0000.
+Disable retrain time for Polling->U0 after modem connect.
+2. After SSIC link changed from Polling to U0, set SSIC_CONFIG2
+bit 24:21 to 0x1111. Enable retrain time for U3<->U0 transition.
+3. After SSIC link disconnect/broken/warm-reset, set SSIC_CONFIG2
+bit 24:21 to 0x0000. So retrain time is disabled for next Polling->U0.
+
+This functionality is only applied when the modem is present,
+platform is CHT and the modem type is 7260 (ACPI tables info).
+
+Tracked-On:
+Change-Id: I93369431c20abb868ceda18caeaa7e29196b4660
+Signed-off-by: Konrad Leszczynski <konrad.leszczynski@intel.com>
+---
+ drivers/usb/host/xhci-intel-cap.c | 62 +++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci-intel-cap.h | 14 +++++++++
+ drivers/usb/host/xhci-pci.c       |  4 +++
+ drivers/usb/host/xhci-ring.c      | 18 ++++++++++++
+ drivers/usb/host/xhci.c           |  5 ++++
+ drivers/usb/host/xhci.h           |  3 ++
+ 6 files changed, 106 insertions(+)
+
+diff --git a/drivers/usb/host/xhci-intel-cap.c b/drivers/usb/host/xhci-intel-cap.c
+index 94c72ca..22f4415c 100644
+--- a/drivers/usb/host/xhci-intel-cap.c
++++ b/drivers/usb/host/xhci-intel-cap.c
+@@ -20,15 +20,77 @@
+ 
+ #include <linux/usb/phy.h>
+ #include <linux/usb/otg.h>
++#include <linux/acpi.h>
++#include <linux/pci.h>
+ 
+ #include "xhci.h"
+ #include "xhci-intel-cap.h"
+ 
++void xhci_change_ssic_regs(struct xhci_hcd *xhci, bool enable)
++{
++
++	struct usb_hcd *hcd = xhci_to_hcd(xhci);
++	u32 data;
++
++	data = readl(hcd->regs + SSIC_CONFIG2);
++	xhci_dbg(xhci, "%s(read): 0x%p = 0x%08x\n", __func__,
++			(hcd->regs + SSIC_CONFIG2), data);
++
++	if (enable)
++		data |= RETRAIN;
++	else
++		data &= ~RETRAIN;
++
++	writel(data, hcd->regs + SSIC_CONFIG2);
++	xhci_dbg(xhci, "%s(write): 0x%p = 0x%08x\n", __func__,
++			(hcd->regs + SSIC_CONFIG2),
++			readl(hcd->regs + SSIC_CONFIG2));
++}
++
++int xhci_intel_need_disable_stall(struct xhci_hcd *xhci)
++{
++	struct acpi_device *acpi_dev;
++	acpi_status modem_status;
++	union acpi_object *modem_data;
++	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
++	struct pci_dev  *pdev = to_pci_dev(xhci_to_hcd(xhci)->self.controller);
++	int modem_present, modem_type;
++
++	/* Get ACPI device */
++	acpi_dev = ACPI_COMPANION(&pdev->dev);
++	if (!acpi_dev) {
++		dev_dbg(&pdev->dev, "No ACPI device!\n");
++		return 0;
++	}
++
++	/* Get modem status from MINF function */
++	modem_status = acpi_evaluate_object(acpi_dev->handle, "MINF",
++			NULL, &buffer);
++	if (ACPI_FAILURE(modem_status) || modem_status != AE_NOT_FOUND) {
++		dev_dbg(&pdev->dev, "No MINF method!\n");
++		return 0;
++	}
++
++	/* Get the data from the buffer */
++	modem_data = buffer.pointer;
++
++	/* Assign the values */
++	modem_present = modem_data->package.elements[0].integer.value;
++	xhci->ssic_port_number = modem_data->package.elements[1].integer.value;
++	modem_type = modem_data->package.elements[2].integer.value;
++
++	/* Evaluate the values from ACPI */
++	return modem_present && modem_type == SSIC_MODEM_7260;
++}
++
+ int xhci_intel_vendor_cap_init(struct xhci_hcd *xhci)
+ {
+ 	struct usb_hcd *hcd;
+ 	int ext_offset, retval;
+ 
++	if (xhci->quirks & XHCI_SSIC_DISABLE_STALL)
++		xhci_change_ssic_regs(xhci, false);
++
+ 	ext_offset = XHCI_HCC_EXT_CAPS(readl(&xhci->cap_regs->hcc_params));
+ 	ext_offset = xhci_find_ext_cap_by_id(&xhci->cap_regs->hc_capbase,
+ 			ext_offset << 2, XHCI_EXT_CAPS_INTEL_HOST_CAP);
+diff --git a/drivers/usb/host/xhci-intel-cap.h b/drivers/usb/host/xhci-intel-cap.h
+index febe31d..2733bcb 100644
+--- a/drivers/usb/host/xhci-intel-cap.h
++++ b/drivers/usb/host/xhci-intel-cap.h
+@@ -33,6 +33,18 @@
+ 
+ #define SSIC_PORT_NUM		2
+ 
++/* SSIC_CONFIG2 register
++ * Retrain Timeout Offset: 0x880c
++ */
++#define SSIC_CONFIG2	0x880c
++#define RETRAIN	(0xf << 21)
++
++/* SSIC modem types
++ * 0x0 - 7360, 0xFF - 7260
++ */
++ #define SSIC_MODEM_7360	0x0
++ #define SSIC_MODEM_7260	0xff
++
+ /* SSIC Configuration Register 2
+  * Address Offset: 0Ch-0Fh
+  * Port 1 ... N : 0Ch, 3Ch, ... ,(0Ch + (NumSSICPorts-1)*30h)
+@@ -58,3 +70,5 @@ extern int xhci_intel_phy_vbus_valid(struct xhci_hcd *xhci, int vbus_valid);
+ extern int xhci_intel_phy_mux_switch(struct xhci_hcd *xhci, int is_device_on);
+ extern void xhci_intel_clr_internal_pme_flag(struct xhci_hcd *xhci);
+ extern void xhci_intel_ssic_port_unused(struct xhci_hcd *xhci, bool unused);
++extern void xhci_change_ssic_regs(struct xhci_hcd *xhci, bool enable);
++extern int xhci_intel_need_disable_stall(struct xhci_hcd *xhci);
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index 5ac2537..28958e1 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -252,6 +252,10 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
+ 	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
+ 			pdev->device == PCI_DEVICE_ID_INTEL_CHT_XHCI) {
+ 		xhci->quirks |= XHCI_SPURIOUS_PME;
++
++		/* Initialize the Disable Stall quirk if necessary */
++		if (xhci_intel_need_disable_stall(xhci))
++			xhci->quirks |= XHCI_SSIC_DISABLE_STALL;
+ 	}
+ 
+ 	if (pdev->vendor == PCI_VENDOR_ID_ETRON &&
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index de102ea..14e5270 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -68,6 +68,7 @@
+ #include <linux/slab.h>
+ #include "xhci.h"
+ #include "xhci-trace.h"
++#include "xhci-intel-cap.h"
+ 
+ static int handle_cmd_in_cmd_wait_list(struct xhci_hcd *xhci,
+ 		struct xhci_virt_device *virt_dev,
+@@ -1740,6 +1741,23 @@ static void handle_port_status(struct xhci_hcd *xhci,
+ 		usb_hcd_resume_root_hub(hcd);
+ 	}
+ 
++	/* Check for CCS and CSC bits */
++	if (xhci->quirks & XHCI_SSIC_DISABLE_STALL &&
++		port_id == xhci->ssic_port_number) {
++		/* Check the bit 17 in PORTSC */
++		if (temp & PORT_CSC) {
++			/*
++			 * Check the bit 0 in PORTSC.
++			 * Disable/Enable Retrain
++			 * Timeout accordingly.
++			 */
++			if (temp & PORT_CONNECT)
++				xhci_change_ssic_regs(xhci, true);
++			else
++				xhci_change_ssic_regs(xhci, false);
++		}
++	}
++
+ 	if (hcd->speed == HCD_USB3 && (temp & PORT_PLS_MASK) == XDEV_INACTIVE) {
+ 		xhci_warn(xhci, "SS port %d goes into inactive\n", port_id);
+ 		bus_state->port_remote_wakeup &= ~(1 << faked_port_index);
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index cc04fad..d4c3a95 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -31,6 +31,7 @@
+ 
+ #include "xhci.h"
+ #include "xhci-trace.h"
++#include "xhci-intel-cap.h"
+ 
+ #define DRIVER_AUTHOR "Sarah Sharp"
+ #define DRIVER_DESC "'eXtensible' Host Controller (xHC) Driver"
+@@ -548,6 +549,10 @@ int xhci_init(struct usb_hcd *hcd)
+ 		compliance_mode_recovery_timer_init(xhci);
+ 	}
+ 
++	/* Disable the Retrain Timeout (on init) */
++	if (xhci->quirks & XHCI_SSIC_DISABLE_STALL)
++		xhci_change_ssic_regs(xhci, false);
++
+ 	return retval;
+ }
+ 
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index fac245c..79de0d0 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1562,6 +1562,7 @@ struct xhci_hcd {
+ #define XHCI_SLOW_SUSPEND	(1 << 17)
+ #define XHCI_SPURIOUS_WAKEUP	(1 << 18)
+ #define XHCI_SPURIOUS_PME	(1 << 19)
++#define XHCI_SSIC_DISABLE_STALL	(1 << 20)
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;
+ 	/* There are two roothubs to keep track of bus suspend info for */
+@@ -1588,6 +1589,8 @@ struct xhci_hcd {
+ 	u32			port_status_u0;
+ /* Compliance Mode Timer Triggered every 2 seconds */
+ #define COMP_MODE_RCVRY_MSECS 2000
++	/* SSIC port number */
++	int ssic_port_number;
+ };
+ 
+ /* convert between an HCD pointer and the corresponding EHCI_HCD */
+-- 
+1.9.1
+

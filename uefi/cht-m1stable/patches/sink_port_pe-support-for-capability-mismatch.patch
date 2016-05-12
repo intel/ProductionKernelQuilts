@@ -1,0 +1,92 @@
+From beb040174331f4776c40a9c2a1243684098c23a4 Mon Sep 17 00:00:00 2001
+From: "R, Kannappan" <r.kannappan@intel.com>
+Date: Thu, 1 Oct 2015 16:47:24 +0530
+Subject: [PATCH] sink_port_pe: support for capability mismatch
+
+when the source capability is not matching the sink
+capability, sink can setup the the capability mismatch
+and request for operating current as published by the
+source and maximum operating current as provided by dpm.
+
+Change-Id: If9da6e7957839504b3f03139aaf1b1a5ee2a69b1
+Signed-off-by: R, Kannappan <r.kannappan@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-19276
+---
+ drivers/usb/typec/pd/sink_port_pe.c | 26 ++++++++++++++++++--------
+ drivers/usb/typec/pd/sink_port_pe.h |  3 ++-
+ 2 files changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/sink_port_pe.c b/drivers/usb/typec/pd/sink_port_pe.c
+index f67e0b3..42bf4a4 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.c
++++ b/drivers/usb/typec/pd/sink_port_pe.c
+@@ -111,17 +111,27 @@ static int snkpe_get_req_cap(struct sink_port_pe *sink,
+ 	}
+ 
+ 	if (!is_mv_match) {
+-		rcap->cap_mismatch = false;
+ 		i = 0; /* to select 1st pdo, Vsafe5V */
+ 	}
+ 
+-	if (!rcap->cap_mismatch)
++	if (!rcap->cap_mismatch) {
+ 		rcap->obj_pos = i + 1; /* obj pos always starts from 1 */
+-	else /* if cur is not match, select the previous pdo */
+-		rcap->obj_pos = i;
++		rcap->max_ma = pcap->ma;
++		rcap->op_ma = pcap->ma;
++	} else  {
++		/* if cur is not match, select the previous pdo */
++		rcap->obj_pos = i ? i : 1;
++		rcap->op_ma = DATA_OBJ_TO_CURRENT(pkt->data_obj[rcap->obj_pos - 1]);
++		if (pcap->ma < rcap->op_ma) {
++			rcap->cap_mismatch = false;
++			rcap->max_ma = rcap->op_ma;
++			rcap->op_ma = pcap->ma;
++		} else {
++			rcap->max_ma = pcap->ma;
++		}
++	}
+ 
+ 	rcap->mv = DATA_OBJ_TO_VOLT(pkt->data_obj[rcap->obj_pos - 1]);
+-	rcap->ma = DATA_OBJ_TO_CURRENT(pkt->data_obj[rcap->obj_pos - 1]);
+ 
+ 	return 0;
+ }
+@@ -149,8 +159,8 @@ static int snkpe_create_reqmsg(struct sink_port_pe *sink,
+ 
+ 	rdo->obj_pos = rcap->obj_pos;
+ 	rdo->cap_mismatch = rcap->cap_mismatch;
+-	rdo->op_cur = CURRENT_TO_DATA_OBJ(rcap->ma);
+-	rdo->max_cur = rdo->op_cur;
++	rdo->op_cur = CURRENT_TO_DATA_OBJ(rcap->op_ma);
++	rdo->max_cur = CURRENT_TO_DATA_OBJ(rcap->max_ma);
+ 
+ 	return 0;
+ 
+@@ -537,7 +547,7 @@ static int snkpe_setup_charging(struct sink_port_pe *sink)
+ 
+ 	pr_debug("SNKPE:%s In\n", __func__);
+ 	/* Update the charger input current limit */
+-	ret = policy_update_charger_ilim(&sink->p, sink->rcap.ma);
++	ret = policy_update_charger_ilim(&sink->p, sink->rcap.op_ma);
+ 	if (ret < 0) {
+ 		pr_err("SNKPE: Error in updating charger ilim (%d)\n",
+ 				ret);
+diff --git a/drivers/usb/typec/pd/sink_port_pe.h b/drivers/usb/typec/pd/sink_port_pe.h
+index 2e1beac..2d7ece1 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.h
++++ b/drivers/usb/typec/pd/sink_port_pe.h
+@@ -80,7 +80,8 @@ enum snkpe_timeout {
+ 
+ struct req_cap {
+ 	u8 obj_pos;
+-	u32 ma;
++	u32 op_ma;
++	u32 max_ma;
+ 	u32 mv;
+ 	bool cap_mismatch;
+ };
+-- 
+1.9.1
+

@@ -1,0 +1,159 @@
+From 7ad3fa0cfa600eb33dba740b11d4b99e5f14127d Mon Sep 17 00:00:00 2001
+Message-Id: <7ad3fa0cfa600eb33dba740b11d4b99e5f14127d.1421702909.git.chang-joon.lee@intel.com>
+In-Reply-To: <3d15895a7390b39f4516100dfdee6339a1313d44.1421702909.git.chang-joon.lee@intel.com>
+References: <3d15895a7390b39f4516100dfdee6339a1313d44.1421702909.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Sat, 29 Nov 2014 08:25:24 +0530
+Subject: [PATCH 2/2] FOR_UPSTREAM [VPG]: drm/i915: Sanitize Display PHY based
+ on VBT
+
+There are special cases where PHY0 power on is not supported because the
+power rail has been wired up on the board. Trying to turn on the
+PHY is causing strange behaviors, like rc6 lockups, and the safest
+thing is not to access it all.
+
+Note: For FFD to boot you need latest GOP which is part of BIOS >= 3.17
+
+Issue: GMINL-4436
+Change-Id: I4cd6b8a9dd4cf51e399cf9301c669f801eac5afc
+Signed-off-by: Deepak S <deepak.s@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h   |    1 +
+ drivers/gpu/drm/i915/intel_bios.h |    1 +
+ drivers/gpu/drm/i915/intel_pm.c   |   74 ++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index f91e6d6..7f92936 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1133,6 +1133,7 @@ struct i915_power_well {
+ 	bool hw_enabled;
+ 	unsigned long domains;
+ 	unsigned long data;
++	bool power_domain_disabled;
+ 	const struct i915_power_well_ops *ops;
+ };
+ 
+diff --git a/drivers/gpu/drm/i915/intel_bios.h b/drivers/gpu/drm/i915/intel_bios.h
+index ffca100..7241db7 100644
+--- a/drivers/gpu/drm/i915/intel_bios.h
++++ b/drivers/gpu/drm/i915/intel_bios.h
+@@ -693,6 +693,7 @@ int intel_parse_bios(struct drm_device *dev);
+ #define	 DEVICE_TYPE_HDMI	0x60D2
+ #define	 DEVICE_TYPE_DP		0x68C6
+ #define	 DEVICE_TYPE_eDP	0x78C6
++#define	 DEVICE_TYPE_DP_HDMI_DVI	0x60D6
+ 
+ #define  DEVICE_TYPE_CLASS_EXTENSION	(1 << 15)
+ #define  DEVICE_TYPE_POWER_MANAGEMENT	(1 << 14)
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 7fb5673..0ece8cd 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -7006,6 +7006,11 @@ void intel_display_power_rpm_get(struct drm_i915_private *dev_priv,
+ 	mutex_lock(&power_domains->lock);
+ 
+ 	for_each_power_well(i, power_well, BIT(domain), power_domains) {
++		if (power_well->power_domain_disabled) {
++			DRM_DEBUG_KMS("Power Domain not supported: %s\n",
++				       power_well->name);
++			continue;
++		}
+ 		if (!power_well->count++) {
+ 			DRM_DEBUG_KMS("enabling %s\n", power_well->name);
+ 			power_well->ops->enable(dev_priv, power_well);
+@@ -7035,8 +7040,13 @@ void intel_display_power_rpm_put(struct drm_i915_private *dev_priv,
+ 	power_domains->domain_use_count[domain]--;
+ 
+ 	for_each_power_well_rev(i, power_well, BIT(domain), power_domains) {
+-		WARN_ON(!power_well->count);
++		if (power_well->power_domain_disabled) {
++			DRM_DEBUG_KMS("Power Domain not supported: %s\n",
++				       power_well->name);
++			continue;
++		}
+ 
++		WARN_ON(!power_well->count);
+ 		if (!--power_well->count && i915.disable_power_well) {
+ 			DRM_DEBUG_KMS("disabling %s\n", power_well->name);
+ 			power_well->hw_enabled = false;
+@@ -7451,6 +7461,57 @@ static struct i915_power_well chv_power_wells[] = {
+ 	(power_domains)->power_well_count = ARRAY_SIZE(__power_wells);	\
+ })
+ 
++static void cherryview_sanitize_power_well(struct drm_i915_private *dev_priv)
++{
++	struct i915_power_domains *power_domains = &dev_priv->power_domains;
++	struct i915_power_well *power_well;
++	int i;
++	bool port_bc_in_use = false, port_d_in_use = false;
++
++	for (i = 0; i < dev_priv->vbt.child_dev_num; i++) {
++		int dvo_port =
++			dev_priv->vbt.child_dev[i].common.dvo_port;
++		int devtype =
++			dev_priv->vbt.child_dev[i].common.device_type;
++
++		if (devtype & DEVICE_TYPE_eDP_BITS) {
++			switch (dvo_port) {
++			case DVO_PORT_DPB:
++			case DVO_PORT_DPC:
++				port_bc_in_use = true;
++				break;
++			case DVO_PORT_DPD:
++				port_d_in_use = true;
++				break;
++			default:
++				break;
++			}
++		}
++
++		if ((devtype == DEVICE_TYPE_HDMI ||
++			  devtype == DEVICE_TYPE_DP_HDMI_DVI ||
++			  devtype == DEVICE_TYPE_DP)) {
++			switch (dvo_port) {
++			case DVO_PORT_HDMIB:
++			case DVO_PORT_HDMIC:
++				port_bc_in_use = true;
++				break;
++			case DVO_PORT_HDMID:
++				port_d_in_use = true;
++			default:
++				break;
++			}
++		}
++	}
++
++	for_each_power_well(i, power_well, POWER_DOMAIN_MASK, power_domains) {
++		if (power_well->data == PUNIT_POWER_WELL_DPIO_CMN_BC)
++			power_well->power_domain_disabled = !port_bc_in_use;
++		if (power_well->data == PUNIT_POWER_WELL_DPIO_CMN_D)
++			power_well->power_domain_disabled = !port_d_in_use;
++	}
++}
++
+ int intel_power_domains_init(struct drm_i915_private *dev_priv)
+ {
+ 	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+@@ -7502,6 +7563,17 @@ void intel_power_domains_init_hw(struct drm_i915_private *dev_priv)
+ {
+ 	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+ 
++	/*
++	 * Not all boards have the power to display phy connected and
++	 * trying to turn on the power well is leaving the hardware in
++	 * a strange state, this manifests itself in RC6 errors later
++	 * in the boot process. Thus we only enable the Display PHY0/1
++	 * power gating only if the ports related to PHY are in use, we
++	 * base this decision on how the VBT child nodes are populated.
++	 */
++	if (IS_CHERRYVIEW(dev_priv->dev))
++		cherryview_sanitize_power_well(dev_priv);
++
+ 	power_domains->initializing = true;
+ 	/* For now, we need the power well to be always enabled. */
+ 	intel_display_set_init_power(dev_priv, true);
+-- 
+1.7.9.5
+

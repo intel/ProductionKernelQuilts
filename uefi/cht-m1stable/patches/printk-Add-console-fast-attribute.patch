@@ -1,0 +1,105 @@
+From f737016c984339de5ef7a1d6372ce5cf1e7a875c Mon Sep 17 00:00:00 2001
+From: Traian Schiau <traianx.schiau@intel.com>
+Date: Wed, 9 Sep 2015 09:42:32 +0300
+Subject: [PATCH] printk: Add console fast attribute
+
+Add a new console flag CON_FAST in order to be able
+to disable slow consoles in cases where a considerable
+amount of data should be logged in a limited amount of
+time (eg. show_state in a WD warning interrupt)
+
+Change-Id: I279e6b7591927415fbd3fcf1633e7c813b35cb2d
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-15439
+Signed-off-by: Traian Schiau <traianx.schiau@intel.com>
+---
+ include/linux/console.h |  5 +++++
+ kernel/printk/printk.c  | 36 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/include/linux/console.h b/include/linux/console.h
+index 40e22a4..f50026f 100644
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -116,6 +116,7 @@ static inline int con_debug_leave(void)
+ #define CON_ANYTIME	(16) /* Safe to call when cpu is offline */
+ #define CON_BRL		(32) /* Used for a braille device */
+ #define CON_IGNORELEVEL	(64) /* Used to ignore log level for a console */
++#define CON_FAST	(128) /* This is a fast console */
+ 
+ struct console {
+ 	char	name[16];
+@@ -151,6 +152,10 @@ extern int console_trylock(void);
+ extern void console_unlock(void);
+ extern void console_conditional_schedule(void);
+ extern void console_unblank(void);
++
++void console_suspend_slow(void);
++void console_restore_slow(void);
++
+ extern struct tty_driver *console_device(int *);
+ extern void console_stop(struct console *);
+ extern void console_start(struct console *);
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index f9d9693..f1515f7 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -257,6 +257,11 @@ static u32 log_buf_len = __LOG_BUF_LEN;
+ /* cpu currently holding logbuf_lock */
+ static volatile unsigned int logbuf_cpu = UINT_MAX;
+ 
++/* Give the posibility to temporary disable slow (!CON_FAST) consoles */
++static atomic_t console_slow_suspended = ATOMIC_INIT(0);
++/* Keep the number of slow suspend in check */
++#define MAX_SLOW_SUSPEND_COUNT	(50)
++
+ /* human readable text of the record */
+ static char *log_text(const struct printk_log *msg)
+ {
+@@ -1269,6 +1274,9 @@ static void call_console_drivers(int level, const char *text, size_t len)
+ 	for_each_console(con) {
+ 		if (exclusive_console && con != exclusive_console)
+ 			continue;
++		if (atomic_read(&console_slow_suspended) &&
++		    !(con->flags & CON_FAST))
++			continue;
+ 		if (!(con->flags & CON_ENABLED))
+ 			continue;
+ 		if (!con->write)
+@@ -2162,6 +2170,34 @@ void console_unblank(void)
+ 	console_unlock();
+ }
+ 
++void console_suspend_slow(void)
++{
++	struct console *c;
++	if (atomic_read(&console_slow_suspended) >= MAX_SLOW_SUSPEND_COUNT) {
++		pr_debug("Max slow suspend\n");
++		return;
++	}
++	if (atomic_add_return(1, &console_slow_suspended) == 1) {
++		pr_err("Suspend slow consoles\n");
++		for_each_console(c)
++			if (!(c->flags & CON_FAST))
++				pr_debug("%s suspended\n", c->name);
++	}
++}
++EXPORT_SYMBOL(console_suspend_slow);
++
++void console_restore_slow(void)
++{
++	if (atomic_read(&console_slow_suspended) <= 0) {
++		pr_debug("Min slow suspend\n");
++		return;
++	}
++
++	if (!atomic_sub_return(1, &console_slow_suspended))
++		pr_err("Restore slow consoles\n");
++}
++EXPORT_SYMBOL(console_restore_slow);
++
+ /*
+  * Return the console tty driver structure and its associated index
+  */
+-- 
+1.9.1
+

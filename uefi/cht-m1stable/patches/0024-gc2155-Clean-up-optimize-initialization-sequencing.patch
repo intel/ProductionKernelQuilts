@@ -1,0 +1,105 @@
+From acd4a518aaa3b263a58ee7b20be4875c146f536b Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Wed, 8 Apr 2015 11:06:29 -0700
+Subject: [PATCH 2/2] gc2155: Clean up & optimize initialization sequencing
+
+Remove the "power down before power up" behavior as that's voodoo in
+our architecture.  The device is always affirmatively off before
+power_up() is called.  This removes a 50ms (!) sleep from the power-on
+path.
+
+Move the final sleep in gpio_ctrl() to after the call.  That allows us
+to drop it in power_down() where it's not needed and save 10ms.
+
+Add a 10ms sleep between bringing up the 1.8v and 2.8v power rails,
+and another between power-on and clock-on.  The datasheet specifies an
+order for these operations and clearly marks "a" delay between steps,
+but is silent on actual numbers.  Doing things synchronously seems
+dangerous and we've seen rare initialization failures in the field.
+
+Remove the voodoo retry of gpio_ctrl.  This call has never been
+observed to fail, and I can't imagine why it would ever do so
+recoverably such that a retry makes sense.
+
+Fix error handling goto targets in power_up.  They were wrong.
+
+Change-Id: Ia036f4a7839f7efeb4a1d2b282c653de83b92682
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-7713
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ drivers/media/i2c/atomisp/gc2155.c | 25 ++++++++++---------------
+ 1 file changed, 10 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/media/i2c/atomisp/gc2155.c b/drivers/media/i2c/atomisp/gc2155.c
+index a9432bd..60837ae 100644
+--- a/drivers/media/i2c/atomisp/gc2155.c
++++ b/drivers/media/i2c/atomisp/gc2155.c
+@@ -857,11 +857,8 @@ static int power_ctrl(struct v4l2_subdev *sd, bool flag)
+ 
+        /* Timings and sequencing from original CTS gc2155 driver */
+        if (flag) {
+-               ret |= dev->platform_data->v1p8_ctrl(sd, 0);
+-               ret |= dev->platform_data->v2p8_ctrl(sd, 0);
+-	       mdelay(50);
+-
+                ret |= dev->platform_data->v1p8_ctrl(sd, 1);
++	       msleep(10);
+                ret |= dev->platform_data->v2p8_ctrl(sd, 1);
+ 	       msleep(10);
+        }
+@@ -892,12 +889,10 @@ static int gpio_ctrl(struct v4l2_subdev *sd, bool flag)
+ 		ret |= dev->platform_data->gpio1_ctrl(sd, 0);
+ 		usleep_range(10000, 15000);
+ 		ret |= dev->platform_data->gpio0_ctrl(sd, 1);
+-		usleep_range(10000, 15000);
+ 	} else {
+ 		ret = dev->platform_data->gpio1_ctrl(sd, 1);
+ 		usleep_range(10000, 15000);
+ 		ret |= dev->platform_data->gpio0_ctrl(sd, 0);
+-		usleep_range(10000, 15000);
+ 	}
+ 
+ 	return ret;
+@@ -922,30 +917,30 @@ static int power_up(struct v4l2_subdev *sd)
+ 	if (ret)
+ 		goto fail_power;
+ 
++	usleep_range(10000, 15000);
++
+ 	/* flis clock control */
+ 	ret = dev->platform_data->flisclk_ctrl(sd, 1);
+ 	if (ret)
+ 		goto fail_clk;
+ 
+-	msleep(2);
++	usleep_range(2000, 3000);
+ 
+ 	/* gpio ctrl */
+ 	ret = gpio_ctrl(sd, 1);
+-	if (ret) {
+-		ret = gpio_ctrl(sd, 1);
+-		if (ret)
+-			goto fail_gpio;
+-	}
++	if (ret)
++		goto fail_gpio;
++
++	usleep_range(10000, 15000);
+ 
+ 	return 0;
+ 
+ fail_gpio:
+-	power_ctrl(sd, 0);
+-fail_power:
+ 	dev->platform_data->flisclk_ctrl(sd, 0);
+ fail_clk:
++	power_ctrl(sd, 0);
++fail_power:
+ 	dev_err(&client->dev, "sensor power-up failed\n");
+-
+ 	return ret;
+ }
+ 
+-- 
+1.9.1
+

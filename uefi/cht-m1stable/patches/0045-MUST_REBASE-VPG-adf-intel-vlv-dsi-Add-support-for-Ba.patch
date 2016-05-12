@@ -1,0 +1,151 @@
+From a8aeacaa7daa711d1bcbf02fb95a426248cd9389 Mon Sep 17 00:00:00 2001
+Message-Id: <a8aeacaa7daa711d1bcbf02fb95a426248cd9389.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Shobhit Kumar <shobhit.kumar@intel.com>
+Date: Mon, 29 Sep 2014 17:00:49 +0530
+Subject: [PATCH 45/75] MUST_REBASE [VPG]: adf/intel/vlv/dsi: Add support for
+ Backlight Enable/Disable
+
+For latest VBT the backlight enable/disable sequence comes from VBT,
+but in case of sequence version < 3, we need to define static
+enabling/disabling functions. Hook them back into same panel ops to have
+a cleaner consistent code.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I1b14b36f8e1db5edcf89e78b8807e734dd0bd758
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ .../video/adf/intel/core/common/dsi/dsi_pipe_ops.c |   56 ++++++++++++++++++++
+ .../video/adf/intel/core/common/dsi/gen_dsi_pipe.c |   10 +++-
+ .../video/adf/intel/core/common/dsi/intel_dsi.h    |    6 +++
+ 3 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c b/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c
+index 153c97b..e08c251 100644
+--- a/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c
++++ b/drivers/video/adf/intel/core/common/dsi/dsi_pipe_ops.c
+@@ -36,6 +36,9 @@
+ #include "intel_dsi_cmd.h"
+ 
+ #define PMIC_PANEL_EN		0x52
++#define PMIC_PWM_EN		0x51
++#define PMIC_BKL_EN		0x4B
++#define PMIC_PWM_LEVEL		0x4E
+ 
+ static void band_gap_reset(void)
+ {
+@@ -106,6 +109,59 @@ int intel_dsi_pmic_power_off(struct dsi_pipe *dsi_pipe)
+ 	return 0;
+ }
+ 
++int intel_dsi_pmic_backlight_on(struct dsi_pipe *dsi_pipe)
++{
++	intel_soc_pmic_writeb(PMIC_BKL_EN, 0xFF);
++	intel_soc_pmic_writeb(PMIC_PWM_EN, 0x01);
++
++	/*
++	 * I2C based control if any was already there
++	 * in seq version < 3, so call that sequence
++	 * here as well
++	 *
++	 * Mainly needed for CHV
++	 */
++	generic_enable_bklt(dsi_pipe);
++
++	return 0;
++}
++
++int intel_dsi_soc_backlight_on(struct dsi_pipe *dsi_pipe)
++{
++	vlv_gpio_write(PANEL1_BKLTEN_GPIONC_10_PCONF0, 0x2000CC00,
++		       IOSF_PORT_GPIO_NC);
++	vlv_gpio_write(PANEL1_BKLTEN_GPIONC_10_PAD, 0x00000005,
++		       IOSF_PORT_GPIO_NC);
++	udelay(500);
++	return 0;
++}
++
++int intel_dsi_pmic_backlight_off(struct dsi_pipe *dsi_pipe)
++{
++	/*
++	 * I2C based control if any was already there
++	 * in seq version < 3, so call that sequence
++	 * here as well
++	 *
++	 * Mainly needed for CHV
++	 */
++	generic_disable_bklt(dsi_pipe);
++
++	intel_soc_pmic_writeb(PMIC_PWM_EN, 0x00);
++	intel_soc_pmic_writeb(PMIC_BKL_EN, 0x7F);
++	return 0;
++}
++
++int intel_dsi_soc_backlight_off(struct dsi_pipe *dsi_pipe)
++{
++	vlv_gpio_write(PANEL1_BKLTEN_GPIONC_10_PCONF0, 0x2000CC00,
++		       IOSF_PORT_GPIO_NC);
++	vlv_gpio_write(PANEL1_BKLTEN_GPIONC_10_PAD, 0x00000004,
++		       IOSF_PORT_GPIO_NC);
++	udelay(500);
++	return 0;
++}
++
+ static void intel_dsi_device_ready(struct dsi_pipe *dsi_pipe)
+ {
+ 	int pipe = dsi_pipe->config.pipe;
+diff --git a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+index cb30507..37a49d9 100644
+--- a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
++++ b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+@@ -454,7 +454,7 @@ int dsi_pipe_init(struct dsi_pipe *pipe, struct device *dev,
+ 	if (vbt->seq_version < 3) {
+ 		/*
+ 		 * We have device with older version of VBT which
+-		 * needs static panel enabling routines
++		 * needs static panel and backlight enabling routines
+ 		 *
+ 		 * Overwrite the panel ops function with static
+ 		 * functions
+@@ -463,10 +463,18 @@ int dsi_pipe_init(struct dsi_pipe *pipe, struct device *dev,
+ 			/* using SOC PWM */
+ 			panel->ops->panel_power_on = intel_dsi_soc_power_on;
+ 			panel->ops->panel_power_off = intel_dsi_soc_power_off;
++			panel->ops->enable_backlight =
++						intel_dsi_soc_backlight_on;
++			panel->ops->disable_backlight =
++						intel_dsi_soc_backlight_off;
+ 		} else {
+ 			/* Using PMIC */
+ 			panel->ops->panel_power_on = intel_dsi_pmic_power_on;
+ 			panel->ops->panel_power_off = intel_dsi_pmic_power_off;
++			panel->ops->enable_backlight =
++						intel_dsi_pmic_backlight_on;
++			panel->ops->disable_backlight =
++						intel_dsi_pmic_backlight_off;
+ 		}
+ 	}
+ 
+diff --git a/drivers/video/adf/intel/core/common/dsi/intel_dsi.h b/drivers/video/adf/intel/core/common/dsi/intel_dsi.h
+index 2c6d2e7..6586d1c 100644
+--- a/drivers/video/adf/intel/core/common/dsi/intel_dsi.h
++++ b/drivers/video/adf/intel/core/common/dsi/intel_dsi.h
+@@ -48,4 +48,10 @@ extern int intel_dsi_soc_power_on(struct dsi_pipe *dsi_pipe);
+ extern int intel_dsi_pmic_power_on(struct dsi_pipe *dsi_pipe);
+ extern int intel_dsi_soc_power_off(struct dsi_pipe *dsi_pipe);
+ extern int intel_dsi_pmic_power_off(struct dsi_pipe *dsi_pipe);
++extern int intel_dsi_pmic_backlight_on(struct dsi_pipe *dsi_pipe);
++extern int intel_dsi_soc_backlight_on(struct dsi_pipe *dsi_pipe);
++extern int intel_dsi_pmic_backlight_off(struct dsi_pipe *dsi_pipe);
++extern int intel_dsi_soc_backlight_off(struct dsi_pipe *dsi_pipe);
++extern int generic_enable_bklt(struct dsi_pipe *interface);
++extern int generic_disable_bklt(struct dsi_pipe *interface);
+ #endif /* _INTEL_DSI_H */
+-- 
+1.7.9.5
+

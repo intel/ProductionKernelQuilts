@@ -1,0 +1,107 @@
+From ac08ab7cd1f1bd72b7d301656594581908516334 Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Wed, 4 Jun 2014 11:51:34 -0700
+Subject: [PATCH 059/117] imx: Support unified gmin atomisp platform device
+
+When available, use the gmin-style unified platform instead of the
+sensor-specific one.  Requires moving a little bit of logic (timings,
+basically, which are uniform across platforms anyway) from the
+original platform driver.
+
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ .../camera/drivers/media/i2c/imx/imx.c             | 58 ++++++++++++++++++++--
+ 1 file changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+index 5d753c1..00b9f16 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/imx/imx.c
+@@ -44,8 +44,6 @@
+ #include <linux/atomisp_gmin_platform.h>
+ #include "imx.h"
+ 
+-void *imx134_platform_data(void *info); /* From platform_imx134.c */
+-
+ static enum atomisp_bayer_order imx_bayer_order_mapping[] = {
+ 	atomisp_bayer_order_rggb,
+ 	atomisp_bayer_order_grbg,
+@@ -553,14 +551,64 @@ static long imx_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ 
+ static int power_ctrl(struct v4l2_subdev *sd, int flag)
+ {
++	int ret;
+ 	struct imx_device *dev = to_imx_sensor(sd);
+-	return dev->platform_data->power_ctrl(sd, flag);
++
++	if (!dev || !dev->platform_data)
++		return -ENODEV;
++
++	/* Non-gmin platforms use the legacy callback */
++	if (dev->platform_data->power_ctrl)
++		return dev->platform_data->power_ctrl(sd, flag);
++
++	/* G-Min only supports imx134 */
++	if (dev->sensor_id && dev->sensor_id != IMX134_ID)
++		return -EINVAL;
++
++	if (flag) {
++		ret = dev->platform_data->v2p8_ctrl(sd, 1);
++		if (!ret) {
++			ret = dev->platform_data->v1p8_ctrl(sd, 1);
++			if (ret)
++				dev->platform_data->v2p8_ctrl(sd, 0);
++		}
++		usleep_range(1000, 1200);
++	} else {
++		ret = dev->platform_data->v2p8_ctrl(sd, 0);
++		ret |= dev->platform_data->v1p8_ctrl(sd, 0);
++	}
++	return ret;
+ }
+ 
+ static int gpio_ctrl(struct v4l2_subdev *sd, int flag)
+ {
++	int ret;
+ 	struct imx_device *dev = to_imx_sensor(sd);
+-	return dev->platform_data->gpio_ctrl(sd, flag);
++
++	if (!dev || !dev->platform_data)
++		return -ENODEV;
++
++	/* Non-gmin platforms use the legacy callback */
++	if (dev->platform_data->gpio_ctrl)
++		return dev->platform_data->gpio_ctrl(sd, flag);
++
++	/* G-Min only supports imx134 */
++	if (dev->sensor_id && dev->sensor_id != IMX134_ID)
++		return -EINVAL;
++
++	ret = dev->platform_data->gpio0_ctrl(sd, flag);
++
++	/* From original platform_imx134.c:
++	 *
++	 * imx134 core silicon initializing time - t1+t2+t3
++	 * 400us(t1) - Time to VDDL is supplied after REGEN high
++	 * 600us(t2) - imx134 core Waking up time
++	 * 459us(t3, 8825clocks) -Initializing time of silicon */
++	if (flag)
++                usleep_range(1500, 1600);
++	else
++		udelay(1);
++	return ret;
+ }
+ 
+ 
+@@ -2274,7 +2322,7 @@ static int imx_probe(struct i2c_client *client,
+ 
+ 	pdata = client->dev.platform_data;
+ 	if (!pdata || ACPI_COMPANION(&client->dev))
+-		pdata = imx134_platform_data(NULL);
++		pdata = gmin_camera_platform_data();
+ 
+ 	if (!pdata) {
+ 		v4l2_err(client, "No imx platform data\n");
+-- 
+1.9.3
+

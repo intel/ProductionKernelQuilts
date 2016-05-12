@@ -1,0 +1,283 @@
+From aee330198c95803acb8227b9e42d2062389cca9c Mon Sep 17 00:00:00 2001
+From: Jenny TC <jenny.tc@intel.com>
+Date: Tue, 18 Nov 2014 18:11:47 +0530
+Subject: [PATCH 1/1] power: Fix ACA detection issues in CHT
+
+In CHT ACA cable detection is not working properly. This
+patch fixes the ACA issue by adding below logic
+
+1). To address USBID failure, ADC IRQs enabled based on request
+and added logic to check the IRQ status on receiving IRQ
+2). Fixed IRQ handling by clearing second level registers of BCU
+and CCSM
+3) Fixed cable name reporting in bq24292
+
+Change-Id: I1dc0de06d51ecec8c00efe6b487f535e51ab93b3
+Signed-off-by: Jenny TC <jenny.tc@intel.com>
+---
+ drivers/iio/adc/intel_wcove_gpadc.c   | 58 ++++++++++++++++++++---------------
+ drivers/mfd/intel_soc_pmic_wc.c       | 44 ++++++++++++++++----------
+ drivers/power/bq24192_charger.c       |  1 +
+ include/linux/iio/intel_wcove_gpadc.h |  9 ++++++
+ 4 files changed, 70 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/iio/adc/intel_wcove_gpadc.c b/drivers/iio/adc/intel_wcove_gpadc.c
+index c7b933c..3d19f0a 100644
+--- a/drivers/iio/adc/intel_wcove_gpadc.c
++++ b/drivers/iio/adc/intel_wcove_gpadc.c
+@@ -152,7 +152,7 @@ int iio_whiskeycove_gpadc_sample(struct iio_dev *indio_dev,
+ {
+ 	struct gpadc_info *info = iio_priv(indio_dev);
+ 	int i, ret, reg_val;
+-	u8 tmp, th, tl;
++	u8 adc_req = 0, irq_en = 0, th, tl, adc_irq;
+ 	u8 mask, cursrc;
+ 	unsigned long rlsb;
+ 	static const unsigned long rlsb_array[] = {
+@@ -166,17 +166,17 @@ int iio_whiskeycove_gpadc_sample(struct iio_dev *indio_dev,
+ 
+ 	mutex_lock(&info->lock);
+ 
+-	mask = info->intr_mask;
+-	intel_soc_pmic_clearb(regs->madcirq, mask);
+-	intel_soc_pmic_clearb(regs->mirqlvl1, regs->mirqlvl1_adc);
+-
+-	tmp = regs->gpadcreq_irqen;
+-
+ 	for (i = 0; i < info->channel_num; i++) {
+-		if (ch & (1 << i))
+-			tmp |= (1 << info->gpadc_regmaps[i].cntl);
++		if (ch & (1 << i)) {
++			adc_req |= (1 << info->gpadc_regmaps[i].cntl);
++			irq_en |= (1 << info->gpadc_regmaps[i].irq_en);
++		}
+ 	}
+ 
++	intel_soc_pmic_clearb(regs->madcirq, irq_en);
++	intel_soc_pmic_clearb(regs->mirqlvl1, regs->mirqlvl1_adc);
++	intel_soc_pmic_setb(regs->adcirq, 0xFF);
++
+ 	info->sample_done = 0;
+ 
+ 	ret = gpadc_busy_wait(regs);
+@@ -185,18 +185,21 @@ int iio_whiskeycove_gpadc_sample(struct iio_dev *indio_dev,
+ 		goto done;
+ 	}
+ 
+-	intel_soc_pmic_writeb(regs->gpadcreq, tmp);
++	intel_soc_pmic_writeb(regs->gpadcreq, adc_req);
+ 
+ 	ret = wait_event_timeout(info->wait, info->sample_done, HZ);
+-	if (ret == 0) {
++
++	/* Chek if the required IRQ bits are set */
++	adc_irq = intel_soc_pmic_readb(regs->adcirq);
++	if (!(adc_irq & irq_en)) {
+ 		gpadc_dump(info);
+-		ret = -ETIMEDOUT;
+-		dev_err(info->dev, "sample timeout, return %d\n", ret);
++		ret = -EIO;
++		dev_err(info->dev, "Error in Sample%d\n", ret);
+ 		goto done;
+-	} else {
+-		ret = 0;
+ 	}
+ 
++	ret = 0;
++
+ 	for (i = 0; i < info->channel_num; i++) {
+ 		if (ch & (1 << i)) {
+ 			tl = intel_soc_pmic_readb(info->gpadc_regmaps[i].rsltl);
+@@ -218,16 +221,6 @@ int iio_whiskeycove_gpadc_sample(struct iio_dev *indio_dev,
+ 			case PMIC_GPADC_CHANNEL_SYSTEMP0:
+ 			case PMIC_GPADC_CHANNEL_SYSTEMP1:
+ 			case PMIC_GPADC_CHANNEL_SYSTEMP2:
+-			if (!info->is_pmic_provisioned) {
+-					/* Auto mode with Scaling 4
+-					 * for non-provisioned A0 */
+-					rlsb = 32550;
+-					res->data[i] = (reg_val * rlsb)/10000;
+-					break;
+-			}
+-			/* Case fall-through for PMIC-A1 onwards.
+-			 * For USBID, Auto-mode-without-scaling always
+-			 */
+ 			case PMIC_GPADC_CHANNEL_USBID:
+ 				/* Auto mode without Scaling */
+ 				cursrc = (th & 0xF0) >> 4;
+@@ -241,6 +234,7 @@ int iio_whiskeycove_gpadc_sample(struct iio_dev *indio_dev,
+ done:
+ 	intel_soc_pmic_setb(regs->mirqlvl1, regs->mirqlvl1_adc);
+ 	intel_soc_pmic_setb(regs->madcirq, mask);
++	intel_soc_pmic_setb(regs->adcirq, mask);
+ 	mutex_unlock(&info->lock);
+ 	return ret;
+ }
+@@ -556,6 +550,8 @@ static int wcove_gpadc_probe(struct platform_device *pdev)
+ 	struct intel_wcove_gpadc_platform_data *pdata =
+ 			pdev->dev.platform_data;
+ 
++	struct gpadc_regs_t *regs;
++
+ 	if (!pdata) {
+ 		dev_err(&pdev->dev, "no platform data supplied\n");
+ 		return -EINVAL;
+@@ -585,6 +581,18 @@ static int wcove_gpadc_probe(struct platform_device *pdev)
+ 		return err;
+ 	}
+ 
++	regs = info->gpadc_regs;
++	intel_soc_pmic_setb(regs->mirqlvl1, regs->mirqlvl1_adc);
++	intel_soc_pmic_setb(regs->madcirq, 0xFF);
++
++	/* configure sample periods */
++	intel_soc_pmic_writeb(regs->thrmmonctl, pdata->thrmmon_val);
++	intel_soc_pmic_writeb(regs->batthermonctl, pdata->battthermmon_val);
++	intel_soc_pmic_writeb(regs->vbatmonctl, pdata->vbatmon_val);
++	intel_soc_pmic_writeb(regs->gpmonctl, pdata->gpmon_val);
++
++	intel_soc_pmic_setb(regs->adcirq, 0xFF);
++
+ 	platform_set_drvdata(pdev, indio_dev);
+ 
+ 	indio_dev->dev.parent = &pdev->dev;
+diff --git a/drivers/mfd/intel_soc_pmic_wc.c b/drivers/mfd/intel_soc_pmic_wc.c
+index 40377b9..60382b8 100644
+--- a/drivers/mfd/intel_soc_pmic_wc.c
++++ b/drivers/mfd/intel_soc_pmic_wc.c
+@@ -47,8 +47,10 @@
+ #define THRM1IRQ	0x05
+ #define THRM2IRQ	0x06
+ #define BCUIRQ		0x07
++#define ADCIRQ		0x08
+ #define THRM3IRQ	0xD9
+-#define CHGRIRQ	0x0A
++#define CHGRIRQ		0x0A
++#define CRITIRQ		0x37
+ 
+ #define MIRQLVL1	0x0E
+ #define MPWRSRCIRQ	0x0F
+@@ -61,18 +63,18 @@
+ static bool wcove_init_done;
+ 
+ static struct gpadc_regmap_t whiskeycove_gpadc_regmaps[GPADC_NUM_CHANNELS] = {
+-	{"VBAT",	5,	0x4F03, 0x4F04, 0xFF, 0xFF, 0xFF, 0xFF},
+-	{"BATID",	4,	0x4F06, 0x4F07, 0xFF, 0xFF, 0xFF, 0xFF},
+-	{"PMICTEMP",	3,	0x4F42,	0x4F43, 0x4F33, 0x4F34, 0x4F33, 0x4F34},
+-	{"BATTEMP0",	2,	0x4F15, 0x4F16, 0xFF, 0xFF, 0xFF, 0xFF},
+-	{"BATTEMP1",	2,	0x4F17, 0x4F18, 0xFF, 0xFF, 0xFF, 0xFF},
+-	{"SYSTEMP0",	3,	0x4F38, 0x4F39, 0x4F23, 0x4F24, 0x4F25, 0x4F26},
+-	{"SYSTEMP1",	3,	0x4F3A, 0x4F3B, 0x4F27, 0x4F28, 0x4F29, 0x4F2A},
+-	{"SYSTEMP2",	3,	0x4F3C, 0x4F3D, 0x4F2B, 0x4F2C, 0x4F2D, 0x4F2E},
+-	{"USBID",	1,	0x4F08, 0x4F09, 0xFF, 0xFF, 0xFF, 0xFF},
+-	{"PEAK",	7,	0x4F13, 0x4F14, 0xFF, 0xFF, 0xFF, 0xFF},
+-	{"AGND",	6,	0x4F0A, 0x4F0B, 0xFF, 0xFF, 0xFF, 0xFF},
+-	{"VREF",	6,	0x4F0A, 0x4F0B, 0xFF, 0xFF, 0xFF, 0xFF},
++	{"VBAT",	5, 0,	0x4F03, 0x4F04, 0xFF, 0xFF, 0xFF, 0xFF},
++	{"BATID",	4, 1,	0x4F06, 0x4F07, 0xFF, 0xFF, 0xFF, 0xFF},
++	{"PMICTEMP",	3, 2,	0x4F42,	0x4F43, 0x4F33, 0x4F34, 0x4F33, 0x4F34},
++	{"BATTEMP0",	2, 3,	0x4F15, 0x4F16, 0xFF, 0xFF, 0xFF, 0xFF},
++	{"BATTEMP1",	2, 3,	0x4F17, 0x4F18, 0xFF, 0xFF, 0xFF, 0xFF},
++	{"SYSTEMP0",	3, 2,	0x4F38, 0x4F39, 0x4F23, 0x4F24, 0x4F25, 0x4F26},
++	{"SYSTEMP1",	3, 2,	0x4F3A, 0x4F3B, 0x4F27, 0x4F28, 0x4F29, 0x4F2A},
++	{"SYSTEMP2",	3, 2,	0x4F3C, 0x4F3D, 0x4F2B, 0x4F2C, 0x4F2D, 0x4F2E},
++	{"USBID",	1, 5,	0x4F08, 0x4F09, 0xFF, 0xFF, 0xFF, 0xFF},
++	{"PEAK",	7, 6,	0x4F13, 0x4F14, 0xFF, 0xFF, 0xFF, 0xFF},
++	{"AGND",	6, 4,	0x4F0A, 0x4F0B, 0xFF, 0xFF, 0xFF, 0xFF},
++	{"VREF",	6, 4,	0x4F0A, 0x4F0B, 0xFF, 0xFF, 0xFF, 0xFF},
+ };
+ 
+ static struct gpadc_regs_t whiskeycove_gpadc_regs = {
+@@ -84,6 +86,10 @@ static struct gpadc_regs_t whiskeycove_gpadc_regs = {
+ 	.adc1cntl	=	0x4F05,
+ 	.adcirq		=	0x6E08,
+ 	.madcirq	=	0x6E15,
++	.thrmmonctl	=	0x4F1E,
++	.batthermonctl =	0x4F1F,
++	.vbatmonctl	=	0x4F20,
++	.gpmonctl	=	0x4F21,
+ };
+ 
+ #define MSIC_ADC_MAP(_adc_channel_label,			\
+@@ -435,8 +441,8 @@ struct intel_pmic_irqregmap whiskey_cove_irqregmap[] = {
+ 	},
+ 	{
+ 		{MIRQLVL1, BCU_IRQ, 1, 0},
+-		{BCUIRQ, 0, 7, 0},
+-		{BCUIRQ, 0, 7, 0},
++		{BCUIRQ, 0, 0x1F, INTEL_PMIC_REG_W1C},
++		{BCUIRQ, 0, 0x1F, INTEL_PMIC_REG_W1C},
+ 	},
+ 	{
+ 		{MIRQLVL1, ADC_IRQ, 1, 0},
+@@ -460,8 +466,8 @@ struct intel_pmic_irqregmap whiskey_cove_irqregmap[] = {
+ 	},
+ 	{
+ 		{MIRQLVL1, CRIT_IRQ, 1, 0},
+-		{IRQLVL1, CRIT_IRQ, 1, 0},
+-		INTEL_PMIC_REG_NULL,
++		{IRQLVL1, CRIT_IRQ, 1, INTEL_PMIC_REG_W1C},
++		{CRITIRQ, 0, 0x03, INTEL_PMIC_REG_W1C}
+ 	},
+ 	{
+ 		{MIRQLVL1, 0, 0x1, 0},
+@@ -533,6 +539,10 @@ static void wc_set_adc_pdata(void)
+ 	wc_adc_pdata.gpadc_regmaps = whiskeycove_gpadc_regmaps;
+ 	wc_adc_pdata.gpadc_regs = &whiskeycove_gpadc_regs;
+ 	wc_adc_pdata.gpadc_channels = wc_adc_channels;
++	wc_adc_pdata.thrmmon_val = 0x1B;
++	wc_adc_pdata.battthermmon_val = 0x7B;
++	wc_adc_pdata.vbatmon_val = 0x1B;
++	wc_adc_pdata.gpmon_val = 0x00;
+ 
+ 	intel_soc_pmic_set_pdata("wcove_gpadc", (void *)&wc_adc_pdata,
+ 			sizeof(wc_adc_pdata), 0);
+diff --git a/drivers/power/bq24192_charger.c b/drivers/power/bq24192_charger.c
+index 03c6ed8..b231577 100644
+--- a/drivers/power/bq24192_charger.c
++++ b/drivers/power/bq24192_charger.c
+@@ -345,6 +345,7 @@ static enum power_supply_type get_power_supply_type(
+ 	case POWER_SUPPLY_CHARGER_TYPE_USB_CDP:
+ 		return POWER_SUPPLY_TYPE_USB_CDP;
+ 	case POWER_SUPPLY_CHARGER_TYPE_USB_ACA:
++	case POWER_SUPPLY_CHARGER_TYPE_ACA_DOCK:
+ 		return POWER_SUPPLY_TYPE_USB_ACA;
+ 	case POWER_SUPPLY_CHARGER_TYPE_AC:
+ 		return POWER_SUPPLY_TYPE_MAINS;
+diff --git a/include/linux/iio/intel_wcove_gpadc.h b/include/linux/iio/intel_wcove_gpadc.h
+index 266bfb5..db4d653 100644
+--- a/include/linux/iio/intel_wcove_gpadc.h
++++ b/include/linux/iio/intel_wcove_gpadc.h
+@@ -53,6 +53,7 @@ enum gpadc_channel_type {
+ struct gpadc_regmap_t {
+ 	char *name;
+ 	int cntl;       /* GPADC Conversion Control Bit indicator */
++	int irq_en;	/* GPADC IRQ bit indicator */
+ 	int rslth;      /* GPADC Conversion Result Register Addr High */
+ 	int rsltl;      /* GPADC Conversion Result Register Addr Low */
+ 	int alrt_min_h;
+@@ -70,6 +71,10 @@ struct gpadc_regs_t {
+ 	u16 adc1cntl;
+ 	u16 adcirq;
+ 	u16 madcirq;
++	u16 thrmmonctl;
++	u16 batthermonctl;
++	u16 vbatmonctl;
++	u16 gpmonctl;
+ };
+ 
+ struct iio_dev;
+@@ -78,6 +83,10 @@ struct intel_wcove_gpadc_platform_data {
+ 	int channel_num;
+ 	unsigned long intr;
+ 	u8 intr_mask;
++	u8 thrmmon_val;
++	u8 battthermmon_val;
++	u8 vbatmon_val;
++	u8 gpmon_val;
+ 	struct iio_map *gpadc_iio_maps;
+ 	struct gpadc_regmap_t *gpadc_regmaps;
+ 	struct gpadc_regs_t *gpadc_regs;
+-- 
+1.9.1
+

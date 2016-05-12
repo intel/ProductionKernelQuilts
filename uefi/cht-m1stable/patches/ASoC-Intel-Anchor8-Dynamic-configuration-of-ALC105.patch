@@ -1,0 +1,141 @@
+From c8f0d9fe3f2d2ca0533c785b2b1be0bf48604878 Mon Sep 17 00:00:00 2001
+From: "ola.lilja" <ola.lilja@intel.com>
+Date: Thu, 2 Oct 2014 15:30:33 +0200
+Subject: [PATCH 2/9] ASoC: Intel: Anchor8: Dynamic configuration of ALC105
+
+Control the reset-pin of ALC105 with the GPIO read
+from ACPI.
+
+Issue: GMINL-1321
+
+Change-Id: I3de4f5c50d2ee02e70637f54fdf6f2ef4910188b
+Signed-off-by: ola.lilja <ola.lilja@intel.com>
+---
+ sound/soc/codecs/rt5651.c                  |   21 ---------------
+ sound/soc/intel/board/byt_cr_dpcm_rt5651.c |   39 +++++++++++++++++++++++++---
+ 2 files changed, 35 insertions(+), 25 deletions(-)
+
+diff --git a/sound/soc/codecs/rt5651.c b/sound/soc/codecs/rt5651.c
+index 8277b55..9e94a06 100644
+--- a/sound/soc/codecs/rt5651.c
++++ b/sound/soc/codecs/rt5651.c
+@@ -25,7 +25,6 @@
+ #include <sound/initval.h>
+ #include <sound/tlv.h>
+ #include <linux/gpio/consumer.h>
+-#include <linux/mfd/intel_soc_pmic.h>
+ 
+ #define RTK_IOCTL
+ #ifdef RTK_IOCTL
+@@ -1164,24 +1163,6 @@ static int rt5651_hp_event(struct snd_soc_dapm_widget *w,
+ 	return 0;
+ }
+ 
+-/* power_up:
+-	power on V5V_SPEAKER_EN(GPIO1P3) for ALC105
+-	power up CODEC_RESET_N (GPIO1P2) for ALC105 */
+-static void ALC105_power_up(void)
+-{
+-	intel_soc_pmic_writeb((GPIO1P0CTLO + 3), (CTLO_OUTPUT_DEF | 0x01));
+-	intel_soc_pmic_writeb((GPIO1P0CTLO + 2), (CTLO_OUTPUT_DEF | 0x01));
+-}
+-
+-/* power_down:
+-	power down CODEC_RESET_N (GPIO1P2) for ALC105
+-	power off V5V_SPEAKER_EN(GPIO1P3) for ALC105 */
+-static void ALC105_power_down(void)
+-{
+-	intel_soc_pmic_writeb((GPIO1P0CTLO + 2), (CTLO_OUTPUT_DEF & 0x0));
+-	intel_soc_pmic_writeb((GPIO1P0CTLO + 3), (CTLO_OUTPUT_DEF & 0x0));
+-}
+-
+ static int rt5651_lout_event(struct snd_soc_dapm_widget *w,
+ 	struct snd_kcontrol *kcontrol, int event)
+ {
+@@ -1191,11 +1172,9 @@ static int rt5651_lout_event(struct snd_soc_dapm_widget *w,
+ 		hp_amp_power(codec, 1);
+ 		snd_soc_update_bits(codec, RT5651_LOUT_CTRL1,
+ 			RT5651_L_MUTE | RT5651_R_MUTE, 0);
+-		ALC105_power_up();
+ 		break;
+ 
+ 	case SND_SOC_DAPM_PRE_PMD:
+-		ALC105_power_down();
+ 		snd_soc_update_bits(codec, RT5651_LOUT_CTRL1,
+ 			RT5651_L_MUTE | RT5651_R_MUTE,
+ 			RT5651_L_MUTE | RT5651_R_MUTE);
+diff --git a/sound/soc/intel/board/byt_cr_dpcm_rt5651.c b/sound/soc/intel/board/byt_cr_dpcm_rt5651.c
+index 82be365..345bdc4 100644
+--- a/sound/soc/intel/board/byt_cr_dpcm_rt5651.c
++++ b/sound/soc/intel/board/byt_cr_dpcm_rt5651.c
+@@ -29,6 +29,7 @@
+ #include <linux/slab.h>
+ #include <linux/vlv2_plat_clock.h>
+ #include <linux/input.h>
++#include <linux/mfd/intel_soc_pmic.h>
+ #include <asm/intel-mid.h>
+ #include <asm/platform_byt_audio.h>
+ #include <sound/pcm.h>
+@@ -346,7 +347,37 @@ static inline struct snd_soc_codec *byt_get_codec(struct snd_soc_card *card)
+ 	return codec;
+ }
+ 
+-static int platform_clock_control(struct snd_soc_dapm_widget *w,
++static int byt_set_alc105(struct snd_soc_dapm_widget *w,
++		struct snd_kcontrol *k, int  event)
++{
++	struct snd_soc_dapm_context *dapm = w->dapm;
++	struct snd_soc_card *card = dapm->card;
++	struct byt_drvdata *drvdata = snd_soc_card_get_drvdata(dapm->card);
++	struct snd_soc_codec *codec;
++	struct gpio_desc *desc;
++
++	pr_debug("%s: Enter.\n", __func__);
++
++	codec = byt_get_codec(card);
++	if (!codec) {
++		pr_err("%s: Codec not found; Unable to set platform clock\n",
++			__func__);
++		return -EIO;
++	}
++
++	desc = gpio_to_desc(drvdata->gpios.alc105_reset_gpio);
++	if (SND_SOC_DAPM_EVENT_ON(event)) {
++		pr_debug("%s: ALC105 ON.\n", __func__);
++		gpiod_set_value(desc, 0);
++	} else {
++		pr_debug("%s: ALC105 OFF.\n", __func__);
++		gpiod_set_value(desc, 1);
++	}
++
++	return 0;
++}
++
++static int byt_set_platform_clock(struct snd_soc_dapm_widget *w,
+ 		struct snd_kcontrol *k, int  event)
+ {
+ 	struct snd_soc_dapm_context *dapm = w->dapm;
+@@ -366,7 +397,7 @@ static int platform_clock_control(struct snd_soc_dapm_widget *w,
+ 				PLAT_CLK_FORCE_ON);
+ 
+ 		pr_debug("%s: Platform clk turned ON\n", __func__);
+-	snd_soc_write(codec, RT5651_ADDA_CLK1, 0x0014);
++		snd_soc_write(codec, RT5651_ADDA_CLK1, 0x0014);
+ 	} else {
+ 		/* Set codec clock source to internal clock before
+ 		   turning off the platform clock. Codec needs clock
+@@ -387,9 +418,9 @@ static const struct snd_soc_dapm_widget byt_dapm_widgets[] = {
+ 	SND_SOC_DAPM_HP("Headphone", NULL),
+ 	SND_SOC_DAPM_MIC("Headset Mic", NULL),
+ 	SND_SOC_DAPM_MIC("Int Mic", NULL),
+-	SND_SOC_DAPM_SPK("Ext Spk", NULL),
++	SND_SOC_DAPM_SPK("Ext Spk", byt_set_alc105),
+ 	SND_SOC_DAPM_SUPPLY("Platform Clock", SND_SOC_NOPM, 0, 0,
+-			platform_clock_control, SND_SOC_DAPM_PRE_PMU |
++			byt_set_platform_clock, SND_SOC_DAPM_PRE_PMU |
+ 			SND_SOC_DAPM_POST_PMD),
+ };
+ 
+-- 
+1.7.9.5
+

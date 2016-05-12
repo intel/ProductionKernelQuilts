@@ -1,0 +1,622 @@
+From c0534bdd00246b5a1514f453756c1cefeff11773 Mon Sep 17 00:00:00 2001
+From: "ola.lilja" <ola.lilja@intel.com>
+Date: Tue, 8 Jul 2014 14:39:53 +0200
+Subject: ASoC: Intel: BYT-CR: Dynamic board-configuration
+
+This patch removes the need for registering more than
+one machine platform-device. It also introduces a
+new inteface used by both sst-driver and machine-driver
+to be able to configure the driver correctly depending
+on different board-variants and to chose default
+configurations for unknown board-variants.
+Currently the board-configs-file supports two codecs:
+RT5640 and RT5651 connected to the BYT-CR platform.
+
+Issue: GMIN-2352
+Change-Id: Ibed6bddbd45ea3d77eb0a98549268dfad824dc5a
+Signed-off-by: ola.lilja <ola.lilja@intel.com>
+---
+ arch/x86/platform/intel-mid/device_libs/Makefile |   2 +-
+ sound/soc/intel/Kconfig                          |  24 +++-
+ sound/soc/intel/board/Makefile                   |   8 +-
+ sound/soc/intel/board/byt_cr_board_configs.c     |  93 ++++++++++++++
+ sound/soc/intel/board/byt_cr_board_configs.h     | 155 +++++++++++++++++++++++
+ sound/soc/intel/board/byt_cr_dpcm_rt5640.c       |  53 ++------
+ sound/soc/intel/board/byt_cr_dpcm_rt5651.c       |  26 +++-
+ sound/soc/intel/sst/sst.c                        |  23 +++-
+ sound/soc/intel/sst/sst_acpi.c                   |  16 ---
+ 9 files changed, 321 insertions(+), 79 deletions(-)
+ create mode 100644 sound/soc/intel/board/byt_cr_board_configs.c
+ create mode 100644 sound/soc/intel/board/byt_cr_board_configs.h
+
+diff --git a/arch/x86/platform/intel-mid/device_libs/Makefile b/arch/x86/platform/intel-mid/device_libs/Makefile
+index e0be103..3006715 100644
+--- a/arch/x86/platform/intel-mid/device_libs/Makefile
++++ b/arch/x86/platform/intel-mid/device_libs/Makefile
+@@ -1,7 +1,7 @@
+ # IPC Devices
+ #obj-y += platform_ipc.o
+ obj-y += platform_sst_audio.o
+-obj-$(subst m,y,$(CONFIG_SND_BYT_MACHINE)) += platform_byt_audio.o
++obj-$(subst m,y,$(CONFIG_SND_SST_PLATFORM)) += platform_byt_audio.o
+ obj-$(subst m,y,$(CONFIG_MFD_INTEL_MSIC)) += platform_msic.o
+ obj-$(subst m,y,$(CONFIG_SND_MFLD_MACHINE)) += platform_msic_audio.o
+ obj-$(subst m,y,$(CONFIG_GPIO_MSIC)) += platform_msic_gpio.o
+diff --git a/sound/soc/intel/Kconfig b/sound/soc/intel/Kconfig
+index bb5e34a..aea6bfd 100644
+--- a/sound/soc/intel/Kconfig
++++ b/sound/soc/intel/Kconfig
+@@ -1,8 +1,22 @@
+-
+-config SND_BYT_MACHINE
+-	tristate "SOC Machine Audio driver for Intel Baytrail MID platform"
++config SND_SOC_INTEL_MRD7
++	tristate "SOC Machine Audio driver for Intel(R) MRD7 device"
+ 	depends on X86
+ 	select SND_SOC_RT5640
++	select SND_SST_PLATFORM
++	select SND_SST_MACHINE
++	select SND_INTEL_SST
++	select SND_HWDEP
++	default n
++
++	help
++	  This adds support for ASoC machine driver for Intel(R) MRD7 device
++          based on the BYT-CR platform and RT5640 codec.
++          Say Y if you have such a device
++          If unsure select "N".
++
++config SND_SOC_INTEL_ANCHOR8
++	tristate "SOC Machine Audio driver for Intel(R) Anchor8 device"
++	depends on X86
+ 	select SND_SOC_RT5651
+ 	select SND_SST_PLATFORM
+ 	select SND_SST_MACHINE
+@@ -11,8 +25,8 @@ config SND_BYT_MACHINE
+ 	default n
+ 
+ 	help
+-	  This adds support for ASoC machine driver for Intel(R) MID Baytrail platform
+-          used as alsa device in audio substem in Intel(R) MID devices
++	  This adds support for ASoC machine driver for Intel(R) Anchor8 device
++          based on the BYT-CR platform and RT5651 codec.
+           Say Y if you have such a device
+           If unsure select "N".
+ 
+diff --git a/sound/soc/intel/board/Makefile b/sound/soc/intel/board/Makefile
+index d34f2f0..54fa1de 100644
+--- a/sound/soc/intel/board/Makefile
++++ b/sound/soc/intel/board/Makefile
+@@ -1,13 +1,13 @@
+-
+ #EXTRA CFLAGS
+ ccflags-y += -Werror
+ 
+ EXTRA_CFLAGS += -DDEBUG
+ 
+ # Baytrail board
+-snd-byt-cr-dpcm-rt5640-objs := byt_cr_dpcm_rt5640.o
+-snd-byt-cr-dpcm-rt5651-objs := byt_cr_dpcm_rt5651.o
+-obj-$(CONFIG_SND_BYT_MACHINE) += snd-byt-cr-dpcm-rt5640.o snd-byt-cr-dpcm-rt5651.o
+ 
++snd-byt-cr-dpcm-rt5640-objs := byt_cr_dpcm_rt5640.o
++obj-$(CONFIG_SND_SOC_INTEL_MRD7) += snd-byt-cr-dpcm-rt5640.o  byt_cr_board_configs.o
+ 
++snd-byt-cr-dpcm-rt5651-objs := byt_cr_dpcm_rt5651.o
++obj-$(CONFIG_SND_SOC_INTEL_ANCHOR8) += snd-byt-cr-dpcm-rt5651.o  byt_cr_board_configs.o
+ 
+diff --git a/sound/soc/intel/board/byt_cr_board_configs.c b/sound/soc/intel/board/byt_cr_board_configs.c
+new file mode 100644
+index 0000000..94aa7b7
+--- /dev/null
++++ b/sound/soc/intel/board/byt_cr_board_configs.c
+@@ -0,0 +1,93 @@
++/*
++ *  byt_cr_board_configs.h - Intel SST Driver for audio engine
++ *
++ *  Copyright (C) 2014 Intel Corporation
++ *  Authors:	Ola Lilja <ola.lilja@intel.com>
++ *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; version 2 of the License.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ *  Board-specific hardware-configurations
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/acpi.h>
++#include <linux/dmi.h>
++
++#include "byt_cr_board_configs.h"
++
++static const struct mach_codec_link *mc_link;
++
++static acpi_status sst_acpi_mach_match(acpi_handle handle, u32 level,
++				       void *context, void **ret)
++{
++	*(bool *)context = true;
++	return AE_OK;
++}
++
++static bool acpi_id_exists(const char *id)
++{
++	bool found = false;
++	acpi_status status;
++
++	status = acpi_get_devices(id, sst_acpi_mach_match, &found, NULL);
++	return ACPI_SUCCESS(status) && found;
++}
++
++int set_mc_link(void)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(mach_codec_links); i++)
++		if (acpi_id_exists(mach_codec_links[i].codec_hid)) {
++			pr_info("%s: %s-codec found! Registering machine-device %s.\n",
++				__func__, mach_codec_links[i].codec_hid,
++				mach_codec_links[i].mach_dev->name);
++			platform_device_register(mach_codec_links[i].mach_dev);
++			mc_link = &mach_codec_links[i];
++			break;
++		}
++	if (i == ARRAY_SIZE(mach_codec_links)) {
++		pr_err("%s: Unknown or no codec found!\n", __func__);
++		return -ENOENT;
++	}
++
++	return 0;
++}
++
++const struct mach_codec_link *get_mc_link(void)
++{
++	if (!mc_link)
++		if (set_mc_link())
++			return NULL;
++
++	return mc_link;
++}
++
++const struct board_config *get_board_config(
++				const struct mach_codec_link *mc_link)
++{
++	const struct dmi_system_id *dmi;
++
++	dmi = dmi_first_match(mc_link->dmi_system_ids);
++	if (!dmi) {
++		pr_info("Board is a default %s.\n", mc_link->mach_dev->name);
++		return mc_link->board_config_default;
++	}
++
++	pr_info("%s: Board is a %s (%s)\n", __func__, dmi->ident,
++		mc_link->mach_dev->name);
++
++	return (const struct board_config *)dmi->driver_data;
++}
+diff --git a/sound/soc/intel/board/byt_cr_board_configs.h b/sound/soc/intel/board/byt_cr_board_configs.h
+new file mode 100644
+index 0000000..6fe5eb1
+--- /dev/null
++++ b/sound/soc/intel/board/byt_cr_board_configs.h
+@@ -0,0 +1,155 @@
++/*
++ *  byt_cr_board_configs.h - Intel SST Driver for audio engine
++ *
++ *  Copyright (C) 2014 Intel Corporation
++ *  Authors:	Ola Lilja <ola.lilja@intel.com>
++ *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; version 2 of the License.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ *  Board-specific hardware-configurations
++ */
++
++#ifndef __BYT_CR_BOARD_CONFIGS_H__
++#define __BYT_CR_BOARD_CONFIGS_H__
++
++struct board_config {
++	int idx;
++	int i2s_port;
++	int speaker_input;
++};
++
++struct mach_codec_link {
++	const char const *codec_hid;
++	struct platform_device *mach_dev;
++	struct dmi_system_id const *dmi_system_ids;
++	struct board_config const *board_configs;
++	struct board_config const *board_config_default;
++};
++
++/* Configurations - RT5640 */
++
++enum board_id_rt5640 {
++	RT5640_DEFAULT = -1,
++	RT5640_MRD7,
++	RT5640_T100,
++};
++
++static const char codec_hid0[] = "10EC5640";
++
++static struct platform_device mach_dev0 = {
++	.name		= "byt_rt5640",
++	.id		= -1,
++	.num_resources	= 0,
++};
++
++static const struct board_config board_config_default0 = {
++	.idx = RT5640_DEFAULT,
++	.i2s_port = 0,
++	.speaker_input = 1,
++};
++
++static const struct board_config board_configs0[] = {
++	[RT5640_MRD7] = {
++		.idx = RT5640_MRD7,
++		.i2s_port = 0,
++		.speaker_input = 3,
++	},
++	[RT5640_T100] = {
++		.idx = RT5640_T100,
++		.i2s_port = 2,
++		.speaker_input = 1,
++	},
++};
++
++static const struct dmi_system_id dmi_system_ids0[] = {
++	[RT5640_MRD7] = {
++		.ident = "MRD7",
++		.matches = {
++			DMI_MATCH(DMI_BOARD_NAME, "TABLET"),
++			DMI_MATCH(DMI_BOARD_VERSION, "MRD 7"),
++		},
++		.driver_data = (void *)&board_configs0[RT5640_MRD7],
++	},
++	[RT5640_T100] = {
++		.ident = "T100",
++		.matches = {
++			DMI_MATCH(DMI_BOARD_NAME, "T100TA"),
++			DMI_MATCH(DMI_BOARD_VERSION, "1.0"),
++		},
++		.driver_data = (void *)&board_configs0[RT5640_T100],
++	},
++};
++
++/* Configurations - RT5651 */
++
++enum board_id_rt5651 {
++	RT5651_DEFAULT = -1,
++	RT5651_ANCHOR8,
++};
++
++static const char codec_hid1[] = "10EC5651";
++
++static struct platform_device mach_dev1 = {
++	.name		= "byt_rt5651",
++	.id		= -1,
++	.num_resources	= 0,
++};
++
++static const struct board_config board_config_default1 = {
++	.idx = RT5651_DEFAULT,
++	.i2s_port = 0,
++	.speaker_input = 3,
++};
++
++static const struct board_config board_configs1[] = {
++	[RT5651_ANCHOR8] = {
++		.idx = RT5651_ANCHOR8,
++		.i2s_port = 0,
++		.speaker_input = 3,
++	},
++};
++
++static const struct dmi_system_id dmi_system_ids1[] = {
++	[RT5651_ANCHOR8] = {
++		.ident = "ANCHOR8",
++		.matches = {
++			DMI_MATCH(DMI_BOARD_NAME, "TABLET"),
++			DMI_MATCH(DMI_BOARD_VERSION, "MRD 7"),
++		},
++		.driver_data = (void *)&board_configs1[RT5651_ANCHOR8],
++	},
++};
++
++static const struct mach_codec_link mach_codec_links[] = {
++	{
++		.codec_hid = &codec_hid0[0],
++		.mach_dev = &mach_dev0,
++		.dmi_system_ids = &dmi_system_ids0[0],
++		.board_configs = &board_configs0[0],
++		.board_config_default = &board_config_default0,
++	},
++	{
++		.codec_hid = &codec_hid1[0],
++		.mach_dev = &mach_dev1,
++		.dmi_system_ids = &dmi_system_ids1[0],
++		.board_configs = &board_configs1[0],
++		.board_config_default = &board_config_default1,
++	},
++};
++
++int set_mc_link(void);
++const struct mach_codec_link *get_mc_link(void);
++const struct board_config *get_board_config(
++				const struct mach_codec_link *mc_link);
++
++#endif
+diff --git a/sound/soc/intel/board/byt_cr_dpcm_rt5640.c b/sound/soc/intel/board/byt_cr_dpcm_rt5640.c
+index 993a21c..a9db98b 100644
+--- a/sound/soc/intel/board/byt_cr_dpcm_rt5640.c
++++ b/sound/soc/intel/board/byt_cr_dpcm_rt5640.c
+@@ -38,6 +38,8 @@
+ #include <sound/jack.h>
+ #include "../../codecs/rt5640.h"
+ 
++#include "byt_cr_board_configs.h"
++
+ #define BYT_PLAT_CLK_3_HZ	25000000
+ #define BYT_CODEC_GPIO_IDX      0
+ #define BYT_JD_GPIO_IDX         1
+@@ -960,47 +962,13 @@ static struct snd_soc_card snd_soc_card_byt_t100 = {
+ 	.num_dapm_routes = ARRAY_SIZE(byt_audio_map),
+ };
+ 
+-enum board_id {
+-	BOARD_DEFAULT = 0,
+-	BOARD_T100 = 1,
+-};
+-
+-static enum board_id get_board_id(void)
+-{
+-	static const struct dmi_system_id dmi_machine_table[] = {
+-		{
+-			/*  ASUS T100 */
+-			.ident = "T100",
+-			.matches = {
+-				DMI_MATCH(DMI_BOARD_NAME, "T100TA"),
+-				DMI_MATCH(DMI_BOARD_VERSION, "1.0"),
+-			},
+-		},
+-		{ }
+-	};
+-	const struct dmi_system_id* dmi_machine;
+-
+-	dmi_machine = dmi_first_match(dmi_machine_table);
+-	if (!dmi_machine) {
+-		pr_debug("No dmi entries found using default!\n");
+-		return BOARD_DEFAULT;
+-	}
+-
+-	if (!strncmp(dmi_machine->ident, "T100", 4)) {
+-		pr_debug("%s: Machine is T100\n", __func__);
+-		return BOARD_T100;
+-	}
+-
+-	return BOARD_DEFAULT;
+-}
+-
+ static int snd_byt_mc_probe(struct platform_device *pdev)
+ {
+ 	int ret_val = 0;
+ 	struct byt_mc_private *drv;
+ 	struct snd_soc_card *card;
+ 	const struct snd_soc_dapm_route *routes;
+-	enum board_id bid;
++	const struct board_config *conf;
+ 
+ 	pr_debug("Entry %s\n", __func__);
+ 
+@@ -1010,15 +978,20 @@ static int snd_byt_mc_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	}
+ 
+-	bid = get_board_id();
+-	switch (bid) {
+-	case BOARD_T100:
++	/* Get board-specific HW-settings */
++	conf = get_board_config(get_mc_link());
++	switch (conf->idx) {
++	case RT5640_T100:
+ 		card = &snd_soc_card_byt_t100;
+ 		routes = &byt_audio_map_t100[0];
+ 		break;
+-	default:
++	case RT5640_MRD7:
++	case RT5640_DEFAULT:
+ 		card = &snd_soc_card_byt_default;
+ 		routes = &byt_audio_map_default[0];
++		break;
++	default:
++		BUG_ON(true);
+ 	}
+ 
+ 	/* register the soc card */
+@@ -1037,7 +1010,7 @@ static int snd_byt_mc_probe(struct platform_device *pdev)
+ 		return ret_val;
+ 	}
+ 
+-	if (bid != BOARD_T100) {
++	if (conf->idx != RT5640_T100) {
+ 		snd_soc_update_bits(byt_get_codec(card), RT5640_JD_CTRL,
+ 				RT5640_JD_MASK, RT5640_JD_JD1_IN4P);
+ 	}
+diff --git a/sound/soc/intel/board/byt_cr_dpcm_rt5651.c b/sound/soc/intel/board/byt_cr_dpcm_rt5651.c
+index 1811ef1..6e002dd 100644
+--- a/sound/soc/intel/board/byt_cr_dpcm_rt5651.c
++++ b/sound/soc/intel/board/byt_cr_dpcm_rt5651.c
+@@ -31,7 +31,6 @@
+ #include <linux/slab.h>
+ #include <linux/vlv2_plat_clock.h>
+ #include <linux/input.h>
+-#include <linux/dmi.h>
+ #include <asm/intel-mid.h>
+ #include <asm/platform_byt_audio.h>
+ #include <sound/pcm.h>
+@@ -40,6 +39,8 @@
+ #include <sound/jack.h>
+ #include "../../codecs/rt5651.h"
+ 
++#include "byt_cr_board_configs.h"
++
+ #define BYT_PLAT_CLK_3_HZ	25000000
+ 
+ #define BYT_JD_INTR_DEBOUNCE            0
+@@ -714,6 +715,7 @@ static int snd_byt_mc_probe(struct platform_device *pdev)
+ 	struct byt_mc_private *drv;
+ 	struct snd_soc_card *card;
+ 	const struct snd_soc_dapm_route *routes;
++	const struct board_config *conf;
+ 
+ 	pr_debug("%s: Enter.\n", __func__);
+ 
+@@ -739,8 +741,17 @@ static int snd_byt_mc_probe(struct platform_device *pdev)
+ 
+ 	mutex_init(&drv->jack_mlock);
+ 
+-	card = &snd_soc_card_byt_default;
+-	routes = &byt_audio_map_default[0];
++	/* Get board-specific HW-settings */
++	conf = get_board_config(get_mc_link());
++	switch (conf->idx) {
++	case RT5651_ANCHOR8:
++	case RT5651_DEFAULT:
++		card = &snd_soc_card_byt_default;
++		routes = &byt_audio_map_default[0];
++		break;
++	default:
++		BUG_ON(true);
++	}
+ 
+ 	/* Register the soc-card */
+ 	card->dev = &pdev->dev;
+@@ -759,9 +770,12 @@ static int snd_byt_mc_probe(struct platform_device *pdev)
+ 		return ret_val;
+ 	}
+ 
+-	pr_err("%s: Setting special-bit for ANCHOR8-board.\n", __func__);
+-	snd_soc_update_bits(byt_get_codec(card), RT5651_JD_CTRL1,
+-			RT5651_JD_MASK, RT5651_JD_JD1_IN4P);
++	if (conf->idx == RT5651_ANCHOR8) {
++		pr_err("%s: Setting special-bit for ANCHOR8-board.\n",
++			__func__);
++		snd_soc_update_bits(byt_get_codec(card), RT5651_JD_CTRL1,
++				RT5651_JD_MASK, RT5651_JD_JD1_IN4P);
++	}
+ 
+ 	pr_debug("%s: Exit.\n", __func__);
+ 	return ret_val;
+diff --git a/sound/soc/intel/sst/sst.c b/sound/soc/intel/sst/sst.c
+index 70d9f05..2e4eca1 100644
+--- a/sound/soc/intel/sst/sst.c
++++ b/sound/soc/intel/sst/sst.c
+@@ -48,6 +48,8 @@
+ #include "../platform_ipc_v2.h"
+ #include "sst.h"
+ 
++#include "../board/byt_cr_board_configs.h"
++
+ #define CREATE_TRACE_POINTS
+ #include "sst_trace.h"
+ 
+@@ -526,14 +528,19 @@ static const struct dmi_system_id dmi_machine_table[] = {
+ int sst_request_firmware_async(struct intel_sst_drv *ctx)
+ {
+ 	int ret = 0;
+-	const struct dmi_system_id* dmi_machine;
+-	dmi_machine = dmi_first_match(dmi_machine_table);
+-	if (!dmi_machine) {
+-		pr_err("%s: Unsupported machine!\n", __func__);
+-		return -ENOENT;	
++	struct mach_codec_link const *mc_link;
++	struct board_config const *conf;
++
++	mc_link = get_mc_link();
++	if (mc_link == NULL) {
++		pr_err("%s: Unsupported machine! Cannot load firmware!\n",
++			__func__);
++		return -ENOENT;
+ 	}
++	conf = get_board_config(mc_link);
++
+ 	snprintf(ctx->firmware_name, sizeof(ctx->firmware_name),
+-			"fw_sst_%04x_%s.bin", ctx->pci_id, (const char*)dmi_machine->driver_data);
++			"fw_sst_%04x_ssp%d.bin", ctx->pci_id, conf->i2s_port);
+ 	pr_err("Requesting FW %s now...\n", ctx->firmware_name);
+ 
+ 	trace_sst_fw_download("Request firmware async", ctx->sst_state);
+@@ -545,6 +552,7 @@ int sst_request_firmware_async(struct intel_sst_drv *ctx)
+ 
+ 	return ret;
+ }
++
+ /*
+ * intel_sst_probe - PCI probe function
+ *
+@@ -565,7 +573,8 @@ static int intel_sst_probe(struct pci_dev *pci,
+ 	u32 dma_base_add;
+ 	u32 len;
+ 
+-
++	/* Detect and setup board-configuration */
++	set_mc_link();
+ 
+ 	pr_debug("Probe for DID %x\n", pci->device);
+ 	ret = sst_alloc_drv_context(&pci->dev);
+diff --git a/sound/soc/intel/sst/sst_acpi.c b/sound/soc/intel/sst/sst_acpi.c
+index cba6a1b..2da3f7ef 100644
+--- a/sound/soc/intel/sst/sst_acpi.c
++++ b/sound/soc/intel/sst/sst_acpi.c
+@@ -512,20 +512,6 @@ static int sst_platform_get_resources(const char *hid,
+ 	}
+ }
+ 
+-struct platform_device byt_rt5640_dev = {
+-	.name		= "byt_rt5640",
+-	.id		= -1,
+-	.num_resources	= 0,
+-
+-};
+-
+-struct platform_device byt_rt5651_dev = {
+-	.name		= "byt_rt5651",
+-	.id		= -1,
+-	.num_resources	= 0,
+-
+-};
+-
+ int sst_acpi_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -534,8 +520,6 @@ int sst_acpi_probe(struct platform_device *pdev)
+ 	const char *hid;
+ 	int i, ret = 0;
+ 	struct intel_sst_drv *ctx;
+-	platform_device_register(&byt_rt5640_dev);
+-	platform_device_register(&byt_rt5651_dev);
+ 
+ 	ret = acpi_bus_get_device(handle, &device);
+ 	if (ret) {
+-- 
+2.0.1
+

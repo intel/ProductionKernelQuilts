@@ -1,0 +1,185 @@
+From f450bf6ef5174b39215456e8b2b7803b695336bf Mon Sep 17 00:00:00 2001
+Message-Id: <f450bf6ef5174b39215456e8b2b7803b695336bf.1440053504.git.chang-joon.lee@intel.com>
+In-Reply-To: <6008ee84d5599bc5fa55865b2ba0bb03e982c7b7.1440053504.git.chang-joon.lee@intel.com>
+References: <6008ee84d5599bc5fa55865b2ba0bb03e982c7b7.1440053504.git.chang-joon.lee@intel.com>
+From: Praveen Paneri <praveen.paneri@intel.com>
+Date: Fri, 12 Jun 2015 14:23:41 +0530
+Subject: [PATCH 4/5] MUST_REBASE [VPG]: i915/dpst: Workaround for pipe B dpst
+ affecting pipe C
+
+Although DPST is only supported on pipes A & B, an issue with the DPST Core
+logic is applying pipe B's DPST correction to pipe C (used by HDMI). Thus,
+to avoid visual artifacts on pipe C, We must disable DPST on pipe B when
+pipe C (HDMI) is active.
+
+If this workaround is enabled, DPST will be disabled when HDMI is connected. It
+will be re-enabled when HDMI disconnects.
+
+At the moment this is an internal requirement; hence marked as MUST_REBASE.
+
+v2: Added dpst pipe unknown case in i915_dpst_wa_action() function
+Renamed hdmi_override to disabled_by_dpst
+Fixed debugfs dpst_disable status
+
+Change-Id: I5285ead69535632a74e8fafda6a2174cb61523ff
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-13783
+Signed-off-by: Praveen Paneri <praveen.paneri@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c  |  2 +-
+ drivers/gpu/drm/i915/i915_dpst.c     | 48 +++++++++++++++++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_drv.h      |  2 ++
+ drivers/gpu/drm/i915/intel_display.c |  8 ++++++
+ 4 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 668e9ab..e1104c3 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -1889,7 +1889,7 @@ static int i915_dpst_disable_get(void *data, u64 *val)
+ 	struct drm_device *dev = data;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+-	*val = dev_priv->dpst.kernel_disable;
++	*val = !dev_priv->dpst.enabled;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_dpst.c b/drivers/gpu/drm/i915/i915_dpst.c
+index 7655512..a8c5d25 100644
+--- a/drivers/gpu/drm/i915/i915_dpst.c
++++ b/drivers/gpu/drm/i915/i915_dpst.c
+@@ -58,6 +58,7 @@ i915_dpst_save_conn_on_edp(struct drm_device *dev)
+ 	struct intel_connector *i_connector = NULL;
+ 	struct drm_connector *d_connector;
+ 	enum pipe new_pipe;
++	bool ret = false;
+ 
+ 	list_for_each_entry(d_connector, &dev->mode_config.connector_list, head)
+ 	{
+@@ -72,10 +73,16 @@ i915_dpst_save_conn_on_edp(struct drm_device *dev)
+ 			if (new_pipe != dev_priv->dpst.pipe)
+ 				dev_priv->dpst.pipe_mismatch = true;
+ 			dev_priv->dpst.pipe = new_pipe;
+-			return true;
++			ret = true;
+ 		}
+ 	}
+-	return false;
++
++	/* Sanitize disabled_by_hdmi if we know correct dpst pipe */
++	if (ret && i915.enable_dpst_wa && dev_priv->dpst.disabled_by_hdmi
++			&& dev_priv->dpst.pipe != PIPE_B)
++		dev_priv->dpst.disabled_by_hdmi = false;
++
++	return ret;
+ }
+ 
+ int i915_dpst_sanitize_wa(struct drm_device *dev, int enable_dpst_wa)
+@@ -87,6 +94,30 @@ int i915_dpst_sanitize_wa(struct drm_device *dev, int enable_dpst_wa)
+ 	return 0;
+ }
+ 
++void i915_dpst_wa_action(struct drm_device *dev, bool hdmi_enabled)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	bool dpst_pipe_known = i915_dpst_save_conn_on_edp(dev);
++
++	if (!hdmi_enabled && dev_priv->dpst.disabled_by_hdmi) {
++		/* HDMI display unplugged, so we can re-enable DPST again */
++		dev_priv->dpst.disabled_by_hdmi = false;
++		i915_dpst_display_on(dev);
++	} else if (hdmi_enabled && dpst_pipe_known &&
++				dev_priv->dpst.pipe == PIPE_B) {
++		/* Do not use DPST on PIPE_B if a HDMI display is connected */
++		if (dev_priv->dpst.user_enable)
++			i915_dpst_enable_disable(dev, 0);
++		dev_priv->dpst.disabled_by_hdmi = true;
++	} else if (hdmi_enabled && !dpst_pipe_known) {
++		/*
++		 * We will make sure to sanitize disabled_by_hdmi when we have
++		 * correct DPST pipe information.
++		 */
++		dev_priv->dpst.disabled_by_hdmi = true;
++	}
++}
++
+ static int
+ i915_dpst_clear_hist_interrupt(struct drm_device *dev)
+ {
+@@ -107,6 +138,13 @@ i915_dpst_enable_hist_interrupt(struct drm_device *dev)
+ 			!dev_priv->is_video_playing)
+ 		return 0;
+ 
++	/*
++	 * Do not switch on the DPST when it is disabled by HDMI WA
++	 * Only HDMI disconnect event should be able to re-enable DPST.
++	 */
++	if (i915.enable_dpst_wa && dev_priv->dpst.disabled_by_hdmi)
++		return 0;
++
+ 	dev_priv->dpst.enabled = true;
+ 	dev_priv->dpst.blc_adjustment = DPST_MAX_FACTOR ;
+ 
+@@ -543,9 +581,11 @@ i915_dpst_set_brightness(struct drm_device *dev, u32 brightness_val)
+ 
+ 	/*
+ 	 * When DPST is enabled only for video mode, we want to phase out when
+-	 * video ends even though DPST is disabled.
++	 * video ends even though DPST is disabled. The same is true when we
++	 * disable dpst as part of pipe B - pipe C workaround.
+ 	 */
+-	if (!(dev_priv->dpst.enabled || dev_priv->dpst.is_video_mode_enabled))
++	if (!(dev_priv->dpst.enabled || dev_priv->dpst.is_video_mode_enabled
++				|| dev_priv->dpst.disabled_by_hdmi))
+ 		return;
+ 
+ 	/* Calculate the backlight after it has been reduced by "dpst
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index a1f23d7..66f2311 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1766,6 +1766,7 @@ struct drm_i915_private {
+ 		bool enabled;		/* actual functional state */
+ 		bool pipe_mismatch;	/* Indicates pipe mismatch between user mode and kernel */
+ 		bool display_off;	/* Indicates that Display is off (could be power gated also) */
++		bool disabled_by_hdmi;	/* Indicates that HDMI connect has disabled DPST */
+ 		bool is_video_mode_enabled;
+ 		struct {
+ 			bool is_valid;
+@@ -3202,6 +3203,7 @@ void i915_dpst_display_on(struct drm_device *dev);
+ void i915_dpst_display_off(struct drm_device *dev);
+ int i915_dpst_enable_disable(struct drm_device *dev, unsigned int val);
+ int i915_dpst_sanitize_wa(struct drm_device *dev, int enable_dpst_wa);
++void i915_dpst_wa_action(struct drm_device *dev, bool enable);
+ 
+ /* intel_acpi.c */
+ #ifdef CONFIG_ACPI
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 8fdb04e..2efe1c8 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5572,6 +5572,10 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
+ 	/* Update DPST context after mode change */
+ 	if (I915_HAS_DPST(dev)) {
+ 		for_each_encoder_on_crtc(dev, crtc, encoder) {
++			if (i915.enable_dpst_wa &&
++					encoder->type == INTEL_OUTPUT_HDMI)
++				i915_dpst_wa_action(dev, true);
++
+ 			if (encoder->type == INTEL_OUTPUT_EDP ||
+ 			    encoder->type == INTEL_OUTPUT_DSI)
+ 				i915_dpst_display_on(dev);
+@@ -5785,6 +5789,10 @@ static void i9xx_crtc_disable(struct drm_crtc *crtc)
+ 
+ 	if (I915_HAS_DPST(dev)) {
+ 		for_each_encoder_on_crtc(dev, crtc, encoder) {
++			if (i915.enable_dpst_wa &&
++				encoder->type == INTEL_OUTPUT_HDMI)
++				i915_dpst_wa_action(dev, false);
++
+ 			if (encoder->type == INTEL_OUTPUT_EDP ||
+ 			    encoder->type == INTEL_OUTPUT_DSI)
+ 				i915_dpst_display_off(dev);
+-- 
+1.9.1
+

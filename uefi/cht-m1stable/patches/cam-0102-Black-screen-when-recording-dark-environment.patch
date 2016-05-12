@@ -1,0 +1,113 @@
+From 374f21ccf81b5a4dd3acf49346cade4dfeae96b5 Mon Sep 17 00:00:00 2001
+From: Sebastien Boeuf <sebastien.boeuf@intel.com>
+Date: Mon, 6 Oct 2014 23:50:35 +0200
+Subject: [PATCH 102/117] Black screen when recording dark environment
+
+When we start to record on front camera, we get a black screen
+during all the record if the environment was too dark when we
+started it. When exposure is reaching a threshold and at the same
+time we start a record, then the driver is not able to refresh
+exposure value.
+This patch aims to fix this issue, registering the value of the
+first exposure before starting the record and then resetting it
+with the same value once the record has been started.
+
+(Forward-port to recent ICG changes by Andy Ross)
+
+Issue: GMIN-3468
+Change-Id: I8da2105154808e143a035a1dcbcba677aede78de
+Signed-off-by: Sebastien Boeuf <sebastien.boeuf@intel.com>
+---
+ .../camera/drivers/media/i2c/mt9m114.c             | 22 ++++++++++++++++++++++
+ .../camera/drivers/media/i2c/mt9m114.h             |  8 ++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+index 64781ea..5a6fc11 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+@@ -904,6 +904,10 @@ static int mt9m114_set_mbus_fmt(struct v4l2_subdev *sd,
+ 	struct camera_mipi_info *mt9m114_info = NULL;
+ #endif
+ 	int ret;
++
++	dev->streamon = 0;
++	dev->first_exp = MT9M114_DEFAULT_FIRST_EXP;
++
+ #ifdef CONFIG_GMIN_INTEL_MID /* FIXME! */
+ 	mt9m114_info = v4l2_get_subdev_hostdata(sd);
+ 	if (mt9m114_info == NULL)
+@@ -1186,6 +1190,12 @@ static long mt9m114_s_exposure(struct v4l2_subdev *sd,
+     FLines = mt9m114_res[dev->res].lines_per_frame;
+     AnalogGain = exposure->gain[0];
+     DigitalGain = exposure->gain[1];
++	if (!dev->streamon) {
++		/*Save the first exposure values while stream is off*/
++		dev->first_exp = coarse_integration;
++		dev->first_gain = AnalogGain;
++		dev->first_diggain = DigitalGain;
++	}
+     //DigitalGain = 0x400 * (((u16) DigitalGain) >> 8) + ((unsigned int)(0x400 * (((u16) DigitalGain) & 0xFF)) >>8);
+ 
+     //Hindden Register usage in REG_SW_RESET bit 15. set REG_SW_RESET bit 15 as 1 for group apply.
+@@ -1824,16 +1834,28 @@ static int mt9m114_s_stream(struct v4l2_subdev *sd, int enable)
+ {
+ 	int ret;
+ 	struct i2c_client *c = v4l2_get_subdevdata(sd);
++	struct mt9m114_device *dev = to_mt9m114_sensor(sd);
++	struct atomisp_exposure exposure;
+ 
+ 	if (enable) {
+ 		ret = mt9m114_write_reg_array(c, mt9m114_chgstat_reg,
+ 					POST_POLLING);
+ 		if (ret < 0)
+ 			return ret;
++
++		if (dev->first_exp > MT9M114_MAX_FIRST_EXP) {
++			exposure.integration_time[0] = dev->first_exp;
++			exposure.gain[0] = dev->first_gain;
++			exposure.gain[1] = dev->first_diggain;
++			mt9m114_s_exposure(sd, &exposure);
++		}
++		dev->streamon = 1;
++
+ #ifndef CONFIG_GMIN_INTEL_MID /* FIXME! for irrational!*/
+ 		ret = mt9m114_set_streaming(sd);
+ #endif
+ 	} else {
++		dev->streamon = 0;
+ 		ret = mt9m114_set_suspend(sd);
+ 	}
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h
+index 1100400..6e2183d 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h
++++ b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.h
+@@ -216,6 +216,9 @@ enum {
+ 
+ #define MT9M114_BIN_FACTOR_MAX			3
+ 
++#define MT9M114_DEFAULT_FIRST_EXP 0x10
++#define MT9M114_MAX_FIRST_EXP 0x302
++
+ /* completion status polling requirements, usage based on Aptina .INI Rev2 */
+ enum poll_reg {
+ 	NO_POLLING,
+@@ -306,9 +309,14 @@ struct mt9m114_device {
+ 
+ 	/*Number of MIPI lanes*/
+ 	unsigned int mipi_lanes;
++	/*WA for low light AE*/
++	unsigned int first_exp;
++	unsigned int first_gain;
++	unsigned int first_diggain;
+ 	char name[32];
+ 
+ 	u8 lightfreq;
++	u8 streamon;
+ };
+ 
+ struct mt9m114_format_struct {
+-- 
+1.9.3
+

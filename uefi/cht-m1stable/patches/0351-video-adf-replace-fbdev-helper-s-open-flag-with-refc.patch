@@ -1,0 +1,133 @@
+From 53c79a6901b7bde32532a39096686e50325f073e Mon Sep 17 00:00:00 2001
+From: Greg Hackmann <ghackmann@google.com>
+Date: Mon, 24 Mar 2014 16:45:43 -0700
+Subject: [PATCH 351/634] video: adf: replace fbdev helper's open flag with
+ refcount
+
+A device's fb_info is shared between clients.  fb_release() is called
+when each client is released, not just the last one.  Since the fbdev
+helper needs to release its dma-buf when the last client goes away, it
+must keep its own reference count.
+
+fbmem and fbcon hold different locks while calling fb_release(), so
+explicit locking is needed.
+
+Change-Id: I42cd659f7633adba7c11f407d4b594bd43305d6a
+Signed-off-by: Greg Hackmann <ghackmann@google.com>
+---
+ drivers/video/adf/adf_fbdev.c | 36 +++++++++++++++++++++++++-----------
+ include/video/adf_fbdev.h     |  4 +++-
+ 2 files changed, 28 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/video/adf/adf_fbdev.c b/drivers/video/adf/adf_fbdev.c
+index cac34d1..9d3c245 100644
+--- a/drivers/video/adf/adf_fbdev.c
++++ b/drivers/video/adf/adf_fbdev.c
+@@ -356,18 +356,25 @@ int adf_fbdev_open(struct fb_info *info, int user)
+ 	struct adf_fbdev *fbdev = info->par;
+ 	int ret;
+ 
+-	if (!fbdev->open) {
++	mutex_lock(&fbdev->refcount_lock);
++
++	if (unlikely(fbdev->refcount == UINT_MAX)) {
++		ret = -EMFILE;
++		goto done;
++	}
++
++	if (!fbdev->refcount) {
+ 		struct drm_mode_modeinfo mode;
+ 		struct fb_videomode fbmode;
+ 		struct adf_device *dev = adf_interface_parent(fbdev->intf);
+ 
+ 		ret = adf_device_attach(dev, fbdev->eng, fbdev->intf);
+ 		if (ret < 0 && ret != -EALREADY)
+-			return ret;
++			goto done;
+ 
+ 		ret = adf_fb_alloc(fbdev);
+ 		if (ret < 0)
+-			return ret;
++			goto done;
+ 
+ 		adf_interface_current_mode(fbdev->intf, &mode);
+ 		adf_modeinfo_to_fb_videomode(&mode, &fbmode);
+@@ -379,13 +386,15 @@ int adf_fbdev_open(struct fb_info *info, int user)
+ 
+ 	ret = adf_fbdev_post(fbdev);
+ 	if (ret < 0) {
+-		if (!fbdev->open)
++		if (!fbdev->refcount)
+ 			adf_fb_destroy(fbdev);
+-		return ret;
++		goto done;
+ 	}
+ 
+-	fbdev->open = true;
+-	return 0;
++	fbdev->refcount++;
++done:
++	mutex_unlock(&fbdev->refcount_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL(adf_fbdev_open);
+ 
+@@ -395,8 +404,12 @@ EXPORT_SYMBOL(adf_fbdev_open);
+ int adf_fbdev_release(struct fb_info *info, int user)
+ {
+ 	struct adf_fbdev *fbdev = info->par;
+-	adf_fb_destroy(fbdev);
+-	fbdev->open = false;
++	mutex_lock(&fbdev->refcount_lock);
++	BUG_ON(!fbdev->refcount);
++	fbdev->refcount--;
++	if (!fbdev->refcount)
++		adf_fb_destroy(fbdev);
++	mutex_unlock(&fbdev->refcount_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(adf_fbdev_release);
+@@ -601,6 +614,7 @@ int adf_fbdev_init(struct adf_fbdev *fbdev, struct adf_interface *interface,
+ 		dev_err(dev, "allocating framebuffer device failed\n");
+ 		return -ENOMEM;
+ 	}
++	mutex_init(&fbdev->refcount_lock);
+ 	fbdev->default_xres_virtual = xres_virtual;
+ 	fbdev->default_yres_virtual = yres_virtual;
+ 	fbdev->default_format = format;
+@@ -644,8 +658,8 @@ EXPORT_SYMBOL(adf_fbdev_init);
+ void adf_fbdev_destroy(struct adf_fbdev *fbdev)
+ {
+ 	unregister_framebuffer(fbdev->info);
+-	if (WARN_ON(fbdev->open))
+-		adf_fb_destroy(fbdev);
++	BUG_ON(fbdev->refcount);
++	mutex_destroy(&fbdev->refcount_lock);
+ 	framebuffer_release(fbdev->info);
+ }
+ EXPORT_SYMBOL(adf_fbdev_destroy);
+diff --git a/include/video/adf_fbdev.h b/include/video/adf_fbdev.h
+index 9c34914..e4d6fb7 100644
+--- a/include/video/adf_fbdev.h
++++ b/include/video/adf_fbdev.h
+@@ -16,6 +16,7 @@
+ #define _VIDEO_ADF_FBDEV_H_
+ 
+ #include <linux/fb.h>
++#include <linux/mutex.h>
+ #include <video/adf.h>
+ 
+ struct adf_fbdev {
+@@ -24,7 +25,8 @@ struct adf_fbdev {
+ 	struct fb_info *info;
+ 	u32 pseudo_palette[16];
+ 
+-	bool open;
++	unsigned int refcount;
++	struct mutex refcount_lock;
+ 
+ 	struct dma_buf *dma_buf;
+ 	u32 offset;
+-- 
+1.9.1
+

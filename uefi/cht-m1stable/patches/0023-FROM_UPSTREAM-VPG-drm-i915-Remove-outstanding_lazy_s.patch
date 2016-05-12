@@ -1,0 +1,384 @@
+From c854d107cd3bd4d6e522628f88f673c918b7e3cc Mon Sep 17 00:00:00 2001
+Message-Id: <c854d107cd3bd4d6e522628f88f673c918b7e3cc.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:29 +0000
+Subject: [PATCH 23/63] FROM_UPSTREAM [VPG]: drm/i915: Remove
+ 'outstanding_lazy_seqno'
+
+The OLS value is now obsolete. Exactly the same value is guarateed to be always
+available as PLR->seqno. Thus it is safe to remove the OLS completely. And also
+to rename the PLR to OLR to keep the 'outstanding lazy ...' naming convention
+valid.
+
+Change-Id: I985752b44250971fe33d24c1de679481477ab930
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: 6259cead57ebc19325183f8fd9968e19fc2fbe53
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_gem.c            |   13 ++++-----
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    6 ++--
+ drivers/gpu/drm/i915/intel_lrc.c           |   32 ++++++++-------------
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |   42 +++++++++++++---------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |   15 +++-------
+ 5 files changed, 44 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 792326a..9c00915 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1160,7 +1160,7 @@ i915_gem_check_olr(struct intel_engine_cs *ring, u32 seqno)
+ 	BUG_ON(!mutex_is_locked(&ring->dev->struct_mutex));
+ 
+ 	ret = 0;
+-	if (seqno == ring->outstanding_lazy_seqno)
++	if (seqno == i915_gem_request_get_seqno(ring->outstanding_lazy_request))
+ 		ret = i915_add_request(ring, NULL);
+ 
+ 	return ret;
+@@ -2468,7 +2468,7 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	u32 request_ring_position, request_start;
+ 	int ret = 0;
+ 
+-	request = ring->preallocated_lazy_request;
++	request = ring->outstanding_lazy_request;
+ 	if (WARN_ON(request == NULL))
+ 		return -ENOMEM;
+ 
+@@ -2516,7 +2516,6 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 			goto end;
+ 	}
+ 
+-	request->seqno = intel_ring_get_seqno(ring);
+ 	request->ring = ring;
+ 	request->head = request_start;
+ 	request->tail = request_ring_position;
+@@ -2553,8 +2552,7 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	}
+ 
+ 	trace_i915_gem_request_add(ring, request->seqno);
+-	ring->outstanding_lazy_seqno = 0;
+-	ring->preallocated_lazy_request = NULL;
++	ring->outstanding_lazy_request = NULL;
+ 
+ 	if (!dev_priv->ums.mm_suspended) {
+ 		cancel_delayed_work_sync(&dev_priv->mm.idle_work);
+@@ -2744,9 +2742,8 @@ static void i915_gem_reset_ring_cleanup(struct drm_i915_private *dev_priv,
+ 		i915_gem_free_request(request);
+ 	}
+ 
+-	/* These may not have been flush before the reset, do so now */
+-	i915_gem_request_assign(&ring->preallocated_lazy_request, NULL);
+-	ring->outstanding_lazy_seqno = 0;
++	/* This may not have been flushed before the reset, so clean it now */
++	i915_gem_request_assign(&ring->outstanding_lazy_request, NULL);
+ }
+ 
+ void i915_gem_restore_fences(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 7f4e5bf..8d523fd 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1126,7 +1126,7 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 			goto error;
+ 	}
+ 
+-	ret = intel_ring_alloc_seqno(ring);
++	ret = intel_ring_alloc_request(ring);
+ 	if (ret)
+ 		goto error;
+ 
+@@ -1284,7 +1284,9 @@ i915_gem_ringbuffer_submission(struct drm_device *dev, struct drm_file *file,
+ 			goto error;
+ 	}
+ 
+-	trace_i915_gem_ring_dispatch(ring, intel_ring_get_seqno(ring), flags);
++	trace_i915_gem_ring_dispatch(ring,
++		    i915_gem_request_get_seqno(intel_ring_get_request(ring)),
++		    flags);
+ 
+ 	i915_gem_execbuffer_move_to_active(vmas, ring);
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index b2161dc..2089348 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -204,8 +204,8 @@ enum {
+ };
+ #define GEN8_CTX_ID_SHIFT 32
+ 
+-static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
+-				    struct intel_context *ctx);
++static int logical_ring_alloc_request(struct intel_engine_cs *ring,
++				      struct intel_context *ctx);
+ static int intel_lr_context_pin(struct intel_engine_cs *ring,
+ 		struct intel_context *ctx);
+ 
+@@ -981,7 +981,7 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = logical_ring_alloc_seqno(ring, ringbuf->FIXME_lrc_ctx);
++	ret = logical_ring_alloc_request(ring, ringbuf->FIXME_lrc_ctx);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1247,22 +1247,14 @@ void intel_lr_context_unpin(struct intel_engine_cs *ring,
+ 	}
+ }
+ 
+-static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
+-				    struct intel_context *ctx)
++static int logical_ring_alloc_request(struct intel_engine_cs *ring,
++				      struct intel_context *ctx)
+ {
+ 	struct drm_i915_gem_request *request;
+ 	int ret;
+ 
+-	/* XXX: The aim is to replace seqno values with request structures.
+-	 * A step along the way is to switch to using the PLR in preference
+-	 * to the OLS. That requires the PLR to only be valid when the OLS is
+-	 * also valid. I.e., the two must be kept in step. */
+-
+-	if (ring->outstanding_lazy_seqno) {
+-		WARN_ON(ring->preallocated_lazy_request == NULL);
++	if (ring->outstanding_lazy_request)
+ 		return 0;
+-	}
+-	WARN_ON(ring->preallocated_lazy_request != NULL);
+ 
+ 	request = kmalloc(sizeof(*request), GFP_KERNEL);
+ 	if (request == NULL)
+@@ -1278,7 +1270,7 @@ static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
+ 
+ 	kref_init(&request->ref);
+ 
+-	ret = i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
++	ret = i915_gem_get_seqno(ring->dev, &request->seqno);
+ 	if (ret) {
+ 		intel_lr_context_unpin(ring, ctx);
+ 		kfree(request);
+@@ -1292,7 +1284,7 @@ static int logical_ring_alloc_seqno(struct intel_engine_cs *ring,
+ 	request->ctx = ctx;
+ 	i915_gem_context_reference(request->ctx);
+ 
+-	ring->preallocated_lazy_request = request;
++	ring->outstanding_lazy_request = request;
+ 	return 0;
+ }
+ 
+@@ -1457,7 +1449,7 @@ int intel_logical_ring_begin(struct intel_ringbuffer *ringbuf, int num_dwords)
+ 		return ret;
+ 
+ 	/* Preallocate the olr before touching the ring */
+-	ret = logical_ring_alloc_seqno(ring, ringbuf->FIXME_lrc_ctx);
++	ret = logical_ring_alloc_request(ring, ringbuf->FIXME_lrc_ctx);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1708,7 +1700,8 @@ static int gen8_emit_request(struct intel_ringbuffer *ringbuf)
+ 				(ring->status_page.gfx_addr +
+ 				(I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT)));
+ 	intel_logical_ring_emit(ringbuf, 0);
+-	intel_logical_ring_emit(ringbuf, ring->outstanding_lazy_seqno);
++	intel_logical_ring_emit(ringbuf,
++		i915_gem_request_get_seqno(ring->outstanding_lazy_request));
+ 	intel_logical_ring_emit(ringbuf, MI_USER_INTERRUPT);
+ 	intel_logical_ring_emit(ringbuf, MI_NOOP);
+ 	intel_logical_ring_advance_and_submit(ringbuf);
+@@ -1737,8 +1730,7 @@ void intel_logical_ring_cleanup(struct intel_engine_cs *ring)
+ 	i915_sync_timeline_advance(ring);
+ 	i915_sync_timeline_destroy(ring);
+ 
+-	i915_gem_request_assign(&ring->preallocated_lazy_request, NULL);
+-	ring->outstanding_lazy_seqno = 0;
++	i915_gem_request_assign(&ring->outstanding_lazy_request, NULL);
+ 
+ 	if (ring->cleanup)
+ 		ring->cleanup(ring);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index e96b73d..46be344 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1324,9 +1324,11 @@ static int gen6_signal(struct intel_engine_cs *signaller,
+ 	for_each_ring(useless, dev_priv, i) {
+ 		u32 mbox_reg = signaller->semaphore.mbox.signal[i];
+ 		if (mbox_reg != GEN6_NOSYNC) {
++			u32 seqno = i915_gem_request_get_seqno(
++					   signaller->outstanding_lazy_request);
+ 			intel_ring_emit(signaller, MI_LOAD_REGISTER_IMM(1));
+ 			intel_ring_emit(signaller, mbox_reg);
+-			intel_ring_emit(signaller, signaller->outstanding_lazy_seqno);
++			intel_ring_emit(signaller, seqno);
+ 			intel_ring_emit(signaller, MI_NOOP);
+ 		} else {
+ 			intel_ring_emit(signaller, MI_NOOP);
+@@ -1359,7 +1361,8 @@ gen6_add_request(struct intel_engine_cs *ring)
+ 
+ 	intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
+ 	intel_ring_emit(ring, I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-	intel_ring_emit(ring, ring->outstanding_lazy_seqno);
++	intel_ring_emit(ring,
++		    i915_gem_request_get_seqno(ring->outstanding_lazy_request));
+ 	intel_ring_emit(ring, MI_USER_INTERRUPT);
+ 	__intel_ring_advance(ring);
+ 
+@@ -1451,7 +1454,8 @@ pc_render_add_request(struct intel_engine_cs *ring)
+ 			PIPE_CONTROL_WRITE_FLUSH |
+ 			PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE);
+ 	intel_ring_emit(ring, ring->scratch.gtt_offset | PIPE_CONTROL_GLOBAL_GTT);
+-	intel_ring_emit(ring, ring->outstanding_lazy_seqno);
++	intel_ring_emit(ring,
++		    i915_gem_request_get_seqno(ring->outstanding_lazy_request));
+ 	intel_ring_emit(ring, 0);
+ 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
+ 	scratch_addr += 2 * CACHELINE_BYTES; /* write to separate cachelines */
+@@ -1470,7 +1474,8 @@ pc_render_add_request(struct intel_engine_cs *ring)
+ 			PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE |
+ 			PIPE_CONTROL_NOTIFY);
+ 	intel_ring_emit(ring, ring->scratch.gtt_offset | PIPE_CONTROL_GLOBAL_GTT);
+-	intel_ring_emit(ring, ring->outstanding_lazy_seqno);
++	intel_ring_emit(ring,
++		    i915_gem_request_get_seqno(ring->outstanding_lazy_request));
+ 	intel_ring_emit(ring, 0);
+ 	__intel_ring_advance(ring);
+ 
+@@ -1744,7 +1749,8 @@ i9xx_add_request(struct intel_engine_cs *ring)
+ 
+ 	intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
+ 	intel_ring_emit(ring, I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-	intel_ring_emit(ring, ring->outstanding_lazy_seqno);
++	intel_ring_emit(ring,
++		    i915_gem_request_get_seqno(ring->outstanding_lazy_request));
+ 	intel_ring_emit(ring, MI_USER_INTERRUPT);
+ 	__intel_ring_advance(ring);
+ 
+@@ -2200,8 +2206,7 @@ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring)
+ 
+ 	intel_unpin_ringbuffer_obj(ringbuf);
+ 	intel_destroy_ringbuffer_obj(ringbuf);
+-	i915_gem_request_assign(&ring->preallocated_lazy_request, NULL);
+-	ring->outstanding_lazy_seqno = 0;
++	i915_gem_request_assign(&ring->outstanding_lazy_request, NULL);
+ 
+ 	if (ring->cleanup)
+ 		ring->cleanup(ring);
+@@ -2356,7 +2361,7 @@ int intel_ring_idle(struct intel_engine_cs *ring)
+ 	int ret;
+ 
+ 	/* We need to add any requests required to flush the objects and ring */
+-	if (ring->outstanding_lazy_seqno) {
++	if (ring->outstanding_lazy_request) {
+ 		ret = i915_add_request(ring, NULL);
+ 		if (ret)
+ 			return ret;
+@@ -2374,22 +2379,13 @@ int intel_ring_idle(struct intel_engine_cs *ring)
+ }
+ 
+ int
+-intel_ring_alloc_seqno(struct intel_engine_cs *ring)
++intel_ring_alloc_request(struct intel_engine_cs *ring)
+ {
+ 	int ret;
+ 	struct drm_i915_gem_request *request;
+ 
+-	/* XXX: The aim is to replace seqno values with request structures.
+-	 * A step along the way is to switch to using the PLR in preference
+-	 * to the OLS. That requires the PLR to only be valid when the OLS
+-	 * is also valid. I.e., the two must be kept in step. */
+-
+-	if (ring->outstanding_lazy_seqno) {
+-		WARN_ON(ring->preallocated_lazy_request == NULL);
++	if (ring->outstanding_lazy_request)
+ 		return 0;
+-	}
+-
+-	WARN_ON(ring->preallocated_lazy_request != NULL);
+ 
+ 	request = kmalloc(sizeof(*request), GFP_KERNEL);
+ 	if (request == NULL)
+@@ -2397,13 +2393,13 @@ intel_ring_alloc_seqno(struct intel_engine_cs *ring)
+ 
+ 	kref_init(&request->ref);
+ 
+-	ret = i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_seqno);
++	ret = i915_gem_get_seqno(ring->dev, &request->seqno);
+ 	if (ret) {
+ 		kfree(request);
+ 		return ret;
+ 	}
+ 
+-	ring->preallocated_lazy_request = request;
++	ring->outstanding_lazy_request = request;
+ 	return 0;
+ }
+ 
+@@ -2445,7 +2441,7 @@ int intel_ring_begin(struct intel_engine_cs *ring,
+ 		return ret;
+ 
+ 	/* Preallocate the olr before touching the ring */
+-	ret = intel_ring_alloc_seqno(ring);
++	ret = intel_ring_alloc_request(ring);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2480,7 +2476,7 @@ void intel_ring_init_seqno(struct intel_engine_cs *ring, u32 seqno)
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+-	BUG_ON(ring->outstanding_lazy_seqno);
++	BUG_ON(ring->outstanding_lazy_request);
+ 
+ 	if (INTEL_INFO(dev)->gen == 6 || INTEL_INFO(dev)->gen == 7) {
+ 		I915_WRITE(RING_SYNC_0(ring->mmio_base), 0);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 38bd240..6af7701 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -276,8 +276,7 @@ struct intel_engine_cs {
+ 	/**
+ 	 * Do we have some not yet emitted requests outstanding?
+ 	 */
+-	struct drm_i915_gem_request *preallocated_lazy_request;
+-	u32 outstanding_lazy_seqno;
++	struct drm_i915_gem_request *outstanding_lazy_request;
+ 	bool gpu_caches_dirty;
+ 	bool fbc_dirty;
+ 
+@@ -418,7 +417,7 @@ int intel_alloc_ringbuffer_obj(struct drm_device *dev,
+ 
+ void intel_stop_ring_buffer(struct intel_engine_cs *ring);
+ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring);
+-int __must_check intel_ring_alloc_seqno(struct intel_engine_cs *ring);
++int __must_check intel_ring_alloc_request(struct intel_engine_cs *ring);
+ 
+ int __must_check intel_ring_begin(struct intel_engine_cs *ring, int n);
+ int __must_check intel_ring_cacheline_align(struct intel_engine_cs *ring);
+@@ -486,17 +485,11 @@ static inline u32 intel_ring_get_tail(struct intel_ringbuffer *ringbuf)
+ int i915_write_active_request(struct intel_engine_cs *ring,
+ 			      struct drm_i915_gem_request *req);
+ 
+-static inline u32 intel_ring_get_seqno(struct intel_engine_cs *ring)
+-{
+-	BUG_ON(ring->outstanding_lazy_seqno == 0);
+-	return ring->outstanding_lazy_seqno;
+-}
+-
+ static inline struct drm_i915_gem_request *
+ intel_ring_get_request(struct intel_engine_cs *ring)
+ {
+-	BUG_ON(ring->preallocated_lazy_request == NULL);
+-	return ring->preallocated_lazy_request;
++	BUG_ON(ring->outstanding_lazy_request == NULL);
++	return ring->outstanding_lazy_request;
+ }
+ 
+ static inline void i915_trace_irq_get(struct intel_engine_cs *ring, u32 seqno)
+-- 
+1.7.9.5
+

@@ -1,0 +1,694 @@
+From 54e65a9ecec2815cf9cac81c7e32c2c6f7271166 Mon Sep 17 00:00:00 2001
+Message-Id: <54e65a9ecec2815cf9cac81c7e32c2c6f7271166.1436852670.git.chang-joon.lee@intel.com>
+From: Durgadoss R <durgadoss.r@intel.com>
+Date: Fri, 19 Jun 2015 16:08:19 +0530
+Subject: [PATCH 1/4] REVERTME [VPG]: drm/i915: Enabling Display Port to
+ support audio
+
+This patch enables DP to support audio by sending notification to
+audio driver based on connected/disconnected status of DP and also
+modifies other functions that are used by audio to support DP mode.
+ELD is modified for DP to intimate audio driver about the external
+panel. Audio driver gets to know if the external panel is HDMI or
+DP through second and third bits of fifth byte of ELD, which should
+be:
+	HDMI	: 00
+	DP	: 01
+Bit 15 of audio config register is set to play audio in DP mode.
+There is a single interface to audio which is used by both DP and
+HDMI. So, both use a single structure named hdmi_priv initialized
+during init. Work queue function and its call are also moved to
+another file to make it accessible by both DP and HDMI.
+In case of audio on HDMI, notification to the audio driver was
+sent using a global variable, i915_notify_had. Now this
+notification is sent by a member notify_had of structures intel_dp
+for DP and intel_hdmi for HDMI.
+Since audio driver registers base address based on pipe which drives
+external panel, before the pipe gets enabled, therefore, the pipe
+driving external panel is obtained according to the port on which
+the external panel is connected during init function.
+Audio driver supports only one external panel at a time. So, if
+VBT enumerates more than one external panel at a time,
+preference is given to HDMI and audio is enabled only on HDMI
+in that case.
+The link rate of DP is sent to audio driver for programming Maud
+and Naud values of DP, based on audio sampling frequency, as per
+DP specs, to enable audio support on it.
+
+REVERTME: LP audio is not available upstream and may not be for
+some more time which is required for this.
+
+Issue: GMINL-10757
+Change-Id: I426d52dc2fb448a6142c45fed0484e10af33cde2
+Signed-off-by: Shubhangi Shrivastava <shubhangi.shrivastava@intel.com>
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Signed-off-by: Durgadoss R <durgadoss.r@intel.com>
+---
+ drivers/gpu/drm/drm_edid.c           |    7 +
+ drivers/gpu/drm/i915/hdmi_audio_if.c |   36 ++++++++-
+ drivers/gpu/drm/i915/hdmi_audio_if.h |    3 
+ drivers/gpu/drm/i915/i915_drv.h      |    2 
+ drivers/gpu/drm/i915/i915_reg.h      |   12 +++
+ drivers/gpu/drm/i915/intel_display.c |   45 +++++++++--
+ drivers/gpu/drm/i915/intel_dp.c      |  139 ++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_drv.h     |    2 
+ drivers/gpu/drm/i915/intel_hdmi.c    |   68 +++++++++++------
+ include/uapi/drm/drm_mode.h          |    2 
+ 10 files changed, 285 insertions(+), 31 deletions(-)
+
+Index: b/drivers/gpu/drm/drm_edid.c
+===================================================================
+--- a/drivers/gpu/drm/drm_edid.c	2016-03-08 10:21:44.818687204 -0800
++++ b/drivers/gpu/drm/drm_edid.c	2016-03-08 10:21:48.470733618 -0800
+@@ -3141,6 +3141,13 @@
+ 		}
+ 	}
+ 	eld[5] |= sad_count << 4;
++	/*
++	 * Audio driver expects the second and third bits
++	 * of fifth byte of ELD to be 01 for DP.
++	 * So, setting second bit to be 1.
++	 */
++	if (connector->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
++		eld[5] |= ELD_DP_CONNECTION_TYPE;
+ 	eld[2] = (20 + mnl + sad_count * 3 + 3) / 4;
+ 
+ 	DRM_DEBUG_KMS("ELD size %d, SAD count %d\n", (int)eld[2], sad_count);
+Index: b/drivers/gpu/drm/i915/hdmi_audio_if.c
+===================================================================
+--- a/drivers/gpu/drm/i915/hdmi_audio_if.c	2016-03-08 10:21:44.818687204 -0800
++++ b/drivers/gpu/drm/i915/hdmi_audio_if.c	2016-03-08 10:21:48.470733618 -0800
+@@ -50,6 +50,17 @@
+ 	hdmi_priv = p_hdmi_priv;
+ }
+ 
++void i915_had_wq(struct work_struct *work)
++{
++	struct drm_i915_private *dev_priv = container_of(work,
++		struct drm_i915_private, hdmi_audio_wq);
++
++	if (i915_hdmi_state == connector_status_connected) {
++		mid_hdmi_audio_signal_event(dev_priv->dev,
++			HAD_EVENT_HOT_PLUG);
++	}
++}
++
+ void hdmi_get_eld(uint8_t *eld)
+ {
+ 	struct drm_device *dev = hdmi_priv->dev;
+@@ -147,6 +158,22 @@
+ 			dev_priv->had_pvt_data);
+ }
+ 
++uint32_t set_dp_mode(uint32_t reg, uint32_t val)
++{
++	if (hdmi_priv->hdmi_reg == VLV_DP_B ||
++		hdmi_priv->hdmi_reg == VLV_DP_C ||
++		hdmi_priv->hdmi_reg == CHV_DP_D) {
++			if (reg == I915_HDMI_AUDIO_LPE_A_CONFIG ||
++				reg == I915_HDMI_AUDIO_LPE_B_CONFIG ||
++				reg == I915_HDMI_AUDIO_LPE_C_CONFIG) {
++					if (val & AUD_CONFIG_VALID_BIT)
++						val = val | AUD_CONFIG_DP_MODE |
++							AUD_CONFIG_BLOCK_BIT;
++			}
++	}
++	return val;
++}
++
+ /**
+  * hdmi_audio_write:
+  * used to write into display controller HDMI audio registers.
+@@ -162,8 +189,10 @@
+ 	if (hdmi_priv->monitor_type == MONITOR_TYPE_DVI)
+ 		return 0;
+ 
+-	if (IS_HDMI_AUDIO_I915(reg))
++	if (IS_HDMI_AUDIO_I915(reg)) {
++		val = set_dp_mode(reg, val);
+ 		I915_WRITE((VLV_DISPLAY_BASE + reg), val);
++	}
+ 	else
+ 		ret = -EINVAL;
+ 
+@@ -209,6 +238,7 @@
+ 	if (IS_HDMI_AUDIO_I915(reg)) {
+ 		val_tmp = (val & mask) |
+ 			(I915_READ((VLV_DISPLAY_BASE + reg)) & ~mask);
++		val_tmp = set_dp_mode(reg, val_tmp);
+ 		I915_WRITE((VLV_DISPLAY_BASE + reg), val_tmp);
+ 	} else {
+ 		ret = -EINVAL;
+@@ -241,6 +271,9 @@
+ 		memcpy(capabilities, &(dev_priv->tmds_clock_speed),
+ 			sizeof(uint32_t));
+ 		break;
++	case HAD_GET_LINK_RATE:
++		memcpy(capabilities, &dev_priv->link_rate, sizeof(uint32_t));
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -390,6 +423,7 @@
+ 	/* The Audio driver is loading now and we need to notify
+ 	 * it if there is an HDMI device attached
+ 	 */
++	INIT_WORK(&dev_priv->hdmi_audio_wq, i915_had_wq);
+ 	DRM_INFO("%s: Scheduling HDMI audio work queue\n", __func__);
+ 	schedule_work(&dev_priv->hdmi_audio_wq);
+ 
+Index: b/drivers/gpu/drm/i915/hdmi_audio_if.h
+===================================================================
+--- a/drivers/gpu/drm/i915/hdmi_audio_if.h	2016-03-08 10:21:44.818687204 -0800
++++ b/drivers/gpu/drm/i915/hdmi_audio_if.h	2016-03-08 10:21:48.474733669 -0800
+@@ -52,6 +52,7 @@
+ 	HAD_SET_DISABLE_AUDIO,
+ 	HAD_SET_ENABLE_AUDIO_INT,
+ 	HAD_SET_DISABLE_AUDIO_INT,
++	HAD_GET_LINK_RATE,
+ 	OTHERS_TBD,
+ };
+ 
+@@ -107,6 +108,7 @@
+ 	bool hdmi_hpd_connected;
+ 	int monitor_type;
+ 	void *context;
++	int pipe;
+ };
+ 
+ extern void i915_hdmi_audio_init(struct hdmi_audio_priv *p_hdmi_priv);
+@@ -120,6 +122,7 @@
+ extern void hdmi_get_eld(uint8_t *eld);
+ extern int i915_enable_hdmi_audio_int(struct drm_device *dev);
+ extern int i915_disable_hdmi_audio_int(struct drm_device *dev);
++extern uint32_t set_dp_mode(uint32_t reg, uint32_t val);
+ extern int mid_hdmi_audio_setup(
+ 	had_event_call_back audio_callbacks,
+ 	struct hdmi_audio_registers_ops *reg_ops,
+Index: b/drivers/gpu/drm/i915/i915_drv.h
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_drv.h	2016-03-08 10:21:44.818687204 -0800
++++ b/drivers/gpu/drm/i915/i915_drv.h	2016-03-08 10:21:48.474733669 -0800
+@@ -1714,8 +1714,10 @@
+ 	struct snd_intel_had_interface *had_interface;
+ 	void *had_pvt_data;
+ 	int tmds_clock_speed;
++	int link_rate;
+ 	int hdmi_audio_interrupt_mask;
+ 	struct work_struct hdmi_audio_wq;
++	bool support_dp_audio;
+ #endif
+ 
+ 	/* Atomicity fixes */
+Index: b/drivers/gpu/drm/i915/i915_reg.h
+===================================================================
+--- a/drivers/gpu/drm/i915/i915_reg.h	2016-03-08 10:21:44.822687255 -0800
++++ b/drivers/gpu/drm/i915/i915_reg.h	2016-03-08 10:21:48.474733669 -0800
+@@ -1691,7 +1691,11 @@
+ #define I915_HDMI_AUDIO_UNDERRUN_ENABLE	(1UL<<15)
+ #define I915_HDMI_AUDIO_LPE_C_CONFIG	0x65900
+ #define I915_HDMI_AUDIO_LPE_B_CONFIG	0x65800
++#define I915_HDMI_AUDIO_LPE_A_CONFIG	0x65000
+ #define GEN6_BSD_RNCID			0x12198
++#define AUD_CONFIG_VALID_BIT			(1<<9)
++#define AUD_CONFIG_DP_MODE				(1<<15)
++#define AUD_CONFIG_BLOCK_BIT			(1<<7)
+ 
+ #define GEN7_FF_THREAD_MODE		0x20a0
+ #define   GEN7_FF_SCHED_MASK		0x0077070
+@@ -2956,7 +2960,12 @@
+ #define HDMIC	(dev_priv->info.display_mmio_offset + 0x61160)
+ #define GEN4_HDMIB	GEN3_SDVOB
+ #define GEN4_HDMIC	GEN3_SDVOC
++#define CHV_HDMIB	0x61140
++#define CHV_HDMIC	0x61160
+ #define CHV_HDMID	0x6116C
++#define VLV_CHV_HDMIB	(VLV_DISPLAY_BASE + CHV_HDMIB)
++#define VLV_CHV_HDMIC	(VLV_DISPLAY_BASE + CHV_HDMIC)
++#define VLV_CHV_HDMID	(VLV_DISPLAY_BASE + CHV_HDMID)
+ #define PCH_SDVOB	0xe1140
+ #define PCH_HDMIB	PCH_SDVOB
+ #define PCH_HDMIC	0xe1150
+@@ -3793,6 +3802,9 @@
+ #define DP_B				0x64100
+ #define DP_C				0x64200
+ #define DP_D				0x64300
++#define VLV_DP_B			(VLV_DISPLAY_BASE + DP_B)
++#define VLV_DP_C			(VLV_DISPLAY_BASE + DP_C)
++#define CHV_DP_D			(VLV_DISPLAY_BASE + DP_D)
+ 
+ #define   DP_PORT_EN			(1 << 31)
+ #define   DP_PIPEB_SELECT		(1 << 30)
+Index: b/drivers/gpu/drm/i915/intel_display.c
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_display.c	2016-03-08 10:21:44.826687305 -0800
++++ b/drivers/gpu/drm/i915/intel_display.c	2016-03-08 10:21:48.478733719 -0800
+@@ -5494,13 +5494,24 @@
+ 
+ 	vlv_update_watermarks(dev_priv);
+ 
+-	if (IS_VALLEYVIEW(dev) &&
+-			intel_pipe_has_type(crtc, INTEL_OUTPUT_HDMI)) {
+-		dev_priv->tmds_clock_speed =
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++	if (IS_VALLEYVIEW(dev)) {
++		if (intel_pipe_has_type(crtc, INTEL_OUTPUT_HDMI)) {
++			dev_priv->tmds_clock_speed =
+ 				intel_crtc->config.port_clock;
+-		mid_hdmi_audio_signal_event
++			mid_hdmi_audio_signal_event
+ 				(dev_priv->dev, HAD_EVENT_MODE_CHANGING);
++		} else if (intel_pipe_has_type(crtc,
++					INTEL_OUTPUT_DISPLAYPORT)) {
++			dev_priv->tmds_clock_speed =
++				intel_crtc->config.adjusted_mode.crtc_clock;
++			dev_priv->link_rate =
++				intel_crtc->config.port_clock;
++			mid_hdmi_audio_signal_event
++				(dev_priv->dev, HAD_EVENT_MODE_CHANGING);
++		}
+ 	}
++#endif
+ 
+ 	intel_enable_pipe(intel_crtc);
+ 
+@@ -13205,6 +13216,7 @@
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int hdmi_ports = 0;
++	int dp_ports = 0;
+ 	int port = 0;
+ 	int i;
+ 
+@@ -13241,9 +13253,7 @@
+ 
+ 			if (devtype == DEVICE_TYPE_DP_HDMI_DVI ||
+ 						devtype == DEVICE_TYPE_DP) {
+-				intel_dp_init(dev, VLV_DISPLAY_BASE
+-						+ DDI_BUF_CTL(dvo_port),
+-							dvo_port);
++				dp_ports |= (1 << dvo_port);
+ 			}
+ 			break;
+ 		default:
+@@ -13279,9 +13289,30 @@
+ 				+ PORT_ADDR(port);
+ 		}
+ 
++		/*
++		 * Since audio is supported only on one external
++		 * panel, either HDMI or DP, we are giving
++		 * preference to HDMI over DP.
++		 */
++		dev_priv->support_dp_audio = false;
++
+ 		intel_hdmi_init(dev, hdmi_reg, port);
+ 		DRM_DEBUG_DRIVER("HDMI port=%c\n",
+ 			port_name(port));
++	} else {
++		dev_priv->support_dp_audio = true;
++	}
++
++	if (dp_ports) {
++		if (dp_ports & (1 << DVO_PORT_HDMIB))
++			port = DVO_PORT_HDMIB;
++		else if (dp_ports & (1 << DVO_PORT_HDMIC))
++			port = DVO_PORT_HDMIC;
++		else if (dp_ports & (1 << DVO_PORT_HDMID))
++			port = DVO_PORT_HDMID;
++
++		intel_dp_init(dev, VLV_DISPLAY_BASE + DDI_BUF_CTL(port), port);
++		DRM_DEBUG_KMS("DP on port=%c\n", port_name(port));
+ 	}
+ }
+ 
+Index: b/drivers/gpu/drm/i915/intel_dp.c
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_dp.c	2016-03-08 10:21:44.826687305 -0800
++++ b/drivers/gpu/drm/i915/intel_dp.c	2016-03-08 10:21:48.478733719 -0800
+@@ -4544,6 +4544,7 @@
+ intel_dp_get_edid_modes(struct drm_connector *connector, struct i2c_adapter *adapter)
+ {
+ 	struct intel_connector *intel_connector = to_intel_connector(connector);
++	struct intel_dp *intel_dp = intel_attached_dp(connector);
+ 
+ 	/* use cached edid if we have one */
+ 	if (intel_connector->edid) {
+@@ -4551,6 +4552,19 @@
+ 		if (IS_ERR(intel_connector->edid))
+ 			return 0;
+ 
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++		drm_edid_to_eld(connector, intel_connector->edid);
++		if (intel_dp->notify_had) {
++			hdmi_get_eld(connector->eld);
++#ifdef CONFIG_EXTCON
++			if (strlen(intel_connector->hotplug_switch.name) != 0)
++				extcon_set_state(&intel_connector->
++					hotplug_switch, true);
++#endif
++			intel_dp->notify_had = false;
++		}
++#endif
++
+ 		return intel_connector_update_modes(connector,
+ 						    intel_connector->edid);
+ 	}
+@@ -4571,6 +4585,9 @@
+ 	enum intel_display_power_domain power_domain;
+ 	struct edid *edid = NULL;
+ 	struct intel_crtc *intel_crtc = NULL;
++#ifdef CONFIG_EXTCON
++	struct intel_connector *intel_connector = to_intel_connector(connector);
++#endif
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
+@@ -4603,7 +4620,7 @@
+ 		edid = intel_dp_get_edid(connector, &intel_dp->aux.ddc);
+ 		if (edid) {
+ 			intel_dp->has_audio = drm_detect_monitor_audio(edid);
+-			kfree(edid);
++			intel_connector->edid = edid;
+ 		}
+ 	}
+ 
+@@ -4628,10 +4645,43 @@
+ 	status = connector_status_connected;
+ 
+ out:
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++	if (IS_VALLEYVIEW(dev) && !is_edp(intel_dp) &&
++		dev_priv->support_dp_audio && status != i915_hdmi_state) {
++
++		/*
++		 * If HDMI status is conencted, the event to audio
++		 * will be sent on basis of current audio status,
++		 * but if its disconnected, the status will be
++		 * sent based on previous audio status
++		 */
++		if (status == connector_status_connected) {
++			if (intel_dp->has_audio)
++				intel_dp->notify_had = true;
++		} else {
++#ifdef CONFIG_EXTCON
++			if (strlen(intel_connector->hotplug_switch.name) != 0)
++				extcon_set_state(
++				&intel_connector->hotplug_switch, false);
++#endif
++			/* Send a disconnect event to audio */
++			DRM_DEBUG_DRIVER("Sending event to audio");
++			mid_hdmi_audio_signal_event(dev_priv->dev,
++						HAD_EVENT_HOT_UNPLUG);
++		}
++		i915_hdmi_state = status;
++	}
++#endif
++
+ 	intel_display_power_put(dev_priv, power_domain);
+ 
+ 	intel_runtime_pm_put(dev_priv);
+ 
++	if (intel_connector && status == connector_status_disconnected) {
++		kfree(intel_connector->edid);
++		intel_connector->edid = NULL;
++	}
++
+ 	return status;
+ }
+ 
+@@ -4816,6 +4866,12 @@
+ {
+ 	struct intel_connector *intel_connector = to_intel_connector(connector);
+ 
++#ifdef CONFIG_EXTCON
++	extcon_dev_unregister(&intel_connector->hotplug_switch);
++	if (&intel_connector->hotplug_switch)
++		kfree(intel_connector->hotplug_switch.name);
++#endif
++
+ 	if (!IS_ERR_OR_NULL(intel_connector->edid))
+ 		kfree(intel_connector->edid);
+ 
+@@ -5301,6 +5357,20 @@
+ 			intel_dp_init_panel_power_timestamps(intel_dp);
+ 			intel_dp_init_panel_power_sequencer(dev, intel_dp, &power_seq);
+ 		}
++	} else {
++#ifdef CONFIG_EXTCON
++		/* use the same name as hdmi for now  */
++		intel_connector->hotplug_switch.name =
++			kasprintf(GFP_KERNEL, "hdmi_%c", 'a' + port);
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++		if (IS_VALLEYVIEW(dev))
++			intel_connector->hotplug_switch.name = "hdmi";
++#endif
++		if (!intel_connector->hotplug_switch.name)
++			DRM_ERROR("Couldn't allocate memory for audio");
++
++		extcon_dev_register(&intel_connector->hotplug_switch);
++#endif
+ 	}
+ 
+ 	intel_dp_aux_init(intel_dp, intel_connector);
+@@ -5339,6 +5409,10 @@
+ 	struct intel_encoder *intel_encoder;
+ 	struct drm_encoder *encoder;
+ 	struct intel_connector *intel_connector;
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++	struct hdmi_audio_priv *hdmi_priv;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++#endif
+ 
+ 	intel_dig_port = kzalloc(sizeof(*intel_dig_port), GFP_KERNEL);
+ 	if (!intel_dig_port)
+@@ -5393,6 +5467,69 @@
+ 	intel_encoder->cloneable = 0;
+ 	intel_encoder->hot_plug = intel_dp_hot_plug;
+ 
++#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
++	if (dev_priv->support_dp_audio) {
++		hdmi_priv = kzalloc(sizeof(struct hdmi_audio_priv),
++					GFP_KERNEL);
++		if (!hdmi_priv) {
++			pr_err("failed to allocate memory");
++			goto mem_err;
++		}
++		hdmi_priv->dev = dev;
++
++		if (IS_CHERRYVIEW(dev)) {
++			/*
++			 * Due to hardware limitaion, Port D will always
++			 * be driven by Pipe C. So Port B and Port C will
++			 * be driven by either Pipe A or PipeB, depending
++			 * on whether the LFP is MIPI or EDP.
++			 */
++			if (port == PORT_D) {
++				hdmi_priv->hdmi_lpe_audio_reg =
++					I915_HDMI_AUDIO_LPE_C_CONFIG;
++				hdmi_priv->pipe = PIPE_C;
++				hdmi_priv->hdmi_reg = CHV_DP_D;
++			} else {
++				list_for_each_entry(intel_encoder, &dev->
++					mode_config.encoder_list, base.head) {
++					/*
++					 * MIPI always comes on Pipe A and EDP
++					 * on Pipe B. So the other pipe will
++					 * only be able to drive the DP.
++					 */
++					if (intel_encoder->type ==
++						INTEL_OUTPUT_EDP) {
++						hdmi_priv->hdmi_lpe_audio_reg =
++						I915_HDMI_AUDIO_LPE_A_CONFIG;
++						hdmi_priv->pipe = PIPE_A;
++						break;
++					} else if (intel_encoder->type ==
++						INTEL_OUTPUT_DSI) {
++						hdmi_priv->hdmi_lpe_audio_reg =
++						I915_HDMI_AUDIO_LPE_B_CONFIG;
++						hdmi_priv->pipe = PIPE_B;
++						break;
++					}
++				}
++
++				if (port == PORT_B)
++					hdmi_priv->hdmi_reg = VLV_DP_B;
++				else
++					hdmi_priv->hdmi_reg = VLV_DP_C;
++			}
++		} else {
++			hdmi_priv->hdmi_lpe_audio_reg =
++				I915_HDMI_AUDIO_LPE_B_CONFIG;
++		}
++
++		/* HACK */
++		hdmi_priv->monitor_type = MONITOR_TYPE_HDMI;
++		hdmi_priv->is_hdcp_supported = false;
++		i915_hdmi_audio_init(hdmi_priv);
++	}
++#endif
++
++mem_err:
+ 	intel_connector->panel.fitting_mode = 0;
+ 	if (!intel_dp_init_connector(intel_dig_port, intel_connector)) {
+ 		drm_encoder_cleanup(encoder);
+Index: b/drivers/gpu/drm/i915/intel_drv.h
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_drv.h	2016-03-08 10:21:44.826687305 -0800
++++ b/drivers/gpu/drm/i915/intel_drv.h	2016-03-08 10:22:29.931260671 -0800
+@@ -650,6 +650,7 @@
+ 	bool rgb_quant_range_selectable;
+ 	struct edid *edid;
+ 	u32 edid_mode_count;
++	int notify_had;
+ 
+ 	/*
+ 	 * For HDCP compliance, we disable port immediately after detecting
+@@ -716,6 +717,7 @@
+ 				     int send_bytes,
+ 				     uint32_t aux_clock_divider);
+ 
++	int notify_had;
+ };
+ 
+ struct intel_digital_port {
+Index: b/drivers/gpu/drm/i915/intel_hdmi.c
+===================================================================
+--- a/drivers/gpu/drm/i915/intel_hdmi.c	2016-03-08 10:21:44.826687305 -0800
++++ b/drivers/gpu/drm/i915/intel_hdmi.c	2016-03-08 10:21:48.478733719 -0800
+@@ -43,8 +43,6 @@
+ #define LIMIT_BW_MAX_HDISPLAY	1280
+ #define LIMIT_BW_MAX_VDISPLAY	800
+ 
+-static int i915_notify_had;
+-
+ /* CEA Mode 4 - 1280x720@60Hz */
+ struct drm_display_mode hdmi_fallback_mode = {
+ 	DRM_MODE("1280x720", DRM_MODE_TYPE_DRIVER,
+@@ -1273,7 +1271,7 @@
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+ 		if ((status != i915_hdmi_state) && (IS_VALLEYVIEW(dev))) {
+ 			if (intel_hdmi->has_audio)
+-				i915_notify_had = 1;
++				intel_hdmi->notify_had = 1;
+ 		}
+ #endif
+ 		if (intel_hdmi->force_audio != HDMI_AUDIO_AUTO)
+@@ -1349,7 +1347,7 @@
+ 		ret = drm_add_edid_modes(connector, edid);
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+ 		drm_edid_to_eld(connector, edid);
+-		if (i915_notify_had) {
++		if (intel_hdmi->notify_had) {
+ 			hdmi_get_eld(connector->eld);
+ #ifdef CONFIG_EXTCON
+ 			if (strlen(intel_connector->hotplug_switch.name) != 0) {
+@@ -1357,7 +1355,7 @@
+ 				&intel_connector->hotplug_switch, 1);
+ 			}
+ #endif
+-			i915_notify_had = 0;
++			intel_hdmi->notify_had = 0;
+ 		}
+ #endif
+ 	}
+@@ -2040,25 +2038,12 @@
+ 	intel_hdmi->skip_port_check = false;
+ }
+ 
+-#ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+-void i915_had_wq(struct work_struct *work)
+-{
+-	struct drm_i915_private *dev_priv = container_of(work,
+-		struct drm_i915_private, hdmi_audio_wq);
+-
+-	if (i915_hdmi_state == connector_status_connected)
+-		mid_hdmi_audio_signal_event(dev_priv->dev,
+-			HAD_EVENT_HOT_PLUG);
+-}
+-#endif
+-
+ void intel_hdmi_init(struct drm_device *dev, int hdmi_reg, enum port port)
+ {
+ 	struct intel_digital_port *intel_dig_port;
+ 	struct intel_encoder *intel_encoder;
+ 	struct intel_connector *intel_connector;
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct hdmi_audio_priv *hdmi_priv;
+ #endif
+ 
+@@ -2120,17 +2105,56 @@
+ 	intel_dig_port->dp.output_reg = 0;
+ 
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+-	INIT_WORK(&dev_priv->hdmi_audio_wq, i915_had_wq);
+ 	hdmi_priv = kzalloc(sizeof(struct hdmi_audio_priv), GFP_KERNEL);
+ 	if (!hdmi_priv) {
+ 		pr_err("failed to allocate memory");
+ 	} else {
+ 		hdmi_priv->dev = dev;
+ 		hdmi_priv->hdmi_reg = hdmi_reg;
+-		if (IS_CHERRYVIEW(dev))
+-			hdmi_priv->hdmi_lpe_audio_reg =
++		if (IS_CHERRYVIEW(dev)) {
++			/*
++			 * Due to hardware limitaion, Port D will always
++			 * be driven by Pipe C. So Port B and Port C will
++			 * be driven by either Pipe A or PipeB, depending
++			 * on whether the LFP is MIPI or EDP.
++			 */
++			if (port == PORT_D) {
++				hdmi_priv->hdmi_lpe_audio_reg =
+ 					I915_HDMI_AUDIO_LPE_C_CONFIG;
+-		else
++				hdmi_priv->pipe = PIPE_C;
++				hdmi_priv->hdmi_reg =
++						VLV_CHV_HDMID;
++			} else {
++				list_for_each_entry(intel_encoder,
++					&dev->mode_config.encoder_list,
++					base.head) {
++				/*
++				 * MIPI always comes on Pipe A and EDP on
++				 * Pipe B. So the other pipe will only be
++				 * able to drive the DP.
++				 */
++					if (intel_encoder->type ==
++							INTEL_OUTPUT_EDP) {
++						hdmi_priv->hdmi_lpe_audio_reg =
++						I915_HDMI_AUDIO_LPE_A_CONFIG;
++						hdmi_priv->pipe = PIPE_A;
++						break;
++					} else if (intel_encoder->type ==
++							INTEL_OUTPUT_DSI) {
++						hdmi_priv->hdmi_lpe_audio_reg =
++						I915_HDMI_AUDIO_LPE_B_CONFIG;
++						hdmi_priv->pipe = PIPE_B;
++						break;
++					}
++				}
++				if (port == PORT_B)
++					hdmi_priv->hdmi_reg =
++						VLV_CHV_HDMIB;
++				else
++					hdmi_priv->hdmi_reg =
++						VLV_CHV_HDMIC;
++			}
++		} else
+ 			hdmi_priv->hdmi_lpe_audio_reg =
+ 					I915_HDMI_AUDIO_LPE_B_CONFIG;
+ 		hdmi_priv->monitor_type = MONITOR_TYPE_HDMI;
+Index: b/include/uapi/drm/drm_mode.h
+===================================================================
+--- a/include/uapi/drm/drm_mode.h	2016-03-08 10:21:44.826687305 -0800
++++ b/include/uapi/drm/drm_mode.h	2016-03-08 10:21:48.478733719 -0800
+@@ -228,6 +228,8 @@
+ #define DRM_MODE_CONNECTOR_VIRTUAL      15
+ #define DRM_MODE_CONNECTOR_DSI		16
+ 
++#define ELD_DP_CONNECTION_TYPE		(1<<2)
++
+ struct drm_mode_get_connector {
+ 
+ 	__u64 encoders_ptr;

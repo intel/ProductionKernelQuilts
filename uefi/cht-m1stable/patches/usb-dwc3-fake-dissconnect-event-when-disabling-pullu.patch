@@ -1,0 +1,71 @@
+From 94ece9544ba651a05b1ae5603e826c0fa0d40dfe Mon Sep 17 00:00:00 2001
+From: "Du, Changbin" <changbin.du@intel.com>
+Date: Mon, 30 Mar 2015 16:59:40 +0800
+Subject: [PATCH] usb/dwc3: fake dissconnect event when disabling pullup
+
+The dwc3 controller doesn't issue disconnect event after pullups
+is disabled. Thus gadget dissconnect callback is not invoked
+when do soft dissconnect. On this case application still think
+gadget is connected. Call dissconnect here to workaround this
+issue. And use gadget.speed flag to avoid double call gadget
+dissconnect callback.
+Before call dissconnect callback, dwc irq should be disabled to
+avoid racing with irq handler.
+
+Change-Id: I98a1a9e1848f5b4a7c8a07e62cfc6b5bd249703d
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-24346
+Signed-off-by: Du, Changbin <changbin.du@intel.com>
+---
+ drivers/usb/dwc3/gadget.c | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 6ed374fdae91..1e71d2ef7aa0 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -1581,6 +1581,7 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
+ {
+ 	struct dwc3		*dwc = gadget_to_dwc(g);
+ 	unsigned long		flags;
++	int			irq;
+ 	int			ret;
+ 
+ 	is_on = !!is_on;
+@@ -1593,6 +1594,24 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
+ 
+ 	pm_runtime_put_autosuspend(dwc->dev);
+ 
++	/**
++	 * WORKAROUND: The dwc3 controller doesn't issue disconnect
++	 * event after pullups is disabled. Thus gadget dissconnect callback
++	 * is not invoked when do soft dissconnect. Call dissconnect here
++	 * to workaround this issue.
++	 */
++	if (!ret && !is_on
++		&& dwc->gadget_driver && dwc->gadget_driver->disconnect) {
++		if (dwc->gadget.speed != USB_SPEED_UNKNOWN) {
++			dev_dbg(dwc->dev, "fake dissconnect event\n");
++			irq = platform_get_irq(to_platform_device(dwc->dev), 0);
++			disable_irq(irq);
++			dwc->gadget_driver->disconnect(&dwc->gadget);
++			dwc->gadget.speed = USB_SPEED_UNKNOWN;
++			enable_irq(irq);
++		}
++	}
++
+ 	return ret;
+ }
+ 
+@@ -2285,7 +2304,8 @@ static void dwc3_gadget_disconnect_interrupt(struct dwc3 *dwc)
+ 	reg &= ~DWC3_DCTL_INITU2ENA;
+ 	dwc3_writel(dwc->regs, DWC3_DCTL, reg);
+ 
+-	dwc3_disconnect_gadget(dwc);
++	if (dwc->gadget.speed != USB_SPEED_UNKNOWN)
++		dwc3_disconnect_gadget(dwc);
+ 	dwc->start_config_issued = false;
+ 
+ 	dwc->gadget.speed = USB_SPEED_UNKNOWN;
+-- 
+1.9.1
+

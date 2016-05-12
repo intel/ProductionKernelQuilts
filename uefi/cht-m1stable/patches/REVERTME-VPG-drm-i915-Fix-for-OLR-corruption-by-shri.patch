@@ -1,0 +1,91 @@
+From 5600180528a01a4e0c57ebbddb087ef33aae13f4 Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 16 Nov 2015 15:29:28 +0000
+Subject: [PATCH 12/12] REVERTME [VPG]: drm/i915: Fix for OLR corruption by
+ shrinker
+
+An issue was observed whereby the OLR had become corrupted during a
+batch buffer submission on a small memory board. This was tracked down
+to a shrinker interaction problem. The first half submission process
+(from user land via IOCTL to scheduler) ran out of memory. The
+shrinker was invoked and decided that it could free up some memory. It
+did a wait for rendering on the object it wanted to free. However, the
+outstanding rendering was actually sat in the scheduler not the
+hardware. Thus the scheduler was called to flush that work out to the
+hardware. This called the back half submission path which a) noticed
+and complained that the OLR was not null and b) updated the OLR to the
+request being submitted so that said submission could proceed.
+Eventually, the shrinker completed, more memory became available and
+control was returned to the original front half submission path.
+Unfortunately, it did not know the OLR had been re-used and cleared
+from one line to another and thus Bad Things happened when it tried to
+use a null pointer.
+
+This patch fixes the problem by saving and restoring the OLR during
+the shrinker operation. Thus it should be safe for the shrinker to
+push batch buffers out of the scheduler to the hardware without fear
+of corrupting an in progess submission.
+
+Note that this patch is a REVERTME because the problem does not exist
+upstream. The OLR has been completely removed in more recent drivers
+and the in progress request is now passed around on the stack instead.
+Thus it is not possible for one submission to corrupt another
+submission (at least from a request point of view). However, that work
+is a very large series of non-trivial patches and thus is not
+considered viable for a customer release tree. If the CHT tree is ever
+updated  to a newer kernel release then this patch can be reverted as
+no longer necessary.
+
+Change-Id: If1920dfd50697cf2d855a4401f9f119c11beef05
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-7013
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-on: https://android.intel.com:443/438505
+---
+ drivers/gpu/drm/i915/i915_gem.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index c01558e..e335cf4 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2224,6 +2224,26 @@ i915_gem_shrink(struct drm_i915_private *dev_priv,
+ {
+ 	const bool purgeable_only = flags & I915_SHRINK_PURGEABLE;
+ 	unsigned long count = 0;
++	struct drm_i915_gem_request *saved_OLR[I915_NUM_RINGS];
++	struct intel_engine_cs *ring;
++	int r;
++
++	/*
++	 * It might be that an object the shrinker tries to free up is being
++	 * referenced by a batch buffer that is still queued up in the
++	 * scheduler and not yet executing on hardware. This is fine, the
++	 * unbind will wait for the object to be idle which in turn will
++	 * flush the outstanding batch buffer from the scheduler. However,
++	 * doing so will require using the OLR as part of the batch buffer
++	 * submission back end. The problem is that the shrink call might
++	 * have come from an out of memory condition during the front half of
++	 * batch buffer submission (i.e. submission from user land into the
++	 * scheduler). In that case, the OLR will already be in use. Thus it
++	 * must be saved away and restored again after to prevent it being
++	 * corrupted part way through the submission.
++	 */
++	for_each_ring(ring, dev_priv, r)
++		saved_OLR[r] = ring->outstanding_lazy_request;
+ 
+ 	/*
+ 	 * As we may completely rewrite the (un)bound list whilst unbinding
+@@ -2307,6 +2327,10 @@ i915_gem_shrink(struct drm_i915_private *dev_priv,
+ 		list_splice(&still_in_list, &dev_priv->mm.bound_list);
+ 	}
+ 
++	/* Restore the OLR again: */
++	for_each_ring(ring, dev_priv, r)
++		ring->outstanding_lazy_request = saved_OLR[r];
++
+ 	return count;
+ }
+ 
+-- 
+1.9.1
+

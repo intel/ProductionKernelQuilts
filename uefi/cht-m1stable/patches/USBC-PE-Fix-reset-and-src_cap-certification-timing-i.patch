@@ -1,0 +1,192 @@
+From 99c48b14889e77d45cd98b8e6e0e32170d848ae3 Mon Sep 17 00:00:00 2001
+From: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Date: Fri, 22 Jan 2016 12:58:59 +0530
+Subject: [PATCH 5/7] USBC/PE: Fix reset and src_cap certification timing
+ issues.
+
+The reset timer triggering and some of the timer values
+are modified to correct certification timing issues.
+
+Change-Id: I4c730bc5bc212c944a066160616eb0107783efb7
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-17109
+Signed-off-by: Venkataramana Kotakonda <venkataramana.kotakonda@intel.com>
+Reviewed-on: https://android.intel.com:443/461213
+---
+ drivers/usb/typec/pd/policy_engine.c | 39 ++++++++++++++++++++++++++----------
+ drivers/usb/typec/pd/policy_engine.h | 16 ++++++++++-----
+ 2 files changed, 39 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 8fd3ae6..2ffff0a 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -76,9 +76,8 @@ static void pe_enable_pd(struct policy_engine *pe, bool en)
+ 	}
+ }
+ 
+-static void pe_do_self_reset(struct policy_engine *pe)
++static void pe_do_pe_reset(struct policy_engine *pe)
+ {
+-	pe_deactivate_all_timers(pe);
+ 	/*
+ 	 * Cancel pending state works. Donot use sync as this
+ 	 * reset itself might be runnig in the worker.
+@@ -111,6 +110,12 @@ static void pe_do_self_reset(struct policy_engine *pe)
+ 	pe_enable_pd(pe, false);
+ }
+ 
++static void pe_do_self_reset(struct policy_engine *pe)
++{
++	pe_deactivate_all_timers(pe);
++	pe_do_pe_reset(pe);
++}
++
+ static void pe_do_dpm_reset_entry(struct policy_engine *pe)
+ {
+ 	/* VBUS Off*/
+@@ -281,9 +286,6 @@ static void pe_handle_gcrc_received(struct policy_engine *pe)
+ 			pe_cancel_timer(pe, NO_RESPONSE_TIMER);
+ 		pe->hard_reset_counter = 0;
+ 		pe->src_caps_couner = 0;
+-		/* Start sender response timer */
+-		pe_start_timer(pe, SENDER_RESPONSE_TIMER,
+-					PE_TIME_SENDER_RESPONSE);
+ 		break;
+ 
+ 	case PE_SRC_NEGOTIATE_CAPABILITY:
+@@ -1456,6 +1458,7 @@ static void pe_timer_expire_worker(struct work_struct *work)
+ 
+ 	case CRC_RECEIVE_TIMER:
+ 		if (pe->cur_state == PE_SRC_SEND_CAPABILITIES) {
++			pe_cancel_timer(pe, SENDER_RESPONSE_TIMER);
+ 			pe_change_state(pe, PE_SRC_DISCOVERY);
+ 			break;
+ 		} else if (pe->cur_state == PE_PRS_SRC_SNK_WAIT_SOURCE_ON) {
+@@ -1614,9 +1617,11 @@ static void pe_timer_expire_worker(struct work_struct *work)
+ static void pe_timer_expire_callback(unsigned long data)
+ {
+ 	struct pe_timer *cur_timer = (struct pe_timer *) data;
++	struct policy_engine *pe = (struct policy_engine *)cur_timer->data;
+ 
+ 	log_dbg("%s expired!!!", timer_to_str(cur_timer->timer_type));
+-	schedule_work(&cur_timer->work);
++	/* Use high priority pd work queue to achive spec timings */
++	pe_schedule_work_pd_wq(&pe->p, &cur_timer->work);
+ }
+ 
+ /************************ Sink State Handlers ********************/
+@@ -1688,6 +1693,7 @@ pe_process_state_pe_snk_wait_for_capabilities(struct policy_engine *pe)
+ 	else
+ 		time_out = PE_TIME_SINK_WAIT_CAP;
+ 	pe_start_timer(pe, SINK_WAIT_CAP_TIMER, time_out);
++	pe_enable_pd(pe, true);
+ }
+ 
+ static void
+@@ -1756,12 +1762,13 @@ pe_process_state_pe_snk_ready(struct policy_engine *pe)
+ static void
+ pe_process_state_pe_snk_hard_reset(struct policy_engine *pe)
+ {
+-	pe_do_self_reset(pe);
++	pe_deactivate_all_timers(pe);
+ 	pe->hard_reset_counter++;
+ 	pe_send_packet(pe, NULL, 0, PD_CMD_HARD_RESET,
+ 			PE_EVT_SEND_HARD_RESET);
+ 	pe_start_timer(pe, HARD_RESET_COMPLETE_TIMER,
+ 		PE_TIME_HARD_RESET + PE_TIME_HARD_RESET_COMPLETE);
++	pe_do_pe_reset(pe);
+ }
+ 
+ static void
+@@ -1883,6 +1890,7 @@ pe_process_state_pe_src_send_capabilities(struct policy_engine *pe)
+ 		pe_change_state(pe, PE_SRC_DISCOVERY);
+ 		return;
+ 	}
++	pe_start_timer(pe, SENDER_RESPONSE_TIMER, PE_TIME_SENDER_RESPONSE);
+ }
+ 
+ static void
+@@ -1892,6 +1900,13 @@ pe_process_state_pe_src_negotiate_capability(struct policy_engine *pe)
+ 	struct pd_fixed_supply_pdo *src_pdo =
+ 		(struct pd_fixed_supply_pdo *) &pe->self_src_pdos.pdo[0];
+ 
++	if (snk_rdo->obj_pos < PD_MIN_PDO ||
++		snk_rdo->obj_pos > pe->self_src_pdos.num_pdos) {
++		log_err("object position mismatch\n");
++		pe_send_packet(pe, NULL, 0,
++				PD_CTRL_MSG_REJECT, PE_EVT_SEND_REJECT);
++		return;
++	}
+ 	/* TODO: Support multiple request PDOs*/
+ 	if (snk_rdo->cap_mismatch)
+ 		log_warn("Capability mismatch!!\n");
+@@ -1958,17 +1973,19 @@ static void pe_process_state_pe_src_hard_reset(struct policy_engine *pe)
+ 	pe_send_packet(pe, NULL, 0,
+ 		PD_CMD_HARD_RESET, PE_EVT_SEND_HARD_RESET);
+ 	pe->hard_reset_counter++;
+-	pe_do_self_reset(pe);
++	pe_deactivate_all_timers(pe);
++	/* Do pe reset after starting timer to avoid reset delay */
+ 	pe_start_timer(pe, PS_HARD_RESET_TIMER, PE_TIME_PS_HARD_RESET_MIN);
++	pe_do_pe_reset(pe);
+ }
+ 
+ static void
+ pe_process_state_pe_src_hard_reset_received(struct policy_engine *pe)
+ {
+-
+-	pe_do_self_reset(pe);
++	pe_deactivate_all_timers(pe);
++	/* Do pe reset after starting timer to avoid reset delay */
+ 	pe_start_timer(pe, PS_HARD_RESET_TIMER, PE_TIME_PS_HARD_RESET_MIN);
+-
++	pe_do_pe_reset(pe);
+ }
+ 
+ static void
+diff --git a/drivers/usb/typec/pd/policy_engine.h b/drivers/usb/typec/pd/policy_engine.h
+index 3268768..53dbb1d 100644
+--- a/drivers/usb/typec/pd/policy_engine.h
++++ b/drivers/usb/typec/pd/policy_engine.h
+@@ -45,12 +45,14 @@
+ #define PE_TIME_PS_HARD_RESET_MIN	25
+ #define PE_TIME_PS_SOURCE_OFF		920
+ #define PE_TIME_PS_SOURCE_ON		480
+-#define PE_TIME_PS_TRANSITION		550
++/* 450 >= tPsTransition <= 550 ms, keep 500 for os delay*/
++#define PE_TIME_PS_TRANSITION		500
+ /* tReceive is time to receive gcrc and it is 1.1mS as per spec */
+-/* Due to software delay, here it is defines as 10mS */
+-#define PE_TIME_RECEIVE			20
++/* Due to software delay, here it is defines as 15mS */
++#define PE_TIME_RECEIVE			15
+ #define PE_TIME_RECEIVER_RESPONSE	15
+-#define PE_TIME_SENDER_RESPONSE		30
++/* tSenderResponse min = 24ms, max = 30ms */
++#define PE_TIME_SENDER_RESPONSE		24
+ #define PE_TIME_SEND_SOURCE_CAP		2000
+ #define PE_TIME_SINK_ACTIVITY		150
+ #define PE_TIME_SINK_REQUEST		100
+@@ -60,7 +62,8 @@
+ #define PE_TIME_SWAP_SINK_READY		15
+ #define PE_TIME_SWAP_SOURCE_START	20
+ #define PE_TIME_TYPEC_SEND_SOURCE_CAP	180
+-#define PE_TIME_TYPEC_SINK_WAIT_CAP	620
++/* TypecSinkWaitCap min = 310ms, max = 620ms, taking 550ms for os delays */
++#define PE_TIME_TYPEC_SINK_WAIT_CAP	550
+ #define PE_TIME_VCONN_SOURCE_OFF	25
+ #define PE_TIME_VCONN_SOURCE_ON		100
+ #define PE_TIME_VDM_BUSSY		50
+@@ -124,6 +127,9 @@
+ #define VOLT_TO_CAP_DATA_OBJ(x)		(x / 50)
+ #define CURRENT_TO_CAP_DATA_OBJ(x)	(x / 10)
+ 
++
++#define PD_MIN_PDO			1
++
+ #define FEATURE_SUPPORTED	1
+ #define FEATURE_NOT_SUPPORTED	0
+ 
+-- 
+1.9.1
+

@@ -1,0 +1,109 @@
+From a5922a605e715efb33f6114c3321f48baf281959 Mon Sep 17 00:00:00 2001
+Message-Id: <a5922a605e715efb33f6114c3321f48baf281959.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 7 Oct 2014 11:42:20 +0100
+Subject: [PATCH 17/61] SQUASHME! [VPG]: drm/i915: Fix for race conditions in
+ request completion caching
+
+An earlier patch (drm/i915: Cache request completion status) has been updated as
+part of the upstreaming process to fix some potential race conditions. This
+patch brings the GMin tree in line with the upstream version. It can be squashed
+into the original patch as that patch will contain this code when it becomes
+FROM_UPSTREAM.
+
+The first race is between the request being waited on and it being marked as
+complete. When a completion interrupt fires, if wait code manages to go back to
+sleep again before the completion handler has marked the request as done, the
+wait will sleep until timeout. The fix is to add a wake up call to the end of
+the completion processing to guarantee that any waiting threads will see the new
+completion state.
+
+The second race is between the seqno being read at the start of the completion
+code and it actually being processed by the scheduler's interrupt handler.
+Specifically, the scheduler reports that the request is still busy but the
+completion code caches the new seqno and never re-processes it. Thus leaving the
+reques floating around in an invalid non-complete state until new work is
+submitted and a new seqno appears.
+
+The solution is to move the update of 'last_read_seqno' to before the loop.
+Thus, when the scheduler clears it from the interrupt handler it stays cleared
+and the completion code will be run again after the dust has settled.
+
+The third race is between the seqno being reset during full GPU reset and a wait
+for request updating the cached 'last read' value. The fix is to just re-order
+the two lines that clear the seqno in the hardware status page and clear last
+read copy. As long as the HWS is done first, the cache cannot return to a stale
+state no matter what is running concurrently.
+
+The original patch was:
+    commit 1a1fc09986037cd25df6c072c136066bee6e6069
+    Author: John Harrison <John.C.Harrison@Intel.com>
+    Date:   Tue Oct 7 11:42:20 2014 +0100
+
+    FOR_UPSTREAM [VPG]: drm/i915: Cache request completion status
+
+    Continuing the removal of seqno based operations - updated the request
+    completion query to not simply chain on to i915_seqno_passed(). Instead, it now
+    returns a pre-cached completion flag in the fast case. In the slow case it reads
+    the hardware seqno and, only if it has moved on since the last scan, looks
+    through the outstanding request list to see which requests can be marked as
+    completed.
+
+    Later in the patch series, this will be optimised further by only doing the
+    completion scan when an interrupt is raised to say that a request has actually
+    completed on the hardware. Thus the call to test the completion status of an
+    arbitrary request simply becomes 'return req->completed'.
+
+    Change-Id: I68cfae4eb22db0ac25482fa6692ff1f6b2999b27
+    For: VIZ-4377
+    Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+    Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+
+Change-Id: Idb9452478425a28ecf7983ee80a2a3bc67f446d6
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c         |    3 ++-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    2 +-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 1ca4750..c61cb0f 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2851,6 +2851,7 @@ void i915_gem_complete_requests_ring(struct intel_engine_cs *ring,
+ 
+ 	if (seqno == ring->last_read_seqno)
+ 		return;
++	ring->last_read_seqno = seqno;
+ 
+ 	spin_lock_irqsave(&ring->reqlist_lock, flags);
+ 	list_for_each_entry(req, &ring->request_list, list) {
+@@ -2864,7 +2865,7 @@ void i915_gem_complete_requests_ring(struct intel_engine_cs *ring,
+ 	}
+ 	spin_unlock_irqrestore(&ring->reqlist_lock, flags);
+ 
+-	ring->last_read_seqno = seqno;
++	wake_up_all(&ring->irq_queue);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 50e1258..ce2feba 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2584,8 +2584,8 @@ void intel_ring_init_seqno(struct intel_engine_cs *ring, u32 seqno)
+ 			I915_WRITE(RING_SYNC_2(ring->mmio_base), 0);
+ 	}
+ 
+-	ring->last_read_seqno = 0;
+ 	ring->set_seqno(ring, seqno);
++	ring->last_read_seqno = 0;
+ }
+ 
+ static void gen6_bsd_ring_write_tail(struct intel_engine_cs *ring,
+-- 
+1.7.9.5
+

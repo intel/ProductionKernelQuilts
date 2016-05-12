@@ -1,0 +1,245 @@
+From 1b56e2b93c04ed2daed77935db4cb1a54aae83ee Mon Sep 17 00:00:00 2001
+From: Jean-Christophe PINCE <jean-christophe.pince@intel.com>
+Date: Fri, 22 May 2015 15:01:20 +0200
+Subject: [PATCH] x86 IO-APIC support chained irqs
+
+Chained irqs associate private structures to their irq_desc->chip_data
+Changes the IO-APIC so that it only handles its own interrupts and
+not interpret the private chip_data structures to irq_cfg. This is
+especially important during cpu onlining/offlining
+
+Change-Id: I0fb965d74b69538572afc7aa76203ebfdce1f9f3
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-30441
+Signed-off-by: Jean-Christophe PINCE <jean-christophe.pince@intel.com>
+---
+ arch/x86/include/asm/hw_irq.h  |  2 ++
+ arch/x86/include/asm/irq.h     |  2 +-
+ arch/x86/kernel/apic/io_apic.c | 48 +++++++++++++++++++++++++++++-------------
+ arch/x86/kernel/irq.c          |  8 ++++++-
+ 4 files changed, 43 insertions(+), 17 deletions(-)
+
+diff --git a/arch/x86/include/asm/hw_irq.h b/arch/x86/include/asm/hw_irq.h
+index 67d69b8e2d20..af7818886901 100644
+--- a/arch/x86/include/asm/hw_irq.h
++++ b/arch/x86/include/asm/hw_irq.h
+@@ -138,7 +138,9 @@ struct irq_2_irte {
+  *
+  * Most irqs are mapped 1:1 with pins.
+  */
++#define IRQ_CFG_MAGIC	0x6c72715f63666700	/* ascii for irq_cfg */
+ struct irq_cfg {
++	u64			magic;
+ 	struct irq_pin_list	*irq_2_pin;
+ 	cpumask_var_t		domain;
+ 	cpumask_var_t		old_domain;
+diff --git a/arch/x86/include/asm/irq.h b/arch/x86/include/asm/irq.h
+index cb6cfcd034cf..42aa5fa170d4 100644
+--- a/arch/x86/include/asm/irq.h
++++ b/arch/x86/include/asm/irq.h
+@@ -27,7 +27,7 @@ extern void irq_ctx_init(int cpu);
+ #include <linux/cpumask.h>
+ extern int check_irq_vectors_for_cpu_disable(void);
+ extern void fixup_irqs(void);
+-extern void irq_force_complete_move(int);
++extern int irq_force_complete_move(int);
+ #endif
+ 
+ extern void (*x86_platform_ipi_callback)(void);
+diff --git a/arch/x86/kernel/apic/io_apic.c b/arch/x86/kernel/apic/io_apic.c
+index 97ead52d61b0..420ba3f0ed87 100644
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@ -74,6 +74,8 @@ int sis_apic_bug = -1;
+ static DEFINE_RAW_SPINLOCK(ioapic_lock);
+ static DEFINE_RAW_SPINLOCK(vector_lock);
+ 
++static struct irq_chip ioapic_chip;
++
+ static struct ioapic {
+ 	/*
+ 	 * # of IRQ routing registers
+@@ -210,6 +212,7 @@ int __init arch_early_irq_init(void)
+ 	irq_reserve_irqs(0, legacy_pic->nr_legacy_irqs);
+ 
+ 	for (i = 0; i < count; i++) {
++		cfg[i].magic = IRQ_CFG_MAGIC;
+ 		irq_set_chip_data(i, &cfg[i]);
+ 		zalloc_cpumask_var_node(&cfg[i].domain, GFP_KERNEL, node);
+ 		zalloc_cpumask_var_node(&cfg[i].old_domain, GFP_KERNEL, node);
+@@ -228,7 +231,12 @@ int __init arch_early_irq_init(void)
+ 
+ static struct irq_cfg *irq_cfg(unsigned int irq)
+ {
+-	return irq_get_chip_data(irq);
++	struct irq_cfg *cfg = irq_get_chip_data(irq);
++
++	if (cfg && cfg->magic != IRQ_CFG_MAGIC)
++		return NULL;
++
++	return cfg;
+ }
+ 
+ static struct irq_cfg *alloc_irq_cfg(unsigned int irq, int node)
+@@ -242,6 +250,7 @@ static struct irq_cfg *alloc_irq_cfg(unsigned int irq, int node)
+ 		goto out_cfg;
+ 	if (!zalloc_cpumask_var_node(&cfg->old_domain, GFP_KERNEL, node))
+ 		goto out_domain;
++	cfg->magic = IRQ_CFG_MAGIC;
+ 	return cfg;
+ out_domain:
+ 	free_cpumask_var(cfg->domain);
+@@ -268,7 +277,7 @@ static struct irq_cfg *alloc_irq_and_cfg_at(unsigned int at, int node)
+ 	if (res < 0) {
+ 		if (res != -EEXIST)
+ 			return NULL;
+-		cfg = irq_get_chip_data(at);
++		cfg = irq_cfg(at);
+ 		if (cfg)
+ 			return cfg;
+ 	}
+@@ -1213,7 +1222,7 @@ void __setup_vector_irq(int cpu)
+ 	raw_spin_lock(&vector_lock);
+ 	/* Mark the inuse vectors */
+ 	for_each_active_irq(irq) {
+-		cfg = irq_get_chip_data(irq);
++		cfg = irq_cfg(irq);
+ 		if (!cfg)
+ 			continue;
+ 
+@@ -1229,14 +1238,12 @@ void __setup_vector_irq(int cpu)
+ 			continue;
+ 
+ 		cfg = irq_cfg(irq);
+-		if (!cpumask_test_cpu(cpu, cfg->domain))
++		if (cfg && !cpumask_test_cpu(cpu, cfg->domain))
+ 			per_cpu(vector_irq, cpu)[vector] = VECTOR_UNDEFINED;
+ 	}
+ 	raw_spin_unlock(&vector_lock);
+ }
+ 
+-static struct irq_chip ioapic_chip;
+-
+ #ifdef CONFIG_X86_32
+ static inline int IO_APIC_irq_trigger(int irq)
+ {
+@@ -1623,7 +1630,7 @@ __apicdebuginit(void) print_IO_APICs(void)
+ 		if (chip != &ioapic_chip)
+ 			continue;
+ 
+-		cfg = irq_get_chip_data(irq);
++		cfg = irq_cfg(irq);
+ 		if (!cfg)
+ 			continue;
+ 		entry = cfg->irq_2_pin;
+@@ -2266,14 +2273,15 @@ static void irq_complete_move(struct irq_cfg *cfg)
+ 	__irq_complete_move(cfg, ~get_irq_regs()->orig_ax);
+ }
+ 
+-void irq_force_complete_move(int irq)
++int irq_force_complete_move(int irq)
+ {
+-	struct irq_cfg *cfg = irq_get_chip_data(irq);
++	struct irq_cfg *cfg = irq_cfg(irq);
+ 
+ 	if (!cfg)
+-		return;
++		return -EINVAL;
+ 
+ 	__irq_complete_move(cfg, cfg->vector);
++	return 0;
+ }
+ #else
+ static inline void irq_complete_move(struct irq_cfg *cfg) { }
+@@ -2542,7 +2550,7 @@ static inline void init_IO_APIC_traps(void)
+ 	 * 0x80, because int 0x80 is hm, kind of importantish. ;)
+ 	 */
+ 	for_each_active_irq(irq) {
+-		cfg = irq_get_chip_data(irq);
++		cfg = irq_cfg(irq);
+ 		if (IO_APIC_IRQ(irq) && cfg && !cfg->vector) {
+ 			/*
+ 			 * Hmm.. We don't have an entry for this,
+@@ -2677,7 +2685,7 @@ int timer_through_8259 __initdata;
+  */
+ static inline void __init check_timer(void)
+ {
+-	struct irq_cfg *cfg = irq_get_chip_data(0);
++	struct irq_cfg *cfg = irq_cfg(0);
+ 	int node = cpu_to_node(0);
+ 	int apic1, pin1, apic2, pin2;
+ 	unsigned long flags;
+@@ -2990,9 +2998,12 @@ int create_irq(void)
+ 
+ void destroy_irq(unsigned int irq)
+ {
+-	struct irq_cfg *cfg = irq_get_chip_data(irq);
++	struct irq_cfg *cfg = irq_cfg(irq);
+ 	unsigned long flags;
+ 
++	if (!cfg)
++		return;
++
+ 	irq_set_status_flags(irq, IRQ_NOREQUEST|IRQ_NOPROBE);
+ 
+ 	free_remapped_irq(irq);
+@@ -3020,6 +3031,9 @@ void native_compose_msi_msg(struct pci_dev *pdev,
+ {
+ 	struct irq_cfg *cfg = irq_cfg(irq);
+ 
++	if (!cfg)
++		return;
++
+ 	msg->address_hi = MSI_ADDR_BASE_HI;
+ 
+ 	if (x2apic_enabled())
+@@ -3056,6 +3070,10 @@ static int msi_compose_msg(struct pci_dev *pdev, unsigned int irq,
+ 		return -ENXIO;
+ 
+ 	cfg = irq_cfg(irq);
++
++	if (!cfg)
++		return -ENXIO;
++
+ 	err = assign_irq_vector(irq, cfg, apic->target_cpus());
+ 	if (err)
+ 		return err;
+@@ -3126,7 +3144,7 @@ int setup_msi_irq(struct pci_dev *dev, struct msi_desc *msidesc,
+ 	if (!irq_offset)
+ 		write_msi_msg(irq, &msg);
+ 
+-	setup_remapped_irq(irq, irq_get_chip_data(irq), chip);
++	setup_remapped_irq(irq, irq_cfg(irq), chip);
+ 
+ 	irq_set_chip_and_handler_name(irq, chip, handle_edge_irq, "edge");
+ 
+@@ -3264,7 +3282,7 @@ int default_setup_hpet_msi(unsigned int irq, unsigned int id)
+ 
+ 	hpet_msi_write(irq_get_handler_data(irq), &msg);
+ 	irq_set_status_flags(irq, IRQ_MOVE_PCNTXT);
+-	setup_remapped_irq(irq, irq_get_chip_data(irq), chip);
++	setup_remapped_irq(irq, irq_cfg(irq), chip);
+ 
+ 	irq_set_chip_and_handler_name(irq, chip, handle_edge_irq, "edge");
+ 	return 0;
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index 5ca03063ab29..bdca24367cd6 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -380,7 +380,13 @@ void fixup_irqs(void)
+ 		 * non intr-remapping case, we can't wait till this interrupt
+ 		 * arrives at this cpu before completing the irq move.
+ 		 */
+-		irq_force_complete_move(irq);
++		if (irq_force_complete_move(irq)) {
++			/*
++			 * Not a valid movable interrupt skip it entirely!
++			 */
++			raw_spin_unlock(&desc->lock);
++			continue;
++		}
+ 
+ 		if (cpumask_any_and(affinity, cpu_online_mask) >= nr_cpu_ids) {
+ 			break_affinity = 1;
+-- 
+1.9.1
+

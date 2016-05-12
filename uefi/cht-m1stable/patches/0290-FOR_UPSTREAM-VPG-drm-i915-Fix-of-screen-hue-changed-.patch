@@ -1,0 +1,133 @@
+From e368a88545d6f85e356955dadc8ba9ed3338237e Mon Sep 17 00:00:00 2001
+Message-Id: <e368a88545d6f85e356955dadc8ba9ed3338237e.1413837857.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: amanna <animesh.manna@intel.com>
+Date: Thu, 3 Apr 2014 19:01:27 +0530
+Subject: [PATCH 290/312] FOR_UPSTREAM [VPG]: drm/i915: Fix of screen hue
+ changed & screen shift issue.
+
+Changes done:
+1) Changed the DL programming sequence for pixel
+format change from 4->2. Theoretically this vblank is
+required for 4->2 pixel size change.
+DL values immediately get updated in the hardware whereas the sprite
+control register updates happen in the next vblank. So 4->2 transition
+needs a vblank, otherwise we will/may hit a underrun.
+As we still have underrun issues, enabling it for 2->4 as well.
+
+Patch also fixes latency values for sprite planes.
+The drain latency values for sprite planes is updated in the DDL registers
+when it is enabled for the first time. After any subsequent disable and
+re-enable of the sprite plane, the drain latency value for sprite plane is
+programmed to 0. Adding fix to update the correct drain latency.
+(IRDA ChangeId: I3f97491333c0c48f65f67da962080f29d95e2dd6)
+
+Issue: GMIN-2819
+Change-Id: Ie305dea312d1db0f6d7af03419f7e15532701f2e
+Signed-off-by: Animesh Manna <animesh.manna@intel.com>
+Signed-off-by: Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
+Signed-off-by: Gagandeep S Arora <gagandeep.s.arora@intel.com>
+Signed-off-by: Mahesh Kumar <mahesh1.kumar@intel.com>
+Signed-off-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ drivers/gpu/drm/i915/intel_drv.h    |    5 +++++
+ drivers/gpu/drm/i915/intel_sprite.c |   33 +++++++++++++++++++++++++++++++--
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index adcaca4..d4c3c55 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -110,6 +110,9 @@
+ #define INTEL_DSI_VIDEO_MODE	0
+ #define INTEL_DSI_COMMAND_MODE	1
+ 
++#define INTEL_PLANE_STATE_ENABLED true
++#define INTEL_PLANE_STATE_DISABLED false
++
+ struct intel_framebuffer {
+ 	struct drm_framebuffer base;
+ 	struct drm_i915_gem_object *obj;
+@@ -460,6 +463,8 @@ struct intel_plane {
+ 	unsigned int crtc_w, crtc_h;
+ 	uint32_t src_x, src_y;
+ 	uint32_t src_w, src_h;
++	int last_pixel_size;
++	bool last_plane_state;
+ 
+ 	/* Since we need to change the watermarks before/after
+ 	 * enabling/disabling the planes, we need to store the parameters here
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 61ddb08..bfb28c8 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -485,8 +485,10 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	 */
+ 	intel_update_drrs(dev);
+ 
+-	intel_update_sprite_watermarks(dplane, crtc, src_w, pixel_size, true,
+-				       src_w != crtc_w || src_h != crtc_h);
++	if (intel_plane->last_pixel_size < pixel_size) {
++		intel_update_sprite_watermarks(dplane, crtc, src_w, pixel_size,
++				true, src_w != crtc_w || src_h != crtc_h);
++	}
+ 
+ 	if (intel_plane->rotate180 &&
+ 			(pipe == 0))
+@@ -539,11 +541,34 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	i915_update_plane_stat(dev_priv, pipe, plane, true, SPRITE_PLANE);
+ 	I915_MODIFY_DISPBASE(SPSURF(pipe, plane),
+ 		i915_gem_obj_ggtt_offset(obj) + sprsurf_offset);
++
++	if (intel_plane->last_plane_state &&
++		(intel_plane->last_pixel_size != pixel_size)) {
++		/*
++		 * Theoretically this vblank is required for 4->2 pixel size
++		 * change. DL values immediately get updated in hardware whereas
++		 * the sprite control register updates happen
++		 * in the next vblank.
++		 * So for 4->2 transition we need a vblank.
++		 * Otherwise we will/may hit underrun
++		 * As we still have underrun issues,
++		 * enabling it for 2->4 as well.
++		 */
++		intel_wait_for_vblank(dev, pipe);
++	}
++	intel_plane->last_plane_state = INTEL_PLANE_STATE_ENABLED;
++
+ 	intel_flush_primary_plane(dev_priv, intel_crtc->plane);
+ 
+ 	if (event == NULL)
+ 		POSTING_READ(SPSURF(pipe, plane));
+ 
++	if (intel_plane->last_pixel_size > pixel_size) {
++		intel_update_sprite_watermarks(dplane, crtc, src_w, pixel_size,
++				true, src_w != crtc_w || src_h != crtc_h);
++	}
++	intel_plane->last_pixel_size = pixel_size;
++
+ 	if (atomic_update)
+ 		intel_pipe_update_end(intel_crtc, start_vbl_count);
+ }
+@@ -575,6 +600,8 @@ vlv_disable_plane(struct drm_plane *dplane, struct drm_crtc *crtc)
+ 		intel_pipe_update_end(intel_crtc, start_vbl_count);
+ 
+ 	intel_update_sprite_watermarks(dplane, crtc, 0, 0, false, false);
++	intel_plane->last_plane_state = INTEL_PLANE_STATE_DISABLED;
++	intel_plane->last_pixel_size = 0;
+ }
+ 
+ void intel_prepare_sprite_page_flip(struct drm_device *dev, int plane)
+@@ -1826,6 +1853,8 @@ intel_plane_init(struct drm_device *dev, enum pipe pipe, int plane)
+ 	intel_plane->pipe = pipe;
+ 	intel_plane->plane = plane;
+ 	intel_plane->rotate180 = false;
++	intel_plane->last_plane_state = INTEL_PLANE_STATE_DISABLED;
++	intel_plane->last_pixel_size = 0;
+ 	possible_crtcs = (1 << pipe);
+ 	ret = drm_plane_init(dev, &intel_plane->base, possible_crtcs,
+ 			     &intel_plane_funcs,
+-- 
+1.7.9.5
+

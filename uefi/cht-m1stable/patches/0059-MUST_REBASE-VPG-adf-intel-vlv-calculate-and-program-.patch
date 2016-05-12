@@ -1,0 +1,395 @@
+From 1228a664333f8902d7cb70089fefe89bbe053bcb Mon Sep 17 00:00:00 2001
+Message-Id: <1228a664333f8902d7cb70089fefe89bbe053bcb.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Mon, 13 Oct 2014 14:37:45 +0530
+Subject: [PATCH 59/75] MUST_REBASE [VPG]: adf/intel/vlv: calculate and
+ program ddl
+
+Calculate the ddl of each planes in the respective calculate/validate,
+only if there is a change in the bpp. Because the DDL calculation
+depends on the bpp and clock. So if in case there is a change program
+the ddl to '0' and in the next vblank, i.e in flip done interrupt
+handler program the calculated ddl, since ddl is a single buffered
+register.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I45d6cec0719306d71196da45dfbd7a1f96cce84d
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+---
+ .../video/adf/intel/core/common/dsi/gen_dsi_pipe.c |   18 ++++++
+ drivers/video/adf/intel/core/vlv/vlv_pri_plane.c   |   39 ++++++++++++-
+ drivers/video/adf/intel/core/vlv/vlv_sp_plane.c    |   59 ++++++++++++++++++--
+ .../video/adf/intel/include/core/intel_dc_config.h |   20 +++++++
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |   29 +++++++++-
+ drivers/video/adf/intel/include/intel_adf_device.h |    1 +
+ drivers/video/adf/intel/intel_adf_device.c         |   10 ++++
+ 7 files changed, 166 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+index 19bea17..187aef4 100644
+--- a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
++++ b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+@@ -326,18 +326,36 @@ static void dsi_get_events(struct intel_pipe *pipe, u32 *events)
+ 	if (pipestat & SPRITE2_FLIP_DONE_STAT) {
+ 		*events |= INTEL_PIPE_EVENT_SPRITE2_FLIP;
+ 		value |= SPRITE2_FLIP_DONE_STAT;
++		/* program the pre-calculated ddl value */
++		if (pipe->regs.sp2_ddl) {
++			REG_WRITE_BITS(VLV_DDL(idx), pipe->regs.sp2_ddl,
++					pipe->regs.sp2_ddl_mask);
++			pipe->regs.sp2_ddl = 0;
++		}
+ 	}
+ 
+ 	/* Sprite A Flip done interrupt */
+ 	if (pipestat & SPRITE1_FLIP_DONE_STAT) {
+ 		*events |= INTEL_PIPE_EVENT_SPRITE1_FLIP;
+ 		value |= SPRITE2_FLIP_DONE_STAT;
++		/* program the pre-calculated ddl value */
++		if (pipe->regs.sp1_ddl) {
++			REG_WRITE_BITS(VLV_DDL(idx), pipe->regs.sp1_ddl,
++					pipe->regs.sp1_ddl_mask);
++			pipe->regs.sp1_ddl = 0;
++		}
+ 	}
+ 
+ 	/* Plane A Flip done interrupt */
+ 	if (pipestat & PLANE_FLIP_DONE_STAT) {
+ 		*events |= INTEL_PIPE_EVENT_PRIMARY_FLIP;
+ 		value |= PLANE_FLIP_DONE_STAT;
++		/* program the pre-calculated ddl value */
++		if (pipe->regs.pri_ddl) {
++			REG_WRITE_BITS(VLV_DDL(idx), pipe->regs.pri_ddl,
++					pipe->regs.pri_ddl_mask);
++			pipe->regs.pri_ddl = 0;
++		}
+ 	}
+ 
+ 	/* Vsync interrupt */
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+index c768e02..ae00cc4 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+@@ -191,11 +191,19 @@ static int vlv_pri_calculate(struct intel_plane *plane,
+ {
+ 	struct vlv_pri_plane *pri_plane = to_vlv_pri_plane(plane);
+ 	struct pri_plane_regs_value *regs = &pri_plane->ctx.regs;
++	struct intel_pipe *intel_pipe = config->pipe;
++	struct dsi_pipe *dsi_pipe = to_dsi_pipe(intel_pipe);
++	struct drm_mode_modeinfo mode;
++	unsigned long dspaddr_offset;
++	int plane_ddl, prec_multi, plane_prec_multi;
+ 	int src_x, src_y;
++	int pipe = intel_pipe->base.idx;
++	u32 dspcntr;
++	u32 mask;
+ 	u32 pidx = pri_plane->ctx.plane;
+ 	u32 format_config = 0;
+-	u8 bpp = 0;
+-	unsigned long dspaddr_offset;
++	u8 bpp = 0, prev_bpp = 0;
++	u8 i = 0;
+ 
+ 	get_format_config(buf->format, &format_config, &bpp);
+ 
+@@ -204,8 +212,33 @@ static int vlv_pri_calculate(struct intel_plane *plane,
+ 
+ 	regs->dspcntr = REG_READ(DSPCNTR(pidx));
+ 	regs->dspcntr |= DISPLAY_PLANE_ENABLE;
++	dspcntr = regs->dspcntr;
++
+ 	regs->dspcntr &= ~DISPPLANE_PIXFORMAT_MASK;
+ 	regs->dspcntr |= format_config;
++	/* Calculate the ddl if there is a change in bpp */
++	for (i = 0; i < ARRAY_SIZE(format_mapping); i++) {
++		if (format_mapping[i].hw_config ==
++				(dspcntr & DISPPLANE_PIXFORMAT_MASK)) {
++			prev_bpp = format_mapping[i].bpp;
++			break;
++		}
++	}
++	mask = DDL_PLANEA_MASK;
++	if (bpp != prev_bpp || !(REG_READ(VLV_DDL(pipe)) & mask)) {
++		dsi_pipe->panel->ops->get_config_mode(&dsi_pipe->config,
++				&mode);
++		vlv_calculate_ddl(mode.clock, bpp, &prec_multi,
++				&plane_ddl);
++		plane_prec_multi = (prec_multi ==
++					DRAIN_LATENCY_PRECISION_32) ?
++					DDL_PLANE_PRECISION_32 :
++					DDL_PLANE_PRECISION_64;
++		plane_ddl = plane_prec_multi | (plane_ddl);
++		intel_pipe->regs.pri_ddl = plane_ddl;
++		intel_pipe->regs.pri_ddl_mask = mask;
++		REG_WRITE_BITS(VLV_DDL(pipe), 0x00, mask);
++	}
+ 	if (buf->tiling_mode != I915_TILING_NONE)
+ 		regs->dspcntr |= DISPPLANE_TILED;
+ 	else
+@@ -279,6 +312,7 @@ static int vlv_pri_enable(struct intel_plane *plane)
+ static int vlv_pri_disable(struct intel_plane *plane)
+ {
+ 	u32 reg, value;
++	u32 mask = DDL_PLANEA_MASK;
+ 
+ 	reg = DSPCNTR(plane->base.idx);
+ 	value = REG_READ(reg);
+@@ -290,6 +324,7 @@ static int vlv_pri_disable(struct intel_plane *plane)
+ 
+ 	REG_WRITE(reg, value & ~DISPLAY_PLANE_ENABLE);
+ 	vlv_adf_flush_disp_plane(plane->base.idx);
++	REG_WRITE_BITS(VLV_DDL(plane->base.idx), 0x00, mask);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+index ef09dd6..4bdadfe 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+@@ -235,21 +235,27 @@ static int vlv_sp_calculate(struct intel_plane *planeptr,
+ 			    struct intel_plane_config *config)
+ {
+ 	struct vlv_sp_plane *splane = to_vlv_sp_plane(planeptr);
++	struct sp_plane_regs_value *regs = &splane->ctx.regs;
++	struct intel_pipe *intel_pipe = config->pipe;
++	struct dsi_pipe *dsi_pipe = to_dsi_pipe(intel_pipe);
++	struct drm_mode_modeinfo mode;
++	unsigned long sprsurf_offset, linear_offset;
++	int sprite_ddl, prec_multi, sp_prec_multi;
+ 	int plane = splane->ctx.plane;
+ 	int pipe = splane->ctx.pipe;
+ 	int s1_zorder, s1_bottom, s2_zorder, s2_bottom;
+ 	int order = config->zorder & 0x000F;
+-	struct sp_plane_regs_value *regs = &splane->ctx.regs;
+ 	u32 hw_format = 0;
+-	u32 bpp = 0;
+-	u32 sprctl;
++	u32 bpp = 0, prev_bpp = 0;
++	u32 sprctl, prev_sprctl;
++	u32 mask, shift;
+ 	u32 dst_w = (config->dst_w & VLV_SP_12BIT_MASK) - 1;
+ 	u32 dst_h = (config->dst_h & VLV_SP_12BIT_MASK) - 1;
+ 	u32 src_x = config->src_x & VLV_SP_12BIT_MASK;
+ 	u32 src_y = config->src_y & VLV_SP_12BIT_MASK;
+ 	u32 dst_x = config->dst_x & VLV_SP_12BIT_MASK;
+ 	u32 dst_y = config->dst_y & VLV_SP_12BIT_MASK;
+-	unsigned long sprsurf_offset, linear_offset;
++	u8 i = 0;
+ 
+ 	/* Z-order */
+ 	s1_zorder = (order >> 3) & 0x1;
+@@ -259,6 +265,7 @@ static int vlv_sp_calculate(struct intel_plane *planeptr,
+ 
+ 	get_format_config(buf->format, &hw_format, &bpp);
+ 	sprctl = REG_READ(SPCNTR(pipe, plane));
++	prev_sprctl = sprctl;
+ 
+ 	if (plane == 0) {
+ 		if (s1_zorder)
+@@ -288,6 +295,40 @@ static int vlv_sp_calculate(struct intel_plane *planeptr,
+ 
+ 	sprctl |= hw_format;
+ 	sprctl |= SP_GAMMA_ENABLE;
++	/* Calculate the ddl if there is a change in bpp */
++	for (i = 0; i < ARRAY_SIZE(format_mappings); i++) {
++		if (format_mappings[i].hw_config ==
++				(prev_sprctl & SP_PIXFORMAT_MASK)) {
++			prev_bpp = format_mappings[i].bpp;
++			break;
++		}
++	}
++	if (plane == 0) {
++		mask = DDL_SPRITEA_MASK;
++		shift = DDL_SPRITEA_SHIFT;
++	} else {
++		mask = DDL_SPRITEB_MASK;
++		shift = DDL_SPRITEB_SHIFT;
++	}
++	if (bpp != prev_bpp || !(REG_READ(VLV_DDL(pipe)) & mask)) {
++		dsi_pipe->panel->ops->get_config_mode(&dsi_pipe->config,
++				&mode);
++		vlv_calculate_ddl(mode.clock, bpp, &prec_multi,
++				&sprite_ddl);
++		sp_prec_multi = (prec_multi ==
++					DRAIN_LATENCY_PRECISION_32) ?
++					DDL_PLANE_PRECISION_32 :
++					DDL_PLANE_PRECISION_64;
++		sprite_ddl = (sp_prec_multi | sprite_ddl) << shift;
++		if (plane == 0) {
++			intel_pipe->regs.sp1_ddl = sprite_ddl;
++			intel_pipe->regs.sp1_ddl_mask = mask;
++		} else {
++			intel_pipe->regs.sp2_ddl = sprite_ddl;
++			intel_pipe->regs.sp2_ddl_mask = mask;
++		}
++		REG_WRITE_BITS(VLV_DDL(pipe), 0x00, mask);
++	}
+ 
+ 	if (buf->tiling_mode != I915_TILING_NONE)
+ 		sprctl |= SP_TILED;
+@@ -448,13 +489,12 @@ static int vlv_sp_enable(struct intel_plane *planeptr)
+ 
+ static int vlv_sp_disable(struct intel_plane *planeptr)
+ {
+-	u32 reg, value;
++	u32 reg, value, mask;
+ 	struct vlv_sp_plane *splane = to_vlv_sp_plane(planeptr);
+ 	int plane = splane->ctx.plane;
+ 	int pipe = splane->ctx.pipe;
+ 
+ 	reg = SPCNTR(pipe, plane);
+-	reg = SPCNTR(pipe, plane);
+ 	value = REG_READ(reg);
+ 	if ((value & DISPLAY_PLANE_ENABLE) == 0) {
+ 		dev_dbg(planeptr->base.dev, "%splane already disabled\n",
+@@ -464,6 +504,13 @@ static int vlv_sp_disable(struct intel_plane *planeptr)
+ 
+ 	REG_WRITE(reg, value & ~DISPLAY_PLANE_ENABLE);
+ 	vlv_adf_flush_sp_plane(pipe, plane);
++	/* While disabling plane reset the plane DDL value */
++	if (plane == 0)
++		mask = DDL_SPRITEA_MASK;
++	else
++		mask = DDL_SPRITEB_MASK;
++
++	REG_WRITE_BITS(VLV_DDL(pipe), 0x00, mask);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index 76547f2..8c2b340 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -276,6 +276,20 @@ struct intel_pipe_ops {
+ #endif
+ };
+ 
++struct pri_plane_regs {
++	u32 dspcntr;
++	u32 stride;
++	u32 pri_ddl;
++	u32 pri_ddl_mask;
++	u32 sp1_ddl;
++	u32 sp1_ddl_mask;
++	u32 sp2_ddl;
++	u32 sp2_ddl_mask;
++	unsigned long linearoff;
++	unsigned long tileoff;
++	unsigned long surfaddr;
++};
++
+ struct intel_pipe {
+ 	struct intel_dc_component base;
+ 	bool primary;
+@@ -283,6 +297,12 @@ struct intel_pipe {
+ 	const struct intel_plane *primary_plane;
+ 	const struct intel_pipe_ops *ops;
+ 	bool dpst_enabled;
++
++	/*
++	 * Store the computed reg values in this to apply in
++	 * one shot later in flip calls
++	 */
++	struct pri_plane_regs regs;
+ };
+ 
+ struct intel_dc_attachment {
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index 1f266de..d51a668 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -3348,20 +3348,33 @@
+ #define DSPFW7			(VLV_DISPLAY_BASE + 0x7007c)
+ 
+ /* drain latency register values*/
++#define VLV_DDL(pipe)	_PIPE(pipe, VLV_DDL1, VLV_DDL2)
++#define DRAIN_LATENCY_PRECISION_64	64
+ #define DRAIN_LATENCY_PRECISION_32	32
+ #define DRAIN_LATENCY_PRECISION_16	16
+ #define VLV_DDL1			(VLV_DISPLAY_BASE + 0x70050)
+ #define DDL_CURSORA_PRECISION_32	(1<<31)
+ #define DDL_CURSORA_PRECISION_16	(0<<31)
+ #define DDL_CURSORA_SHIFT		24
+-#define DDL_PLANEA_PRECISION_32		(1<<7)
+-#define DDL_PLANEA_PRECISION_16		(0<<7)
++#define DDL_PLANEA_PRECISION_64		(1<<7)
++#define DDL_PLANEA_PRECISION_32		(0<<7)
++#define DDL_PLANEA_MASK				0xFF
++#define DDL_SPRITEA_PRECISION_64	(1<<15)
++#define DDL_SPRITEA_PRECISION_32	(0<<15)
++#define DDL_SPRITEA_SHIFT	8
++#define DDL_SPRITEA_MASK			(0xFF << DDL_SPRITEA_SHIFT)
++#define DDL_SPRITEB_PRECISION_64	(1<<23)
++#define DDL_SPRITEB_PRECISION_32	(0<<23)
++#define DDL_SPRITEB_SHIFT	16
++#define DDL_SPRITEB_MASK			(0xFF << DDL_SPRITEB_SHIFT)
+ #define VLV_DDL2			(VLV_DISPLAY_BASE + 0x70054)
+ #define DDL_CURSORB_PRECISION_32	(1<<31)
+ #define DDL_CURSORB_PRECISION_16	(0<<31)
+ #define DDL_CURSORB_SHIFT		24
+ #define DDL_PLANEB_PRECISION_32		(1<<7)
+ #define DDL_PLANEB_PRECISION_16		(0<<7)
++#define DDL_PLANE_PRECISION_64		(1<<7)
++#define DDL_PLANE_PRECISION_32		(0<<7)
+ 
+ /* FIFO watermark sizes etc */
+ #define G4X_FIFO_LINE_SIZE	64
+@@ -5895,4 +5908,16 @@
+ #define wait_for_atomic(COND, MS) _wait_for(COND, MS, 0)
+ #define wait_for_atomic_us(COND, US) _wait_for((COND), \
+ 					       DIV_ROUND_UP((US), 1000), 0)
++#define vlv_calculate_ddl(clock, pixel_size, prec_multi, ddl) (	\
++{									\
++	int entries;							\
++	bool latencyprogrammed = false;					\
++									\
++	entries = DIV_ROUND_UP(clock, 1000) * pixel_size;		\
++	*prec_multi = (entries > 256) ?					\
++		DRAIN_LATENCY_PRECISION_64 : DRAIN_LATENCY_PRECISION_32;\
++	*ddl = (64 * (*prec_multi) * 4) / entries;			\
++	latencyprogrammed = true;					\
++})
++
+ #endif /* _VLV_DC_REGS_H_ */
+diff --git a/drivers/video/adf/intel/include/intel_adf_device.h b/drivers/video/adf/intel/include/intel_adf_device.h
+index 9320951..7e73811 100644
+--- a/drivers/video/adf/intel/include/intel_adf_device.h
++++ b/drivers/video/adf/intel/include/intel_adf_device.h
+@@ -66,5 +66,6 @@ extern void intel_adf_device_destroy(struct intel_adf_device *dev);
+ extern u32 REG_READ(u32 reg);
+ extern u32 REG_POSTING_READ(u32 reg);
+ extern void REG_WRITE(u32 reg, u32 val);
++extern void REG_WRITE_BITS(u32 reg, u32 val, u32 mask);
+ 
+ #endif /* INTEL_ADF_DEVICE_H_ */
+diff --git a/drivers/video/adf/intel/intel_adf_device.c b/drivers/video/adf/intel/intel_adf_device.c
+index 36fa4e9..fadb8f4 100644
+--- a/drivers/video/adf/intel/intel_adf_device.c
++++ b/drivers/video/adf/intel/intel_adf_device.c
+@@ -43,6 +43,16 @@ void REG_WRITE(u32 reg, u32 val)
+ 	iowrite32(val, g_intel_adf_dev->mmio + reg);
+ }
+ 
++void REG_WRITE_BITS(u32 reg, u32 val, u32 mask)
++{
++	u32 tmp;
++	tmp = REG_READ(reg);
++	tmp &= ~mask;
++	val &= mask;
++	val |= tmp;
++	REG_WRITE(reg, val);
++}
++
+ u32 REG_POSTING_READ(u32 reg)
+ {
+ 	return ioread32(g_intel_adf_dev->mmio + (reg));
+-- 
+1.7.9.5
+

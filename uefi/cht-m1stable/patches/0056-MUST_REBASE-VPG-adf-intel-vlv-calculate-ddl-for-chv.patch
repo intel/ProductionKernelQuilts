@@ -1,0 +1,245 @@
+From 36c9ae36f2c81afaf28b4a5dde4accf58a91f845 Mon Sep 17 00:00:00 2001
+Message-Id: <36c9ae36f2c81afaf28b4a5dde4accf58a91f845.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Sat, 31 Jan 2015 03:12:15 +0530
+Subject: [PATCH 56/95] MUST_REBASE [VPG]: adf/intel/vlv: calculate ddl for
+ chv
+
+Update ddl with chv precision. Also divide the calculated
+ddl value by 2 as suggested by hardware architects.
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5594
+Change-Id: I1248baff731c303b446437158973b0b6eb82c5e0
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+---
+ drivers/video/adf/intel/core/vlv/vlv_dp_port.c     |   10 ++---
+ drivers/video/adf/intel/core/vlv/vlv_pipeline.c    |    6 +--
+ drivers/video/adf/intel/core/vlv/vlv_pm.c          |   41 +++++++++++++++-----
+ drivers/video/adf/intel/core/vlv/vlv_pri_plane.c   |   11 ++++--
+ drivers/video/adf/intel/core/vlv/vlv_sp_plane.c    |    9 +++--
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |   21 ++++------
+ drivers/video/adf/intel/include/core/vlv/vlv_pm.h  |    1 +
+ 7 files changed, 59 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_dp_port.c b/drivers/video/adf/intel/core/vlv/vlv_dp_port.c
+index 139f1c5..c5162c1 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_dp_port.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_dp_port.c
+@@ -916,11 +916,11 @@ bool vlv_dp_port_init(struct vlv_dp_port *port, enum port port_id,
+ 	if (port->is_edp)
+ 		vlv_dp_port_vdd_seq(port, true);
+ 
+-#ifdef CONFIG_ADF_INTEL_CHV
+-	port->pipe_select_val = DP_PIPE_SELECT_CHV(pipe_id);
+-#else
+-	port->pipe_select_val = (pipe_id ? DP_PIPE_MASK : 0);
+-#endif
++	if (IS_CHERRYVIEW())
++		port->pipe_select_val = DP_PIPE_SELECT_CHV(pipe_id);
++	else
++		port->pipe_select_val = (pipe_id ? DP_PIPE_MASK : 0);
++
+ 	pr_info("%s:%d port_id %d pipe %d\n", __func__, __LINE__,
+ 			port_id, pipe_id);
+ 
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+index 47f5667..cbb97a3 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+@@ -866,9 +866,9 @@ u32 vlv_set_signal_levels(struct intel_pipeline *pipeline,
+ 	struct vlv_dp_port *dp_port = &disp->port.dp_port;
+ 	u32 deemp = 0, margin = 0;
+ 
+-#ifdef CONFIG_ADF_INTEL_CHV
+-	return chv_set_signal_levels(pipeline, params);
+-#endif
++	if (IS_CHERRYVIEW())
++		return chv_set_signal_levels(pipeline, params);
++
+ 	vlv_dp_port_set_signal_levels(dp_port, params, &deemp, &margin);
+ 	vlv_dpio_signal_levels(pipeline, deemp, margin);
+ 
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pm.c b/drivers/video/adf/intel/core/vlv/vlv_pm.c
+index c9f0dfa..f6d0c3f 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pm.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pm.c
+@@ -100,24 +100,45 @@ void vlv_pm_pre_post(struct intel_dc_config *intel_config,
+ 				&pipeline->status.wait_vblank);
+ }
+ 
++bool vlv_calc_ddl(int clock, int pixel_size, int *prec_multi, int *ddl)
++{
++	int entries;
++	bool latencyprogrammed = false;
++
++	entries = DIV_ROUND_UP(clock, 1000) * pixel_size;
++	*prec_multi = (entries > 256) ?
++		DDL_PRECISION_H : DDL_PRECISION_L;
++	*ddl = (64 * (*prec_multi) * 4) / entries;
++	latencyprogrammed = true;
++
++	/*
++	 * chv: divide the calculated ddl by 2,
++	 * for supporting PM5 and DDR DVFS
++	 */
++	if (IS_CHERRYVIEW())
++		*ddl /= 2;
++
++	return latencyprogrammed;
++}
++
+ bool vlv_pm_update_maxfifo_status(struct vlv_pm *pm, bool enable)
+ {
+-#ifdef CONFIG_ADF_INTEL_CHV
+ 	u32 val = 0;
+-#endif
+ 
+ 	if (enable) {
+ 		REG_WRITE(FW_BLC_SELF_VLV, FW_CSPWRDWNEN);
+-#ifdef CONFIG_ADF_INTEL_CHV
+-		val = vlv_punit_read(CHV_DPASSC);
+-		vlv_punit_write(CHV_DPASSC, (val | CHV_PW_MAXFIFO_MASK));
+-#endif
++		if (IS_CHERRYVIEW()) {
++			val = vlv_punit_read(CHV_DPASSC);
++			vlv_punit_write(CHV_DPASSC,
++					(val | CHV_PW_MAXFIFO_MASK));
++		}
+ 	} else {
+ 		REG_WRITE(FW_BLC_SELF_VLV, ~FW_CSPWRDWNEN);
+-#ifdef CONFIG_ADF_INTEL_CHV
+-		val = vlv_punit_read(CHV_DPASSC);
+-		vlv_punit_write(CHV_DPASSC, (val & ~CHV_PW_MAXFIFO_MASK));
+-#endif
++		if (IS_CHERRYVIEW()) {
++			val = vlv_punit_read(CHV_DPASSC);
++			vlv_punit_write(CHV_DPASSC,
++					(val & ~CHV_PW_MAXFIFO_MASK));
++		}
+ 	}
+ 
+ 	return true;
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+index ed18933..d24f920 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pri_plane.c
+@@ -18,6 +18,7 @@
+ #include <core/vlv/vlv_pri_plane.h>
+ #include <core/vlv/vlv_dc_config.h>
+ #include <core/vlv/vlv_dc_regs.h>
++#include <core/vlv/vlv_pm.h>
+ #include <drm/i915_drm.h>
+ #include <video/intel_adf.h>
+ 
+@@ -264,12 +265,14 @@ static int vlv_pri_calculate(struct intel_plane *plane,
+ 		/*FIXME: get mode from interface itself */
+ 		intel_pipe->ops->get_current_mode(intel_pipe, &mode);
+ 		if (mode.clock && bpp) {
+-			vlv_calculate_ddl(mode.clock, bpp, &prec_multi,
++			vlv_calc_ddl(mode.clock, bpp, &prec_multi,
+ 					&plane_ddl);
++			/* FIXME : Please add DDL_PRECISION_L and H for VLV */
+ 			plane_prec_multi = (prec_multi ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-				DDL_PLANE_PRECISION_32 :
+-				DDL_PLANE_PRECISION_64;
++					DDL_PRECISION_L) ?
++				DDL_PLANE_PRECISION_L :
++				DDL_PLANE_PRECISION_H;
++
+ 			plane_ddl = plane_prec_multi | (plane_ddl);
+ 
+ 			/* save the ddl in pm object to flush later */
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+index 3275d4d..1bddb94 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_sp_plane.c
+@@ -24,6 +24,7 @@
+ #include "core/intel_dc_config.h"
+ #include "core/vlv/vlv_sp_plane.h"
+ #include "core/vlv/vlv_pri_plane.h"
++#include "core/vlv/vlv_pm.h"
+ 
+ struct format_info {
+ 	u32 drm_format;
+@@ -309,12 +310,12 @@ static int vlv_sp_calculate(struct intel_plane *planeptr,
+ 	}
+ 	if (bpp != prev_bpp || !(REG_READ(VLV_DDL(pipe)) & mask)) {
+ 		intel_pipe->ops->get_current_mode(intel_pipe, &mode);
+-		vlv_calculate_ddl(mode.clock, bpp, &prec_multi,
++		vlv_calc_ddl(mode.clock, bpp, &prec_multi,
+ 				&sprite_ddl);
+ 		sp_prec_multi = (prec_multi ==
+-					DRAIN_LATENCY_PRECISION_32) ?
+-					DDL_PLANE_PRECISION_32 :
+-					DDL_PLANE_PRECISION_64;
++					DDL_PRECISION_L) ?
++					DDL_PLANE_PRECISION_L :
++					DDL_PLANE_PRECISION_H;
+ 		sprite_ddl = (sp_prec_multi | sprite_ddl) << shift;
+ 		vlv_sp_pane_save_ddl(splane, sprite_ddl);
+ 		REG_WRITE_BITS(VLV_DDL(pipe), 0x00, mask);
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index 9dbe4d0..c9ce2f3 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -3677,6 +3677,11 @@ extern int chv_cursor_offsets[];
+ #define DRAIN_LATENCY_PRECISION_64	64
+ #define DRAIN_LATENCY_PRECISION_32	32
+ #define DRAIN_LATENCY_PRECISION_16	16
++
++/* FIXME : Add for VLV also */
++#define DDL_PRECISION_L                DRAIN_LATENCY_PRECISION_16
++#define DDL_PRECISION_H                DRAIN_LATENCY_PRECISION_32
++
+ #define VLV_DDL1			(VLV_DISPLAY_BASE + 0x70050)
+ #define DDL_CURSORA_PRECISION_32	(1<<31)
+ #define DDL_CURSORA_PRECISION_16	(0<<31)
+@@ -3698,8 +3703,8 @@ extern int chv_cursor_offsets[];
+ #define DDL_CURSORB_SHIFT		24
+ #define DDL_PLANEB_PRECISION_32		(1<<7)
+ #define DDL_PLANEB_PRECISION_16		(0<<7)
+-#define DDL_PLANE_PRECISION_64		(1<<7)
+-#define DDL_PLANE_PRECISION_32		(0<<7)
++#define DDL_PLANE_PRECISION_H		(1<<7)
++#define DDL_PLANE_PRECISION_L		(0<<7)
+ 
+ /* FIFO watermark sizes etc */
+ #define G4X_FIFO_LINE_SIZE	64
+@@ -6372,16 +6377,4 @@ extern int chv_cursor_offsets[];
+ #define single_plane_enabled(plane_stat)       is_power_of_2(plane_stat)
+ #define single_pipe_enabled(pipe_stat)         is_power_of_2(pipe_stat)
+ 
+-#define vlv_calculate_ddl(clock, pixel_size, prec_multi, ddl) (	\
+-{									\
+-	int entries;							\
+-	bool latencyprogrammed = false;					\
+-									\
+-	entries = DIV_ROUND_UP(clock, 1000) * pixel_size;		\
+-	*prec_multi = (entries > 256) ?					\
+-		DRAIN_LATENCY_PRECISION_64 : DRAIN_LATENCY_PRECISION_32;\
+-	*ddl = (64 * (*prec_multi) * 4) / entries;			\
+-	latencyprogrammed = true;					\
+-})
+-
+ #endif /* _VLV_DC_REGS_H_ */
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pm.h b/drivers/video/adf/intel/include/core/vlv/vlv_pm.h
+index e48a457..e0cf571 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_pm.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pm.h
+@@ -38,5 +38,6 @@ void vlv_pm_pre_validate(struct intel_dc_config *intel_config,
+ 		struct intel_pipeline *intel_pipeline, struct intel_pipe *pipe);
+ void vlv_pm_pre_post(struct intel_dc_config *intel_config,
+ 		struct intel_pipeline *intel_pipeline, struct intel_pipe *pipe);
++bool vlv_calc_ddl(int clock, int pixel_size, int *prec_multi, int *ddl);
+ 
+ #endif /*_VLV_WATERMARK_H_*/
+-- 
+1.7.9.5
+

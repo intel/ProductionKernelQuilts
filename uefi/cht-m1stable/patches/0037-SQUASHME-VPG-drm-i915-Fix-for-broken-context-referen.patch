@@ -1,0 +1,92 @@
+From bb1648e8725e8673ecd56845cd0c1c5f82973b48 Mon Sep 17 00:00:00 2001
+Message-Id: <bb1648e8725e8673ecd56845cd0c1c5f82973b48.1431284209.git.chang-joon.lee@intel.com>
+In-Reply-To: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+References: <89460f3fc3d6c0659d44897a6adec3c3fecc5564.1431284209.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Fri, 10 Apr 2015 13:29:46 +0100
+Subject: [PATCH 37/68] SQUASHME! [VPG]: drm/i915: Fix for broken context
+ referencing in legacy mode
+
+An earlier change to make native syncs work with the scheduler added
+the context pointer to the request object at request creation time for
+legacy mode. In LRC mode, this already happened. However, that change
+did not move the point of referencing said context. That was still
+only done during i915_add_request(). In general this was fine.
+Unfortunately, in the case of execbuf failing and going through the
+clean up code path it would lead to a unbalanced dereference of the
+context.
+
+This change moves the call to context_reference() to the point of
+request creation as well. Thus the reference counts are always correct.
+
+This patch could be squashed into the patch that originally introduced
+this issue:
+  commit 7b04cfcfcb08fa5f33d61a0870cf0337f5cc2259
+  Author: John Harrison <John.C.Harrison@Intel.com>
+  Date:   Fri Jan 9 13:32:36 2015 +0000
+  Subject: REVERTME [VPG]: drm/i915: Make native sync work with scheduler
+  Change-Id: Ia80f332a25c2a3dfcaaadcf4c8bfcf718f24cf64
+
+Change-Id: I2647309844fbfbee32af5b58f98764780c04483b
+For: VIZ-1587
+For: VIZ-4741
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c         |   10 +---------
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    5 ++++-
+ 2 files changed, 5 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 30296f8..4bc10a7 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2606,15 +2606,7 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	 */
+ 	request->batch_obj = obj;
+ 
+-	if (!i915.enable_execlists) {
+-		/* Hold a reference to the current context so that we can inspect
+-		 * it later in case a hangcheck error event fires.
+-		 */
+-		WARN_ON(request->ctx && (request->ctx != ring->last_context));
+-		request->ctx = ring->last_context;
+-		if (request->ctx)
+-			i915_gem_context_reference(request->ctx);
+-	}
++	WARN_ON(!i915.enable_execlists && (request->ctx != ring->last_context));
+ 
+ 	request->emitted_jiffies = jiffies;
+ 	list_add_tail(&request->list, &ring->request_list);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 9a98990..2abc034 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2493,6 +2493,8 @@ intel_ring_alloc_request(struct intel_engine_cs *ring, struct intel_context *ctx
+ 	struct drm_i915_gem_request *request;
+ 	struct drm_i915_private *dev_private = ring->dev->dev_private;
+ 
++	WARN_ON(ctx == NULL);
++
+ 	if (ring->outstanding_lazy_request)
+ 		return 0;
+ 
+@@ -2504,6 +2506,7 @@ intel_ring_alloc_request(struct intel_engine_cs *ring, struct intel_context *ctx
+ 	request->ring = ring;
+ 	request->ringbuf = ring->buffer;
+ 	request->ctx = ctx;
++	i915_gem_context_reference(request->ctx);
+ 	request->uniq = dev_private->request_uniq++;
+ 
+ 	ring->outstanding_lazy_request = request;
+@@ -2548,7 +2551,7 @@ int intel_ring_begin(struct intel_engine_cs *ring,
+ 		return ret;
+ 
+ 	/* Preallocate the olr before touching the ring */
+-	ret = intel_ring_alloc_request(ring, NULL);
++	ret = intel_ring_alloc_request(ring, ring->default_context);
+ 	if (ret)
+ 		return ret;
+ 
+-- 
+1.7.9.5
+

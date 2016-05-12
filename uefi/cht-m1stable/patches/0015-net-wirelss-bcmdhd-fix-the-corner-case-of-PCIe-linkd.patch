@@ -1,0 +1,335 @@
+From aaaa6c17b6880d0159daf9073c6dadf62f35aa38 Mon Sep 17 00:00:00 2001
+From: Ecco park <eccopark@broadcom.com>
+Date: Tue, 14 Oct 2014 01:13:00 -0700
+Subject: [PATCH 15/27] net: wirelss: bcmdhd fix the corner case of PCIe
+ linkdown
+
+1) [Issue 17755061] Wi-Fi stuck in Off position with new log, we missed the one
+case for NON-IOCTL.  Sometimes we have issue for deleting flow ring.
+2) For failure of WLAN-on, we don't set g_wifi_on to TRUE.  So, we don't do
+anything to clear resource even through framework will call wl_android_wifi_off
+
+Change-Id: I8078988eee3520780b1151422db88bf631a39084
+Signed-off-by: Ecco park <eccopark@broadcom.com>
+Signed-off-by: Iliyan Malchev <malchev@google.com>
+---
+ drivers/net/wireless/bcmdhd/dhd.h          |  2 ++
+ drivers/net/wireless/bcmdhd/dhd_common.c   |  2 +-
+ drivers/net/wireless/bcmdhd/dhd_flowring.c |  8 +++---
+ drivers/net/wireless/bcmdhd/dhd_linux.c    |  4 +--
+ drivers/net/wireless/bcmdhd/dhd_pcie.c     | 40 ++++++++++++++++++++++++++----
+ drivers/net/wireless/bcmdhd/dhd_pcie.h     |  3 ++-
+ drivers/net/wireless/bcmdhd/wl_android.c   | 16 ++++++------
+ drivers/net/wireless/bcmdhd/wl_android.h   |  8 +++---
+ 8 files changed, 58 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/net/wireless/bcmdhd/dhd.h b/drivers/net/wireless/bcmdhd/dhd.h
+index 3c2da8a..868697d 100644
+--- a/drivers/net/wireless/bcmdhd/dhd.h
++++ b/drivers/net/wireless/bcmdhd/dhd.h
+@@ -90,6 +90,8 @@ enum dhd_bus_state {
+ 	DHD_BUS_SUSPEND,	/* Bus has been suspended */
+ };
+ 
++#define DHD_IF_ROLE_STA(role)	(role == WLC_E_IF_ROLE_STA ||\
++				role == WLC_E_IF_ROLE_P2P_CLIENT)
+ 
+ /* For supporting multiple interfaces */
+ #define DHD_MAX_IFS	16
+diff --git a/drivers/net/wireless/bcmdhd/dhd_common.c b/drivers/net/wireless/bcmdhd/dhd_common.c
+index 1ed11d6..379270c 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_common.c
++++ b/drivers/net/wireless/bcmdhd/dhd_common.c
+@@ -1773,7 +1773,7 @@ wl_host_event(dhd_pub_t *dhd_pub, int *ifidx, void *pktdata,
+ 		if (type != WLC_E_LINK) {
+ 			uint8 ifindex = (uint8)hostidx;
+ 			uint8 role = dhd_flow_rings_ifindex2role(dhd_pub, ifindex);
+-			if (role == WLC_E_IF_ROLE_STA) {
++			if (DHD_IF_ROLE_STA(role)) {
+ 				dhd_flow_rings_delete(dhd_pub, ifindex);
+ 			} else {
+ 				dhd_flow_rings_delete_for_peer(dhd_pub, ifindex,
+diff --git a/drivers/net/wireless/bcmdhd/dhd_flowring.c b/drivers/net/wireless/bcmdhd/dhd_flowring.c
+index 4b0cbee..16d6467 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_flowring.c
++++ b/drivers/net/wireless/bcmdhd/dhd_flowring.c
+@@ -355,7 +355,7 @@ dhd_flowid_find(dhd_pub_t *dhdp, uint8 ifindex, uint8 prio, char *sa, char *da)
+ 	DHD_FLOWID_LOCK(dhdp->flowid_lock, flags);
+ 	if_flow_lkup = (if_flow_lkup_t *)dhdp->if_flow_lkup;
+ 
+-	if (if_flow_lkup[ifindex].role == WLC_E_IF_ROLE_STA) {
++	if (DHD_IF_ROLE_STA(if_flow_lkup[ifindex].role)) {
+ #ifdef WLTDLS
+ 		if (dhdp->peer_tbl.tdls_peer_count && !(ETHER_ISMULTI(da)) &&
+ 			is_tdls_destination(dhdp, da)) {
+@@ -439,7 +439,7 @@ dhd_flowid_alloc(dhd_pub_t *dhdp, uint8 ifindex, uint8 prio, char *sa, char *da)
+ 
+ 	DHD_FLOWID_LOCK(dhdp->flowid_lock, flags);
+ 	if_flow_lkup = (if_flow_lkup_t *)dhdp->if_flow_lkup;
+-	if (if_flow_lkup[ifindex].role == WLC_E_IF_ROLE_STA) {
++	if (DHD_IF_ROLE_STA(if_flow_lkup[ifindex].role)) {
+ 		/* For STA non TDLS dest we allocate entry based on prio only */
+ #ifdef WLTDLS
+ 		if (dhdp->peer_tbl.tdls_peer_count &&
+@@ -721,7 +721,7 @@ dhd_update_interface_flow_info(dhd_pub_t *dhdp, uint8 ifindex,
+ 
+ 		if_flow_lkup[ifindex].role = role;
+ 
+-		if (role != WLC_E_IF_ROLE_STA) {
++		if (!(DHD_IF_ROLE_STA(role))) {
+ 			if_flow_lkup[ifindex].status = TRUE;
+ 			DHD_INFO(("%s: Mcast Flow ring for ifindex %d role is %d \n",
+ 			          __FUNCTION__, ifindex, role));
+@@ -751,7 +751,7 @@ dhd_update_interface_link_status(dhd_pub_t *dhdp, uint8 ifindex, uint8 status)
+ 	DHD_FLOWID_LOCK(dhdp->flowid_lock, flags);
+ 	if_flow_lkup = (if_flow_lkup_t *)dhdp->if_flow_lkup;
+ 
+-	if (if_flow_lkup[ifindex].role == WLC_E_IF_ROLE_STA) {
++	if (DHD_IF_ROLE_STA(if_flow_lkup[ifindex].role)) {
+ 		if (status)
+ 			if_flow_lkup[ifindex].status = TRUE;
+ 		else
+diff --git a/drivers/net/wireless/bcmdhd/dhd_linux.c b/drivers/net/wireless/bcmdhd/dhd_linux.c
+index 5388c50..3fb53e8 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_linux.c
++++ b/drivers/net/wireless/bcmdhd/dhd_linux.c
+@@ -2001,7 +2001,7 @@ dhd_ifadd_event_handler(void *handle, void *event_info, u8 event)
+ 	}
+ #ifdef PCIE_FULL_DONGLE
+ 	/* Turn on AP isolation in the firmware for interfaces operating in AP mode */
+-	if (FW_SUPPORTED((&dhd->pub), ap) && (if_event->event.role != WLC_E_IF_ROLE_STA)) {
++	if (FW_SUPPORTED((&dhd->pub), ap) && !(DHD_IF_ROLE_STA(if_event->event.role))) {
+ 		char iovbuf[WLC_IOCTL_SMLEN];
+ 		uint32 var_int =  1;
+ 
+@@ -3880,7 +3880,7 @@ dhd_stop(struct net_device *net)
+ exit:
+ #if defined(WL_CFG80211)
+ 	if (ifidx == 0 && !dhd_download_fw_on_driverload)
+-		wl_android_wifi_off(net);
++		wl_android_wifi_off(net, TRUE);
+ #endif
+ 	dhd->pub.rxcnt_timeout = 0;
+ 	dhd->pub.txcnt_timeout = 0;
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie.c b/drivers/net/wireless/bcmdhd/dhd_pcie.c
+index 4ebc71f..a9c3afcd 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie.c
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie.c
+@@ -74,6 +74,7 @@ int dhd_dongle_ramsize;
+ static int dhdpcie_checkdied(dhd_bus_t *bus, char *data, uint size);
+ static int dhdpcie_bus_readconsole(dhd_bus_t *bus);
+ #endif
++static void dhdpcie_bus_report_pcie_linkdown(dhd_bus_t *bus);
+ static int dhdpcie_bus_membytes(dhd_bus_t *bus, bool write, ulong address, uint8 *data, uint size);
+ static int dhdpcie_bus_doiovar(dhd_bus_t *bus, const bcm_iovar_t *vi, uint32 actionid,
+ 	const char *name, void *params,
+@@ -1450,6 +1451,18 @@ done:
+ 	return bcmerror;
+ }
+ #endif /* DHD_DEBUG */
++static void
++dhdpcie_bus_report_pcie_linkdown(dhd_bus_t *bus)
++{
++	if (bus == NULL)
++		return;
++#ifdef MSM_PCIE_LINKDOWN_RECOVERY
++	bus->islinkdown = TRUE;
++	DHD_ERROR(("PCIe link down, Device ID and Vendor ID are 0x%x\n",
++			dhdpcie_bus_cfg_read_dword(bus, PCI_VENDOR_ID, 4)));
++	dhd_os_send_hang_message(bus->dhd);
++#endif /* SUPPORT_LINKDOWN_RECOVERY */
++}
+ 
+ /**
+  * Transfers bytes from host to dongle using pio mode.
+@@ -2878,7 +2891,7 @@ dhdpcie_bus_suspend(struct  dhd_bus *bus, bool state)
+ 		timeleft = dhd_os_d3ack_wait(bus->dhd, &bus->wait_for_d3_ack, &pending);
+ 		dhd_os_set_ioctl_resp_timeout(IOCTL_RESP_TIMEOUT);
+ 		DHD_OS_WAKE_LOCK_RESTORE(bus->dhd);
+-		if (bus->wait_for_d3_ack) {
++		if (bus->wait_for_d3_ack == 1) {
+ 			/* Got D3 Ack. Suspend the bus */
+ 			if (dhd_os_check_wakelock_all(bus->dhd)) {
+ 				DHD_ERROR(("Suspend failed because of wakelock\n"));
+@@ -2902,6 +2915,12 @@ dhdpcie_bus_suspend(struct  dhd_bus *bus, bool state)
+ 			bus->suspended = FALSE;
+ 			bus->dhd->busstate = DHD_BUS_DATA;
+ 			rc = -ETIMEDOUT;
++		} else if (bus->wait_for_d3_ack == DHD_INVALID) {
++			DHD_ERROR(("PCIe link down during suspend"));
++			bus->suspended = FALSE;
++			bus->dhd->busstate = DHD_BUS_DOWN;
++			rc = -ETIMEDOUT;
++			dhdpcie_bus_report_pcie_linkdown(bus);
+ 		}
+ 		bus->wait_for_d3_ack = 1;
+ 	} else {
+@@ -2909,8 +2928,15 @@ dhdpcie_bus_suspend(struct  dhd_bus *bus, bool state)
+ 		DHD_ERROR(("dhdpcie_bus_suspend resume\n"));
+ 		rc = dhdpcie_pci_suspend_resume(bus->dev, state);
+ 		bus->suspended = FALSE;
+-		bus->dhd->busstate = DHD_BUS_DATA;
+-		dhdpcie_bus_intr_enable(bus);
++		if (dhdpcie_bus_cfg_read_dword(bus, PCI_VENDOR_ID, 4) == PCIE_LINK_DOWN) {
++			DHD_ERROR(("PCIe link down during resume"));
++			rc = -ETIMEDOUT;
++			bus->dhd->busstate = DHD_BUS_DOWN;
++			dhdpcie_bus_report_pcie_linkdown(bus);
++		} else {
++			bus->dhd->busstate = DHD_BUS_DATA;
++			dhdpcie_bus_intr_enable(bus);
++		}
+ 	}
+ 	return rc;
+ }
+@@ -3399,7 +3425,11 @@ dhdpcie_handle_mb_data(dhd_bus_t *bus)
+ 		return;
+ 
+ 	dhd_bus_cmn_writeshared(bus, &zero, sizeof(uint32), DTOH_MB_DATA, 0);
+-
++	if (d2h_mb_data == PCIE_LINK_DOWN) {
++		DHD_ERROR(("%s pcie linkdown, 0x%08x\n", __FUNCTION__, d2h_mb_data));
++		bus->wait_for_d3_ack = DHD_INVALID;
++		dhd_os_d3ack_wake(bus->dhd);
++	}
+ 	DHD_INFO(("D2H_MB_DATA: 0x%04x\n", d2h_mb_data));
+ 	if (d2h_mb_data & D2H_DEV_DS_ENTER_REQ)  {
+ 		/* what should we do */
+@@ -4119,7 +4149,7 @@ dhd_bus_flow_ring_delete_response(dhd_bus_t *bus, uint16 flowid, uint32 status)
+ {
+ 	flow_ring_node_t *flow_ring_node;
+ 
+-	DHD_INFO(("%s :Flow Delete Response %d \n", __FUNCTION__, flowid));
++	DHD_ERROR(("%s :Flow Delete Response %d \n", __FUNCTION__, flowid));
+ 
+ 	flow_ring_node = DHD_FLOW_RING(bus->dhd, flowid);
+ 	ASSERT(flow_ring_node->flowid == flowid);
+diff --git a/drivers/net/wireless/bcmdhd/dhd_pcie.h b/drivers/net/wireless/bcmdhd/dhd_pcie.h
+index f0c7bd9..36153a3 100644
+--- a/drivers/net/wireless/bcmdhd/dhd_pcie.h
++++ b/drivers/net/wireless/bcmdhd/dhd_pcie.h
+@@ -48,7 +48,8 @@
+ #define	REMAP_ISADDR(bus, a)		(((a) >= ((bus)->orig_ramsize)) && ((a) < ((bus)->ramsize)))
+ 
+ #define MAX_DHD_TX_FLOWS	256
+-
++#define PCIE_LINK_DOWN		0xFFFFFFFF
++#define DHD_INVALID 		-1
+ /* user defined data structures */
+ #ifdef DHD_DEBUG
+ /* Device console log buffer state */
+diff --git a/drivers/net/wireless/bcmdhd/wl_android.c b/drivers/net/wireless/bcmdhd/wl_android.c
+index 36ab67b..f2bed33 100644
+--- a/drivers/net/wireless/bcmdhd/wl_android.c
++++ b/drivers/net/wireless/bcmdhd/wl_android.c
+@@ -2,13 +2,13 @@
+  * Linux cfg80211 driver - Android related functions
+  *
+  * Copyright (C) 1999-2014, Broadcom Corporation
+- * 
++ *
+  *      Unless you and Broadcom execute a separate written software license
+  * agreement governing use of this software, this software is licensed to you
+  * under the terms of the GNU General Public License version 2 (the "GPL"),
+  * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+  * following added to such license:
+- * 
++ *
+  *      As a special exception, the copyright holders of this software give you
+  * permission to link this software with independent modules, and to copy and
+  * distribute the resulting executable under terms of your choice, provided that
+@@ -16,7 +16,7 @@
+  * the license of that module.  An independent module is a module which is not
+  * derived from this software.  The special exception does not apply to any
+  * modifications of the software.
+- * 
++ *
+  *      Notwithstanding the above, under no circumstances may you combine this
+  * software in any way with any other Broadcom software provided under a license
+  * other than the GPL, without Broadcom's express prior written consent.
+@@ -198,7 +198,7 @@ static int lock_cookie_wifi = 'W' | 'i'<<8 | 'F'<<16 | 'i'<<24;	/* cookie is "Wi
+ extern bool ap_fw_loaded;
+ #if defined(CUSTOMER_HW2)
+ extern char iface_name[IFNAMSIZ];
+-#endif 
++#endif
+ 
+ /**
+  * Local (static) functions and variables
+@@ -718,7 +718,7 @@ exit:
+ 	return ret;
+ }
+ 
+-int wl_android_wifi_off(struct net_device *dev)
++int wl_android_wifi_off(struct net_device *dev, bool on_failure)
+ {
+ 	int ret = 0;
+ 
+@@ -729,7 +729,7 @@ int wl_android_wifi_off(struct net_device *dev)
+ 	}
+ 
+ 	dhd_net_if_lock(dev);
+-	if (g_wifi_on) {
++	if (g_wifi_on || on_failure) {
+ #if defined(BCMSDIO) || defined(BCMPCIE)
+ 		ret = dhd_net_bus_devreset(dev, TRUE);
+ #ifdef BCMSDIO
+@@ -1343,7 +1343,7 @@ int wl_android_priv_cmd(struct net_device *net, struct ifreq *ifr, int cmd)
+ 	}
+ 
+ 	if (strnicmp(command, CMD_STOP, strlen(CMD_STOP)) == 0) {
+-		bytes_written = wl_android_wifi_off(net);
++		bytes_written = wl_android_wifi_off(net, FALSE);
+ 	}
+ 	else if (strnicmp(command, CMD_SCAN_ACTIVE, strlen(CMD_SCAN_ACTIVE)) == 0) {
+ 		/* TBD: SCAN-ACTIVE */
+@@ -1540,7 +1540,7 @@ int wl_android_init(void)
+ 		memset(iface_name, 0, IFNAMSIZ);
+ 		bcm_strncpy_s(iface_name, IFNAMSIZ, "wlan", IFNAMSIZ);
+ 	}
+-#endif 
++#endif
+ 
+ 
+ 	return ret;
+diff --git a/drivers/net/wireless/bcmdhd/wl_android.h b/drivers/net/wireless/bcmdhd/wl_android.h
+index a9e1ad3..2827132 100644
+--- a/drivers/net/wireless/bcmdhd/wl_android.h
++++ b/drivers/net/wireless/bcmdhd/wl_android.h
+@@ -2,13 +2,13 @@
+  * Linux cfg80211 driver - Android related functions
+  *
+  * Copyright (C) 1999-2014, Broadcom Corporation
+- * 
++ *
+  *      Unless you and Broadcom execute a separate written software license
+  * agreement governing use of this software, this software is licensed to you
+  * under the terms of the GNU General Public License version 2 (the "GPL"),
+  * available at http://www.broadcom.com/licenses/GPLv2.php, with the
+  * following added to such license:
+- * 
++ *
+  *      As a special exception, the copyright holders of this software give you
+  * permission to link this software with independent modules, and to copy and
+  * distribute the resulting executable under terms of your choice, provided that
+@@ -16,7 +16,7 @@
+  * the license of that module.  An independent module is a module which is not
+  * derived from this software.  The special exception does not apply to any
+  * modifications of the software.
+- * 
++ *
+  *      Notwithstanding the above, under no circumstances may you combine this
+  * software in any way with any other Broadcom software provided under a license
+  * other than the GPL, without Broadcom's express prior written consent.
+@@ -51,7 +51,7 @@ int wl_android_init(void);
+ int wl_android_exit(void);
+ void wl_android_post_init(void);
+ int wl_android_wifi_on(struct net_device *dev);
+-int wl_android_wifi_off(struct net_device *dev);
++int wl_android_wifi_off(struct net_device *dev, bool on_failure);
+ int wl_android_priv_cmd(struct net_device *net, struct ifreq *ifr, int cmd);
+ 
+ 
+-- 
+1.9.1
+

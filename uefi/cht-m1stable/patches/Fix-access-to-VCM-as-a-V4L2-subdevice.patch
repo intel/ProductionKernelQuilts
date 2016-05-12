@@ -1,0 +1,133 @@
+From f4993c63fa8abe198169a4ba66e3b111272ec465 Mon Sep 17 00:00:00 2001
+From: Sebastien Boeuf <sebastien.boeuf@intel.com>
+Date: Wed, 6 May 2015 09:25:41 +0200
+Subject: [PATCH] Fix access to VCM as a V4L2 subdevice
+
+There is some code in atomisp_v4l2.c, particularly in
+atomisp_subdev_probe() function, which does not handle
+properly the matching between a VCM subdevice and the
+corresponding camera subdevice. Instead it is able to
+handle only one VCM subdevice for N camera subdevice.
+However, this code is not working in some cases because
+isp->motor subdevice reference is not assigned to the right
+isp->inputs[raw_index].motor because raw_index is wrong.
+
+This patch propose a way to avoid matching VCM subdevice
+index with camera subdevice index, considering we can have
+only one VCM subdev which is accessible with isp->motor
+pointer. It is not the best solution because we cannot handle
+several VCM subdevices (but it is not worst because it was already
+the case), but it ensures we can use VCM ioctls if the driver has
+been registered as a V4L2 subdevice.
+
+Change-Id: I6178d987160d7d85944ddaf75b533f12f381fa18
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-7449
+Signed-off-by: Sebastien Boeuf <sebastien.boeuf@intel.com>
+Reviewed-on: https://icggerrit.ir.intel.com/54809
+Build: Dessert M COHO (SC)
+Reviewed-by: Tuukka Toivonen <tuukka.toivonen@intel.com>
+Build: Dessert M CHT FFD (SC)
+Reviewed-by: Jukka O Kaartinen <jukka.o.kaartinen@intel.com>
+Approver: Yunliang Ding <yunliang.ding@intel.com>
+Integrator: WeiX Meng <weix.meng@intel.com>
+Build: WeiX Meng <weix.meng@intel.com>
+Reviewed-by: WeiX Meng <weix.meng@intel.com>
+Maintainer: WeiX Meng <weix.meng@intel.com>
+---
+ .../pci/atomisp2/atomisp_driver/atomisp_ioctl.c    | 36 +++++++++++++---------
+ 1 file changed, 22 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+index 0673fa5..ae4a9f37 100644
+--- a/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
++++ b/drivers/external_drivers/camera/drivers/media/pci/atomisp2/atomisp_driver/atomisp_ioctl.c
+@@ -621,15 +621,15 @@ static int atomisp_enum_input(struct file *file, void *fh,
+ 	 * ioctl is the only way to enum inputs + possible external actuators
+ 	 * for 3A tuning purpose.
+ 	 */
+-	if (isp->inputs[index].motor &&
+-	    strlen(isp->inputs[index].motor->name) > 0) {
++	if (isp->motor &&
++	    strlen(isp->motor->name) > 0) {
+ 		const int cur_len = strlen(input->name);
+ 		const int max_size = sizeof(input->name) - cur_len - 1;
+ 
+ 		if (max_size > 1) {
+ 			input->name[cur_len] = '+';
+ 			strncpy(&input->name[cur_len + 1],
+-				isp->inputs[index].motor->name, max_size - 1);
++				isp->motor->name, max_size - 1);
+ 		}
+ 	}
+ 
+@@ -764,9 +764,11 @@ static int atomisp_s_input(struct file *file, void *fh, unsigned int input)
+ 		goto error;
+ 	}
+ 
+-	if (!isp->sw_contex.file_input && isp->inputs[input].motor)
+-		ret = v4l2_subdev_call(isp->inputs[input].motor, core,
+-				       init, 1);
++	if (isp->motor)
++		ret = v4l2_subdev_call(isp->motor, core, s_power, 1);
++
++	if (!isp->sw_contex.file_input && isp->motor)
++		ret = v4l2_subdev_call(isp->motor, core, init, 1);
+ 
+ 	asd->input_curr = input;
+ 	/* mark this camera is used by the current stream */
+@@ -2371,8 +2373,14 @@ static int atomisp_queryctl(struct file *file, void *fh,
+ 		case V4L2_CID_FOCUS_ABSOLUTE:
+ 		case V4L2_CID_FOCUS_RELATIVE:
+ 		case V4L2_CID_FOCUS_STATUS:
+-			return v4l2_subdev_call(isp->inputs[asd->input_curr].camera,
+-						core, queryctrl, qc);
++			if (isp->motor)
++				return v4l2_subdev_call(
++					isp->motor,
++					core, queryctrl, qc);
++			else
++				return v4l2_subdev_call(
++					isp->inputs[asd->input_curr].camera,
++					core, queryctrl, qc);
+ 	}
+ 
+ 	if (qc->id & V4L2_CTRL_FLAG_NEXT_CTRL)
+@@ -2431,9 +2439,9 @@ static int atomisp_camera_g_ext_ctrls(struct file *file, void *fh,
+ 		case V4L2_CID_FOCUS_RELATIVE:
+ 		case V4L2_CID_FOCUS_STATUS:
+ 		case V4L2_CID_FOCUS_AUTO:
+-			if (isp->inputs[asd->input_curr].motor)
++			if (isp->motor)
+ 				ret = v4l2_subdev_call(
+-					isp->inputs[asd->input_curr].motor,
++					isp->motor,
+ 					core, g_ctrl, &ctrl);
+ 			else
+ 				ret = v4l2_subdev_call(
+@@ -2538,9 +2546,9 @@ static int atomisp_camera_s_ext_ctrls(struct file *file, void *fh,
+ 		case V4L2_CID_FOCUS_RELATIVE:
+ 		case V4L2_CID_FOCUS_STATUS:
+ 		case V4L2_CID_FOCUS_AUTO:
+-			if (isp->inputs[asd->input_curr].motor)
++			if (isp->motor)
+ 				ret = v4l2_subdev_call(
+-					isp->inputs[asd->input_curr].motor,
++					isp->motor,
+ 					core, s_ctrl, &ctrl);
+ 			else
+ 				ret = v4l2_subdev_call(
+@@ -2904,9 +2912,9 @@ static long atomisp_vidioc_default(struct file *file, void *fh,
+ 		break;
+ 
+ 	case ATOMISP_IOC_G_MOTOR_PRIV_INT_DATA:
+-		if (isp->inputs[asd->input_curr].motor)
++		if (isp->motor)
+ 			err = v4l2_subdev_call(
+-					isp->inputs[asd->input_curr].motor,
++					isp->motor,
+ 					core, ioctl, cmd, arg);
+ 		else
+ 			err = v4l2_subdev_call(
+-- 
+1.9.1
+

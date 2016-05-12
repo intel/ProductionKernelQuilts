@@ -1,0 +1,139 @@
+From b1e20772b326255cb9d36224c90be21a8bc97fd5 Mon Sep 17 00:00:00 2001
+Message-Id: <b1e20772b326255cb9d36224c90be21a8bc97fd5.1424394676.git.feitong.yi@intel.com>
+In-Reply-To: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+References: <00f4430a265007e8e2c016cc7926bf530835ea30.1424394676.git.feitong.yi@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 2 Apr 2014 11:38:35 +0100
+Subject: [PATCH 24/61] FOR_UPSTREAM [VPG]: drm/i915: Added scheduler hook
+ when closing DRM file handles
+
+The scheduler decouples the submission of batch buffers to the driver with
+submission of batch buffers to the hardware. Thus it is possible for an
+application to submit work, then close the DRM handle and free up all the
+resources that piece of work wishes to use before the work has even been
+submitted to the hardware. To prevent this, the scheduler needs to be informed
+of the DRM close event so that it can force through any outstanding work
+attributed to that file handle.
+
+Change-Id: I24ac056c062b075ff1cc5e2ed2d3fa8e17e85951
+For: VIZ-1587
+For: VIZ-4741
+For: GMIN-3638
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c       |    3 ++
+ drivers/gpu/drm/i915/i915_scheduler.c |   66 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.h |    2 +
+ 3 files changed, 71 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 71060fd..5d587cb 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -45,6 +45,7 @@
+ #include <linux/vga_switcheroo.h>
+ #include <linux/slab.h>
+ #include <acpi/video.h>
++#include "i915_scheduler.h"
+ #include <linux/pm.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/oom.h>
+@@ -2110,6 +2111,8 @@ void i915_driver_lastclose(struct drm_device * dev)
+ 
+ void i915_driver_preclose(struct drm_device *dev, struct drm_file *file)
+ {
++	i915_scheduler_closefile(dev, file);
++
+ 	mutex_lock(&dev->struct_mutex);
+ 	i915_gem_context_close(dev, file);
+ 	i915_gem_release(dev, file);
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index a0b64b3..b9642ba 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -975,3 +975,69 @@ bool i915_scheduler_is_request_tracked(struct drm_i915_gem_request *req,
+ 
+ 	return true;
+ }
++
++int i915_scheduler_closefile(struct drm_device *dev, struct drm_file *file)
++{
++	struct i915_scheduler_queue_entry  *node;
++	struct drm_i915_private            *dev_priv = dev->dev_private;
++	struct i915_scheduler              *scheduler = dev_priv->scheduler;
++	struct drm_i915_gem_request        *req;
++	struct intel_engine_cs  *ring;
++	int                     i, ret;
++	unsigned long           flags;
++	bool                    found;
++
++	if (!scheduler)
++		return 0;
++
++	for_each_ring(ring, dev_priv, i) {
++		do {
++			spin_lock_irqsave(&scheduler->lock, flags);
++
++			found = false;
++			list_for_each_entry(node, &scheduler->node_queue[ring->id], link) {
++				if (I915_SQS_IS_COMPLETE(node))
++					continue;
++
++				if (node->params.file != file)
++					continue;
++
++				found = true;
++				req = node->params.request;
++				i915_gem_request_reference(req);
++				break;
++			}
++
++			spin_unlock_irqrestore(&scheduler->lock, flags);
++
++			if (found) {
++				do {
++					mutex_lock(&dev->struct_mutex);
++					ret = i915_wait_request(req);
++					mutex_unlock(&dev->struct_mutex);
++					if (ret == -EAGAIN)
++						msleep(20);
++				} while (ret == -EAGAIN);
++
++				mutex_lock(&dev->struct_mutex);
++				i915_gem_request_unreference(req);
++				mutex_unlock(&dev->struct_mutex);
++			}
++		} while (found);
++	}
++
++	spin_lock_irqsave(&scheduler->lock, flags);
++	for_each_ring(ring, dev_priv, i) {
++		list_for_each_entry(node, &scheduler->node_queue[ring->id], link) {
++			if (node->params.file != file)
++				continue;
++
++			WARN_ON(!I915_SQS_IS_COMPLETE(node));
++
++			node->params.file = NULL;
++		}
++	}
++	spin_unlock_irqrestore(&scheduler->lock, flags);
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 619a192..6690507 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -85,6 +85,8 @@ enum {
+ 
+ bool        i915_scheduler_is_enabled(struct drm_device *dev);
+ int         i915_scheduler_init(struct drm_device *dev);
++int         i915_scheduler_closefile(struct drm_device *dev,
++				     struct drm_file *file);
+ int         i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe);
+ int         i915_scheduler_handle_irq(struct intel_engine_cs *ring);
+ bool        i915_scheduler_is_request_tracked(struct drm_i915_gem_request *req,
+-- 
+1.7.9.5
+

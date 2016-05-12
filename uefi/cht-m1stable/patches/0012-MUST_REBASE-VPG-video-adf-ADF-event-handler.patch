@@ -1,0 +1,850 @@
+From 9d6b9018deaec2472ae3ab091ac6f1b67d48b6e0 Mon Sep 17 00:00:00 2001
+Message-Id: <9d6b9018deaec2472ae3ab091ac6f1b67d48b6e0.1423872525.git.feitong.yi@intel.com>
+In-Reply-To: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+References: <3062c7e6b919c393846ff0e13558e7f648b352ca.1423872525.git.feitong.yi@intel.com>
+From: Shashank Sharma <shashank.sharma@intel.com>
+Date: Sun, 25 Jan 2015 14:11:02 +0530
+Subject: [PATCH 12/95] MUST_REBASE [VPG]: video/adf: ADF event handler
+
+This patch adds central event handler for ADF driver.
+Event handler takes care of pipe, port and encoder
+events.
+
+To align with ADF framework, event handler has 3 parts:
+1. Get events: checks for the pipe, port and hotplug events
+	and reports to ADF driver framework.
+2. Set event: enables/disables requested event from the
+	driver event handling (One at a time)
+3. Handle events: Handle the events reported by framework
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed.
+
+Issue: GMINL-5249
+Change-Id: Iab5eca4f214cebec3e72ec2096a202479a019c5f
+Signed-off-by: Shashank Sharma <shashank.sharma@intel.com>
+---
+ drivers/video/adf/intel/core/common/Makefile       |    1 +
+ .../video/adf/intel/core/common/dsi/gen_dsi_pipe.c |   51 ++-
+ .../video/adf/intel/core/common/intel_adf_events.c |  351 ++++++++++++++++++++
+ drivers/video/adf/intel/core/vlv/vlv_pipeline.c    |   29 +-
+ .../video/adf/intel/include/core/intel_dc_config.h |   21 ++
+ .../adf/intel/include/core/intel_platform_config.h |    2 -
+ .../adf/intel/include/core/vlv/vlv_dc_config.h     |    4 +-
+ .../video/adf/intel/include/core/vlv/vlv_dc_regs.h |   26 ++
+ .../video/adf/intel/include/core/vlv/vlv_pipe.h    |    1 -
+ drivers/video/adf/intel/include/intel_adf.h        |   11 +
+ drivers/video/adf/intel/intel_adf.c                |   41 ++-
+ drivers/video/adf/intel/intel_adf_interface.c      |   20 +-
+ 12 files changed, 505 insertions(+), 53 deletions(-)
+ create mode 100644 drivers/video/adf/intel/core/common/intel_adf_events.c
+
+diff --git a/drivers/video/adf/intel/core/common/Makefile b/drivers/video/adf/intel/core/common/Makefile
+index 80f2350..8f0e77d 100644
+--- a/drivers/video/adf/intel/core/common/Makefile
++++ b/drivers/video/adf/intel/core/common/Makefile
+@@ -3,5 +3,6 @@ ccflags-y := -Idrivers/staging/ -Iinclude/adf -Iinclude/uapi/adf -Idrivers/video
+ 
+ obj-$(CONFIG_ADF_INTEL) += backlight_dev.o
+ obj-$(CONFIG_ADF_INTEL) += intel_gen_backlight.o
++obj-y 			+= intel_adf_events.o
+ 
+ obj-y			+= dsi/
+diff --git a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+index 0835f3b..32fdae5 100644
+--- a/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
++++ b/drivers/video/adf/intel/core/common/dsi/gen_dsi_pipe.c
+@@ -483,34 +483,42 @@ static u32 dsi_get_supported_events(struct intel_pipe *pipe)
+ 
+ int dsi_set_event(struct intel_pipe *pipe, u16 event, bool enabled)
+ {
++	int ret;
+ 	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
+-	struct intel_pipeline *pipeline = dsi_pipe->pipeline;
+ 
+-	return vlv_set_event(pipeline, event, enabled);
+-}
++	pr_debug("ADF: %s\n", __func__);
+ 
+-/**
+- * FIXME: hardware vsync counter failed to work on ANN. use static SW
+- * counter for now.
+- */
+-static u32 vsync_counter;
++	/* HW events */
++	ret = intel_adf_set_event(pipe, event, enabled);
++	if (ret) {
++		pr_err("ADF: %s: Failed to set events\n", __func__);
++		return ret;
++	}
+ 
+-#define VSYNC_COUNT_MAX_MASK 0xffffff
++	/* Encoder events */
++	if (dsi_pipe->ops.set_event) {
++		ret = dsi_pipe->ops.set_event(dsi_pipe, event, enabled);
++		if (ret)
++			pr_err("ADF: %s: Failed to set DSI events\n", __func__);
++	}
++	return ret;
++}
+ 
+ static void dsi_get_events(struct intel_pipe *pipe, u32 *events)
+ {
+ 	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
+-	struct intel_pipeline *pipeline = dsi_pipe->pipeline;
+ 
+-	vlv_get_event(pipeline, events);
++	pr_debug("ADF: %s\n", __func__);
+ 
+-	/**
+-	 * FIXME: should use hardware vsync counter.
+-	 */
+-	if (*events & INTEL_PIPE_EVENT_VSYNC) {
+-		if (++vsync_counter > VSYNC_COUNT_MAX_MASK)
+-			vsync_counter = 0;
++	/* HW events */
++	if (intel_adf_get_events(pipe, events)) {
++		pr_err("ADF: %s: Failed to get events\n", __func__);
++		return;
+ 	}
++
++	/* Encoder events */
++	if (dsi_pipe->ops.get_events)
++		dsi_pipe->ops.get_events(dsi_pipe, events);
+ }
+ 
+ u32 dsi_get_vsync_counter(struct intel_pipe *pipe, u32 interval)
+@@ -532,6 +540,15 @@ static void dsi_handle_events(struct intel_pipe *pipe, u32 events)
+ {
+ 	struct dsi_pipe *dsi_pipe = to_dsi_pipe(pipe);
+ 
++	pr_debug("ADF: %s\n", __func__);
++
++	/* HW events */
++	if (intel_adf_handle_events(pipe, events)) {
++		pr_err("ADF: %s: failed to handle events\n", __func__);
++		return;
++	}
++
++	/* Encoder specific events */
+ 	if (dsi_pipe->ops.handle_events)
+ 		dsi_pipe->ops.handle_events(dsi_pipe, events);
+ }
+diff --git a/drivers/video/adf/intel/core/common/intel_adf_events.c b/drivers/video/adf/intel/core/common/intel_adf_events.c
+new file mode 100644
+index 0000000..cff9df5
+--- /dev/null
++++ b/drivers/video/adf/intel/core/common/intel_adf_events.c
+@@ -0,0 +1,351 @@
++/*
++ * Copyright (C) 2014, Intel Corporation.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Created on 12 Dec 2014
++ * Author: Shashank Sharma
++ */
++#include <linux/types.h>
++#include <intel_adf.h>
++#include <intel_adf_interface.h>
++#include <core/intel_dc_config.h>
++#include <core/vlv/vlv_dc_config.h>
++#include <core/vlv/vlv_dc_regs.h>
++#include <core/vlv/vlv_dc_hw.h>
++#include <core/vlv/vlv_pipe.h>
++#include <core/common/dsi/dsi_pipe.h>
++
++struct intel_adf_context *context_from_hp_work(struct work_struct *work)
++{
++	return container_of(work, struct intel_adf_context, hotplug_work);
++}
++
++void intel_adf_shortpulse_work_function(struct work_struct *work)
++{
++	return;
++}
++
++void intel_adf_hotplug_work_function(struct work_struct *work)
++{
++	return;
++}
++
++int intel_adf_handle_events(struct intel_pipe *pipe, u32 events)
++{
++	int ret = 0;
++	struct vlv_pipeline *pipeline = to_vlv_pipeline(pipe->pipeline);
++	struct vlv_pm *pm = &pipeline->pm;
++
++	ret = vlv_pm_flush_values(pm, events);
++	if (ret)
++		pr_err("ADF: %s: PM flush failed\n", __func__);
++
++	/* Todo: Increment pipe vsync counter here */
++	pr_debug("ADF: %s\n", __func__);
++	return ret;
++}
++
++u32 intel_adf_set_pipe_event(struct intel_pipe *pipe, u32 event, bool enabled)
++{
++	u32 err = 0;
++	u32 value = 0;
++	u32 pipestat;
++
++	struct vlv_pipe *vlv_pipe = &((to_vlv_pipeline(pipe->pipeline))->pipe);
++
++	if ((enabled == false) && (event == INTEL_PIPE_EVENT_VSYNC)) {
++		pr_debug("ADF: %s: Not allowing VSYNC OFF\n", __func__);
++		return 0;
++	}
++
++	pr_debug("ADF: %s:\n", __func__);
++
++	switch (event) {
++	case INTEL_PIPE_EVENT_SPRITE2_FLIP:
++		pipestat = SPRITE2_FLIP_DONE_EN;
++		break;
++	case INTEL_PIPE_EVENT_SPRITE1_FLIP:
++		pipestat = SPRITE1_FLIP_DONE_EN;
++		break;
++	case INTEL_PIPE_EVENT_PRIMARY_FLIP:
++		pipestat = PLANE_FLIP_DONE_EN;
++		break;
++	case INTEL_PIPE_EVENT_VSYNC:
++		pipestat = VSYNC_EN;
++		break;
++	case INTEL_PIPE_EVENT_DPST:
++		pipestat = DPST_EVENT_EN;
++		break;
++	default:
++		err = -EINVAL;
++		break;
++	}
++
++	if (err)
++		goto out;
++
++	value = REG_READ(vlv_pipe->status_offset);
++
++	if (enabled)
++		/* Enable interrupts */
++		REG_WRITE(vlv_pipe->status_offset, value | pipestat);
++	else
++		/* Disable interrupts */
++		REG_WRITE(vlv_pipe->status_offset, value & (~pipestat));
++out:
++	return err;
++}
++
++
++int intel_adf_set_event(struct intel_pipe *pipe, u16 event, bool enabled)
++{
++	u32 ret = 0;
++	pr_debug("ADF: %s\n", __func__);
++
++	ret = intel_adf_set_pipe_event(pipe, event, enabled);
++	if (ret)
++		pr_err("ADF: %s: Failed to set pipe events\n", __func__);
++
++	return ret;
++}
++
++u32 intel_adf_get_port_events(struct intel_pipe *intel_pipe)
++{
++	bool found = false;
++	u32 val;
++	u32 events = 0;
++	u32 hp_type = 0;
++	u32 hp_status = REG_READ(PORT_HOTPLUG_STAT);
++	enum port port;
++
++	/*
++	 * Allow hot plug status check only if the pipe has registered
++	 * for a hotplug interrupt
++	 */
++	if (!intel_pipe->hp_reqd)
++		return 0;
++
++	port = vlv_get_connected_port(intel_pipe);
++
++	if (port == PORT_INVALID)
++		return 0;
++
++	/* Hot pluggable ports are PORT_B and above */
++	if (hp_status && port) {
++		pr_debug("ADF: %s: Hotplug status = 0x%x\n",
++			__func__, hp_status);
++
++		/*
++		 * Detect port hotplug:
++		 * First check if there is a hotplug.
++		 * Consider long pulse for display detection
++		 * Short pulse as other interrupts
++		 */
++		val = PORT_HOTPLUG_INT_STATUS(port);
++		if (hp_status & val) {
++			hp_type = PORT_HOTPLUG_LONG_PULSE(port);
++			if (hp_status & hp_type) {
++				events |= INTEL_PORT_EVENT_HOTPLUG_DISPLAY;
++				pr_info("ADF: Display hot plug, long pulse\n");
++			} else {
++				events |= INTEL_PORT_EVENT_SHORT;
++				pr_info("ADF: Display hot plug, short pulse\n");
++			}
++			found = true;
++		}
++
++		/* Aux */
++		val = DP_AUX_CHANNEL_INT_STATUS_G4X(port);
++		if (hp_status & val) {
++			events |= INTEL_PORT_EVENT_AUX;
++			pr_debug("ADF: Aux interrupt\n");
++			found = true;
++		}
++
++		/* HDCP Audio */
++		val = PORT_AUDIO_HDCP_REQUEST(port);
++		if (hp_status & val) {
++			events |= INTEL_PORT_EVENT_AUDIO;
++			pr_debug("ADF: Audio HDCP interrupt\n");
++			found = true;
++		}
++
++		/*
++		 * Clear hotplug interrupts, only if found one on this port
++		 * This can belong to some other pipe coming next
++		 */
++		if (found) {
++			REG_WRITE(PORT_HOTPLUG_STAT, hp_status);
++			REG_POSTING_READ(PORT_HOTPLUG_STAT);
++			pr_info("ADF: %s: hp_stat=0x%x\n", __func__,
++				REG_POSTING_READ(PORT_HOTPLUG_STAT));
++		}
++	}
++	return events;
++}
++
++u32 intel_adf_get_pipe_events(struct intel_pipe *pipe)
++{
++	u8 pipe_id = pipe->base.idx;
++	u32 value = 0;
++	u32 events = 0;
++	u32 pipestat = REG_READ(PIPESTAT(pipe_id));
++
++	pr_debug("ADF: %s: PIPESTAT = 0x%x\n", __func__, pipestat);
++
++	/* FIFO under run */
++	if (pipestat & FIFO_UNDERRUN_STAT) {
++		events |= INTEL_PIPE_EVENT_UNDERRUN;
++		value |= FIFO_UNDERRUN_STAT;
++	}
++
++	/* Sprite B Flip done interrupt */
++	if (pipestat & SPRITE2_FLIP_DONE_STAT) {
++		events |= INTEL_PIPE_EVENT_SPRITE2_FLIP;
++		value |= SPRITE2_FLIP_DONE_STAT;
++
++		/* program the pre-calculated ddl value */
++		if (pipe->regs.sp2_ddl) {
++			REG_WRITE_BITS(VLV_DDL(pipe_id), pipe->regs.sp2_ddl,
++					pipe->regs.sp2_ddl_mask);
++			pipe->regs.sp2_ddl = 0;
++		}
++	}
++
++	/* Sprite A Flip done interrupt */
++	if (pipestat & SPRITE1_FLIP_DONE_STAT) {
++		events |= INTEL_PIPE_EVENT_SPRITE1_FLIP;
++		value |= SPRITE2_FLIP_DONE_STAT;
++
++		/* program the pre-calculated ddl value */
++		if (pipe->regs.sp1_ddl) {
++			REG_WRITE_BITS(VLV_DDL(pipe_id), pipe->regs.sp1_ddl,
++					pipe->regs.sp1_ddl_mask);
++			pipe->regs.sp1_ddl = 0;
++		}
++	}
++
++	/* Plane A Flip done interrupt */
++	if (pipestat & PLANE_FLIP_DONE_STAT) {
++		events |= INTEL_PIPE_EVENT_PRIMARY_FLIP;
++		value |= PLANE_FLIP_DONE_STAT;
++
++		/* program the pre-calculated ddl value */
++		if (pipe->regs.pri_ddl) {
++			REG_WRITE_BITS(VLV_DDL(pipe_id), pipe->regs.pri_ddl,
++					pipe->regs.pri_ddl_mask);
++			pipe->regs.pri_ddl = 0;
++		}
++	}
++
++	/* Vsync interrupt */
++	if (pipestat & VSYNC_STAT) {
++		events |= INTEL_PIPE_EVENT_VSYNC;
++		value |= VSYNC_STAT;
++	}
++
++	/* DPST event */
++	if (pipestat & DPST_EVENT_STAT) {
++		events |= INTEL_PIPE_EVENT_DPST;
++		value |= DPST_EVENT_STAT;
++	}
++
++	/* Clear the 1st level interrupt. */
++	REG_WRITE(PIPESTAT(pipe_id), pipestat | value);
++
++	return events;
++}
++
++int intel_adf_get_events(struct intel_pipe *pipe, u32 *events)
++{
++	if (!pipe || !events) {
++		pr_debug("ADF: %s Null input\n", __func__);
++		return -EINVAL;
++	}
++
++	*events = 0;
++
++	/* Check PIPE interrupts */
++	*events |= intel_adf_get_pipe_events(pipe);
++
++	/* Fixme: This should go to handle events */
++	if (*events & INTEL_PIPE_EVENT_VSYNC) {
++		if (++pipe->vsync_counter > VSYNC_COUNT_MAX_MASK)
++			pipe->vsync_counter = 0;
++	}
++
++	/* Check PORT interrupts */
++	*events |= intel_adf_get_port_events(pipe);
++
++	pr_debug("ADF: %s\n", __func__);
++	return 0;
++}
++
++u32 intel_adf_get_supported_events(struct intel_pipe *pipe)
++{
++	pr_debug("ADF: %s\n", __func__);
++
++	/* Todo: Call ecoder's get event for any special request */
++	return INTEL_PIPE_EVENT_VSYNC |
++			INTEL_PORT_EVENT_HOTPLUG_DISPLAY |
++				INTEL_PORT_EVENT_AUX |
++					INTEL_PORT_EVENT_AUDIO;
++}
++
++static void intel_adf_hpd_reset(void)
++{
++	REG_WRITE(PORT_HOTPLUG_EN, 0);
++	REG_WRITE(PORT_HOTPLUG_STAT, REG_READ(PORT_HOTPLUG_STAT));
++}
++
++void intel_adf_hpd_init(struct intel_adf_context *ctx)
++{
++	u8 count = 0;
++	u32 hotplug_en = REG_READ(PORT_HOTPLUG_EN);
++	struct intel_adf_interface *intf;
++	struct intel_pipe *intel_pipe;
++	enum port port;
++
++	/* Clear old values */
++	intel_adf_hpd_reset();
++
++	/*
++	 * Enable a hot plug interrupt only if an encoder has
++	 * requested for it.
++	 */
++	while (count < ctx->n_intfs) {
++		intf = &ctx->intfs[count++];
++		intel_pipe = intf->pipe;
++		if (intel_pipe->hp_reqd) {
++			port = vlv_get_connected_port(intel_pipe);
++			if (port < PORT_A || port > PORT_D)
++				pr_err("ADF: %s Skipping invalid port on pipe(%d)\n",
++					__func__, intel_pipe->base.idx);
++			else {
++				/*
++				 * Extract the port on which encoder is
++				 * connected and enable hot plug only on
++				 * that port
++				 */
++				hotplug_en |= PORT_HOTPLUG_INT_EN(port);
++				pr_info("ADF: %s: Selecting port %d for hotplug\n",
++					__func__, port);
++			}
++		}
++	}
++
++	if (hotplug_en) {
++		hotplug_en |= CRT_HOTPLUG_ACTIVATION_PERIOD_64;
++		hotplug_en &= ~CRT_HOTPLUG_VOLTAGE_COMPARE_MASK;
++		hotplug_en |= CRT_HOTPLUG_VOLTAGE_COMPARE_50;
++		REG_WRITE(PORT_HOTPLUG_EN, hotplug_en);
++	}
++}
+diff --git a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+index 0cbbd77..d947668 100644
+--- a/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
++++ b/drivers/video/adf/intel/core/vlv/vlv_pipeline.c
+@@ -25,6 +25,11 @@
+ #include <drm/drmP.h>
+ #include <drm/i915_drm.h>
+ 
++enum port vlv_get_connected_port(struct intel_pipe *intel_pipe)
++{
++	return PORT_INVALID;
++}
++
+ bool vlv_wait_for_vblank(struct intel_pipeline *pipeline)
+ {
+ 	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
+@@ -101,7 +106,6 @@ u32 vlv_dsi_prepare_on(struct intel_pipeline *pipeline,
+ 		pll->config = pipeline->params.dsi.dsi_config;
+ 
+ 		vlv_dsi_pll_enable(pll, mode);
+-
+ 		err = vlv_pipe_wait_for_pll_lock(pipe);
+ 		if (err)
+ 			goto out;
+@@ -452,29 +456,6 @@ int vlv_cmd_dpi_send_cmd(struct intel_pipeline *pipeline, u32 cmd, bool hs)
+ 	return err;
+ }
+ 
+-u32 vlv_get_event(struct intel_pipeline *pipeline, u32 *event)
+-{
+-	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
+-	struct vlv_pipe *pipe = &disp->pipe;
+-	struct vlv_pm *pm = &disp->pm;
+-	u32 ret = 0;
+-
+-	ret = vlv_pipe_get_event(pipe, event);
+-
+-	if (ret == 0)
+-		ret = vlv_pm_flush_values(pm, *event);
+-
+-	return ret;
+-}
+-
+-u32 vlv_set_event(struct intel_pipeline *pipeline, u32 event, bool enabled)
+-{
+-	struct vlv_pipeline *disp = to_vlv_pipeline(pipeline);
+-	struct vlv_pipe *pipe = &disp->pipe;
+-
+-	return vlv_pipe_set_event(pipe, event, enabled);
+-}
+-
+ bool vlv_is_plane_enabled(struct intel_pipeline *pipeline,
+ 		struct intel_plane *plane)
+ {
+diff --git a/drivers/video/adf/intel/include/core/intel_dc_config.h b/drivers/video/adf/intel/include/core/intel_dc_config.h
+index e1d4469..f627bd7 100644
+--- a/drivers/video/adf/intel/include/core/intel_dc_config.h
++++ b/drivers/video/adf/intel/include/core/intel_dc_config.h
+@@ -35,6 +35,8 @@
+ #define DVO_PORT_DSI_C			23
+ #define DVO_PORT_DSI_D			24
+ 
++#define CHV_MAX_PLANES VLV_MAX_PLANES
++
+ struct intel_dc_component;
+ struct intel_plane;
+ struct intel_pipe;
+@@ -42,6 +44,8 @@ struct intel_dc_memory;
+ struct intel_dc_power_ops;
+ struct intel_pipeline;
+ 
++#define VSYNC_COUNT_MAX_MASK 0xffffff
++
+ enum gen_id {
+ 	gen_invalid = 0,
+ 	/*
+@@ -67,6 +71,7 @@ enum port {
+ 	PORT_B,
+ 	PORT_C,
+ 	PORT_D,
++	PORT_INVALID,
+ };
+ 
+ enum pll {
+@@ -268,6 +273,16 @@ enum intel_pipe_event {
+ 	INTEL_PIPE_EVENT_DPST = 0x400,
+ };
+ 
++enum intel_port_event {
++	INTEL_PORT_EVENT_HOTPLUG_DISPLAY = (1 << 11),
++	INTEL_PORT_EVENT_AUDIO = (1 << 12),
++	INTEL_PORT_EVENT_HOTPLUG_CRT = (1 << 13),
++	INTEL_PORT_EVENT_HOTPLUG_TV = (1 << 14),
++	INTEL_PORT_EVENT_AUX = (1 << 15),
++	INTEL_PORT_EVENT_SDVO = (1 << 16),
++	INTEL_PORT_EVENT_SHORT = (1 << 17)
++};
++
+ /**
+  * struct intel_pipe_ops - Intel display controller pipe operations
+  *
+@@ -354,6 +369,7 @@ struct intel_pipe {
+ 	bool dpst_enabled;
+ 	struct intel_pipeline *pipeline;
+ 	u32 vsync_counter;
++	bool hp_reqd;
+ 	/*
+ 	 * Store the computed reg values in this to apply in
+ 	 * one shot later in flip calls
+@@ -483,4 +499,9 @@ extern struct intel_dc_config *intel_adf_get_dc_config(
+ 	struct pci_dev *pdev, const u32 id);
+ extern void intel_adf_destroy_config(struct intel_dc_config *config);
+ 
++/* From intel_adf_events.c */
++extern int intel_adf_handle_events(struct intel_pipe *pipe, u32 events);
++extern int intel_adf_set_event(struct intel_pipe *pipe, u16 event,
++		bool enabled);
++extern int intel_adf_get_events(struct intel_pipe *pipe, u32 *events);
+ #endif /* INTEL_DC_CONFIG_H_ */
+diff --git a/drivers/video/adf/intel/include/core/intel_platform_config.h b/drivers/video/adf/intel/include/core/intel_platform_config.h
+index ffeefdc..5c0acd3 100644
+--- a/drivers/video/adf/intel/include/core/intel_platform_config.h
++++ b/drivers/video/adf/intel/include/core/intel_platform_config.h
+@@ -41,8 +41,6 @@ u32 vlv_dpst_irq_handler(struct intel_pipeline *pipeline);
+ u32 vlv_num_planes_enabled(struct intel_pipeline *pipeline);
+ bool vlv_can_be_disabled(struct intel_pipeline *pipeline);
+ bool vlv_update_maxfifo_status(struct intel_pipeline *pipeline, bool enable);
+-u32 vlv_set_event(struct intel_pipeline *pipeline, u32 event, bool enabled);
+-u32 vlv_get_event(struct intel_pipeline *pipeline, u32 *event);
+ int vlv_enable_plane(struct intel_pipeline *pipeline,
+ 		struct intel_plane *plane);
+ int vlv_disable_plane(struct intel_pipeline *pipeline,
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+index 9a8b5134..a310c2d 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_config.h
+@@ -150,6 +150,7 @@ bool vlv_intf_screen_connected(struct intel_pipeline *pipeline);
+ u32 vlv_intf_vsync_counter(struct intel_pipeline *pipeline, u32 interval);
+ 
+ /* vlv_modeset */
++extern enum port vlv_get_connected_port(struct intel_pipe *intel_pipe);
+ extern bool vlv_wait_for_vblank(struct intel_pipeline *pipeline);
+ extern void vlv_evade_vblank(struct intel_pipeline *pipeline,
+ 			struct drm_mode_modeinfo *mode, bool *wait_for_vblank);
+@@ -167,9 +168,6 @@ extern bool vlv_is_vid_mode(struct intel_pipeline *pipeline);
+ extern bool vlv_can_be_disabled(struct intel_pipeline *pipeline);
+ extern bool vlv_update_maxfifo_status(struct intel_pipeline *pipeline,
+ 		bool enable);
+-extern u32 vlv_get_event(struct intel_pipeline *pipeline, u32 *event);
+-extern u32 vlv_set_event(struct intel_pipeline *pipeline, u32 event,
+-		bool enabled);
+ extern int vlv_cmd_dpi_send_cmd(struct intel_pipeline *pipeline, u32 cmd,
+ 		bool hs);
+ extern int vlv_cmd_vc_generic_read(struct intel_pipeline *pipeline,
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+index 03ab284..edcd761 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_dc_regs.h
+@@ -2091,6 +2091,8 @@
+ #define   PORTB_HOTPLUG_INT_EN			(1 << 29)
+ #define   PORTC_HOTPLUG_INT_EN			(1 << 28)
+ #define   PORTD_HOTPLUG_INT_EN			(1 << 27)
++#define PORT_HOTPLUG_INT_EN(port) (PORTB_HOTPLUG_INT_EN >> \
++						(port - PORT_B))
+ #define   SDVOB_HOTPLUG_INT_EN			(1 << 26)
+ #define   SDVOC_HOTPLUG_INT_EN			(1 << 25)
+ #define   TV_HOTPLUG_INT_EN			(1 << 18)
+@@ -2132,9 +2134,23 @@
+ #define   PORTD_HOTPLUG_LIVE_STATUS_VLV		(1 << 27)
+ #define   PORTC_HOTPLUG_LIVE_STATUS_VLV		(1 << 28)
+ #define   PORTB_HOTPLUG_LIVE_STATUS_VLV		(1 << 29)
++#define PORT_HOTPLUG_LIVE_STATUS(port) (PORTB_HOTPLUG_LIVE_STATUS_VLV \
++							>> (port - PORT_B))
++
+ #define   PORTD_HOTPLUG_INT_STATUS		(3 << 21)
+ #define   PORTC_HOTPLUG_INT_STATUS		(3 << 19)
+ #define   PORTB_HOTPLUG_INT_STATUS		(3 << 17)
++#define PORT_HOTPLUG_INT_STATUS(port) (PORTB_HOTPLUG_INT_STATUS \
++						<< (2 * (port - PORT_B)))
++#define PORT_HOTPLUG_INT_STATUS_ALL (PORTB_HOTPLUG_INT_STATUS \
++		| PORTC_HOTPLUG_INT_STATUS | PORTD_HOTPLUG_INT_STATUS)
++
++#define PORTD_HOTPLUG_LONG_PULSE		(1 << 22)
++#define PORTC_HOTPLUG_LONG_PULSE		(1 << 20)
++#define PORTB_HOTPLUG_LONG_PULSE		(1 << 18)
++#define PORT_HOTPLUG_LONG_PULSE(port) ( \
++		PORTB_HOTPLUG_LONG_PULSE << (2 * (port - PORT_B)))
++
+ /* CRT/TV common between gen3+ */
+ #define   CRT_HOTPLUG_INT_STATUS		(1 << 11)
+ #define   TV_HOTPLUG_INT_STATUS			(1 << 10)
+@@ -2145,7 +2161,17 @@
+ #define   DP_AUX_CHANNEL_D_INT_STATUS_G4X	(1 << 6)
+ #define   DP_AUX_CHANNEL_C_INT_STATUS_G4X	(1 << 5)
+ #define   DP_AUX_CHANNEL_B_INT_STATUS_G4X	(1 << 4)
++#define   DP_AUX_CHANNEL_INT_STATUS_G4X(port) ( \
++		DP_AUX_CHANNEL_B_INT_STATUS_G4X << (port - PORT_B))
+ #define   DP_AUX_CHANNEL_MASK_INT_STATUS_G4X	(7 << 4)
++#define   PIPEA_AUDIO_HDCP_REQUEST		(1 << 16)
++#define   PIPEB_AUDIO_HDCP_REQUEST		(1 << 0)
++#define   PIPE_AUDIO_HDCP_REQUEST(pipe) \
++				(PIPEA_AUDIO_HDCP_REQUEST >> (16 * pipe))
++#define   PORTB_AUDIO_HDCP_REQUEST		(1 << 15)
++#define   PORTC_AUDIO_HDCP_REQUEST		(1 << 14)
++#define   PORT_AUDIO_HDCP_REQUEST(port) \
++				(PORTB_AUDIO_HDCP_REQUEST >> (port - PORT_B))
+ 
+ /* SDVO is different across gen3/4 */
+ #define   SDVOC_HOTPLUG_INT_STATUS_G4X		(1 << 3)
+diff --git a/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h b/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h
+index 6172a54..63be89e 100644
+--- a/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h
++++ b/drivers/video/adf/intel/include/core/vlv/vlv_pipe.h
+@@ -14,7 +14,6 @@
+ #ifndef _VLV_PIPE_H_
+ #define _VLV_PIPE_H_
+ 
+-#include <core/vlv/vlv_dc_config.h>
+ #include <core/intel_dc_config.h>
+ 
+ struct vlv_pipe {
+diff --git a/drivers/video/adf/intel/include/intel_adf.h b/drivers/video/adf/intel/include/intel_adf.h
+index 99118ad..789adfe 100644
+--- a/drivers/video/adf/intel/include/intel_adf.h
++++ b/drivers/video/adf/intel/include/intel_adf.h
+@@ -44,11 +44,22 @@ struct intel_adf_context {
+ #ifdef CONFIG_BACKLIGHT_CLASS_DEVICE
+ 	struct backlight_device *bl_dev;
+ #endif
++	/*
++	 * hotplug work and work queues, one for each long pulse
++	 * and short pulse interrupts.
++	 */
++	struct workqueue_struct *hotplug_wq;
++	struct work_struct hotplug_work;
++	struct workqueue_struct *shortpulse_wq;
++	struct work_struct shortpulse_work;
+ };
+ 
++extern const struct intel_adf_context *g_adf_context;
+ extern struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev);
+ extern void intel_adf_context_destroy(struct intel_adf_context *ctx);
+ extern int intel_adf_context_on_event(void);
+ extern int intel_adf_map_dma_to_flip(unsigned long args);
+ extern int intel_adf_unmap_dma_to_flip(unsigned long args);
++extern void intel_adf_hotplug_work_function(struct work_struct *work);
++extern void intel_adf_hpd_init(struct intel_adf_context *ctx);
+ #endif /* INTEL_ADF_H_ */
+diff --git a/drivers/video/adf/intel/intel_adf.c b/drivers/video/adf/intel/intel_adf.c
+index c99df0c..65290ff 100644
+--- a/drivers/video/adf/intel/intel_adf.c
++++ b/drivers/video/adf/intel/intel_adf.c
+@@ -14,7 +14,38 @@
+ #include <drm/i915_adf.h>
+ #include <intel_adf.h>
+ 
+-static const struct intel_adf_context *g_adf_context;
++const struct intel_adf_context *g_adf_context;
++
++static int init_hotplug_handling(struct intel_adf_context *ctx)
++{
++
++	/* Enable hotplug */
++	intel_adf_hpd_init(ctx);
++
++	/* Create a wq dedicated to hotplug */
++	ctx->hotplug_wq = create_singlethread_workqueue("hotplug-bh");
++	if (!ctx->hotplug_wq) {
++		pr_err("ADF: %s: Cant create hotplug work queue\n", __func__);
++		return -ENOMEM;
++	}
++
++	/* Init work */
++	INIT_WORK(&ctx->hotplug_work, intel_adf_hotplug_work_function);
++	pr_debug("ADF: %s: Hot plug work initialized\n", __func__);
++
++	/* Create another for short pulse events (DP) */
++	ctx->shortpulse_wq = create_singlethread_workqueue("short-pulse-bh");
++	if (!ctx->shortpulse_wq) {
++		pr_err("ADF: %s: Cant create short pulse queue\n", __func__);
++		return -ENOMEM;
++	}
++
++	/* Init work */
++	INIT_WORK(&ctx->shortpulse_work, intel_adf_hotplug_work_function);
++	pr_debug("ADF: %s: Hot plug work initialized\n", __func__);
++
++	return 0;
++}
+ 
+ static struct intel_adf_interface *create_interfaces(
+ 	struct intel_adf_device *dev,
+@@ -303,6 +334,14 @@ struct intel_adf_context *intel_adf_context_create(struct pci_dev *pdev)
+ 	ctx->intfs = intfs;
+ 	ctx->n_intfs = n_intfs;
+ 
++	/* Init hotplug only after context loading */
++	err = init_hotplug_handling(ctx);
++	if (err) {
++		dev_err(&pdev->dev, "%s: failed to init interrupt handlers\n",
++				__func__);
++		goto err;
++	}
++
+ 	g_adf_context = ctx;
+ 
+ #if defined(CONFIG_ADF_FBDEV) && defined(CONFIG_ADF_INTEL_FBDEV)
+diff --git a/drivers/video/adf/intel/intel_adf_interface.c b/drivers/video/adf/intel/intel_adf_interface.c
+index b48ea0d..7f0de80 100644
+--- a/drivers/video/adf/intel/intel_adf_interface.c
++++ b/drivers/video/adf/intel/intel_adf_interface.c
+@@ -48,7 +48,8 @@ static u32 to_intel_pipe_event(enum adf_event_type event)
+ 		break;
+ 	case ADF_EVENT_HOTPLUG:
+ 		pipe_event = (INTEL_PIPE_EVENT_HOTPLUG_CONNECTED |
+-			INTEL_PIPE_EVENT_HOTPLUG_DISCONNECTED);
++			INTEL_PIPE_EVENT_HOTPLUG_DISCONNECTED |
++				INTEL_PORT_EVENT_HOTPLUG_DISPLAY);
+ 		break;
+ 	default:
+ 		pipe_event = INTEL_PIPE_EVENT_UNKNOWN;
+@@ -329,13 +330,15 @@ static void handle_hotplug_disconnected(struct intel_adf_interface *intf)
+ 
+ int intel_adf_interface_handle_event(struct intel_adf_interface *intf)
+ {
+-	struct intel_pipe *pipe = intf->pipe;
++	int ret = 0;
+ 	u32 events = 0;
++	struct intel_pipe *pipe = intf->pipe;
+ 
+ 	if (!pipe || !pipe->ops || !pipe->ops->get_events)
+ 		return IRQ_NONE;
+ 
+-	pipe->ops->get_events(pipe, &events);
++	if (pipe->ops->get_events)
++		pipe->ops->get_events(pipe, &events);
+ 
+ 	if (!events)
+ 		return IRQ_NONE;
+@@ -355,8 +358,15 @@ int intel_adf_interface_handle_event(struct intel_adf_interface *intf)
+ 		events &= ~INTEL_PIPE_EVENT_HOTPLUG_DISCONNECTED;
+ 	}
+ 
+-	if (events && INTEL_PIPE_EVENT_DPST)
+-		pipe->ops->dpst_irq_handler(pipe);
++	if (events && INTEL_PIPE_EVENT_DPST) {
++		if (pipe->ops->dpst_irq_handler) {
++			ret = pipe->ops->dpst_irq_handler(pipe);
++			if (ret) {
++				pr_err("ADF: failed to handle dpst interrupts\n");
++				return IRQ_NONE;
++			}
++		}
++	}
+ 
+ 	if (events && pipe->ops->handle_events)
+ 		pipe->ops->handle_events(pipe, events);
+-- 
+1.7.9.5
+

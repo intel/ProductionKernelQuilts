@@ -1,0 +1,153 @@
+From 693a30a8e58b7b9a96c1792c625988c0eaf56570 Mon Sep 17 00:00:00 2001
+From: Jeff Vander Stoep <jeffv@google.com>
+Date: Thu, 22 Oct 2015 09:30:40 -0700
+Subject: [PATCH 642/645] selinux: Android kernel compatibility with M
+ userspace
+
+NOT intended for new Android devices - this commit is unnecessary
+for a target device that does not have a previous M variant.
+
+DO NOT upstream. Android only.
+
+Motivation:
+
+This commit mitigates a mismatch between selinux kernel and
+selinux userspace. The selinux ioctl white-listing binary policy
+format that was accepted into Android M differs slightly from what
+was later accepted into the upstream kernel. This leaves Android
+master branch kernels incompatible with Android M releases. This
+patch restores backwards compatibility. This is important because:
+
+1. kernels may be updated on a different cycle than the rest of the
+   OS e.g. security patching.
+2. Android M bringup may still be ongoing for some devices. The
+   same kernel should work for both M and master.
+
+Backwards compatibility is achieved by checking for an Android M
+policy characteristic during initial policy read and converting to
+upstream policy format. The inverse conversion is done for policy
+write as required for CTS testing.
+
+Bug: 22846070
+Change-Id: I2f1ee2eee402f37cf3c9df9f9e03c1b9ddec1929
+Signed-off-by: Jeff Vander Stoep <jeffv@google.com>
+---
+ security/selinux/ss/avtab.c | 69 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 61 insertions(+), 8 deletions(-)
+
+diff --git a/security/selinux/ss/avtab.c b/security/selinux/ss/avtab.c
+index a6bef63..640c16b 100644
+--- a/security/selinux/ss/avtab.c
++++ b/security/selinux/ss/avtab.c
+@@ -335,6 +335,32 @@ void avtab_hash_eval(struct avtab *h, char *tag)
+ 	       chain2_len_sum);
+ }
+ 
++/*
++ * extended permissions compatibility. Make ToT Android kernels compatible
++ * with Android M releases
++ */
++#define AVTAB_OPTYPE_ALLOWED	0x1000
++#define AVTAB_OPTYPE_AUDITALLOW	0x2000
++#define AVTAB_OPTYPE_DONTAUDIT	0x4000
++#define AVTAB_OPTYPE		(AVTAB_OPTYPE_ALLOWED | \
++				AVTAB_OPTYPE_AUDITALLOW | \
++				AVTAB_OPTYPE_DONTAUDIT)
++#define AVTAB_XPERMS_OPTYPE	4
++
++#define avtab_xperms_to_optype(x) (x << AVTAB_XPERMS_OPTYPE)
++#define avtab_optype_to_xperms(x) (x >> AVTAB_XPERMS_OPTYPE)
++
++static unsigned int avtab_android_m_compat;
++
++static void avtab_android_m_compat_set(void)
++{
++	if (!avtab_android_m_compat) {
++		pr_info("SELinux:  Android master kernel running Android"
++				" M policy in compatibility mode.\n");
++		avtab_android_m_compat = 1;
++	}
++}
++
+ static uint16_t spec_order[] = {
+ 	AVTAB_ALLOWED,
+ 	AVTAB_AUDITDENY,
+@@ -359,6 +385,7 @@ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
+ 	struct avtab_datum datum;
+ 	struct avtab_extended_perms xperms;
+ 	__le32 buf32[ARRAY_SIZE(xperms.perms.p)];
++	unsigned int android_m_compat_optype = 0;
+ 	int i, rc;
+ 	unsigned set;
+ 
+@@ -449,6 +476,13 @@ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
+ 	key.target_class = le16_to_cpu(buf16[items++]);
+ 	key.specified = le16_to_cpu(buf16[items++]);
+ 
++	if ((key.specified & AVTAB_OPTYPE) &&
++			(vers == POLICYDB_VERSION_XPERMS_IOCTL)) {
++		key.specified = avtab_optype_to_xperms(key.specified);
++		android_m_compat_optype = 1;
++		avtab_android_m_compat_set();
++	}
++
+ 	if (!policydb_type_isvalid(pol, key.source_type) ||
+ 	    !policydb_type_isvalid(pol, key.target_type) ||
+ 	    !policydb_class_isvalid(pol, key.target_class)) {
+@@ -479,10 +513,22 @@ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
+ 			printk(KERN_ERR "SELinux: avtab: truncated entry\n");
+ 			return rc;
+ 		}
+-		rc = next_entry(&xperms.driver, fp, sizeof(u8));
+-		if (rc) {
+-			printk(KERN_ERR "SELinux: avtab: truncated entry\n");
+-			return rc;
++		if (avtab_android_m_compat ||
++			    ((xperms.specified != AVTAB_XPERMS_IOCTLFUNCTION) &&
++			    (xperms.specified != AVTAB_XPERMS_IOCTLDRIVER) &&
++			    (vers == POLICYDB_VERSION_XPERMS_IOCTL))) {
++			xperms.driver = xperms.specified;
++			if (android_m_compat_optype)
++				xperms.specified = AVTAB_XPERMS_IOCTLDRIVER;
++			else
++				xperms.specified = AVTAB_XPERMS_IOCTLFUNCTION;
++			avtab_android_m_compat_set();
++		} else {
++			rc = next_entry(&xperms.driver, fp, sizeof(u8));
++			if (rc) {
++				printk(KERN_ERR "SELinux: avtab: truncated entry\n");
++				return rc;
++			}
+ 		}
+ 		rc = next_entry(buf32, fp, sizeof(u32)*ARRAY_SIZE(xperms.perms.p));
+ 		if (rc) {
+@@ -568,15 +614,22 @@ int avtab_write_item(struct policydb *p, struct avtab_node *cur, void *fp)
+ 	buf16[0] = cpu_to_le16(cur->key.source_type);
+ 	buf16[1] = cpu_to_le16(cur->key.target_type);
+ 	buf16[2] = cpu_to_le16(cur->key.target_class);
+-	buf16[3] = cpu_to_le16(cur->key.specified);
++	if (avtab_android_m_compat && (cur->key.specified & AVTAB_XPERMS) &&
++		    (cur->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLDRIVER))
++		buf16[3] = cpu_to_le16(avtab_xperms_to_optype(cur->key.specified));
++	else
++		buf16[3] = cpu_to_le16(cur->key.specified);
+ 	rc = put_entry(buf16, sizeof(u16), 4, fp);
+ 	if (rc)
+ 		return rc;
+ 
+ 	if (cur->key.specified & AVTAB_XPERMS) {
+-		rc = put_entry(&cur->datum.u.xperms->specified, sizeof(u8), 1, fp);
+-		if (rc)
+-			return rc;
++		if (avtab_android_m_compat == 0) {
++			rc = put_entry(&cur->datum.u.xperms->specified,
++					sizeof(u8), 1, fp);
++			if (rc)
++				return rc;
++		}
+ 		rc = put_entry(&cur->datum.u.xperms->driver, sizeof(u8), 1, fp);
+ 		if (rc)
+ 			return rc;
+-- 
+1.9.1
+

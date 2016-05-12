@@ -1,0 +1,386 @@
+From 9463770f9b6ae8c58219b95961e7a04194cb297b Mon Sep 17 00:00:00 2001
+Message-Id: <9463770f9b6ae8c58219b95961e7a04194cb297b.1424979244.git.feitong.yi@intel.com>
+In-Reply-To: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+References: <d8466aca83b11ab8b0870e775536306782d73e9f.1424979244.git.feitong.yi@intel.com>
+From: Jon Bloomfield <jon.bloomfield@intel.com>
+Date: Thu, 10 Jul 2014 14:38:16 +0100
+Subject: [PATCH 27/28] FOR_UPSTREAM [VPG]: Introduce extended ioctl interface
+
+Adds a new extended ioctl mechanism, allowing several discrete
+ioctls to share a single device ioctl.
+
+Extended ioctls are defined similarly to the standard ioctls:
+	In include/uapi/drm/i915_drm.h:
+		struct myfunc_iface
+		{
+			...
+		};
+
+		#define DRM_I915_EXT_MYFUNC 0x1 /* Any value from 0x00-0xFF */
+
+		#define DRM_IOCTL_I915_EXT_MYFUNC \
+			DRM_IOWR(DRM_I915_EXT_MYFUNC, struct myfunc_iface)
+
+	In drivers/gpu/drm/i915/i915_ext_ioctl.h:
+		int i915_myfunc(struct drm_device *dev, void *data,
+				struct drm_file *file_priv);
+
+	In drivers/gpu/drm/i915/i915_ext_ioctl.c:
+		const struct drm_ioctl_desc i915_ext_ioctls[] = {
+		    ...
+
+		    DRM_IOCTL_DEF_DRV(I915_EXT_MYFUNC, i915_myfunc,
+			DRM_UNLOCKED|DRM_CONTROL_ALLOW|DRM_RENDER_ALLOW),
+		    ...
+		 };
+
+The interface allows for multiple groups of extended ioctls, by providing a
+table field. This could be used in the future to select from one of many
+extended ioctl tables. Currently the table is fixed at 0, and only a single
+table (i915_ext_ioctls) is permitted.
+
+v2: Use u64 instead of void * for args to avoid 32-bit/64-bit
+    userspace/kernelspace issues.
+
+v3: Removed checkpatch warnings (Whitespace/error string split over two lines)
+
+Issue: VIZ-3781
+Change-Id: If6b1c3e05bb8d347c8ae1e03edad43b6fa8c86a4
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/drm_drv.c             |    2 +-
+ drivers/gpu/drm/i915/Makefile         |    3 +
+ drivers/gpu/drm/i915/i915_dma.c       |    9 ++
+ drivers/gpu/drm/i915/i915_ext_ioctl.c |  160 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_ext_ioctl.h |   36 ++++++++
+ include/drm/drmP.h                    |    1 +
+ include/uapi/drm/i915_drm.h           |   23 +++++
+ 7 files changed, 233 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/i915/i915_ext_ioctl.c
+ create mode 100644 drivers/gpu/drm/i915/i915_ext_ioctl.h
+
+diff --git a/drivers/gpu/drm/drm_drv.c b/drivers/gpu/drm/drm_drv.c
+index 718df97..5e88fad 100644
+--- a/drivers/gpu/drm/drm_drv.c
++++ b/drivers/gpu/drm/drm_drv.c
+@@ -296,7 +296,7 @@ static int drm_version(struct drm_device *dev, void *data,
+  * indicated permissions. If so, returns zero. Otherwise returns an
+  * error code suitable for ioctl return.
+  */
+-static int drm_ioctl_permit(u32 flags, struct drm_file *file_priv)
++int drm_ioctl_permit(u32 flags, struct drm_file *file_priv)
+ {
+ 	/* ROOT_ONLY is only for CAP_SYS_ADMIN */
+ 	if (unlikely((flags & DRM_ROOT_ONLY) && !capable(CAP_SYS_ADMIN)))
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index 812ab03..18531b7 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -84,6 +84,9 @@ i915-y += dvo_ch7017.o \
+ i915-y += i915_dma.o \
+ 	  i915_ums.o
+ 
++# Extended ioctl interface
++i915-y += i915_ext_ioctl.o
++
+ obj-$(CONFIG_DRM_I915)  += i915.o
+ 
+ obj-$(CONFIG_DRM_I915_SYNC)  += intel_sync.o
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index c4e6b96..b2ae901 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -49,6 +49,7 @@
+ #include <linux/pm.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/oom.h>
++#include "i915_ext_ioctl.h"
+ 
+ #define LP_RING(d) (&((struct drm_i915_private *)(d))->ring[RCS])
+ 
+@@ -2196,6 +2197,14 @@ const struct drm_ioctl_desc i915_ioctls[] = {
+ 							DRM_AUTH|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF_DRV(I915_CMD_PARSER_APPEND, i915_cmd_parser_append_ioctl,
+ 			  DRM_UNLOCKED|DRM_ROOT_ONLY),
++
++/*
++ * Extended ioctl layers extra ioctls into a single master ioctl
++ * Must allow full access to this ioctl - The i915_extended_ioctl
++ * handler will apply appropriate tests for the underlying ioctl
++*/
++	DRM_IOCTL_DEF_DRV(I915_EXT_IOCTL, i915_extended_ioctl,
++			  DRM_UNLOCKED|DRM_CONTROL_ALLOW|DRM_RENDER_ALLOW),
+ };
+ 
+ int i915_max_ioctl = ARRAY_SIZE(i915_ioctls);
+diff --git a/drivers/gpu/drm/i915/i915_ext_ioctl.c b/drivers/gpu/drm/i915/i915_ext_ioctl.c
+new file mode 100644
+index 0000000..03526db
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_ext_ioctl.c
+@@ -0,0 +1,160 @@
++/*
++ * Copyright © 2014 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Authors:
++ *    Jon Bloomfield <jon.bloomfield@intel.com>
++ *
++ */
++#include <drm/drmP.h>
++#include <drm/i915_drm.h>
++#include "i915_drv.h"
++#include "i915_ext_ioctl.h"
++
++const struct drm_ioctl_desc i915_ext_ioctls[];
++int i915_max_ext_ioctl;
++
++int i915_extended_ioctl(struct drm_device *dev, void *data,
++			       struct drm_file *file_priv)
++{
++	struct i915_ext_ioctl_data *args = data;
++	const struct drm_ioctl_desc *ioctl = NULL;
++	drm_ioctl_t *func;
++	unsigned int cmd = args->sub_cmd;
++	void __user *arg = to_user_ptr(args->args_ptr);
++	unsigned int nr = DRM_IOCTL_NR(cmd);
++	int retcode = -EINVAL;
++	char stack_kdata[128];
++	char *kdata = NULL;
++	unsigned int usize, asize;
++
++	DRM_DEBUG("sub_nr=%u, table=%u, available ext_ioctls=%d\n",
++			nr,
++			(unsigned int)args->table,
++			i915_max_ext_ioctl);
++
++	/* table is reserved for future expansion, and must be 0 */
++	if (args->table > 0) {
++		DRM_ERROR("table range error\n");
++		goto err_i1;
++	} else if (nr >= i915_max_ext_ioctl) {
++		DRM_ERROR("sub_nr range error\n");
++		goto err_i1;
++	} else {
++		u32 drv_size;
++		DRM_DEBUG("sub_nr is in range\n");
++
++		ioctl = &i915_ext_ioctls[nr];
++		drv_size = _IOC_SIZE(ioctl->cmd_drv);
++		usize = asize = _IOC_SIZE(cmd);
++		if (drv_size > asize)
++			asize = drv_size;
++
++		cmd = ioctl->cmd_drv;
++	}
++
++	DRM_DEBUG("pid=%d, dev=0x%lx, auth=%d, %s\n",
++		task_pid_nr(current),
++		(long)old_encode_dev(file_priv->minor->kdev->devt),
++		file_priv->authenticated, ioctl->name);
++
++	/* Do not trust userspace, use our own definition */
++	func = ioctl->func;
++
++	if (unlikely(!func)) {
++		DRM_DEBUG("no function\n");
++		retcode = -EINVAL;
++		goto err_i1;
++	}
++
++	retcode = drm_ioctl_permit(ioctl->flags, file_priv);
++	if (unlikely(retcode))
++		goto err_i1;
++
++	if (cmd & (IOC_IN | IOC_OUT)) {
++		if (asize <= sizeof(stack_kdata)) {
++			kdata = stack_kdata;
++		} else {
++			kdata = kmalloc(asize, GFP_KERNEL);
++			if (!kdata) {
++				DRM_ERROR("nomem\n");
++				retcode = -ENOMEM;
++				goto err_i1;
++			}
++		}
++		if (asize > usize)
++			memset(kdata + usize, 0, asize - usize);
++	}
++
++	if (cmd & IOC_IN) {
++		if (copy_from_user(kdata, arg, usize) != 0) {
++			DRM_ERROR("copy in failed\n");
++			retcode = -EFAULT;
++			goto err_i1;
++		}
++	} else
++		memset(kdata, 0, usize);
++
++	if (ioctl->flags & DRM_UNLOCKED) {
++		retcode = func(dev, kdata, file_priv);
++	} else {
++		mutex_lock(&drm_global_mutex);
++		retcode = func(dev, kdata, file_priv);
++		mutex_unlock(&drm_global_mutex);
++	}
++	DRM_DEBUG("sub-func returned %d\n", retcode);
++
++	if (cmd & IOC_OUT) {
++		if (copy_to_user(arg, kdata, usize) != 0) {
++			DRM_ERROR("copy out failed\n");
++			retcode = -EFAULT;
++		} else
++			DRM_DEBUG("copy-out succeeded\n");
++	}
++
++
++err_i1:
++	if (!ioctl) {
++		DRM_ERROR("%s: pid=%d, dev=0x%lx, auth=%d, cmd=0x%x, nr=0x%x\n",
++			  "invalid ioctl",
++			  task_pid_nr(current),
++			  (long)old_encode_dev(file_priv->minor->kdev->devt),
++			  file_priv->authenticated, cmd, nr);
++	}
++
++	if (kdata != stack_kdata)
++		kfree(kdata);
++	if (retcode)
++		DRM_ERROR("ret = %d\n", retcode);
++	return retcode;
++}
++
++/*
++ * ----------------------------------------------------------------------------
++ * Extended ioctl interface table
++ * Format is identical to the standard ioctls
++ * ----------------------------------------------------------------------------
++ */
++
++const struct drm_ioctl_desc i915_ext_ioctls[] = {
++};
++
++int i915_max_ext_ioctl = ARRAY_SIZE(i915_ext_ioctls);
+diff --git a/drivers/gpu/drm/i915/i915_ext_ioctl.h b/drivers/gpu/drm/i915/i915_ext_ioctl.h
+new file mode 100644
+index 0000000..158fa7a
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_ext_ioctl.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright © 2014 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Authors:
++ *    Jon Bloomfield <jon.bloomfield@intel.com>
++ *
++ */
++
++#ifndef _I915_EXT_IOCTL_H_
++#define _I915_EXT_IOCTL_H_
++
++#include <drm/drmP.h>
++#include <drm/i915_drm.h>
++
++extern int i915_extended_ioctl(struct drm_device *dev, void *data,
++			       struct drm_file *file_priv);
++#endif
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index b068a0d..a270ca6 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -1218,6 +1218,7 @@ static inline bool drm_is_primary_client(const struct drm_file *file_priv)
+ /*@{*/
+ 
+ 				/* Driver support (drm_drv.h) */
++extern int drm_ioctl_permit(u32 flags, struct drm_file *file_priv);
+ extern long drm_ioctl(struct file *filp,
+ 		      unsigned int cmd, unsigned long arg);
+ extern long drm_compat_ioctl(struct file *filp,
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index c2975c5..11f1509 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -211,6 +211,21 @@ struct csc_coeff {
+ 	unsigned int csc_mode;
+ };
+ 
++struct i915_ext_ioctl_data {
++	u32 sub_cmd;	/* Extended ioctl to call */
++	u8  table;	/* Reserved, must be zero */
++	u8  pad1;	/* Alignment pad */
++	u16 pad2;	/* Alignment pad */
++
++	/*
++	 * User-space pointer could be 32-bits or 64-bits
++	 * so use u64 to guarantee compatibility with 64-bit kernels
++	 * This obviates the need to provide both a compat_ioctl and standard
++	 * ioctl for this interface
++	 */
++	u64 args_ptr;
++};
++
+ /* due to userspace building against these headers we need some compat here */
+ #define planeA_x pipeA_x
+ #define planeA_y pipeA_y
+@@ -292,6 +307,9 @@ struct csc_coeff {
+ #define DRM_I915_PERFMON		0x3e
+ #define DRM_I915_CMD_PARSER_APPEND	0x3f
+ 
++/* Special, two-level, extended ioctl */
++#define DRM_I915_EXT_IOCTL		0x5F
++
+ #define DRM_IOCTL_I915_INIT		DRM_IOW( DRM_COMMAND_BASE + DRM_I915_INIT, drm_i915_init_t)
+ #define DRM_IOCTL_I915_FLUSH		DRM_IO ( DRM_COMMAND_BASE + DRM_I915_FLUSH)
+ #define DRM_IOCTL_I915_FLIP		DRM_IO ( DRM_COMMAND_BASE + DRM_I915_FLIP)
+@@ -369,6 +387,11 @@ struct csc_coeff {
+ 		DRM_IOW (DRM_COMMAND_BASE + DRM_I915_CMD_PARSER_APPEND, \
+ 		struct drm_i915_cmd_parser_append)
+ 
++#define DRM_IOCTL_I915_EXT_IOCTL	\
++		DRM_IOW(DRM_COMMAND_BASE + DRM_I915_EXT_IOCTL, \
++		struct i915_ext_ioctl_data)
++
++
+ /* Allow drivers to submit batchbuffers directly to hardware, relying
+  * on the security mechanisms provided by hardware.
+  */
+-- 
+1.7.9.5
+

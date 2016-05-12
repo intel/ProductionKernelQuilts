@@ -1,0 +1,201 @@
+From 2abf0c763305c1478872a8f1b0c3a73abd4af7e3 Mon Sep 17 00:00:00 2001
+Message-Id: <2abf0c763305c1478872a8f1b0c3a73abd4af7e3.1421709247.git.chang-joon.lee@intel.com>
+In-Reply-To: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+References: <3650eb44734ad4fbe098313349da8185595a20d8.1421709247.git.chang-joon.lee@intel.com>
+From: Deepak S <deepak.s@intel.com>
+Date: Wed, 27 Aug 2014 17:24:26 +0530
+Subject: [PATCH 06/75] MUST_REBASE [VPG]: drm/i915/adf: Export intel sideband
+ access interface for adf driver.
+
+This patch exposes two interfaces for adf to access pci & dpio sideband
+iosf channel.
+
+v2: Moving adf specific export's to adf wrapper.h to reduce the
+potential for future rebase conflicts.
+
+v3: For DSI register access, correct the opcode used in the wrapper to match
+the actual flisdsi r/w in intel_sideband.c. This makes this function
+usable only for flisdsi writes. Anyway other variants is not used yet.
+When we enable HDMI, we need to re-look all vlv_dpio_read/write
+functions as well
+
+v3: rename drm include i915_adf_wrapper.h to i915_adf.h
+
+MUST_REBASE: Since Google ADF framework is not in upstream and also
+we cannot have two display drivers, other one being i915, we need to
+work on i915 and ADF convergence path before it can be upstreamed
+
+For: GMINL-3547
+Change-Id: I887e66b1530765fe946aef64d8c35afb7dc8bb8c
+Signed-off-by: Deepak S <deepak.s@intel.com>
+---
+ drivers/gpu/drm/i915/i915_adf_wrapper.c |   56 ++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_adf_wrapper.h |    2 ++
+ drivers/gpu/drm/i915/intel_sideband.c   |    8 +++++
+ include/drm/i915_adf.h                  |   46 +++++++++++++++++++++++++
+ 4 files changed, 111 insertions(+), 1 deletion(-)
+ create mode 100644 include/drm/i915_adf.h
+
+diff --git a/drivers/gpu/drm/i915/i915_adf_wrapper.c b/drivers/gpu/drm/i915/i915_adf_wrapper.c
+index d588a27..15fc6f9 100644
+--- a/drivers/gpu/drm/i915/i915_adf_wrapper.c
++++ b/drivers/gpu/drm/i915/i915_adf_wrapper.c
+@@ -26,7 +26,7 @@
+  */
+ 
+ #include "intel_drv.h"
+-#include <drm/i915_drm.h>
++#include <drm/i915_adf.h>
+ #include "i915_drv.h"
+ #include "i915_trace.h"
+ #include "i915_adf_wrapper.h"
+@@ -36,6 +36,16 @@
+ 
+ #ifdef CONFIG_ADF_INTEL
+ 
++/* Standard MMIO read, non-posted */
++#define SB_MRD_NP	0x00
++/* Standard MMIO write, non-posted */
++#define SB_MWR_NP	0x01
++/* Private register read, double-word addressing, non-posted */
++#define SB_CRRDDA_NP	0x06
++/* Private register write, double-word addressing, non-posted */
++#define SB_CRWRDA_NP	0x07
++
++
+ /* Global for adf driver to get at the current i915 device. */
+ static struct drm_i915_private *i915_adf_dev;
+ 
+@@ -49,4 +59,48 @@ void i915_adf_wrapper_teardown(void)
+ 	i915_adf_dev = NULL;
+ }
+ 
++/**
++ * intel_adf_pci_sideband_rw - Interface to allow ADF driver read/write to intel sideband.
++ */
++void intel_adf_pci_sideband_rw(u32 operation, u32 port, u32 reg, u32 *val)
++{
++	struct drm_i915_private *dev_priv;
++	u32 opcode;
++
++	if (!i915_adf_dev)
++		return;
++
++	dev_priv = i915_adf_dev;
++
++	opcode = (operation == INTEL_SIDEBAND_REG_READ) ?
++				SB_CRRDDA_NP : SB_CRWRDA_NP;
++
++	mutex_lock(&dev_priv->dpio_lock);
++	vlv_adf_sideband_rw(dev_priv, PCI_DEVFN(2, 0), port, opcode, reg, val);
++	mutex_unlock(&dev_priv->dpio_lock);
++}
++EXPORT_SYMBOL(intel_adf_pci_sideband_rw);
++
++/**
++ * intel_adf_dpio_sideband_rw - Interface to allow ADF driver read/write to intel sideband.
++ */
++void intel_adf_dpio_sideband_rw(u32 operation, u32 port, u32 reg, u32 *val)
++{
++	struct drm_i915_private *dev_priv;
++	u32 opcode;
++
++	if (!i915_adf_dev)
++		return;
++
++	dev_priv = i915_adf_dev;
++
++	opcode = (operation == INTEL_SIDEBAND_REG_READ) ?
++				SB_CRRDDA_NP : SB_CRWRDA_NP;
++
++	mutex_lock(&dev_priv->dpio_lock);
++	vlv_adf_sideband_rw(dev_priv, DPIO_DEVFN, port, opcode, reg, val);
++	mutex_unlock(&dev_priv->dpio_lock);
++}
++EXPORT_SYMBOL(intel_adf_dpio_sideband_rw);
++
+ #endif
+diff --git a/drivers/gpu/drm/i915/i915_adf_wrapper.h b/drivers/gpu/drm/i915/i915_adf_wrapper.h
+index b889b88..65b4c39 100644
+--- a/drivers/gpu/drm/i915/i915_adf_wrapper.h
++++ b/drivers/gpu/drm/i915/i915_adf_wrapper.h
+@@ -8,6 +8,8 @@
+ #ifdef CONFIG_ADF_INTEL
+ void i915_adf_wrapper_init(struct drm_i915_private *dev_priv);
+ void i915_adf_wrapper_teardown(void);
++void vlv_adf_sideband_rw(struct drm_i915_private *dev_priv, u32 devfn,
++			u32 port, u32 opcode, u32 reg, u32 *val);
+ #endif
+ 
+ #endif /* __I915_ADF_WRAPPER_H__ */
+diff --git a/drivers/gpu/drm/i915/intel_sideband.c b/drivers/gpu/drm/i915/intel_sideband.c
+index bbab71c..f5b0226 100644
+--- a/drivers/gpu/drm/i915/intel_sideband.c
++++ b/drivers/gpu/drm/i915/intel_sideband.c
+@@ -286,3 +286,11 @@ void vlv_flisdsi_write(struct drm_i915_private *dev_priv, u32 reg, u32 val)
+ 	vlv_sideband_rw(dev_priv, DPIO_DEVFN, IOSF_PORT_FLISDSI, SB_CRWRDA_NP,
+ 			reg, &val);
+ }
++
++#ifdef CONFIG_ADF_INTEL
++void vlv_adf_sideband_rw(struct drm_i915_private *dev_priv, u32 devfn,
++			u32 port, u32 opcode, u32 reg, u32 *val)
++{
++	vlv_sideband_rw(dev_priv, devfn, port, opcode, reg, val);
++}
++#endif
+diff --git a/include/drm/i915_adf.h b/include/drm/i915_adf.h
+new file mode 100644
+index 0000000..6426ec4
+--- /dev/null
++++ b/include/drm/i915_adf.h
+@@ -0,0 +1,46 @@
++/**************************************************************************
++ *
++ * Copyright 2013 Intel Inc.
++ * All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sub license, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial portions
++ * of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDERS, AUTHORS AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM,
++ * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
++ * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
++ * USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Author:
++ * Deepak S <deepak.s@intel.com>
++ *
++ **************************************************************************/
++
++#ifndef _I915_ADF_WRAPPER_H_
++#define _I915_ADF_WRAPPER_H_
++
++#include <drm/drm_crtc.h>
++
++#define INTEL_SIDEBAND_REG_READ		0
++#define INTEL_SIDEBAND_REG_WRITE	1
++
++extern void intel_adf_dpio_sideband_rw(u32 operation, u32 port,
++				       u32 reg, u32 *val);
++extern void intel_adf_pci_sideband_rw(u32 operation, u32 port,
++				      u32 reg, u32 *val);
++
++#endif
++
++
+-- 
+1.7.9.5
+

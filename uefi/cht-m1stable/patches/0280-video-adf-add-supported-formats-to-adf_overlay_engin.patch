@@ -1,0 +1,180 @@
+From f67b806da6dc41d55ed0a9804051bf320350b05d Mon Sep 17 00:00:00 2001
+From: Greg Hackmann <ghackmann@google.com>
+Date: Tue, 11 Jun 2013 12:59:41 -0700
+Subject: [PATCH 280/634] video: adf: add supported formats to
+ adf_overlay_engine_data
+
+Change-Id: If2aa783b9ece60160f465bf697508fc58682e1bc
+Signed-off-by: Greg Hackmann <ghackmann@google.com>
+---
+ drivers/video/adf/adf.c        |  6 ++++++
+ drivers/video/adf/adf_fops.c   | 36 ++++++++++++++++++++++++++++++++----
+ drivers/video/adf/adf_fops32.c |  9 ++++++++-
+ drivers/video/adf/adf_fops32.h |  3 +++
+ include/uapi/video/adf.h       |  6 ++++++
+ include/video/adf.h            |  3 ++-
+ 6 files changed, 57 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/video/adf/adf.c b/drivers/video/adf/adf.c
+index 4e35960..15fbc4a 100644
+--- a/drivers/video/adf/adf.c
++++ b/drivers/video/adf/adf.c
+@@ -756,6 +756,12 @@ int adf_overlay_engine_init(struct adf_overlay_engine *eng,
+ 		return -EINVAL;
+ 	}
+ 
++	if (ops->n_supported_formats > ADF_MAX_SUPPORTED_FORMATS) {
++		pr_err("%s: overlay engine supports too many formats\n",
++				__func__);
++		return -EINVAL;
++	}
++
+ 	if (adf_overlay_engine_has_custom_formats(ops) &&
+ 			!dev->ops->validate_custom_format) {
+ 		pr_err("%s: overlay engine has custom formats but parent device %s does not implement validate_custom_format\n",
+diff --git a/drivers/video/adf/adf_fops.c b/drivers/video/adf/adf_fops.c
+index d2e30c9..343bdcc7 100644
+--- a/drivers/video/adf/adf_fops.c
++++ b/drivers/video/adf/adf_fops.c
+@@ -105,6 +105,8 @@ static int adf_eng_get_data(struct adf_overlay_engine *eng,
+ {
+ 	struct adf_device *dev = adf_overlay_engine_parent(eng);
+ 	struct adf_overlay_engine_data data;
++	size_t n_supported_formats;
++	u32 *supported_formats = NULL;
+ 	int ret = 0;
+ 
+ 	if (copy_from_user(&data, arg, sizeof(data)))
+@@ -112,18 +114,44 @@ static int adf_eng_get_data(struct adf_overlay_engine *eng,
+ 
+ 	strlcpy(data.name, eng->base.name, sizeof(data.name));
+ 
++	if (data.n_supported_formats > ADF_MAX_SUPPORTED_FORMATS)
++		return -EINVAL;
++
++	n_supported_formats = data.n_supported_formats;
++	data.n_supported_formats = eng->ops->n_supported_formats;
++
++	if (n_supported_formats) {
++		supported_formats = kzalloc(n_supported_formats *
++				sizeof(supported_formats[0]), GFP_KERNEL);
++		if (!supported_formats)
++			return -ENOMEM;
++	}
++
++	memcpy(supported_formats, eng->ops->supported_formats,
++			sizeof(u32) * min(n_supported_formats,
++					eng->ops->n_supported_formats));
++
+ 	mutex_lock(&dev->client_lock);
+ 	ret = adf_obj_copy_custom_data_to_user(&eng->base, arg->custom_data,
+ 			&data.custom_data_size);
+ 	mutex_unlock(&dev->client_lock);
+ 
+ 	if (ret < 0)
+-		return ret;
++		goto done;
+ 
+-	if (copy_to_user(arg, &data, sizeof(data)))
+-		return -EFAULT;
++	if (copy_to_user(arg, &data, sizeof(data))) {
++		ret = -EFAULT;
++		goto done;
++	}
+ 
+-	return 0;
++	if (supported_formats && copy_to_user(arg->supported_formats,
++			supported_formats,
++			n_supported_formats * sizeof(supported_formats[0])))
++		ret = -EFAULT;
++
++done:
++	kfree(supported_formats);
++	return ret;
+ }
+ 
+ static int adf_buffer_import(struct adf_device *dev,
+diff --git a/drivers/video/adf/adf_fops32.c b/drivers/video/adf/adf_fops32.c
+index a7d5381..2ecf8c8 100644
+--- a/drivers/video/adf/adf_fops32.c
++++ b/drivers/video/adf/adf_fops32.c
+@@ -166,7 +166,11 @@ long adf_compat_get_overlay_engine_data(struct file *file,
+ 	if (!access_ok(VERIFY_WRITE, data, sizeof(*data)))
+ 		return -EFAULT;
+ 
+-	if (put_user(data32.custom_data_size, &data->custom_data_size) ||
++	if (put_user(data32.n_supported_formats, &data->n_supported_formats) ||
++			put_user(compat_ptr(data32.supported_formats),
++					&data->supported_formats) ||
++			put_user(data32.custom_data_size,
++					&data->custom_data_size) ||
+ 			put_user(compat_ptr(data32.custom_data),
+ 					&data->custom_data))
+ 		return -EFAULT;
+@@ -177,6 +181,9 @@ long adf_compat_get_overlay_engine_data(struct file *file,
+ 		return ret;
+ 
+ 	if (copy_in_user(arg->name, data->name, sizeof(arg->name)) ||
++			copy_in_user(&arg->n_supported_formats,
++					&data->n_supported_formats,
++					sizeof(arg->n_supported_formats)) ||
+ 			copy_in_user(&arg->custom_data_size,
+ 					&data->custom_data_size,
+ 					sizeof(arg->custom_data_size)))
+diff --git a/drivers/video/adf/adf_fops32.h b/drivers/video/adf/adf_fops32.h
+index c3e9c22..8d04132 100644
+--- a/drivers/video/adf/adf_fops32.h
++++ b/drivers/video/adf/adf_fops32.h
+@@ -64,6 +64,9 @@ struct adf_interface_data32 {
+ struct adf_overlay_engine_data32 {
+ 	char name[ADF_NAME_LEN];
+ 
++	compat_size_t n_supported_formats;
++	compat_uptr_t supported_formats;
++
+ 	compat_size_t custom_data_size;
+ 	compat_uptr_t custom_data;
+ };
+diff --git a/include/uapi/video/adf.h b/include/uapi/video/adf.h
+index 4b9e60c..1080646 100644
+--- a/include/uapi/video/adf.h
++++ b/include/uapi/video/adf.h
+@@ -274,15 +274,21 @@ struct adf_interface_data {
+  * struct adf_overlay_engine_data - describes an overlay engine
+  *
+  * @name: overlay engine's name
++ * @n_supported_formats: number of supported formats
++ * @supported_formats: list of supported formats
+  * @custom_data_size: size of driver-private data
+  * @custom_data: driver-private data
+  */
+ struct adf_overlay_engine_data {
+ 	char name[ADF_NAME_LEN];
+ 
++	size_t n_supported_formats;
++	__u32 __user *supported_formats;
++
+ 	size_t custom_data_size;
+ 	void __user *custom_data;
+ };
++#define ADF_MAX_SUPPORTED_FORMATS (PAGE_SIZE / sizeof(__u32))
+ 
+ #define ADF_SET_EVENT		_IOW('D', 0, struct adf_set_event)
+ #define ADF_BLANK		_IOW('D', 1, __u8)
+diff --git a/include/video/adf.h b/include/video/adf.h
+index 6c2191a..eb7b9be 100644
+--- a/include/video/adf.h
++++ b/include/video/adf.h
+@@ -374,7 +374,8 @@ struct adf_interface {
+  * @base: common operations (see &struct adf_obj_ops)
+  *
+  * @supported_formats: list of fourccs the overlay engine can scan out
+- * @n_supported_formats: length of supported_formats
++ * @n_supported_formats: length of supported_formats, up to
++ *	ADF_MAX_SUPPORTED_FORMATS
+  */
+ struct adf_overlay_engine_ops {
+ 	const struct adf_obj_ops base;
+-- 
+1.9.1
+

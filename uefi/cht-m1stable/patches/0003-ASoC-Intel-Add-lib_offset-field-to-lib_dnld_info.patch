@@ -1,0 +1,123 @@
+From 6eaa560eff26ae5509bf486a29aaaf566f6313fb Mon Sep 17 00:00:00 2001
+From: Mythri P K <mythri.p.k@intel.com>
+Date: Mon, 23 Feb 2015 14:21:23 +0530
+Subject: [PATCH 03/15] ASoC: Intel: Add lib_offset field to lib_dnld_info
+
+Issue: GMINL-6292
+
+In Firmware the new arrangement for MOFD and Firmware is as follows
+    IA->LPE mailbox offset @1k
+    LPE->IA mailbox offset @2k
+    PIL(module) Table offset @3k
+    Lib base offset @0x100000
+
+All the tables are moved to the beginning and LIB starts at different
+offset.
+
+Thus our earlier calculation of calculating LIB offset based on
+the MODULE table offset does not hold good, so add another LIB offset
+to handle the same.
+
+Change-Id: I21e890d341a68e8a14a2c726e6d8af5bf575c5aa
+Signed-off-by: Mythri P K <mythri.p.k@intel.com>
+Signed-off-by: Samreen Nilofer <samreen.nilofer@intel.com>
+Signed-off-by: Fabien Marotte <fabien.marotte@intel.com>
+---
+ arch/x86/include/asm/platform_byt_audio.h | 1 +
+ arch/x86/include/asm/platform_cht_audio.h | 8 ++++++++
+ arch/x86/include/asm/platform_sst.h       | 1 +
+ sound/soc/intel/sst/sst.c                 | 5 +++--
+ sound/soc/intel/sst/sst_acpi.c            | 7 +++++++
+ 5 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/include/asm/platform_byt_audio.h b/arch/x86/include/asm/platform_byt_audio.h
+index d5c586a..29ebc2f 100644
+--- a/arch/x86/include/asm/platform_byt_audio.h
++++ b/arch/x86/include/asm/platform_byt_audio.h
+@@ -34,5 +34,6 @@ enum {
+ 
+ #define BYT_FW_MOD_TABLE_OFFSET 0x80000
+ #define BYT_FW_MOD_TABLE_SIZE   0x100
++#define BYT_FW_MOD_OFFSET (BYT_FW_MOD_TABLE_OFFSET + BYT_FW_MOD_TABLE_SIZE)
+ 
+ #endif
+diff --git a/arch/x86/include/asm/platform_cht_audio.h b/arch/x86/include/asm/platform_cht_audio.h
+index 7b7312c..51965d7 100644
+--- a/arch/x86/include/asm/platform_cht_audio.h
++++ b/arch/x86/include/asm/platform_cht_audio.h
+@@ -17,4 +17,12 @@ enum {
+ 	CHT_DPCM_VOIP,
+ };
+ 
++/* LPE viewpoint addresses */
++/* TODO: move to DSDT */
++#define CHT_FW_LSP_DDR_BASE 0xC0000000
++#define CHT_FW_MOD_END (CHT_FW_LSP_DDR_BASE + 0x1FFFFF)
++#define CHT_FW_MOD_TABLE_OFFSET 0x3000
++#define CHT_FW_MOD_OFFSET 0x100000
++#define CHT_FW_MOD_TABLE_SIZE 0x100
++
+ #endif
+diff --git a/arch/x86/include/asm/platform_sst.h b/arch/x86/include/asm/platform_sst.h
+index 397ee16..83f973f 100644
+--- a/arch/x86/include/asm/platform_sst.h
++++ b/arch/x86/include/asm/platform_sst.h
+@@ -116,6 +116,7 @@ struct sst_lib_dnld_info {
+ 	unsigned int mod_end;
+ 	unsigned int mod_table_offset;
+ 	unsigned int mod_table_size;
++	unsigned int mod_offset;
+ 	bool mod_ddr_dnld;
+ };
+ 
+diff --git a/sound/soc/intel/sst/sst.c b/sound/soc/intel/sst/sst.c
+index cdca28b..9405bce 100644
+--- a/sound/soc/intel/sst/sst.c
++++ b/sound/soc/intel/sst/sst.c
+@@ -624,8 +624,9 @@ void sst_init_lib_mem_mgr(struct intel_sst_drv *ctx)
+ 	const struct sst_lib_dnld_info *lib_info = ctx->pdata->lib_info;
+ 
+ 	memset(mgr, 0, sizeof(*mgr));
+-	mgr->current_base = lib_info->mod_base + lib_info->mod_table_offset
+-						+ lib_info->mod_table_size;
++
++	mgr->current_base = lib_info->mod_base + lib_info->mod_offset;
++
+ 	mgr->avail = lib_info->mod_end - mgr->current_base + 1;
+ 
+ 	pr_debug("current base = 0x%lx , avail = 0x%x\n",
+diff --git a/sound/soc/intel/sst/sst_acpi.c b/sound/soc/intel/sst/sst_acpi.c
+index 733f5e2..515f442 100644
+--- a/sound/soc/intel/sst/sst_acpi.c
++++ b/sound/soc/intel/sst/sst_acpi.c
+@@ -31,6 +31,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/pm_qos.h>
+ #include <asm/platform_byt_audio.h>
++#include <asm/platform_cht_audio.h>
+ #include <asm/platform_sst.h>
+ #include <linux/acpi.h>
+ #include <acpi/acbuffer.h>
+@@ -196,6 +197,7 @@ static const struct sst_lib_dnld_info  byt_lib_dnld_info = {
+ 	.mod_end            = SST_BYT_IMR_VIRT_END,
+ 	.mod_table_offset   = BYT_FW_MOD_TABLE_OFFSET,
+ 	.mod_table_size     = BYT_FW_MOD_TABLE_SIZE,
++	.mod_offset         = BYT_FW_MOD_OFFSET,
+ #ifndef CONFIG_SND_SST_SW_CODECS
+ 	.mod_ddr_dnld       = true,
+ #else
+@@ -204,6 +206,11 @@ static const struct sst_lib_dnld_info  byt_lib_dnld_info = {
+ };
+ 
+ static const struct sst_lib_dnld_info  cht_lib_dnld_info = {
++	.mod_base           = CHT_FW_LSP_DDR_BASE,
++	.mod_end            = CHT_FW_MOD_END,
++	.mod_table_offset   = CHT_FW_MOD_TABLE_OFFSET,
++	.mod_table_size     = CHT_FW_MOD_TABLE_SIZE,
++	.mod_offset         = CHT_FW_MOD_OFFSET,
+ 	.mod_ddr_dnld = false,
+ };
+ 
+-- 
+1.9.1
+

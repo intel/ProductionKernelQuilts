@@ -1,0 +1,167 @@
+From bee4dfdd8534b0385e4be18e5123b85177036c90 Mon Sep 17 00:00:00 2001
+Message-Id: <bee4dfdd8534b0385e4be18e5123b85177036c90.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 30 Oct 2014 12:00:47 +0000
+Subject: [PATCH 28/63] REVERTME [VPG]: drm/i915: Add IRQ friendly request
+ deference facility
+
+The next patch in the series converts some display related seqno
+usage to request structure usage. However, the request dereference
+introduced must be done from interrupt context. As the dereference
+potentially involves freeing the request structure and thus calling
+lots of non-interrupt friendly code, this poses a problem.
+
+The solution is to add an IRQ friendly version of the dereference
+function. All this does is to add the request structure to a 'delayed
+free' list and return. The retire code, which is run periodically,
+then processes this list and does the actual dereferencing of the
+request structures.
+
+v2: Added a count to allow for multiple IRQ dereferences of the same
+request at a time.
+
+NB: This code is no longer part of the seqno -> request patch set as
+found in DRM nightly. The display code has been sufficiently
+rearranged to make the dereference from IRQ unnecessary. Thus once the
+display code has been updated to a newer version by the next forklift,
+this patch can be dropped.
+
+Change-Id: I2b264bdf72a62e15443310f4cb0d58f0575f80a7
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    6 ++++++
+ drivers/gpu/drm/i915/i915_gem.c         |   33 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_lrc.c        |    2 ++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    2 ++
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    2 ++
+ 5 files changed, 45 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 8b7765c..57c9a66 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2106,6 +2106,10 @@ struct drm_i915_gem_request {
+ 	struct drm_i915_file_private *file_priv;
+ 	/** file_priv list entry for this request */
+ 	struct list_head client_list;
++
++	/** deferred free list for dereferencing from IRQ context */
++	struct list_head delay_free_list;
++	uint32_t delay_free_count;
+ };
+ 
+ void i915_gem_request_free(struct kref *req_ref);
+@@ -2135,6 +2139,8 @@ i915_gem_request_unreference(struct drm_i915_gem_request *req)
+ 	kref_put(&req->ref, i915_gem_request_free);
+ }
+ 
++void i915_gem_request_unreference_irq(struct drm_i915_gem_request *req);
++
+ static inline void i915_gem_request_assign(struct drm_i915_gem_request **pdst,
+ 					   struct drm_i915_gem_request *src)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index b5b6500..a1a5eab 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2788,6 +2788,19 @@ void i915_gem_reset(struct drm_device *dev)
+ 	i915_gem_restore_fences(dev);
+ }
+ 
++void i915_gem_request_unreference_irq(struct drm_i915_gem_request *req)
++{
++	struct intel_engine_cs *ring = req->ring;
++	unsigned long flags;
++
++	/* Need to add the req to a deferred dereference list to be processed
++	 * outside of interrupt time */
++	spin_lock_irqsave(&ring->reqlist_lock, flags);
++	if (req->delay_free_count++ == 0)
++		list_add_tail(&req->delay_free_list, &ring->delayed_free_list);
++	spin_unlock_irqrestore(&ring->reqlist_lock, flags);
++}
++
+ /**
+  * This function clears the request list as sequence numbers are passed.
+  */
+@@ -2862,6 +2875,25 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ 		ring->trace_irq_seqno = 0;
+ 	}
+ 
++	while (!list_empty(&ring->delayed_free_list)) {
++		struct drm_i915_gem_request *request;
++		unsigned long flags;
++		uint32_t count;
++
++		request = list_first_entry(&ring->delayed_free_list,
++					   struct drm_i915_gem_request,
++					   delay_free_list);
++
++		spin_lock_irqsave(&request->ring->reqlist_lock, flags);
++		list_del(&request->delay_free_list);
++		count = request->delay_free_count;
++		request->delay_free_count = 0;
++		spin_unlock_irqrestore(&request->ring->reqlist_lock, flags);
++
++		while (count-- > 0)
++			i915_gem_request_unreference(request);
++	}
++
+ 	WARN_ON(i915_verify_lists(ring->dev));
+ }
+ 
+@@ -5195,6 +5227,7 @@ init_ring_lists(struct intel_engine_cs *ring)
+ {
+ 	INIT_LIST_HEAD(&ring->active_list);
+ 	INIT_LIST_HEAD(&ring->request_list);
++	INIT_LIST_HEAD(&ring->delayed_free_list);
+ }
+ 
+ void i915_init_vm(struct drm_i915_private *dev_priv,
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 004c5a9..cbae127 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1751,7 +1751,9 @@ static int logical_ring_init(struct drm_device *dev, struct intel_engine_cs *rin
+ 	ring->dev = dev;
+ 	INIT_LIST_HEAD(&ring->active_list);
+ 	INIT_LIST_HEAD(&ring->request_list);
++	spin_lock_init(&ring->reqlist_lock);
+ 	init_waitqueue_head(&ring->irq_queue);
++	INIT_LIST_HEAD(&ring->delayed_free_list);
+ 
+ 	INIT_LIST_HEAD(&ring->execlist_queue);
+ 	INIT_LIST_HEAD(&ring->execlist_retired_req_list);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index d2d9892..50341b9 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2120,6 +2120,8 @@ static int intel_init_ring_buffer(struct drm_device *dev,
+ 	ring->dev = dev;
+ 	INIT_LIST_HEAD(&ring->active_list);
+ 	INIT_LIST_HEAD(&ring->request_list);
++	spin_lock_init(&ring->reqlist_lock);
++	INIT_LIST_HEAD(&ring->delayed_free_list);
+ 	INIT_LIST_HEAD(&ring->execlist_queue);
+ 	ringbuf->size = 32 * PAGE_SIZE;
+ 	ringbuf->ring = ring;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 6af7701..69f9c80 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -272,6 +272,8 @@ struct intel_engine_cs {
+ 	 * outstanding.
+ 	 */
+ 	struct list_head request_list;
++	spinlock_t reqlist_lock;
++	struct list_head delayed_free_list;
+ 
+ 	/**
+ 	 * Do we have some not yet emitted requests outstanding?
+-- 
+1.7.9.5
+

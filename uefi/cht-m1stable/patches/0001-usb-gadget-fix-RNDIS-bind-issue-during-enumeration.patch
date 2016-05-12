@@ -1,0 +1,169 @@
+From 548ce1d2f784e5b45b591346d35545a458b19ebd Mon Sep 17 00:00:00 2001
+From: Jiebing Li <jiebing.li@intel.com>
+Date: Mon, 1 Dec 2014 17:16:29 +0800
+Subject: [PATCH 1/1] usb/gadget: fix RNDIS bind issue during enumeration
+
+Current andriod gadget has two issues during RNDIS bind:
+1. it wrongly registers two net devices during RNDIS bind operation.
+2. RNDIS can only be enabled once. It fails if user space tries to
+bind it again because last time's unbind operation is not complete.
+
+This patch utilizes upstream RNDIS bind method to fix the issue, just
+like ACM and FFS functions implemented in android.c.
+
+Change-Id: I46b46c8f74f7ee1753d942f08dec8f8d0f0969b9
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-9182
+Signed-off-by: Jiebing Li <jiebing.li@intel.com>
+---
+ drivers/usb/gadget/android.c | 56 ++++++++++++++++++++++++++++++++++----------
+ drivers/usb/gadget/f_rndis.c | 36 ----------------------------
+ 2 files changed, 44 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/usb/gadget/android.c b/drivers/usb/gadget/android.c
+index a890a87..db2de41 100644
+--- a/drivers/usb/gadget/android.c
++++ b/drivers/usb/gadget/android.c
+@@ -641,6 +641,8 @@ struct rndis_function_config {
+ 	/* "Wireless" RNDIS; auto-detected by Windows */
+ 	bool	wceis;
+ 	struct eth_dev *dev;
++	struct usb_function *f_rndis;
++	struct usb_function_instance *f_rndis_inst;
+ };
+ 
+ static int
+@@ -664,7 +666,7 @@ rndis_function_bind_config(struct android_usb_function *f,
+ 		struct usb_configuration *c)
+ {
+ 	int ret;
+-	struct eth_dev *dev;
++	struct f_rndis_opts *rndis_opts;
+ 	struct rndis_function_config *rndis = f->config;
+ 
+ 	if (!rndis) {
+@@ -672,18 +674,29 @@ rndis_function_bind_config(struct android_usb_function *f,
+ 		return -1;
+ 	}
+ 
++	rndis->f_rndis_inst = usb_get_function_instance("rndis");
++	if (IS_ERR(rndis->f_rndis_inst)) {
++		ret = PTR_ERR(rndis->f_rndis_inst);
++		return ret;
++	}
++
++	rndis_opts = container_of(rndis->f_rndis_inst,
++		struct f_rndis_opts, func_inst);
++
++	rndis_opts->vendor_id = rndis->vendorID;
++	rndis_opts->manufacturer = rndis->manufacturer;
++
++	gether_set_qmult(rndis_opts->net, qmult);
++	if (!gether_set_host_addr(rndis_opts->net, host_addr))
++		pr_info("using host ethernet address: %s\n", host_addr);
++	if (!gether_set_dev_addr(rndis_opts->net, dev_addr))
++		pr_info("using self ethernet address: %s\n", dev_addr);
++
++	gether_get_host_addr_u8(rndis_opts->net, rndis->ethaddr);
+ 	pr_info("%s MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", __func__,
+ 		rndis->ethaddr[0], rndis->ethaddr[1], rndis->ethaddr[2],
+ 		rndis->ethaddr[3], rndis->ethaddr[4], rndis->ethaddr[5]);
+ 
+-	dev = gether_setup_name(c->cdev->gadget,dev_addr, host_addr, rndis->ethaddr, qmult, "rndis");
+-	if (IS_ERR(dev)) {
+-		ret = PTR_ERR(dev);
+-		pr_err("%s: gether_setup failed\n", __func__);
+-		return ret;
+-	}
+-	rndis->dev = dev;
+-
+ 	if (rndis->wceis) {
+ 		/* "Wireless" RNDIS; auto-detected by Windows */
+ 		rndis_iad_descriptor.bFunctionClass =
+@@ -696,15 +709,34 @@ rndis_function_bind_config(struct android_usb_function *f,
+ 		rndis_control_intf.bInterfaceProtocol =	 0x03;
+ 	}
+ 
+-	return rndis_bind_config_vendor(c, rndis->ethaddr, rndis->vendorID,
+-					   rndis->manufacturer, rndis->dev);
++	rndis->f_rndis = usb_get_function(rndis->f_rndis_inst);
++		if (IS_ERR(rndis->f_rndis)) {
++			ret = PTR_ERR(rndis->f_rndis);
++			goto err_usb_get_function;
++		}
++
++	ret = usb_add_function(c, rndis->f_rndis);
++	if (ret) {
++		pr_err("Could not bind rndis config\n");
++		goto err_usb_add_function;
++	}
++
++	return 0;
++
++err_usb_add_function:
++	usb_put_function(rndis->f_rndis);
++err_usb_get_function:
++	usb_put_function_instance(rndis->f_rndis_inst);
++	return ret;
+ }
+ 
+ static void rndis_function_unbind_config(struct android_usb_function *f,
+ 						struct usb_configuration *c)
+ {
+ 	struct rndis_function_config *rndis = f->config;
+-	gether_cleanup(rndis->dev);
++
++	usb_put_function(rndis->f_rndis);
++	usb_put_function_instance(rndis->f_rndis_inst);
+ }
+ 
+ static ssize_t rndis_manufacturer_show(struct device *dev,
+diff --git a/drivers/usb/gadget/f_rndis.c b/drivers/usb/gadget/f_rndis.c
+index 2ac790c..c11761c 100644
+--- a/drivers/usb/gadget/f_rndis.c
++++ b/drivers/usb/gadget/f_rndis.c
+@@ -822,42 +822,6 @@ fail:
+ 	return status;
+ }
+ 
+-int
+-rndis_bind_config_vendor(struct usb_configuration *c, u8 ethaddr[ETH_ALEN],
+-		u32 vendorID, const char *manufacturer, struct eth_dev *dev)
+-{
+-	struct usb_function_instance *func_inst;
+-	struct usb_function *func;
+-	struct f_rndis_opts *opts;
+-	int status;
+-
+-	/* allocate and initialize one new instance */
+-	func_inst = usb_get_function_instance("rndis");
+-	if (IS_ERR(func_inst))
+-		return PTR_ERR(func_inst);
+-
+-	opts =  container_of(func_inst, struct f_rndis_opts, func_inst);
+-	opts->vendor_id = vendorID;
+-	opts->manufacturer = manufacturer;
+-
+-	func = usb_get_function(func_inst);
+-	if (IS_ERR(func)) {
+-		status = PTR_ERR(func);
+-		goto err_put_func_inst;
+-	}
+-
+-	status = usb_add_function(c, func);
+-	if (status)
+-		goto err_put_func;
+-	return 0;
+-
+-err_put_func:
+-	usb_put_function(func);
+-err_put_func_inst:
+-	usb_put_function_instance(func_inst);
+-	return status;
+-}
+-
+ void rndis_borrow_net(struct usb_function_instance *f, struct net_device *net)
+ {
+ 	struct f_rndis_opts *opts;
+-- 
+1.9.1
+

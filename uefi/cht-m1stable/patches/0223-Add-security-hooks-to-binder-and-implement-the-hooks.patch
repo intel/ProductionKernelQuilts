@@ -1,0 +1,321 @@
+From d65571eaaea293712b58dc6ca6c0c2149302549f Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <sds@tycho.nsa.gov>
+Date: Mon, 5 Nov 2012 08:15:34 -0500
+Subject: [PATCH 223/634] Add security hooks to binder and implement the hooks
+ for SELinux.
+
+Add security hooks to the binder and implement the hooks for SELinux.
+The security hooks enable security modules such as SELinux to implement
+controls over binder IPC.  The security hooks include support for
+controlling what process can become the binder context manager
+(binder_set_context_mgr), controlling the ability of a process
+to invoke a binder transaction/IPC to another process (binder_transaction),
+controlling the ability a process to transfer a binder reference to
+another process (binder_transfer_binder), and controlling the ability
+of a process to transfer an open file to another process (binder_transfer_file).
+
+This support is used by SE Android, http://selinuxproject.org/page/SEAndroid.
+
+Change-Id: I9a64a87825df2e60b9c51400377af4a9cd1c4049
+Signed-off-by: Stephen Smalley <sds@tycho.nsa.gov>
+---
+ drivers/staging/android/binder.c    | 21 ++++++++++++
+ include/linux/security.h            | 29 ++++++++++++++++
+ security/capability.c               | 24 ++++++++++++++
+ security/security.c                 | 20 +++++++++++
+ security/selinux/hooks.c            | 66 +++++++++++++++++++++++++++++++++++++
+ security/selinux/include/classmap.h |  1 +
+ 6 files changed, 161 insertions(+)
+
+diff --git a/drivers/staging/android/binder.c b/drivers/staging/android/binder.c
+index 1432d95..0327a63 100644
+--- a/drivers/staging/android/binder.c
++++ b/drivers/staging/android/binder.c
+@@ -37,6 +37,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ #include <linux/pid_namespace.h>
++#include <linux/security.h>
+ 
+ #include "binder.h"
+ #include "binder_trace.h"
+@@ -1383,6 +1384,10 @@ static void binder_transaction(struct binder_proc *proc,
+ 			return_error = BR_DEAD_REPLY;
+ 			goto err_dead_binder;
+ 		}
++		if (security_binder_transaction(proc->tsk, target_proc->tsk) < 0) {
++			return_error = BR_FAILED_REPLY;
++			goto err_invalid_target_handle;
++		}
+ 		if (!(tr->flags & TF_ONE_WAY) && thread->transaction_stack) {
+ 			struct binder_transaction *tmp;
+ 			tmp = thread->transaction_stack;
+@@ -1525,6 +1530,10 @@ static void binder_transaction(struct binder_proc *proc,
+ 					fp->cookie, node->cookie);
+ 				goto err_binder_get_ref_for_node_failed;
+ 			}
++			if (security_binder_transfer_binder(proc->tsk, target_proc->tsk)) {
++				return_error = BR_FAILED_REPLY;
++				goto err_binder_get_ref_for_node_failed;
++			}
+ 			ref = binder_get_ref_for_node(target_proc, node);
+ 			if (ref == NULL) {
+ 				return_error = BR_FAILED_REPLY;
+@@ -1554,6 +1563,10 @@ static void binder_transaction(struct binder_proc *proc,
+ 				return_error = BR_FAILED_REPLY;
+ 				goto err_binder_get_ref_failed;
+ 			}
++			if (security_binder_transfer_binder(proc->tsk, target_proc->tsk)) {
++				return_error = BR_FAILED_REPLY;
++				goto err_binder_get_ref_failed;
++			}
+ 			if (ref->node->proc == target_proc) {
+ 				if (fp->type == BINDER_TYPE_HANDLE)
+ 					fp->type = BINDER_TYPE_BINDER;
+@@ -1610,6 +1623,11 @@ static void binder_transaction(struct binder_proc *proc,
+ 				return_error = BR_FAILED_REPLY;
+ 				goto err_fget_failed;
+ 			}
++			if (security_binder_transfer_file(proc->tsk, target_proc->tsk, file) < 0) {
++				fput(file);
++				return_error = BR_FAILED_REPLY;
++				goto err_get_unused_fd_failed;
++			}
+ 			target_fd = task_get_unused_fd_flags(target_proc, O_CLOEXEC);
+ 			if (target_fd < 0) {
+ 				fput(file);
+@@ -2627,6 +2645,9 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 			ret = -EBUSY;
+ 			goto err;
+ 		}
++		ret = security_binder_set_context_mgr(proc->tsk);
++		if (ret < 0)
++			goto err;
+ 		if (uid_valid(binder_context_mgr_uid)) {
+ 			if (!uid_eq(binder_context_mgr_uid, current->cred->euid)) {
+ 				pr_err("BINDER_SET_CONTEXT_MGR bad uid %d != %d\n",
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 2a8f853..c0e7c1d 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -1432,6 +1432,11 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
+ struct security_operations {
+ 	char name[SECURITY_NAME_MAX + 1];
+ 
++	int (*binder_set_context_mgr) (struct task_struct *mgr);
++	int (*binder_transaction) (struct task_struct *from, struct task_struct *to);
++	int (*binder_transfer_binder) (struct task_struct *from, struct task_struct *to);
++	int (*binder_transfer_file) (struct task_struct *from, struct task_struct *to, struct file *file);
++
+ 	int (*ptrace_access_check) (struct task_struct *child, unsigned int mode);
+ 	int (*ptrace_traceme) (struct task_struct *parent);
+ 	int (*capget) (struct task_struct *target,
+@@ -1729,6 +1734,10 @@ extern void __init security_fixup_ops(struct security_operations *ops);
+ 
+ 
+ /* Security operations */
++int security_binder_set_context_mgr(struct task_struct *mgr);
++int security_binder_transaction(struct task_struct *from, struct task_struct *to);
++int security_binder_transfer_binder(struct task_struct *from, struct task_struct *to);
++int security_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file);
+ int security_ptrace_access_check(struct task_struct *child, unsigned int mode);
+ int security_ptrace_traceme(struct task_struct *parent);
+ int security_capget(struct task_struct *target,
+@@ -1915,6 +1924,26 @@ static inline int security_init(void)
+ 	return 0;
+ }
+ 
++static inline int security_binder_set_context_mgr(struct task_struct *mgr)
++{
++	return 0;
++}
++
++static inline int security_binder_transaction(struct task_struct *from, struct task_struct *to)
++{
++	return 0;
++}
++
++static inline int security_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
++{
++	return 0;
++}
++
++static inline int security_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
++{
++	return 0;
++}
++
+ static inline int security_ptrace_access_check(struct task_struct *child,
+ 					     unsigned int mode)
+ {
+diff --git a/security/capability.c b/security/capability.c
+index 21e2b9c..2f6ab98 100644
+--- a/security/capability.c
++++ b/security/capability.c
+@@ -12,6 +12,26 @@
+ 
+ #include <linux/security.h>
+ 
++static int cap_binder_set_context_mgr(struct task_struct *mgr)
++{
++	return 0;
++}
++
++static int cap_binder_transaction(struct task_struct *from, struct task_struct *to)
++{
++	return 0;
++}
++
++static int cap_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
++{
++	return 0;
++}
++
++static int cap_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
++{
++	return 0;
++}
++
+ static int cap_syslog(int type)
+ {
+ 	return 0;
+@@ -925,6 +945,10 @@ static void cap_audit_rule_free(void *lsmrule)
+ 
+ void __init security_fixup_ops(struct security_operations *ops)
+ {
++	set_to_cap_if_null(ops, binder_set_context_mgr);
++	set_to_cap_if_null(ops, binder_transaction);
++	set_to_cap_if_null(ops, binder_transfer_binder);
++	set_to_cap_if_null(ops, binder_transfer_file);
+ 	set_to_cap_if_null(ops, ptrace_access_check);
+ 	set_to_cap_if_null(ops, ptrace_traceme);
+ 	set_to_cap_if_null(ops, capget);
+diff --git a/security/security.c b/security/security.c
+index 919cad9..1805238 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -135,6 +135,26 @@ int __init register_security(struct security_operations *ops)
+ 
+ /* Security operations */
+ 
++int security_binder_set_context_mgr(struct task_struct *mgr)
++{
++	return security_ops->binder_set_context_mgr(mgr);
++}
++
++int security_binder_transaction(struct task_struct *from, struct task_struct *to)
++{
++	return security_ops->binder_transaction(from, to);
++}
++
++int security_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
++{
++	return security_ops->binder_transfer_binder(from, to);
++}
++
++int security_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
++{
++	return security_ops->binder_transfer_file(from, to, file);
++}
++
+ int security_ptrace_access_check(struct task_struct *child, unsigned int mode)
+ {
+ #ifdef CONFIG_SECURITY_YAMA_STACKED
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 47b5c69..66f812d 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -1924,6 +1924,67 @@ static inline u32 open_file_to_av(struct file *file)
+ 
+ /* Hook functions begin here. */
+ 
++static int selinux_binder_set_context_mgr(struct task_struct *mgr)
++{
++	u32 mysid = current_sid();
++	u32 mgrsid = task_sid(mgr);
++
++	return avc_has_perm(mysid, mgrsid, SECCLASS_BINDER, BINDER__SET_CONTEXT_MGR, NULL);
++}
++
++static int selinux_binder_transaction(struct task_struct *from, struct task_struct *to)
++{
++	u32 mysid = current_sid();
++	u32 fromsid = task_sid(from);
++	u32 tosid = task_sid(to);
++	int rc;
++
++	if (mysid != fromsid) {
++		rc = avc_has_perm(mysid, fromsid, SECCLASS_BINDER, BINDER__IMPERSONATE, NULL);
++		if (rc)
++			return rc;
++	}
++
++	return avc_has_perm(fromsid, tosid, SECCLASS_BINDER, BINDER__CALL, NULL);
++}
++
++static int selinux_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
++{
++	u32 fromsid = task_sid(from);
++	u32 tosid = task_sid(to);
++	return avc_has_perm(fromsid, tosid, SECCLASS_BINDER, BINDER__TRANSFER, NULL);
++}
++
++static int selinux_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
++{
++	u32 sid = task_sid(to);
++	struct file_security_struct *fsec = file->f_security;
++	struct inode *inode = file->f_path.dentry->d_inode;
++	struct inode_security_struct *isec = inode->i_security;
++	struct common_audit_data ad;
++	struct selinux_audit_data sad = {0,};
++	int rc;
++
++	COMMON_AUDIT_DATA_INIT(&ad, PATH);
++	ad.u.path = file->f_path;
++	ad.selinux_audit_data = &sad;
++
++	if (sid != fsec->sid) {
++		rc = avc_has_perm(sid, fsec->sid,
++				  SECCLASS_FD,
++				  FD__USE,
++				  &ad);
++		if (rc)
++			return rc;
++	}
++
++	if (unlikely(IS_PRIVATE(inode)))
++		return 0;
++
++	return avc_has_perm(sid, isec->sid, isec->sclass, file_to_av(file),
++			    &ad);
++}
++
+ static int selinux_ptrace_access_check(struct task_struct *child,
+ 				     unsigned int mode)
+ {
+@@ -5762,6 +5823,11 @@ static int selinux_key_getsecurity(struct key *key, char **_buffer)
+ static struct security_operations selinux_ops = {
+ 	.name =				"selinux",
+ 
++	.binder_set_context_mgr =	selinux_binder_set_context_mgr,
++	.binder_transaction =		selinux_binder_transaction,
++	.binder_transfer_binder =	selinux_binder_transfer_binder,
++	.binder_transfer_file =		selinux_binder_transfer_file,
++
+ 	.ptrace_access_check =		selinux_ptrace_access_check,
+ 	.ptrace_traceme =		selinux_ptrace_traceme,
+ 	.capget =			selinux_capget,
+diff --git a/security/selinux/include/classmap.h b/security/selinux/include/classmap.h
+index 14d04e6..c32ff7b 100644
+--- a/security/selinux/include/classmap.h
++++ b/security/selinux/include/classmap.h
+@@ -151,5 +151,6 @@ struct security_class_mapping secclass_map[] = {
+ 	{ "kernel_service", { "use_as_override", "create_files_as", NULL } },
+ 	{ "tun_socket",
+ 	  { COMMON_SOCK_PERMS, "attach_queue", NULL } },
++	{ "binder", { "impersonate", "call", "set_context_mgr", "transfer", NULL } },
+ 	{ NULL }
+   };
+-- 
+1.9.1
+

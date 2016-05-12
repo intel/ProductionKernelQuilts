@@ -1,0 +1,343 @@
+From 599f90898d44fcecd67e4c66fbe3c27228702822 Mon Sep 17 00:00:00 2001
+From: "R, Kannappan" <r.kannappan@intel.com>
+Date: Mon, 5 Oct 2015 19:23:15 +0530
+Subject: [PATCH] typec-pd: optimize the power supply calls
+
+when the sink port negotiates for the power due to sudden
+increase / decrease of power, charger has to be disconnected
+and connected back. Use the power_supply notifier to
+notify the change, which helps to off-load the tasks to the
+power supply framework. Sink port shall update the negotiated
+current using the updated interface.
+
+Change-Id: I839598de8c6fb1e5ab21404bca42bfcf1f08889f
+Signed-off-by: R, Kannappan <r.kannappan@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-19005
+---
+ drivers/usb/typec/pd/devpolicy_mgr.c | 95 ++++++++++++++++++++----------------
+ drivers/usb/typec/pd/devpolicy_mgr.h | 14 +++---
+ drivers/usb/typec/pd/policy_engine.c |  6 +--
+ drivers/usb/typec/pd/policy_engine.h | 12 ++---
+ drivers/usb/typec/pd/sink_port_pe.c  | 21 ++------
+ 5 files changed, 74 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/devpolicy_mgr.c b/drivers/usb/typec/pd/devpolicy_mgr.c
+index aa31c1b..2bf07ba 100644
+--- a/drivers/usb/typec/pd/devpolicy_mgr.c
++++ b/drivers/usb/typec/pd/devpolicy_mgr.c
+@@ -75,34 +75,50 @@ struct dpm_cable_state {
+ 	bool cbl_state;
+ };
+ 
+-static inline struct power_supply *dpm_get_psy(enum psy_type type)
++static struct power_supply *dpm_get_psy(struct devpolicy_mgr *dpm,
++							enum psy_type type)
+ {
+ 	struct class_dev_iter iter;
+ 	struct device *dev;
+-	static struct power_supply *psy;
++	struct power_supply *psy;
++	bool found = false;
++
++	if (type == PSY_TYPE_CHARGER && dpm->charger_psy)
++		return dpm->charger_psy;
++
++	if (type == PSY_TYPE_BATTERY && dpm->battery_psy)
++		return dpm->battery_psy;
+ 
+ 	class_dev_iter_init(&iter, power_supply_class, NULL, NULL);
+ 	while ((dev = class_dev_iter_next(&iter))) {
+ 		psy = (struct power_supply *)dev_get_drvdata(dev);
+-		if ((type == PSY_TYPE_BATTERY && IS_BATTERY(psy)) ||
+-			(type == PSY_TYPE_CHARGER && IS_CHARGER(psy))) {
+-			class_dev_iter_exit(&iter);
+-			return psy;
++		if (type == PSY_TYPE_BATTERY && IS_BATTERY(psy)) {
++			dpm->battery_psy = psy;
++			found = true;
++			break;
++		}
++		if (type == PSY_TYPE_CHARGER && IS_CHARGER(psy)) {
++			dpm->charger_psy = psy;
++			found = true;
++			break;
+ 		}
+ 	}
+ 	class_dev_iter_exit(&iter);
+ 
++	if (found)
++		return psy;
++
+ 	return NULL;
+ }
+ 
+ /* Reading the state of charge value of the battery */
+-static inline int dpm_read_soc(int *soc)
++static int dpm_read_soc(struct devpolicy_mgr *dpm, int *soc)
+ {
+ 	struct power_supply *psy;
+ 	union power_supply_propval val;
+ 	int ret;
+ 
+-	psy = dpm_get_psy(PSY_TYPE_BATTERY);
++	psy = dpm_get_psy(dpm, PSY_TYPE_BATTERY);
+ 	if (!psy)
+ 		return -EINVAL;
+ 
+@@ -156,7 +172,7 @@ static enum batt_soc_status dpm_get_batt_status(struct devpolicy_mgr *dpm)
+ {
+ 	int soc;
+ 
+-	if (dpm_read_soc(&soc)) {
++	if (dpm_read_soc(dpm, &soc)) {
+ 		pr_err("DPM: Error in getting soc\n");
+ 		return -ENODATA;
+ 	} else {
+@@ -231,7 +247,6 @@ static int dpm_set_charger_state(struct power_supply *psy, bool state)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	power_supply_changed(psy);
+ 	return 0;
+ }
+ 
+@@ -243,7 +258,7 @@ static int dpm_set_charger_mode(struct devpolicy_mgr *dpm,
+ 
+ 	mutex_lock(&dpm->charger_lock);
+ 
+-	psy = dpm_get_psy(PSY_TYPE_CHARGER);
++	psy = dpm_get_psy(dpm, PSY_TYPE_CHARGER);
+ 	if (!psy) {
+ 		mutex_unlock(&dpm->charger_lock);
+ 		return -EINVAL;
+@@ -265,45 +280,39 @@ static int dpm_set_charger_mode(struct devpolicy_mgr *dpm,
+ 	return ret;
+ }
+ 
+-static int dpm_update_current_lim(struct devpolicy_mgr *dpm,
+-					int ilim)
++static int dpm_update_charger(struct devpolicy_mgr *dpm,
++					int ilim, int query)
+ {
+-	int ret = 0;
+-	struct power_supply *psy;
+-	union power_supply_propval val;
++	struct power_supply_cable_props cable_props = {0};
++	int evt;
++	int ma;
+ 
+-	mutex_lock(&dpm->charger_lock);
++	evt = (ilim != 0) ? POWER_SUPPLY_CHARGER_EVENT_CONNECT :
++				POWER_SUPPLY_CHARGER_EVENT_DISCONNECT;
+ 
+-	psy = dpm_get_psy(PSY_TYPE_CHARGER);
+-	if (!psy) {
+-		mutex_unlock(&dpm->charger_lock);
+-		return -EINVAL;
+-	}
+ 
+-	/* reading current inlimit value */
+-	ret = psy->get_property(psy, POWER_SUPPLY_PROP_INLMT, &val);
+-	if (ret < 0) {
+-		pr_err("DPM: Unable to get the current limit (%d)\n", ret);
+-		goto error;
+-	}
++	if (query) {
++		ma = typec_get_host_current(dpm->phy);
+ 
+-	if (val.intval != ilim) {
+-		val.intval = ilim;
+-		ret = psy->set_property(psy, POWER_SUPPLY_PROP_INLMT, &val);
+-		if (ret < 0) {
+-			pr_err("DPM: Unable to set the current limit (%d)\n",
+-					ret);
+-			goto error;
+-		}
+-		power_supply_changed(psy);
+-	}
++		if (ma < 0 || ma == TYPEC_CURRENT_USB)
++			/* setting 900mA source current in case of USB, as
++			 * typec connector is capable of supporting USB3.0 */
++			ma = IBUS_0P9A;
++	} else
++		ma = ilim;
+ 
+-error:
+-	mutex_unlock(&dpm->charger_lock);
+-	return ret;
++	cable_props.ma = ma;
++	cable_props.chrg_evt = evt;
++	cable_props.chrg_type =
++			POWER_SUPPLY_CHARGER_TYPE_USB_TYPEC;
+ 
+-}
++	pr_debug("DPM: calling psy with evt %d cur %d\n", evt, ma);
+ 
++	atomic_notifier_call_chain(&power_supply_notifier,
++						PSY_CABLE_EVENT,
++						&cable_props);
++	return 0;
++}
+ static int dpm_get_sink_pr_swap_status(struct devpolicy_mgr *dpm)
+ {
+ 	enum batt_soc_status sts;
+@@ -1124,7 +1133,7 @@ static struct dpm_interface interface = {
+ 	.get_sink_power_caps = dpm_get_sink_power_caps,
+ 	.get_cable_state = dpm_get_cable_state,
+ 	.set_charger_mode = dpm_set_charger_mode,
+-	.update_current_lim = dpm_update_current_lim,
++	.update_charger = dpm_update_charger,
+ 	.get_min_current = dpm_get_min_current,
+ 	.update_data_role = dpm_update_data_role,
+ 	.update_power_role = dpm_update_power_role,
+diff --git a/drivers/usb/typec/pd/devpolicy_mgr.h b/drivers/usb/typec/pd/devpolicy_mgr.h
+index 60d8e96..d2a2646 100644
+--- a/drivers/usb/typec/pd/devpolicy_mgr.h
++++ b/drivers/usb/typec/pd/devpolicy_mgr.h
+@@ -164,6 +164,8 @@ struct devpolicy_mgr {
+ 	struct work_struct cable_notify_work;
+ 	struct mutex cable_notify_lock;
+ 	struct list_head cable_notify_list;
++	struct power_supply *charger_psy;
++	struct power_supply *battery_psy;
+ };
+ 
+ struct dpm_interface {
+@@ -188,8 +190,8 @@ struct dpm_interface {
+ 					enum pwr_role prole);
+ 	int (*set_charger_mode)(struct devpolicy_mgr *dpm,
+ 					enum charger_mode mode);
+-	int (*update_current_lim)(struct devpolicy_mgr *dpm,
+-					int ilim);
++	int (*update_charger)(struct devpolicy_mgr *dpm,
++					int ilim, int query);
+ 	int (*get_min_current)(struct devpolicy_mgr *dpm,
+ 					int *ma);
+ 	int (*is_pr_swapped)(struct devpolicy_mgr *dpm,
+@@ -254,11 +256,11 @@ static inline int devpolicy_set_charger_mode(struct devpolicy_mgr *dpm,
+ 	return -ENODEV;
+ }
+ 
+-static inline int devpolicy_update_current_limit(struct devpolicy_mgr *dpm,
+-							int ilim)
++static inline int devpolicy_update_charger(struct devpolicy_mgr *dpm,
++							int ilim, int query)
+ {
+-	if (dpm && dpm->interface && dpm->interface->update_current_lim)
+-		return dpm->interface->update_current_lim(dpm, ilim);
++	if (dpm && dpm->interface && dpm->interface->update_charger)
++		return dpm->interface->update_charger(dpm, ilim, query);
+ 
+ 	return -ENODEV;
+ }
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 8582e9d..a2eab7b 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -356,10 +356,10 @@ static int pe_set_charger_mode(struct policy_engine *pe, enum charger_mode mode)
+ 	return -ENODEV;
+ }
+ 
+-static int pe_update_charger_ilim(struct policy_engine *pe, int ilim)
++static int pe_update_charger(struct policy_engine *pe, int ilim, int query)
+ {
+ 	if (pe && pe->dpm)
+-		return devpolicy_update_current_limit(pe->dpm, ilim);
++		return devpolicy_update_charger(pe->dpm, ilim, query);
+ 
+ 	return -ENODEV;
+ }
+@@ -808,7 +808,7 @@ static struct pe_operations ops = {
+ 	.set_data_role = pe_set_data_role,
+ 	.set_power_role = pe_set_power_role,
+ 	.set_charger_mode = pe_set_charger_mode,
+-	.update_charger_ilim = pe_update_charger_ilim,
++	.update_charger = pe_update_charger,
+ 	.get_min_snk_current = pe_get_min_snk_current,
+ 	.is_pr_swap_support = pe_is_pr_swap_support,
+ 	.send_packet = pe_send_packet,
+diff --git a/drivers/usb/typec/pd/policy_engine.h b/drivers/usb/typec/pd/policy_engine.h
+index f8d22be..075c30d 100644
+--- a/drivers/usb/typec/pd/policy_engine.h
++++ b/drivers/usb/typec/pd/policy_engine.h
+@@ -360,8 +360,8 @@ struct pe_operations {
+ 	int (*set_power_role)(struct policy_engine *pe, enum pwr_role role);
+ 	int (*set_charger_mode)(struct policy_engine *pe,
+ 					enum charger_mode mode);
+-	int (*update_charger_ilim)(struct policy_engine *pe,
+-					int ilim);
++	int (*update_charger)(struct policy_engine *pe,
++					int ilim, int query);
+ 	int (*get_min_snk_current)(struct policy_engine *pe,
+ 					int *ma);
+ 	int (*is_pr_swap_support)(struct policy_engine *pe,
+@@ -477,11 +477,11 @@ static inline int policy_set_charger_mode(struct policy *p,
+ 	return -ENOTSUPP;
+ }
+ 
+-static inline int policy_update_charger_ilim(struct policy *p,
+-						int ilim)
++static inline int policy_update_charger(struct policy *p,
++						int ilim, int query)
+ {
+-	if (p && p->pe && p->pe->ops && p->pe->ops->update_charger_ilim)
+-		return p->pe->ops->update_charger_ilim(p->pe, ilim);
++	if (p && p->pe && p->pe->ops && p->pe->ops->update_charger)
++		return p->pe->ops->update_charger(p->pe, ilim, query);
+ 
+ 	return -ENOTSUPP;
+ }
+diff --git a/drivers/usb/typec/pd/sink_port_pe.c b/drivers/usb/typec/pd/sink_port_pe.c
+index f118adb..a40b75c 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.c
++++ b/drivers/usb/typec/pd/sink_port_pe.c
+@@ -379,6 +379,7 @@ static int snkpe_handle_trigger_dr_swap(struct sink_port_pe *sink)
+ 		snkpe_update_state(sink, PE_DRS_DFP_UFP_SEND_DR_SWAP);
+ 	else
+ 		snkpe_update_state(sink, PE_DRS_UFP_DFP_SEND_DR_SWAP);
++
+ 	schedule_work(&sink->timer_work);
+ 
+ 	policy_send_packet(&sink->p, NULL, 0,
+@@ -546,20 +547,8 @@ static int snkpe_setup_charging(struct sink_port_pe *sink)
+ 	int ret = 0;
+ 
+ 	pr_debug("SNKPE:%s In\n", __func__);
+-	/* Update the charger input current limit */
+-	ret = policy_update_charger_ilim(&sink->p, sink->rcap.op_ma);
+-	if (ret < 0) {
+-		pr_err("SNKPE: Error in updating charger ilim (%d)\n",
+-				ret);
+-		return ret;
+-	}
+-
+-	/* Enable charger */
+-	ret = policy_set_charger_mode(&sink->p, CHRGR_ENABLE);
+-	if (ret < 0)
+-		pr_err("SNKPE: Error in enabling charger (%d)\n", ret);
+-	else
+-		pr_info("SNKPE: Consumer Policy Negotiation Success!\n");
++	policy_update_charger(&sink->p, sink->rcap.op_ma, 0);
++	pr_info("SNKPE: Consumer Policy Negotiation Success!\n");
+ 	return ret;
+ }
+ 
+@@ -793,13 +782,13 @@ static void sink_handle_transition_sink(struct sink_port_pe *sink)
+ 	int ret;
+ 
+ 	pr_debug("SNKPE:%s: in\n", __func__);
+-	policy_set_charger_mode(&sink->p, CHRGR_SET_HZ);
++	policy_update_charger(&sink->p, 0, true);
+ 	ret = wait_for_completion_timeout(&sink->pstt_complete,
+ 				msecs_to_jiffies(TYPEC_PS_TRANSITION_TIMER));
+ 
+ 	if (ret == 0) {
+ 		pr_warn("SNKPE: %s PSTransition expired\n", __func__);
+-		policy_set_charger_mode(&sink->p, CHRGR_ENABLE);
++		policy_update_charger(&sink->p, 0, true);
+ 		snkpe_update_state(sink, PE_SNK_HARD_RESET);
+ 		schedule_work(&sink->timer_work);
+ 		goto trans_sink_end;
+-- 
+1.9.1
+

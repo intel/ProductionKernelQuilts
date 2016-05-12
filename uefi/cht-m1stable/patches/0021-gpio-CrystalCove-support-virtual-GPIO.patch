@@ -1,0 +1,133 @@
+From dc2426a19baa1bfad21d7cc88aa589cbb50393ff Mon Sep 17 00:00:00 2001
+From: Aaron Lu <aaron.lu@intel.com>
+Date: Tue, 20 May 2014 15:03:21 +0800
+Subject: [PATCH 21/23] gpio / CrystalCove: support virtual GPIO
+
+The virtual GPIO introduced in ACPI table of Baytrail-T based system is
+used to solve a problem under Windows. We do not have such problems
+under Linux so we do not actually need them. But we have to tell GPIO
+library that the Crystal Cove GPIO chip has this many GPIO pins or the
+common GPIO handler will refuse any access to those high number GPIO
+pins and resulted in a failure evaluation of ACPI control methods that
+are used to turn on/off power resource and/or report sensor
+temperatures.
+
+Change-Id: I34fdaf9b138828a9ddd7fb9a8c6199fd5453d95d
+Signed-off-by: Aaron Lu <aaron.lu@intel.com>
+---
+ drivers/gpio/gpio-crystalcove.c |   40 ++++++++++++++++++++++++++++++---------
+ 1 file changed, 31 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpio/gpio-crystalcove.c b/drivers/gpio/gpio-crystalcove.c
+index 59a7697..5d27a20 100644
+--- a/drivers/gpio/gpio-crystalcove.c
++++ b/drivers/gpio/gpio-crystalcove.c
+@@ -29,6 +29,7 @@
+ #include <linux/gpio.h>
+ 
+ #define NUM_GPIO		16
++#define NUM_VGPIO		0x5e
+ 
+ #define UPDATE_TYPE		(1 << 0)
+ #define UPDATE_MASK		(1 << 1)
+@@ -100,7 +101,12 @@ static void __crystalcove_irq_type(int gpio, int type)
+ static int crystalcove_gpio_direction_input(struct gpio_chip *chip,
+ 					    unsigned gpio)
+ {
+-	u8 ctlo = gpio < 8 ? GPIO0P0CTLO + gpio : GPIO1P0CTLO + (gpio - 8);
++	u8 ctlo;
++
++	if (gpio > NUM_GPIO)
++		return 0;
++
++	ctlo = gpio < 8 ? GPIO0P0CTLO + gpio : GPIO1P0CTLO + (gpio - 8);
+ 
+ 	intel_soc_pmic_writeb(ctlo, CTLO_INPUT_DEF);
+ 	return 0;
+@@ -109,7 +115,12 @@ static int crystalcove_gpio_direction_input(struct gpio_chip *chip,
+ static int crystalcove_gpio_direction_output(struct gpio_chip *chip,
+ 					     unsigned gpio, int value)
+ {
+-	u8 ctlo = gpio < 8 ? GPIO0P0CTLO + gpio : GPIO1P0CTLO + (gpio - 8);
++	u8 ctlo;
++
++	if (gpio > NUM_GPIO)
++		return 0;
++
++	ctlo = gpio < 8 ? GPIO0P0CTLO + gpio : GPIO1P0CTLO + (gpio - 8);
+ 
+ 	intel_soc_pmic_writeb(ctlo, CTLO_OUTPUT_DEF | value);
+ 	return 0;
+@@ -117,7 +128,12 @@ static int crystalcove_gpio_direction_output(struct gpio_chip *chip,
+ 
+ static int crystalcove_gpio_get(struct gpio_chip *chip, unsigned gpio)
+ {
+-	u8 ctli = gpio < 8 ? GPIO0P0CTLI + gpio : GPIO1P0CTLI + (gpio - 8);
++	u8 ctli;
++
++	if (gpio > NUM_GPIO)
++		return 0;
++
++	ctli = gpio < 8 ? GPIO0P0CTLI + gpio : GPIO1P0CTLI + (gpio - 8);
+ 
+ 	return intel_soc_pmic_readb(ctli) & 0x1;
+ }
+@@ -125,7 +141,12 @@ static int crystalcove_gpio_get(struct gpio_chip *chip, unsigned gpio)
+ static void crystalcove_gpio_set(struct gpio_chip *chip,
+ 				 unsigned gpio, int value)
+ {
+-	u8 ctlo = gpio < 8 ? GPIO0P0CTLO + gpio : GPIO1P0CTLO + (gpio - 8);
++	u8 ctlo;
++
++	if (gpio > NUM_GPIO)
++		return;
++
++	ctlo = gpio < 8 ? GPIO0P0CTLO + gpio : GPIO1P0CTLO + (gpio - 8);
+ 
+ 	if (value)
+ 		intel_soc_pmic_setb(ctlo, 1);
+@@ -148,6 +169,9 @@ static int crystalcove_gpio_to_irq(struct gpio_chip *chip, unsigned gpio)
+ 	struct crystalcove_gpio *cg =
+ 		container_of(chip, struct crystalcove_gpio, chip);
+ 
++	if (gpio > NUM_GPIO)
++		return -1;
++
+ 	return cg->irq_base + gpio;
+ }
+ 
+@@ -209,7 +233,7 @@ static irqreturn_t crystalcove_gpio_irq_handler(int irq, void *data)
+ 	intel_soc_pmic_writeb(GPIO1IRQ, (pending >> 8) & 0xff);
+ 
+ 	local_irq_disable();
+-	for (gpio = 0; gpio < cg->chip.ngpio; gpio++)
++	for (gpio = 0; gpio < NUM_GPIO; gpio++)
+ 		if (pending & (1 << gpio))
+ 			generic_handle_irq(cg->irq_base + gpio);
+ 	local_irq_enable();
+@@ -220,12 +244,10 @@ static irqreturn_t crystalcove_gpio_irq_handler(int irq, void *data)
+ static void crystalcove_gpio_dbg_show(struct seq_file *s,
+ 				      struct gpio_chip *chip)
+ {
+-	struct crystalcove_gpio *cg =
+-		container_of(chip, struct crystalcove_gpio, chip);
+ 	int gpio, offset;
+ 	u8 ctlo, ctli, mirqs0, mirqsx, irq;
+ 
+-	for (gpio = 0; gpio < cg->chip.ngpio; gpio++) {
++	for (gpio = 0; gpio < NUM_GPIO; gpio++) {
+ 		offset = gpio < 8 ? gpio : gpio - 8;
+ 		ctlo = intel_soc_pmic_readb(
+ 			(gpio < 8 ? GPIO0P0CTLO : GPIO1P0CTLO) + offset);
+@@ -265,7 +287,7 @@ static int crystalcove_gpio_probe(struct platform_device *pdev)
+ 	cg->chip.set = crystalcove_gpio_set;
+ 	cg->chip.to_irq = crystalcove_gpio_to_irq;
+ 	cg->chip.base = -1;
+-	cg->chip.ngpio = NUM_GPIO;
++	cg->chip.ngpio = NUM_VGPIO;
+ 	cg->chip.can_sleep = 1;
+ 	cg->chip.dev = dev;
+ 	cg->chip.dbg_show = crystalcove_gpio_dbg_show;
+-- 
+1.7.9.5
+

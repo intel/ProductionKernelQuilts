@@ -1,0 +1,257 @@
+From 905b19708bc4f43d953ece5bfbad5190441a2b75 Mon Sep 17 00:00:00 2001
+Message-Id: <905b19708bc4f43d953ece5bfbad5190441a2b75.1434058173.git.chang-joon.lee@intel.com>
+In-Reply-To: <cb13d6abcebb263859514735a399f7f8b895c27a.1434058173.git.chang-joon.lee@intel.com>
+References: <cb13d6abcebb263859514735a399f7f8b895c27a.1434058173.git.chang-joon.lee@intel.com>
+From: Durgadoss R <durgadoss.r@intel.com>
+Date: Fri, 22 May 2015 14:30:07 +0530
+Subject: [PATCH 6/6] FOR_UPSTREAM [VPG]: drm/i915: Enable Upfront link
+ training for type-C DP support
+
+To support USB type C alternate DP mode, the display driver needs to know the
+number of lanes required by DP panel as well as number of lanes that can be
+supported by the type-C cable. Sometimes, the type-C cable may limit the
+bandwidth even if Panel can support more lanes. To address these scenarios,
+the display driver will start link training with max lanes, and if the link
+training fails, the driver then falls back to x2 lanes.
+
+* Since link training is done before modeset, planes are not enabled. Only
+  encoder and the its associated PLLs are enabled.
+* Once link training is done, the encoder and its PLLs are disabled; so that
+  the subsequent modeset is not aware of these changes.
+* As of now, this is tested only on CHV.
+
+Issue: GMINL-9867
+Change-Id: I2ae866b32a0998abcf32826efa2504e203dc8ffa
+Signed-off-by: Durgadoss R <durgadoss.r@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c | 118 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_dp.c      |  31 ++++++++-
+ drivers/gpu/drm/i915/intel_drv.h     |   4 ++
+ 3 files changed, 151 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index a615a9d..a353cea 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -14781,3 +14781,121 @@ intel_display_print_error_state(struct drm_i915_error_state_buf *m,
+ 		err_printf(m, "  VSYNC: %08x\n", error->transcoder[i].vsync);
+ 	}
+ }
++
++bool chv_upfront_link_train(struct drm_device *dev,
++		struct intel_dp *intel_dp, struct intel_crtc *crtc)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_connector *connector = intel_dp->attached_connector;
++	struct intel_encoder *encoder = connector->encoder;
++	bool found = false;
++	bool valid_crtc = false;
++
++	if (!connector || !encoder) {
++		DRM_DEBUG_KMS("dp connector/encoder is NULL\n");
++		return false;
++	}
++
++	/* If we already have a crtc, start link training directly */
++	if (crtc) {
++		valid_crtc = true;
++		goto start_link_train;
++	}
++
++	/* Find an unused crtc and use it for link training */
++	for_each_intel_crtc(dev, crtc) {
++		if (intel_crtc_active(&crtc->base))
++			continue;
++
++		connector->new_encoder = encoder;
++		encoder->new_crtc = crtc;
++		encoder->base.crtc = &crtc->base;
++
++		/* Make sure the new crtc will work with the encoder */
++		if (drm_encoder_crtc_ok(&encoder->base,
++					 &crtc->base)) {
++			found = true;
++			break;
++		}
++	}
++
++	if (!found) {
++		DRM_ERROR("Could not find crtc for upfront link training\n");
++		return false;
++	}
++
++start_link_train:
++
++	DRM_DEBUG_KMS("upfront link training on pipe:%c\n",
++					pipe_name(crtc->pipe));
++	found = false;
++
++	/* Initialize with Max Link rate & lane count supported by panel */
++	intel_dp->link_bw =  intel_dp->dpcd[DP_MAX_LINK_RATE];
++	intel_dp->lane_count = intel_dp->dpcd[DP_MAX_LANE_COUNT] &
++					DP_MAX_LANE_COUNT_MASK;
++
++	do {
++		/* Find port clock from link_bw */
++		crtc->config.port_clock =
++				drm_dp_bw_code_to_link_rate(intel_dp->link_bw);
++
++		/* Enable PLL followed by port */
++		intel_dp_set_clock(encoder, &crtc->config, intel_dp->link_bw);
++		chv_update_pll(crtc);
++		encoder->pre_pll_enable(encoder);
++		chv_enable_pll(crtc);
++		encoder->pre_enable(encoder);
++
++		/* Check if link training passed; if so update lane count */
++		if (intel_dp->has_fast_link_train) {
++			intel_dp->dpcd[DP_MAX_LANE_COUNT] &=
++						~DP_MAX_LANE_COUNT_MASK;
++			intel_dp->dpcd[DP_MAX_LANE_COUNT] |=
++				intel_dp->lane_count & DP_MAX_LANE_COUNT_MASK;
++
++			found = true;
++		}
++
++		/* Reset encoder for next retry or for clean up */
++		encoder->disable(encoder);
++		encoder->post_disable(encoder);
++		chv_disable_pll(dev_priv, crtc->pipe);
++
++		if (found)
++			goto exit;
++
++		DRM_DEBUG_KMS("upfront link training failed. lanes:%d bw:%d\n",
++				intel_dp->lane_count, intel_dp->link_bw);
++
++		/* Go down to the next level and retry link training */
++		if (intel_dp->lane_count == 4) {
++			intel_dp->lane_count = 2;
++		} else if (intel_dp->lane_count == 2) {
++			intel_dp->lane_count = 1;
++		} else if (intel_dp->link_bw == DP_LINK_BW_5_4) {
++			intel_dp->link_bw = DP_LINK_BW_2_7;
++			intel_dp->lane_count = 4;
++		} else if (intel_dp->link_bw == DP_LINK_BW_2_7) {
++			intel_dp->link_bw = DP_LINK_BW_1_62;
++			intel_dp->lane_count = 4;
++		} else {
++			/* Tried all combinations, so exit */
++			break;
++		}
++
++	} while (1);
++
++exit:
++	/* Clear local associations made */
++	if (!valid_crtc) {
++		connector->new_encoder = NULL;
++		encoder->new_crtc = NULL;
++		encoder->base.crtc = NULL;
++	}
++
++	if (found)
++		DRM_DEBUG_KMS("upfront link training passed. lanes:%d bw:%d\n",
++				intel_dp->lane_count, intel_dp->link_bw);
++	return found;
++}
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 97f03bf..394a7a5 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -878,7 +878,7 @@ intel_dp_connector_unregister(struct intel_connector *intel_connector)
+ 	intel_connector_unregister(intel_connector);
+ }
+ 
+-static void
++void
+ intel_dp_set_clock(struct intel_encoder *encoder,
+ 		   struct intel_crtc_config *pipe_config, int link_bw)
+ {
+@@ -1010,7 +1010,6 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 				link_clock = drm_dp_bw_code_to_link_rate(bws[clock]);
+ 				link_avail = intel_dp_max_data_rate(link_clock,
+ 								    lane_count);
+-
+ 				if (mode_rate <= link_avail) {
+ 					goto found;
+ 				}
+@@ -4522,6 +4521,11 @@ g4x_dp_detect(struct intel_dp *intel_dp)
+ 	if ((I915_READ(PORT_HOTPLUG_STAT) & bit) == 0)
+ 		return connector_status_disconnected;
+ 
++	/* Avoid DPCD opertations if status is same */
++	if (intel_dp->attached_connector->base.status ==
++				connector_status_connected)
++		return connector_status_connected;
++
+ 	return intel_dp_detect_dpcd(intel_dp);
+ }
+ 
+@@ -4566,11 +4570,13 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 	struct intel_dp *intel_dp = intel_attached_dp(connector);
+ 	struct intel_digital_port *intel_dig_port = dp_to_dig_port(intel_dp);
+ 	struct intel_encoder *intel_encoder = &intel_dig_port->base;
++	struct drm_crtc *crtc = intel_dig_port->base.base.crtc;
+ 	struct drm_device *dev = connector->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	enum drm_connector_status status;
+ 	enum intel_display_power_domain power_domain;
+ 	struct edid *edid = NULL;
++	struct intel_crtc *intel_crtc = NULL;
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
+@@ -4590,6 +4596,11 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 	if (status != connector_status_connected)
+ 		goto out;
+ 
++	if (connector->status == connector_status_connected) {
++		DRM_DEBUG_KMS("Connector status is already connected\n");
++		goto out;
++	}
++
+ 	intel_dp_probe_oui(intel_dp);
+ 
+ 	if (intel_dp->force_audio != HDMI_AUDIO_AUTO) {
+@@ -4604,6 +4615,22 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 
+ 	if (intel_encoder->type != INTEL_OUTPUT_EDP)
+ 		intel_encoder->type = INTEL_OUTPUT_DISPLAYPORT;
++
++	if (IS_CHERRYVIEW(dev) &&
++			intel_encoder->type == INTEL_OUTPUT_DISPLAYPORT) {
++		/* TODO: Need to test connected boot scenario once platform
++		 * patches are ready. This path is tested on reworked-RVP only.
++		 */
++		if (intel_encoder->connectors_active &&
++						crtc && crtc->enabled) {
++			intel_crtc = to_intel_crtc(crtc);
++			DRM_DEBUG_KMS("Disabling crtc %c for upfront link training\n",
++					pipe_name(intel_crtc->pipe));
++			intel_crtc_control(crtc, false);
++		}
++		chv_upfront_link_train(dev, intel_dp, intel_crtc);
++	}
++
+ 	status = connector_status_connected;
+ 
+ out:
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index fc266da..15eef94d 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -991,6 +991,10 @@ void intel_dp_start_link_train(struct intel_dp *intel_dp);
+ void intel_dp_complete_link_train(struct intel_dp *intel_dp);
+ void intel_dp_stop_link_train(struct intel_dp *intel_dp);
+ bool intel_dp_fast_link_train(struct intel_dp *intel_dp);
++bool chv_upfront_link_train(struct drm_device *dev,
++			struct intel_dp *intel_dp, struct intel_crtc *crtc);
++void intel_dp_set_clock(struct intel_encoder *encoder,
++			struct intel_crtc_config *pipe_config, int link_bw);
+ void intel_dp_sink_dpms(struct intel_dp *intel_dp, int mode);
+ void intel_dp_set_m2_n2(struct intel_crtc *crtc, struct intel_link_m_n *m_n);
+ void intel_dp_encoder_destroy(struct drm_encoder *encoder);
+-- 
+1.9.1
+

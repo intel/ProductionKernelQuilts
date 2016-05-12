@@ -1,0 +1,390 @@
+From 0094dba48635ece6281d9270417427783e37ff9b Mon Sep 17 00:00:00 2001
+Message-Id: <0094dba48635ece6281d9270417427783e37ff9b.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Fri, 2 May 2014 16:36:37 +0100
+Subject: [PATCH 58/63] FOR_UPSTREAM [VPG]: drm/i915: Add extra add_request
+ calls
+
+The scheduler needs to track batch buffers by request without extra, non-batch
+buffer work being attached to the same request. This means that anywhere which
+adds work to the ring should explicitly call i915_add_request() when it has
+finished writing to the ring.
+
+The add_request() function does extra work, such as flushing caches, that does
+not necessarily want to be done everywhere. Instead, a new
+i915_add_request_wo_flush() function has been added which skips the cache flush
+and just tidies up the request structure.
+
+Note, much of this patch was implemented by Naresh Kumar Kachhi for pending
+power management improvements. However, it is also directly applicable to the
+scheduler work as noted above.
+
+Change-Id: I66a6861118ee8e7ad7ca6c80c71a3b256db92e18
+For: VIZ-1587
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c              |    5 +++
+ drivers/gpu/drm/i915/i915_drv.h              |    9 ++++--
+ drivers/gpu/drm/i915/i915_gem.c              |   45 ++++++++++++++++----------
+ drivers/gpu/drm/i915/i915_gem_context.c      |   11 +++++++
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c   |    4 +--
+ drivers/gpu/drm/i915/i915_gem_gtt.c          |   11 +++++++
+ drivers/gpu/drm/i915/i915_gem_render_state.c |    2 +-
+ drivers/gpu/drm/i915/intel_display.c         |   10 +++---
+ drivers/gpu/drm/i915/intel_huc_chv.c         |    2 +-
+ drivers/gpu/drm/i915/intel_lrc.c             |    4 +--
+ 10 files changed, 72 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index c4cd6cf..01cd007 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -458,6 +458,7 @@ static int i915_dispatch_cmdbuffer(struct drm_device * dev,
+ 				   struct drm_clip_rect *cliprects,
+ 				   void *cmdbuf)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int nbox = cmd->num_cliprects;
+ 	int i = 0, count, ret;
+ 
+@@ -484,6 +485,7 @@ static int i915_dispatch_cmdbuffer(struct drm_device * dev,
+ 	}
+ 
+ 	i915_emit_breadcrumb(dev);
++	i915_add_request_no_flush(LP_RING(dev_priv));
+ 	return 0;
+ }
+ 
+@@ -546,6 +548,7 @@ static int i915_dispatch_batchbuffer(struct drm_device * dev,
+ 	}
+ 
+ 	i915_emit_breadcrumb(dev);
++	i915_add_request_no_flush(LP_RING(dev_priv));
+ 	return 0;
+ }
+ 
+@@ -599,6 +602,7 @@ static int i915_dispatch_flip(struct drm_device * dev)
+ 		ADVANCE_LP_RING();
+ 	}
+ 
++	i915_add_request_no_flush(LP_RING(dev_priv));
+ 	master_priv->sarea_priv->pf_current_page = dev_priv->dri1.current_page;
+ 	return 0;
+ }
+@@ -776,6 +780,7 @@ static int i915_emit_irq(struct drm_device * dev)
+ 		OUT_RING(dev_priv->dri1.counter);
+ 		OUT_RING(MI_USER_INTERRUPT);
+ 		ADVANCE_LP_RING();
++		i915_add_request_no_flush(LP_RING(dev_priv));
+ 	}
+ 
+ 	return dev_priv->dri1.counter;
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 752a6fe..309daca 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2632,7 +2632,7 @@ static inline void i915_gem_object_unpin_pages(struct drm_i915_gem_object *obj)
+ 
+ int __must_check i915_mutex_lock_interruptible(struct drm_device *dev);
+ int i915_gem_object_sync(struct drm_i915_gem_object *obj,
+-			 struct intel_engine_cs *to);
++			 struct intel_engine_cs *to, bool add_request);
+ void i915_vma_move_to_active(struct i915_vma *vma,
+ 			     struct intel_engine_cs *ring);
+ int i915_gem_dumb_create(struct drm_file *file_priv,
+@@ -2712,9 +2712,12 @@ int __must_check i915_gpu_idle(struct drm_device *dev);
+ int __must_check i915_gem_suspend(struct drm_device *dev);
+ int __i915_add_request(struct intel_engine_cs *ring,
+ 		       struct drm_file *file,
+-		       struct drm_i915_gem_object *batch_obj);
++		       struct drm_i915_gem_object *batch_obj,
++		       bool flush_caches);
+ #define i915_add_request(ring) \
+-	__i915_add_request(ring, NULL, NULL)
++	__i915_add_request(ring, NULL, NULL, true)
++#define i915_add_request_no_flush(ring) \
++	__i915_add_request(ring, NULL, NULL, false)
+ int __must_check i915_wait_request(struct drm_i915_gem_request *req);
+ int i915_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+ int __must_check
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 32b9f5c..f961a32b 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2491,7 +2491,8 @@ static void queue_retire_work(struct drm_i915_private *dev_priv,
+ 
+ int __i915_add_request(struct intel_engine_cs *ring,
+ 		       struct drm_file *file,
+-		       struct drm_i915_gem_object *obj)
++		       struct drm_i915_gem_object *obj,
++		       bool flush_caches)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	struct drm_i915_gem_request *request;
+@@ -2520,12 +2521,11 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	 * is that the flush _must_ happen before the next request, no matter
+ 	 * what.
+ 	 */
+-	if (i915.enable_execlists) {
+-		ret = logical_ring_flush_all_caches(ringbuf);
+-		if (ret)
+-			goto end;
+-	} else {
+-		ret = intel_ring_flush_all_caches(ring);
++	if (flush_caches) {
++		if (i915.enable_execlists)
++			ret = logical_ring_flush_all_caches(ringbuf);
++		else
++			ret = intel_ring_flush_all_caches(ring);
+ 		if (ret)
+ 			goto end;
+ 	}
+@@ -2537,15 +2537,12 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	 */
+ 	request_ring_position = intel_ring_get_tail(ringbuf);
+ 
+-	if (i915.enable_execlists) {
++	if (i915.enable_execlists)
+ 		ret = ring->emit_request(ringbuf);
+-		if (ret)
+-			goto end;
+-	} else {
++	else
+ 		ret = ring->add_request(ring);
+-		if (ret)
+-			goto end;
+-	}
++	if (ret)
++		goto end;
+ 
+ 	request->head = request_start;
+ 	request->tail = request_ring_position;
+@@ -3137,6 +3134,8 @@ out:
+  *
+  * @obj: object which may be in use on another ring.
+  * @to: ring we wish to use the object on. May be NULL.
++ * @add_request: do we need to add a request to track operations
++ *    submitted on ring with sync_to function
+  *
+  * This code is meant to abstract object synchronization with the GPU.
+  * Calling with NULL implies synchronizing the object with the CPU
+@@ -3146,7 +3145,7 @@ out:
+  */
+ int
+ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+-		     struct intel_engine_cs *to)
++		     struct intel_engine_cs *to, bool add_request)
+ {
+ 	struct intel_engine_cs *from;
+ 	u32 seqno;
+@@ -3172,13 +3171,16 @@ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 
+ 	trace_i915_gem_ring_sync_to(from, to, obj->last_read_req);
+ 	ret = to->semaphore.sync_to(to, from, seqno);
+-	if (!ret)
++	if (!ret) {
+ 		/* We use last_read_req because sync_to()
+ 		 * might have just caused seqno wrap under
+ 		 * the radar.
+ 		 */
+ 		from->semaphore.sync_seqno[idx] =
+ 				i915_gem_request_get_seqno(obj->last_read_req);
++		if (add_request)
++			i915_add_request_no_flush(to);
++	}
+ 
+ 	return ret;
+ }
+@@ -3284,6 +3286,15 @@ int i915_gpu_idle(struct drm_device *dev)
+ 				return ret;
+ 		}
+ 
++		/* Make sure the context switch (if one actually happened)
++		 * gets wrapped up and finished rather than hanging around
++		 * and confusing things later. */
++		if (ring->outstanding_lazy_request) {
++			ret = i915_add_request(ring);
++			if (ret)
++				return ret;
++		}
++
+ 		ret = intel_ring_idle(ring);
+ 		if (ret)
+ 			return ret;
+@@ -4149,7 +4160,7 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 	int ret;
+ 
+ 	if (pipelined != i915_gem_request_get_ring(obj->last_read_req)) {
+-		ret = i915_gem_object_sync(obj, pipelined);
++		ret = i915_gem_object_sync(obj, pipelined, true);
+ 		if (ret)
+ 			return ret;
+ 	}
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index b10c36e..48f2946 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -439,6 +439,17 @@ int i915_gem_context_enable(struct drm_i915_private *dev_priv)
+ 		ret = i915_switch_context(ring, ring->default_context);
+ 		if (ret)
+ 			return ret;
++
++		/*
++		 * Make sure the context switch (if one actually happened)
++		 * gets wrapped up and finished rather than hanging around
++		 * and confusing things later.
++		 */
++		if (ring->outstanding_lazy_request) {
++			ret = i915_add_request_no_flush(ring);
++			if (ret)
++				return ret;
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index f990564..253c5ed 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -846,7 +846,7 @@ i915_gem_execbuffer_move_to_gpu(struct intel_engine_cs *ring,
+ 
+ 	list_for_each_entry(vma, vmas, exec_list) {
+ 		struct drm_i915_gem_object *obj = vma->obj;
+-		ret = i915_gem_object_sync(obj, ring);
++		ret = i915_gem_object_sync(obj, ring, false);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -1001,7 +1001,7 @@ i915_gem_execbuffer_retire_commands(struct drm_device *dev,
+ 	ring->gpu_caches_dirty = true;
+ 
+ 	/* Add a breadcrumb for the completion of the batch buffer */
+-	(void)__i915_add_request(ring, file, obj);
++	(void)__i915_add_request(ring, file, obj, true);
+ }
+ 
+ static int
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index fc8bfc5..d18fcf8 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -1252,6 +1252,17 @@ int i915_ppgtt_init_hw(struct drm_device *dev)
+ 			ret = ppgtt->switch_mm(ppgtt, ring, true);
+ 			if (ret != 0)
+ 				return ret;
++
++			/*
++			 * Make sure the context switch (if one actually happened)
++			 * gets wrapped up and finished rather than hanging around
++			 * and confusing things later.
++			 */
++			if (ring->outstanding_lazy_request) {
++				ret = i915_add_request_no_flush(ring);
++				if (ret)
++					return ret;
++			}
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_render_state.c b/drivers/gpu/drm/i915/i915_gem_render_state.c
+index 2a030a7..5be0073 100644
+--- a/drivers/gpu/drm/i915/i915_gem_render_state.c
++++ b/drivers/gpu/drm/i915/i915_gem_render_state.c
+@@ -171,7 +171,7 @@ int i915_gem_render_state_init(struct intel_engine_cs *ring)
+ 
+ 	i915_vma_move_to_active(i915_gem_obj_to_ggtt(so.obj), ring);
+ 
+-	ret = __i915_add_request(ring, NULL, so.obj);
++	ret = __i915_add_request(ring, NULL, so.obj, true);
+ 	/* __i915_add_request moves object to inactive if it fails */
+ out:
+ 	i915_gem_render_state_fini(&so);
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 12002e7..8343872 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10107,7 +10107,7 @@ static int intel_gen2_queue_flip(struct drm_device *dev,
+ 	intel_ring_emit(ring, 0); /* aux display base address, unused */
+ 
+ 	intel_mark_page_flip_active(intel_crtc);
+-	__intel_ring_advance(ring);
++	i915_add_request_no_flush(ring);
+ 	return 0;
+ }
+ 
+@@ -10139,7 +10139,7 @@ static int intel_gen3_queue_flip(struct drm_device *dev,
+ 	intel_ring_emit(ring, MI_NOOP);
+ 
+ 	intel_mark_page_flip_active(intel_crtc);
+-	__intel_ring_advance(ring);
++	i915_add_request_no_flush(ring);
+ 	return 0;
+ }
+ 
+@@ -10178,7 +10178,7 @@ static int intel_gen4_queue_flip(struct drm_device *dev,
+ 	intel_ring_emit(ring, pf | pipesrc);
+ 
+ 	intel_mark_page_flip_active(intel_crtc);
+-	__intel_ring_advance(ring);
++	i915_add_request_no_flush(ring);
+ 	return 0;
+ }
+ 
+@@ -10214,7 +10214,7 @@ static int intel_gen6_queue_flip(struct drm_device *dev,
+ 	intel_ring_emit(ring, pf | pipesrc);
+ 
+ 	intel_mark_page_flip_active(intel_crtc);
+-	__intel_ring_advance(ring);
++	i915_add_request_no_flush(ring);
+ 	return 0;
+ }
+ 
+@@ -10333,7 +10333,7 @@ static int intel_gen7_queue_flip(struct drm_device *dev,
+ 	intel_ring_emit(ring, MI_NOOP);
+ 
+ 	intel_mark_page_flip_active(intel_crtc);
+-	__intel_ring_advance(ring);
++	i915_add_request_no_flush(ring);
+ 
+ 	/*
+ 	 * Sync the sprite plane disable with corresponding flip.
+diff --git a/drivers/gpu/drm/i915/intel_huc_chv.c b/drivers/gpu/drm/i915/intel_huc_chv.c
+index b1e96e5..0846d6e 100644
+--- a/drivers/gpu/drm/i915/intel_huc_chv.c
++++ b/drivers/gpu/drm/i915/intel_huc_chv.c
+@@ -220,7 +220,7 @@ static void finish_chv_huc_load(const struct firmware *fw, void *context)
+ 
+ 	req = intel_ring_get_request(ring);
+ 
+-	ret = __i915_add_request(ring, NULL, ringbuf->obj);
++	ret = __i915_add_request(ring, NULL, ringbuf->obj, true);
+ 	if (ret)
+ 		HUC_ERROR_OUT("Failed to add request");
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 562a3aa..f2bae7d 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1256,7 +1256,7 @@ static int execlists_move_to_gpu(struct intel_ringbuffer *ringbuf,
+ 	list_for_each_entry(vma, vmas, exec_list) {
+ 		struct drm_i915_gem_object *obj = vma->obj;
+ 
+-		ret = i915_gem_object_sync(obj, ring);
++		ret = i915_gem_object_sync(obj, ring, true);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -2755,7 +2755,7 @@ int intel_lr_context_render_state_init(struct intel_engine_cs *ring,
+ 
+ 	i915_vma_move_to_active(i915_gem_obj_to_ggtt(so.obj), ring);
+ 
+-	ret = __i915_add_request(ring, file, so.obj);
++	ret = __i915_add_request(ring, file, so.obj, true);
+ 	/* intel_logical_ring_add_request moves object to inactive if it
+ 	 * fails */
+ out:
+-- 
+1.7.9.5
+

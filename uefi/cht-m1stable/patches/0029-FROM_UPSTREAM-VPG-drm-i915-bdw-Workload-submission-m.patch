@@ -1,0 +1,232 @@
+From f4edb39017eb2790d5a623568927f80a7499c178 Mon Sep 17 00:00:00 2001
+Message-Id: <f4edb39017eb2790d5a623568927f80a7499c178.1413836944.git.chang-joon.lee@intel.com>
+In-Reply-To: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+References: <5d8aa9994fff43965a6fab8c9a528b8b47a9d624.1413836944.git.chang-joon.lee@intel.com>
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Thu, 24 Jul 2014 17:04:33 +0100
+Subject: [PATCH 29/71] FROM_UPSTREAM [VPG]: drm/i915/bdw: Workload submission
+ mechanism for Execlists
+
+This is what i915_gem_do_execbuffer calls when it wants to execute some
+worload in an Execlists world.
+
+v2: Check arguments before doing stuff in intel_execlists_submission. Also,
+get rel_constants parsing right.
+
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+[danvet: Drop the chipset flush, that's pre-gen6. And appease
+checkpatch a bit .... again!]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit ba8b7ccb196b07c1c553450e8e7b44a7a938e58a)
+
+Change-Id: I6e8d21c50eb01bdd020c175be3ac07b33a32699f
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: ba8b7ccb196b07c1c553450e8e7b44a7a938e58a
+Upstream-as-of-tag: drm-intel-next-2014-08-22
+For: GMIN-2332
+For: VIZ-2020
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    6 ++
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    4 +-
+ drivers/gpu/drm/i915/intel_lrc.c           |  130 +++++++++++++++++++++++++++-
+ 3 files changed, 135 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 97e7c84..5a5c950 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2388,6 +2388,12 @@ int i915_gem_set_domain_ioctl(struct drm_device *dev, void *data,
+ 			      struct drm_file *file_priv);
+ int i915_gem_sw_finish_ioctl(struct drm_device *dev, void *data,
+ 			     struct drm_file *file_priv);
++void i915_gem_execbuffer_move_to_active(struct list_head *vmas,
++					struct intel_engine_cs *ring);
++void i915_gem_execbuffer_retire_commands(struct drm_device *dev,
++					 struct drm_file *file,
++					 struct intel_engine_cs *ring,
++					 struct drm_i915_gem_object *obj);
+ int i915_gem_ringbuffer_submission(struct drm_device *dev,
+ 				   struct drm_file *file,
+ 				   struct intel_engine_cs *ring,
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 0ece129..44e8bcc 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -962,7 +962,7 @@ i915_gem_validate_context(struct drm_device *dev, struct drm_file *file,
+ 	return ctx;
+ }
+ 
+-static void
++void
+ i915_gem_execbuffer_move_to_active(struct list_head *vmas,
+ 				   struct intel_engine_cs *ring)
+ {
+@@ -996,7 +996,7 @@ i915_gem_execbuffer_move_to_active(struct list_head *vmas,
+ 	}
+ }
+ 
+-static void
++void
+ i915_gem_execbuffer_retire_commands(struct drm_device *dev,
+ 				    struct drm_file *file,
+ 				    struct intel_engine_cs *ring,
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 4e998d4..2590070 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -89,6 +89,55 @@ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists
+ 	return 0;
+ }
+ 
++static int logical_ring_invalidate_all_caches(struct intel_ringbuffer *ringbuf)
++{
++	struct intel_engine_cs *ring = ringbuf->ring;
++	uint32_t flush_domains;
++	int ret;
++
++	flush_domains = 0;
++	if (ring->gpu_caches_dirty)
++		flush_domains = I915_GEM_GPU_DOMAINS;
++
++	ret = ring->emit_flush(ringbuf, I915_GEM_GPU_DOMAINS, flush_domains);
++	if (ret)
++		return ret;
++
++	ring->gpu_caches_dirty = false;
++	return 0;
++}
++
++static int execlists_move_to_gpu(struct intel_ringbuffer *ringbuf,
++				 struct list_head *vmas)
++{
++	struct intel_engine_cs *ring = ringbuf->ring;
++	struct i915_vma *vma;
++	uint32_t flush_domains = 0;
++	bool flush_chipset = false;
++	int ret;
++
++	list_for_each_entry(vma, vmas, exec_list) {
++		struct drm_i915_gem_object *obj = vma->obj;
++
++		ret = i915_gem_object_sync(obj, ring);
++		if (ret)
++			return ret;
++
++		if (obj->base.write_domain & I915_GEM_DOMAIN_CPU)
++			flush_chipset |= i915_gem_clflush_object(obj, false);
++
++		flush_domains |= obj->base.write_domain;
++	}
++
++	if (flush_domains & I915_GEM_DOMAIN_GTT)
++		wmb();
++
++	/* Unconditionally invalidate gpu caches and ensure that we do flush
++	 * any residual writes from the previous batch.
++	 */
++	return logical_ring_invalidate_all_caches(ringbuf);
++}
++
+ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 			       struct intel_engine_cs *ring,
+ 			       struct intel_context *ctx,
+@@ -97,7 +146,84 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
+ 			       struct drm_i915_gem_object *batch_obj,
+ 			       u64 exec_start, u32 flags)
+ {
+-	/* TODO */
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_ringbuffer *ringbuf = ctx->engine[ring->id].ringbuf;
++	int instp_mode;
++	u32 instp_mask;
++	int ret;
++
++	instp_mode = args->flags & I915_EXEC_CONSTANTS_MASK;
++	instp_mask = I915_EXEC_CONSTANTS_MASK;
++	switch (instp_mode) {
++	case I915_EXEC_CONSTANTS_REL_GENERAL:
++	case I915_EXEC_CONSTANTS_ABSOLUTE:
++	case I915_EXEC_CONSTANTS_REL_SURFACE:
++		if (instp_mode != 0 && ring != &dev_priv->ring[RCS]) {
++			DRM_DEBUG("non-0 rel constants mode on non-RCS\n");
++			return -EINVAL;
++		}
++
++		if (instp_mode != dev_priv->relative_constants_mode) {
++			if (instp_mode == I915_EXEC_CONSTANTS_REL_SURFACE) {
++				DRM_DEBUG("rel surface constants mode invalid on gen5+\n");
++				return -EINVAL;
++			}
++
++			/* The HW changed the meaning on this bit on gen6 */
++			instp_mask &= ~I915_EXEC_CONSTANTS_REL_SURFACE;
++		}
++		break;
++	default:
++		DRM_DEBUG("execbuf with unknown constants: %d\n", instp_mode);
++		return -EINVAL;
++	}
++
++	if (args->num_cliprects != 0) {
++		DRM_DEBUG("clip rectangles are only valid on pre-gen5\n");
++		return -EINVAL;
++	} else {
++		if (args->DR4 == 0xffffffff) {
++			DRM_DEBUG("UXA submitting garbage DR4, fixing up\n");
++			args->DR4 = 0;
++		}
++
++		if (args->DR1 || args->DR4 || args->cliprects_ptr) {
++			DRM_DEBUG("0 cliprects but dirt in cliprects fields\n");
++			return -EINVAL;
++		}
++	}
++
++	if (args->flags & I915_EXEC_GEN7_SOL_RESET) {
++		DRM_DEBUG("sol reset is gen7 only\n");
++		return -EINVAL;
++	}
++
++	ret = execlists_move_to_gpu(ringbuf, vmas);
++	if (ret)
++		return ret;
++
++	if (ring == &dev_priv->ring[RCS] &&
++	    instp_mode != dev_priv->relative_constants_mode) {
++		ret = intel_logical_ring_begin(ringbuf, 4);
++		if (ret)
++			return ret;
++
++		intel_logical_ring_emit(ringbuf, MI_NOOP);
++		intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
++		intel_logical_ring_emit(ringbuf, INSTPM);
++		intel_logical_ring_emit(ringbuf, instp_mask << 16 | instp_mode);
++		intel_logical_ring_advance(ringbuf);
++
++		dev_priv->relative_constants_mode = instp_mode;
++	}
++
++	ret = ring->emit_bb_start(ringbuf, exec_start, flags);
++	if (ret)
++		return ret;
++
++	i915_gem_execbuffer_move_to_active(vmas, ring);
++	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
++
+ 	return 0;
+ }
+ 
+@@ -361,8 +487,6 @@ static int gen8_init_render_ring(struct intel_engine_cs *ring)
+ static int gen8_emit_bb_start(struct intel_ringbuffer *ringbuf,
+ 			      u64 offset, unsigned flags)
+ {
+-	struct intel_engine_cs *ring = ringbuf->ring;
+-	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 	bool ppgtt = !(flags & I915_DISPATCH_SECURE);
+ 	int ret;
+ 
+-- 
+1.7.9.5
+

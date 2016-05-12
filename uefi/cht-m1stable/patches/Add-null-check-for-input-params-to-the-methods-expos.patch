@@ -1,0 +1,187 @@
+From 9b06d7f7ee551c84be1d40fe07294acdb41c8009 Mon Sep 17 00:00:00 2001
+From: Albin B <albin.bala.krishnan@intel.com>
+Date: Tue, 25 Aug 2015 23:11:33 +0530
+Subject: [PATCH] Add null check for input params to the methods exposed to
+ other source
+
+The method which is called from external source, if the input
+parameter is not null it will cause a null pointer exception
+or crash. So the methods called from external sources and the
+exported function input parameters are validated (ie, null or
+valid data) to keep the code secure
+
+Change-Id: I2c016060643f09ca89a21bcc0adaec5d3199f571
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-16361
+Signed-off-by: Albin B <albin.bala.krishnan@intel.com>
+---
+ drivers/usb/typec/pd/display_pe.c    |  3 +++
+ drivers/usb/typec/pd/policy_engine.c | 14 +++++++++++---
+ drivers/usb/typec/pd/protocol.c      | 31 ++++++++++++++++++++++++++++---
+ drivers/usb/typec/pd/sink_port_pe.c  |  3 +++
+ drivers/usb/typec/pd/src_port_pe.c   |  3 +++
+ 5 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/usb/typec/pd/display_pe.c b/drivers/usb/typec/pd/display_pe.c
+index 0fd3dd8..83ce496 100644
+--- a/drivers/usb/typec/pd/display_pe.c
++++ b/drivers/usb/typec/pd/display_pe.c
+@@ -727,6 +727,9 @@ struct policy *disp_pe_init(struct policy_engine *pe)
+ 	struct disp_port_pe *disp_pe;
+ 	struct policy *p;
+ 
++	if (!pe)
++		return ERR_PTR(-EINVAL);
++
+ 	disp_pe = kzalloc(sizeof(struct disp_port_pe),
+ 						GFP_KERNEL);
+ 	if (!disp_pe) {
+diff --git a/drivers/usb/typec/pd/policy_engine.c b/drivers/usb/typec/pd/policy_engine.c
+index 40c145e..9ebb1d1 100644
+--- a/drivers/usb/typec/pd/policy_engine.c
++++ b/drivers/usb/typec/pd/policy_engine.c
+@@ -520,7 +520,7 @@ static struct policy *__pe_find_policy(struct list_head *list,
+ 		return p;
+ 	}
+ 
+-	return ERR_PTR(-ENODEV);
++	return NULL;
+ }
+ 
+ static void pe_policy_status_changed(struct policy_engine *pe,
+@@ -816,6 +816,9 @@ int policy_engine_bind_dpm(struct devpolicy_mgr *dpm)
+ 	if (!dpm)
+ 		return -EINVAL;
+ 
++	if (dpm->pe)
++		return -EEXIST;
++
+ 	pe = devm_kzalloc(dpm->phy->dev, sizeof(struct policy_engine),
+ 				GFP_KERNEL);
+ 	if (!pe)
+@@ -851,11 +854,15 @@ EXPORT_SYMBOL_GPL(policy_engine_bind_dpm);
+ 
+ void policy_engine_unbind_dpm(struct devpolicy_mgr *dpm)
+ {
+-	struct policy_engine *pe = dpm->pe;
++	struct policy_engine *pe;
+ 	struct policy *p;
+ 	struct pd_policy *supported_policy;
+ 	int i;
+ 
++	if (!dpm || !dpm->pe)
++		return;
++
++	pe = dpm->pe;
+ 	mutex_lock(&pe->pe_lock);
+ 	/* remove the pe ops to avoid further external
+ 	 * notifications and callbacks.
+@@ -867,7 +874,8 @@ void policy_engine_unbind_dpm(struct devpolicy_mgr *dpm)
+ 	for (i = 0; i < supported_policy->num_policies; i++) {
+ 		p = __pe_find_policy(&pe->policy_list,
+ 					supported_policy->policies[i]);
+-		p->exit(p);
++		if (p)
++			p->exit(p);
+ 	}
+ 	/* Unbind from protocol layer */
+ 	protocol_unbind_pe(pe);
+diff --git a/drivers/usb/typec/pd/protocol.c b/drivers/usb/typec/pd/protocol.c
+index 7f397f9..2be4d84 100644
+--- a/drivers/usb/typec/pd/protocol.c
++++ b/drivers/usb/typec/pd/protocol.c
+@@ -486,13 +486,23 @@ static void prot_role_chnage_worker(struct work_struct *work)
+ 
+ int protocol_bind_pe(struct policy_engine *pe)
+ {
+-	struct typec_phy *phy = pe_get_phy(pe);
++	struct typec_phy *phy;
+ 	struct pd_prot *prot;
+-	if (!phy)
++
++	if (!pe)
++		return -EINVAL;
++
++	if (pe->prot)
++		return -EEXIST;
++
++	phy = pe_get_phy(pe);
++	if (!phy || !phy->proto)
+ 		return -ENODEV;
++
+ 	prot = phy->proto;
+ 	if (!prot)
+ 		return -ENODEV;
++
+ 	pe->prot = prot;
+ 	prot->pe = pe;
+ 	return 0;
+@@ -501,6 +511,9 @@ EXPORT_SYMBOL_GPL(protocol_bind_pe);
+ 
+ void protocol_unbind_pe(struct policy_engine *pe)
+ {
++	if (!pe)
++		return;
++
+ 	pe->prot->pe = NULL;
+ 	pe->prot = NULL;
+ }
+@@ -510,6 +523,14 @@ int protocol_bind_dpm(struct typec_phy *phy)
+ {
+ 	struct pd_prot *prot;
+ 
++	if (!phy)
++		return -EINVAL;
++
++	if (phy->proto) {
++		dev_dbg(phy->dev, "Protocol alreay exist!\n");
++		return -EEXIST;
++	}
++
+ 	prot = devm_kzalloc(phy->dev, sizeof(struct pd_prot), GFP_KERNEL);
+ 	if (!prot)
+ 		return -ENOMEM;
+@@ -552,8 +573,12 @@ EXPORT_SYMBOL_GPL(protocol_bind_dpm);
+ 
+ void protocol_unbind_dpm(struct typec_phy *phy)
+ {
+-	struct pd_prot *prot = phy->proto;
++	struct pd_prot *prot;
++
++	if (!phy || !phy->proto)
++		return;
+ 
++	prot = phy->proto;
+ 	/* Clear the rx list and reset phy */
+ 	pd_reset_counters(prot);
+ 	prot_clear_rx_msg_list(prot);
+diff --git a/drivers/usb/typec/pd/sink_port_pe.c b/drivers/usb/typec/pd/sink_port_pe.c
+index 698abf2..64d9b64 100644
+--- a/drivers/usb/typec/pd/sink_port_pe.c
++++ b/drivers/usb/typec/pd/sink_port_pe.c
+@@ -1148,6 +1148,9 @@ struct policy *sink_port_policy_init(struct policy_engine *pe)
+ 	struct sink_port_pe *snkpe;
+ 	struct policy *p;
+ 
++	if (!pe)
++		return ERR_PTR(-EINVAL);
++
+ 	snkpe = kzalloc(sizeof(*snkpe), GFP_KERNEL);
+ 	if (!snkpe)
+ 		return ERR_PTR(-ENOMEM);
+diff --git a/drivers/usb/typec/pd/src_port_pe.c b/drivers/usb/typec/pd/src_port_pe.c
+index 500a9ac..62dc4ee 100644
+--- a/drivers/usb/typec/pd/src_port_pe.c
++++ b/drivers/usb/typec/pd/src_port_pe.c
+@@ -885,6 +885,9 @@ struct policy *src_pe_init(struct policy_engine *pe)
+ 	struct src_port_pe *src_pe;
+ 	struct policy *p;
+ 
++	if (!pe)
++		return ERR_PTR(-EINVAL);
++
+ 	src_pe = kzalloc(sizeof(struct src_port_pe),
+ 						GFP_KERNEL);
+ 	if (!src_pe) {
+-- 
+1.9.1
+

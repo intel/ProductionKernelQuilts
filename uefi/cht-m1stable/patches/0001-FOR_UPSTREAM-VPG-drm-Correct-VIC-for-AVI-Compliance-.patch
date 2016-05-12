@@ -1,0 +1,149 @@
+From bf1030973d60050117965176cfa2e18cdaf9c0a1 Mon Sep 17 00:00:00 2001
+Message-Id: <bf1030973d60050117965176cfa2e18cdaf9c0a1.1428642548.git.chang-joon.lee@intel.com>
+From: Shubhangi Shrivastava <shubhangi.shrivastava@intel.com>
+Date: Thu, 26 Feb 2015 21:05:31 +0530
+Subject: [PATCH 1/7] FOR_UPSTREAM [VPG]: drm: Correct VIC for AVI Compliance
+ test
+
+Get VIC from short video descriptor, add clock range 60HZ and 59.94HZ
+check, send aspect ratio information to userspace via "flags" parameter
+of DRM mode info structure so that can get correct VIC number when
+setting timing from userspace equal to cea_mode.
+
+Issue: GMINL-6518
+Change-Id: I57f8e6cf81e4e807f358e4896382003628a2a800
+Signed-off-by: Akashdeep Sharma <akashdeep.sharma@intel.com>
+Signed-off-by: ljia5 <lin.a.jia@intel.com>
+Signed-off-by: Shubhangi Shrivastava <shubhangi.shrivastava@intel.com>
+---
+ drivers/gpu/drm/drm_crtc.c  |   22 ++++++++++++++++++++++
+ drivers/gpu/drm/drm_edid.c  |   34 +++++++++++++++++++++++++---------
+ drivers/gpu/drm/drm_modes.c |    3 +++
+ include/uapi/drm/drm_mode.h |    5 +++++
+ 4 files changed, 55 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index bba3b60..dce6c11 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -1564,6 +1564,12 @@ static void drm_crtc_convert_to_umode(struct drm_mode_modeinfo *out,
+ 	out->type = in->type;
+ 	strncpy(out->name, in->name, DRM_DISPLAY_MODE_LEN);
+ 	out->name[DRM_DISPLAY_MODE_LEN-1] = 0;
++
++	/* Send picture aspect ratio to user space in flags parameter */
++	if (in->picture_aspect_ratio == HDMI_PICTURE_ASPECT_4_3)
++		out->flags |= DRM_MODE_FLAG_PAR4_3;
++	else if (in->picture_aspect_ratio == HDMI_PICTURE_ASPECT_16_9)
++		out->flags |= DRM_MODE_FLAG_PAR16_9;
+ }
+ 
+ /**
+@@ -1603,6 +1609,22 @@ static int drm_crtc_convert_umode(struct drm_display_mode *out,
+ 	strncpy(out->name, in->name, DRM_DISPLAY_MODE_LEN);
+ 	out->name[DRM_DISPLAY_MODE_LEN-1] = 0;
+ 
++	/* Extract picture aspect ratio info from flags parameter */
++	switch (in->flags & DRM_MODE_FLAG_PARMASK) {
++	case DRM_MODE_FLAG_PAR4_3:
++		out->picture_aspect_ratio = HDMI_PICTURE_ASPECT_4_3;
++		break;
++	case DRM_MODE_FLAG_PAR16_9:
++		out->picture_aspect_ratio = HDMI_PICTURE_ASPECT_16_9;
++		break;
++	default:
++		out->picture_aspect_ratio = HDMI_PICTURE_ASPECT_NONE;
++		break;
++	}
++
++	/* Clear aspect ratio info from flags */
++	out->flags &= ~DRM_MODE_FLAG_PARMASK;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index dfa9769..f766219 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -2409,6 +2409,27 @@ static u8 *drm_find_cea_extension(struct edid *edid)
+ }
+ 
+ /*
++ * helper function to check whether two clocks can fall into the same VIC.
++ *
++ * Returns: true if possible, false otherwise.
++ */
++static bool drm_check_clock_match(int target, int reference)
++{
++	/*
++	 * check target clock is in range of 60Hz or 59.94
++	 * (reference * 1000/1001) with (-0.5%, +0.5%) tolerance.
++	 * Based on CEA spec, when determining whether two video timings
++	 * are identical, clock frequencey within (-0.5%, +0.5%) tolerance
++	 * should be considered as the same.
++	 */
++
++	if (target >= DIV_ROUND_UP(reference * 995, 1001) &&
++		target <= DIV_ROUND_UP(reference * 1005, 1000))
++		return true;
++	return false;
++}
++
++/*
+  * Calculate the alternate clock for the CEA mode
+  * (60Hz vs. 59.94Hz etc.)
+  */
+@@ -2449,15 +2470,10 @@ u8 drm_match_cea_mode(const struct drm_display_mode *to_match)
+ 
+ 	for (mode = 0; mode < ARRAY_SIZE(edid_cea_modes); mode++) {
+ 		const struct drm_display_mode *cea_mode = &edid_cea_modes[mode];
+-		unsigned int clock1, clock2;
+-
+-		/* Check both 60Hz and 59.94Hz */
+-		clock1 = cea_mode->clock;
+-		clock2 = cea_mode_alternate_clock(cea_mode);
+-
+-		if ((KHZ2PICOS(to_match->clock) == KHZ2PICOS(clock1) ||
+-		     KHZ2PICOS(to_match->clock) == KHZ2PICOS(clock2)) &&
+-		    drm_mode_equal_no_clocks_no_stereo(to_match, cea_mode))
++		if (drm_check_clock_match(to_match->clock, cea_mode->clock) &&
++		    drm_mode_equal_no_clocks_no_stereo(to_match, cea_mode) &&
++		    to_match->picture_aspect_ratio ==
++				cea_mode->picture_aspect_ratio)
+ 			return mode + 1;
+ 	}
+ 	return 0;
+diff --git a/drivers/gpu/drm/drm_modes.c b/drivers/gpu/drm/drm_modes.c
+index bedf189..00b1e29 100644
+--- a/drivers/gpu/drm/drm_modes.c
++++ b/drivers/gpu/drm/drm_modes.c
+@@ -865,6 +865,9 @@ bool drm_mode_equal(const struct drm_display_mode *mode1, const struct drm_displ
+ 	} else if (mode1->clock != mode2->clock)
+ 		return false;
+ 
++	if (mode1->picture_aspect_ratio != mode2->picture_aspect_ratio)
++		return false;
++
+ 	if ((mode1->flags & DRM_MODE_FLAG_3D_MASK) !=
+ 	    (mode2->flags & DRM_MODE_FLAG_3D_MASK))
+ 		return false;
+diff --git a/include/uapi/drm/drm_mode.h b/include/uapi/drm/drm_mode.h
+index 528322c..e886b39 100644
+--- a/include/uapi/drm/drm_mode.h
++++ b/include/uapi/drm/drm_mode.h
+@@ -73,6 +73,11 @@
+ #define  DRM_MODE_FLAG_3D_TOP_AND_BOTTOM	(7<<14)
+ #define  DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF	(8<<14)
+ 
++/* Picture aspect ratio flags */
++#define DRM_MODE_FLAG_PARMASK			(3<<19)
++#define DRM_MODE_FLAG_PARNONE			(0<<19)
++#define DRM_MODE_FLAG_PAR16_9			(1<<19)
++#define DRM_MODE_FLAG_PAR4_3			(2<<19)
+ 
+ /* DPMS flags */
+ /* bit compatible with the xorg definitions. */
+-- 
+1.7.9.5
+

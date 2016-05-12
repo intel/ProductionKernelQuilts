@@ -1,0 +1,160 @@
+From 7211a64efe85c297044d830ffd40fb7493681800 Mon Sep 17 00:00:00 2001
+From: Yuyang Du <yuyang.du@intel.com>
+Date: Mon, 17 Nov 2014 19:55:00 -0500
+Subject: [PATCH] sched: Implement workload consolidation in wakeup/fork/exec
+
+In WAKE_AFFINE, if the target (first wakee, then waker) is not idle,
+but the the target is capable of handling the wakee task according
+to CC, we also select it.
+
+With regard to find the idlest sched_group, we first try to find
+the consolidated group.
+
+Change-Id: I9adb884306595c0e64067b518703e405029cf741
+Orig-Change-Id: Ia6a618e61cd2172cdc3fdb3b0dddbe6240078132
+Orig-Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-20603
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-9774
+Signed-off-by: Yuyang Du <yuyang.du@intel.com>
+Signed-off-by: Srinidhi Kasagar <srinidhi.kasagar@intel.com>
+---
+ include/linux/sched/sysctl.h |  4 ++++
+ kernel/sched/fair.c          | 52 +++++++++++++++++++++++++++++++++++++++++---
+ kernel/sysctl.c              |  9 ++++++++
+ 3 files changed, 62 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
+index 8045a55..e39d282 100644
+--- a/include/linux/sched/sysctl.h
++++ b/include/linux/sched/sysctl.h
+@@ -36,6 +36,10 @@ extern unsigned int sysctl_sched_min_granularity;
+ extern unsigned int sysctl_sched_wakeup_granularity;
+ extern unsigned int sysctl_sched_child_runs_first;
+ 
++#ifdef CONFIG_SMP
++extern unsigned int sysctl_sched_cc_wakeup_threshold;
++#endif
++
+ enum sched_tunable_scaling {
+ 	SCHED_TUNABLESCALING_NONE,
+ 	SCHED_TUNABLESCALING_LOG,
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index f315010..3f9a10b 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2397,6 +2397,9 @@ static inline void dequeue_entity_load_avg(struct cfs_rq *cfs_rq,
+ }
+ 
+ void update_cpu_concurrency(struct rq *rq);
++static struct sched_group *wc_find_group(struct sched_domain *sd,
++	struct task_struct *p, int this_cpu);
++static int cpu_cc_capable(int cpu);
+ 
+ /*
+  * Update the rq's load with the elapsed running time before entering
+@@ -4173,7 +4176,19 @@ static int select_idle_sibling(struct task_struct *p, int target)
+ 	struct sched_group *sg;
+ 	int i = task_cpu(p);
+ 
+-	if (idle_cpu(target))
++	/*
++	 * We prefer wakee to waker CPU. For each of them, if it is idle, then
++	 * select it, but if not, we lower down the bar to use a threshold of CC
++	 * to determine whether it is capable of handling the wakee task
++	 */
++	if (sysctl_sched_cc_wakeup_threshold) {
++		if (idle_cpu(i) || cpu_cc_capable(i))
++			return i;
++
++		if (i != target && (idle_cpu(target) || cpu_cc_capable(target)))
++			return target;
++	}
++	else if (idle_cpu(target))
+ 		return target;
+ 
+ 	/*
+@@ -4266,7 +4281,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
+ 	}
+ 
+ 	while (sd) {
+-		struct sched_group *group;
++		struct sched_group *group = NULL;
+ 		int weight;
+ 
+ 		if (!(sd->flags & sd_flag)) {
+@@ -4274,7 +4289,12 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
+ 			continue;
+ 		}
+ 
+-		group = find_idlest_group(sd, p, cpu, sd_flag);
++		if (sd->flags & SD_WORKLOAD_CONSOLIDATION)
++			group = wc_find_group(sd, p, cpu);
++
++		if (!group)
++			group = find_idlest_group(sd, p, cpu, sd_flag);
++
+ 		if (!group) {
+ 			sd = sd->child;
+ 			continue;
+@@ -7381,6 +7401,12 @@ __init void init_sched_fair_class(void)
+  */
+ 
+ /*
++ * Concurrency lower than this threshold% is capable of running
++ * wakee task, otherwise make it 0
++ */
++unsigned int sysctl_sched_cc_wakeup_threshold = 60;
++
++/*
+  * Aggressively push the task even it is hot
+  */
+ static int wc_push_hot_task = 1;
+@@ -7417,6 +7443,26 @@ static inline unsigned long get_cpu_concurrency(int cpu)
+ 	return cpu_rq(cpu)->concurrency.avg.load_avg_contrib;
+ }
+ 
++/*
++ * whether cpu is capable of having more concurrency
++ */
++static int cpu_cc_capable(int cpu)
++{
++	unsigned long cpu_cc = get_cpu_concurrency(cpu);
++	unsigned long threshold = cc_weight(1);
++
++	cpu_cc *= 100;
++	cpu_cc *= cpu_rq(cpu)->cpu_power;
++
++	threshold *= sysctl_sched_cc_wakeup_threshold;
++	threshold <<= SCHED_POWER_SHIFT;
++
++	if (cpu_cc <= threshold)
++		return 1;
++
++	return 0;
++}
++
+ static inline unsigned long sched_group_cc(struct sched_group *sg)
+ {
+ 	unsigned long sg_cc = 0;
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 4d0d288..370083b 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -1110,6 +1110,15 @@ static struct ctl_table kern_table[] = {
+ 		.proc_handler	= proc_dointvec,
+ 	},
+ #endif
++#ifdef CONFIG_SMP
++	{
++		.procname	= "sched_cc_wakeup_threshold",
++		.data		= &sysctl_sched_cc_wakeup_threshold,
++		.maxlen		= sizeof(sysctl_sched_cc_wakeup_threshold),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++#endif
+ 	{ }
+ };
+ 
+-- 
+1.9.1
+

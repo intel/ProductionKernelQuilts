@@ -1,0 +1,185 @@
+From fd53d79441fb0eee6846cb07f6cbcd1b16470f96 Mon Sep 17 00:00:00 2001
+Message-Id: <fd53d79441fb0eee6846cb07f6cbcd1b16470f96.1417780177.git.chang-joon.lee@intel.com>
+In-Reply-To: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+References: <e293659a31a2970805251d9fed030ac809a9a6d0.1417780177.git.chang-joon.lee@intel.com>
+From: Michel Thierry <michel.thierry@intel.com>
+Date: Tue, 11 Nov 2014 16:47:33 +0000
+Subject: [PATCH 19/30] FROM_UPSTREAM [VPG]: drm/i915: Initialize workarounds
+ in logical ring mode too
+
+Following the legacy ring submission example, update the
+ring->init_context() hook to support the execlist submission mode.
+
+v2: update to use the new workaround macros and cleanup unused code.
+This takes care of both bdw and chv workarounds.
+
+v2.1: Add missing call to init_context() during deferred context creation.
+
+v3: Split init_context (emit) in legacy/lrc modes. For lrc, get the ringbuf
+from the context (Mika/Daniel).
+
+v4: Merge init_context interfaces back, the legacy mode only needs the ring,
+but the lrc mode needs the ring and context (Mika).
+
+Issue: VIZ-4092
+Issue: GMIN-3475
+Change-Id: I079789c5aad51db167fd1abc1b15d12f9a4020eb
+Cc: Deepak S <deepak.s@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+Signed-off-by: Arun Siluvery <arun.siluvery@linux.intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Upstream-repo:Upstream-repo: http://cgit.freedesktop.org/drm-intel/log/?h=drm-intel-next-queued
+Upstream-commit: 38ceabe88a884aa92404c396a7b2f28e2ed27215
+[danvet: Align function paramater lists properly.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Tested-By: PRC QA PRTS (Patch Regression Test System Contact: shuang.he@intel.com)
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |    2 +-
+ drivers/gpu/drm/i915/intel_lrc.c        |   47 ++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    5 ++--
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    5 +++-
+ 4 files changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 865e43b..6975c46 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -709,7 +709,7 @@ done:
+ 
+ 	if (uninitialized) {
+ 		if (ring->init_context) {
+-			ret = ring->init_context(ring);
++			ret = ring->init_context(ring, to);
+ 			if (ret)
+ 				DRM_ERROR("ring init context: %d\n", ret);
+ 		}
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 2711b54..7891987 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1215,6 +1215,44 @@ int intel_logical_ring_begin(struct intel_ringbuffer *ringbuf, int num_dwords)
+ 	return 0;
+ }
+ 
++static int intel_logical_ring_workarounds_emit(struct intel_engine_cs *ring,
++	       struct intel_context *ctx)
++{
++	int ret, i;
++	struct intel_ringbuffer *ringbuf = ctx->engine[ring->id].ringbuf;
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct i915_workarounds *w = &dev_priv->workarounds;
++
++	if (WARN_ON(w->count == 0))
++		return 0;
++
++	ring->gpu_caches_dirty = true;
++	ret = logical_ring_flush_all_caches(ringbuf);
++	if (ret)
++		return ret;
++
++	ret = intel_logical_ring_begin(ringbuf, w->count * 2 + 2);
++	if (ret)
++		return ret;
++
++	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(w->count));
++	for (i = 0; i < w->count; i++) {
++		intel_logical_ring_emit(ringbuf, w->reg[i].addr);
++		intel_logical_ring_emit(ringbuf, w->reg[i].value);
++	}
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++
++	intel_logical_ring_advance(ringbuf);
++
++	ring->gpu_caches_dirty = true;
++	ret = logical_ring_flush_all_caches(ringbuf);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
+ static int gen8_init_common_ring(struct intel_engine_cs *ring)
+ {
+ 	struct drm_device *dev = ring->dev;
+@@ -1256,7 +1294,7 @@ static int gen8_init_render_ring(struct intel_engine_cs *ring)
+ 
+ 	I915_WRITE(INSTPM, _MASKED_BIT_ENABLE(INSTPM_FORCE_ORDERING));
+ 
+-	return ret;
++	return init_workarounds_ring(ring);
+ }
+ 
+ static int gen8_emit_bb_start(struct intel_ringbuffer *ringbuf,
+@@ -1516,6 +1554,7 @@ static int logical_render_ring_init(struct drm_device *dev)
+ 		ring->irq_keep_mask |= GT_RENDER_L3_PARITY_ERROR_INTERRUPT;
+ 
+ 	ring->init = gen8_init_render_ring;
++	ring->init_context = intel_logical_ring_workarounds_emit;
+ 	ring->cleanup = intel_fini_pipe_control;
+ 	ring->get_seqno = gen8_get_seqno;
+ 	ring->set_seqno = gen8_set_seqno;
+@@ -1983,6 +2022,12 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	}
+ 
+ 	if (ring->id == RCS && !ctx->rcs_initialized) {
++		if (ring->init_context) {
++			ret = ring->init_context(ring, ctx);
++			if (ret)
++				DRM_ERROR("ring init context: %d\n", ret);
++		}
++
+ 		ret = intel_lr_context_render_state_init(ring, ctx);
+ 		if (ret) {
+ 			DRM_ERROR("Init render state failed: %d\n", ret);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 479579a..07e753d 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1059,7 +1059,8 @@ get_pipe_control_scratch_addr(struct intel_engine_cs *ring)
+ 	return ring->scratch.gtt_offset;
+ }
+ 
+-static int intel_ring_workarounds_emit(struct intel_engine_cs *ring)
++static int intel_ring_workarounds_emit(struct intel_engine_cs *ring,
++				       struct intel_context *ctx)
+ {
+ 	int ret, i;
+ 	struct drm_device *dev = ring->dev;
+@@ -1199,7 +1200,7 @@ static int chv_init_workarounds(struct intel_engine_cs *ring)
+ 	return 0;
+ }
+ 
+-static int init_workarounds_ring(struct intel_engine_cs *ring)
++int init_workarounds_ring(struct intel_engine_cs *ring)
+ {
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index c01afc6..68d5e01 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -187,7 +187,8 @@ struct intel_engine_cs {
+ 
+ 	int		(*init)(struct intel_engine_cs *ring);
+ 
+-	int		(*init_context)(struct intel_engine_cs *ring);
++	int		(*init_context)(struct intel_engine_cs *ring,
++					struct intel_context *ctx);
+ 
+ 	void		(*write_tail)(struct intel_engine_cs *ring,
+ 				      u32 value);
+@@ -469,6 +470,8 @@ int intel_init_vebox_ring_buffer(struct drm_device *dev);
+ u64 intel_ring_get_active_head(struct intel_engine_cs *ring);
+ void intel_ring_setup_status_page(struct intel_engine_cs *ring);
+ u32 get_pipe_control_scratch_addr(struct intel_engine_cs *ring);
++int init_workarounds_ring(struct intel_engine_cs *ring);
++
+ 
+ static inline u32 intel_ring_get_tail(struct intel_ringbuffer *ringbuf)
+ {
+-- 
+1.7.9.5
+

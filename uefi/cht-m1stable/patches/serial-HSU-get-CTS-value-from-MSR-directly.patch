@@ -1,0 +1,109 @@
+From 76ce0da39a8424d03c68fc8db2ad18bcb6e4579d Mon Sep 17 00:00:00 2001
+From: Huiquan Zhong <huiquan.zhong@intel.com>
+Date: Tue, 9 Jun 2015 23:32:02 +0800
+Subject: [PATCH] serial: HSU: get CTS value from MSR directly
+
+Actually, CTS value can get from MSR register directly on CHT platform.
+No need WA to assert CTS to '1' if AFE enabled.
+
+DesignWare UART CTS is auto controlled by HW IP, ignore sw-assisted CTS
+flow control.
+
+Change-Id: If1a82987d0f554d8005d0d1da41a1835cf732721
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-37496
+Signed-off-by: Huiquan Zhong <huiquan.zhong@intel.com>
+---
+ drivers/tty/serial/hsu/hsu.h      |  9 ++-------
+ drivers/tty/serial/hsu/hsu_core.c | 12 ++++++++----
+ drivers/tty/serial/hsu/hsu_plat.c |  7 +++++++
+ 3 files changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/tty/serial/hsu/hsu.h b/drivers/tty/serial/hsu/hsu.h
+index 510fe5f5a2c9..1ba3d33d4f83 100644
+--- a/drivers/tty/serial/hsu/hsu.h
++++ b/drivers/tty/serial/hsu/hsu.h
+@@ -238,7 +238,6 @@ struct uart_hsu_port {
+ 	void			*dma_priv;
+ 	struct hsu_dma_ops	*dma_ops;
+ 	int			dma_inited;
+-	int			prev_mcr;
+ 	struct hsu_port_cfg	*port_cfg;
+ };
+ 
+@@ -263,13 +262,9 @@ static inline unsigned int serial_in(struct uart_hsu_port *up, int offset)
+ {
+ 	unsigned int val;
+ 
+-	if (offset > UART_MSR || up->hw_type == hsu_dw) {
++	if (offset > UART_MSR || up->hw_type == hsu_dw)
+ 		val = readl(up->port.membase + (offset << 2));
+-		if (offset == UART_MSR && up->prev_mcr & UART_MCR_AFE) {
+-			val |= UART_MSR_CTS;
+-			val &= ~UART_MSR_DCTS;
+-		}
+-	} else
++	else
+ 		val = (unsigned int)readb(up->port.membase + offset);
+ 
+ 	return val;
+diff --git a/drivers/tty/serial/hsu/hsu_core.c b/drivers/tty/serial/hsu/hsu_core.c
+index a19ecafca01b..21a565ab463b 100644
+--- a/drivers/tty/serial/hsu/hsu_core.c
++++ b/drivers/tty/serial/hsu/hsu_core.c
+@@ -834,9 +834,14 @@ static unsigned int serial_hsu_get_mctrl(struct uart_port *port)
+ {
+ 	struct uart_hsu_port *up =
+ 		container_of(port, struct uart_hsu_port, port);
+-	unsigned char status = up->msr;
++	unsigned char status;
+ 	unsigned int ret = 0;
+ 
++	if (likely(!test_bit(flag_suspend, &up->flags)))
++		up->msr = serial_in(up, UART_MSR);
++
++	status = up->msr;
++
+ 	if (status & UART_MSR_DCD)
+ 		ret |= TIOCM_CAR;
+ 	if (status & UART_MSR_RI)
+@@ -1225,10 +1230,9 @@ serial_hsu_do_set_termios(struct uart_port *port, struct ktermios *termios,
+ 
+ 	serial_out(up, UART_IER, up->ier);
+ 
+-	if (termios->c_cflag & CRTSCTS) {
++	if (termios->c_cflag & CRTSCTS)
+ 		up->mcr |= UART_MCR_AFE | UART_MCR_RTS;
+-		up->prev_mcr = up->mcr;
+-	} else
++	else
+ 		up->mcr &= ~UART_MCR_AFE;
+ 
+ 	up->dll	= quot & 0xff;
+diff --git a/drivers/tty/serial/hsu/hsu_plat.c b/drivers/tty/serial/hsu/hsu_plat.c
+index 3f7ebd027535..8069f2d8c70e 100644
+--- a/drivers/tty/serial/hsu/hsu_plat.c
++++ b/drivers/tty/serial/hsu/hsu_plat.c
+@@ -175,6 +175,7 @@ static void cht_hsu_set_clk(unsigned int m, unsigned int n,
+ static void hsu_set_termios(struct uart_port *p, struct ktermios *termios,
+ 				struct ktermios *old)
+ {
++	struct tty_port *tport = &p->state->port;
+ 	u32 reg;
+ 
+ 	/*
+@@ -187,6 +188,12 @@ static void hsu_set_termios(struct uart_port *p, struct ktermios *termios,
+ 		reg |= CHT_GENERAL_DIS_RTS_N_OVERRIDE;
+ 	writel(reg, p->membase + CHT_GENERAL_REG);
+ 
++	/* DesignWare UART CTS is auto controlled by HW IP,
++	 * ignore sw-assisted CTS flow control
++	 */
++	if (termios->c_cflag & CRTSCTS)
++		clear_bit(ASYNCB_CTS_FLOW, &tport->flags);
++
+ 	serial_hsu_do_set_termios(p, termios, old);
+ }
+ 
+-- 
+1.9.1
+

@@ -1,0 +1,333 @@
+From fb68fd8913c90775c1277295a1ddbe62955ebd02 Mon Sep 17 00:00:00 2001
+Message-Id: <fb68fd8913c90775c1277295a1ddbe62955ebd02.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: "G, Pallavi" <pallavi.g@intel.com>
+Date: Thu, 21 Nov 2013 16:48:17 +0530
+Subject: [PATCH 044/312] FOR_UPSTREAM [VPG]: drm/i915: z-order alpha fix
+
+Fixed the z-order change alpha broken by the dynamic page flip
+
+Issue: APDEV-1286
+Change-Id: Icc9873db971d944d5287d4a747d22d5c8a61b176
+Signed-off-by: G, Pallavi <pallavi.g@intel.com>
+Signed-off-by: A.Sunil Kamath <sunil.kamath@intel.com>
+Reviewed-on: https://android.intel.com/162831
+Reviewed-by: Kulkarni, Vandita <vandita.kulkarni@intel.com>
+Tested-by: Kulkarni, Vandita <vandita.kulkarni@intel.com>
+Tested-by: sys_abtbuild <sys_abtbuild@intel.com>
+Reviewed-by: Bloomfield, Jon <jon.bloomfield@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/intel_display.c |   24 ++++-
+ drivers/gpu/drm/i915/intel_drv.h     |    3 +
+ drivers/gpu/drm/i915/intel_sprite.c  |  176 +++++++---------------------------
+ 3 files changed, 57 insertions(+), 146 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 777a117..d2179b2 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2760,18 +2760,27 @@ static int hsw_set_pixelformat(struct drm_crtc *crtc, u32 pixel_format)
+ 		break;
+ 	case DRM_FORMAT_XRGB1555:
+ 	case DRM_FORMAT_ARGB1555:
+-		dspcntr |= DISPPLANE_BGRX555;
++		if (intel_crtc->primary_alpha)
++			dspcntr |= DISPPLANE_BGRA555;
++		else
++			dspcntr |= DISPPLANE_BGRX555;
+ 		break;
+ 	case DRM_FORMAT_RGB565:
+ 		dspcntr |= DISPPLANE_BGRX565;
+ 		break;
+ 	case DRM_FORMAT_XRGB8888:
+ 	case DRM_FORMAT_ARGB8888:
+-		dspcntr |= DISPPLANE_BGRX888;
++		if (intel_crtc->primary_alpha)
++			dspcntr |= DISPPLANE_BGRA888;
++		else
++			dspcntr |= DISPPLANE_BGRX888;
+ 		break;
+ 	case DRM_FORMAT_XBGR8888:
+ 	case DRM_FORMAT_ABGR8888:
+-		dspcntr |= DISPPLANE_RGBX888;
++		if (intel_crtc->primary_alpha)
++			dspcntr |= DISPPLANE_RGBA888;
++		else
++			dspcntr |= DISPPLANE_RGBX888;
+ 		break;
+ 	case DRM_FORMAT_XRGB2101010:
+ 	case DRM_FORMAT_ARGB2101010:
+@@ -2779,7 +2788,10 @@ static int hsw_set_pixelformat(struct drm_crtc *crtc, u32 pixel_format)
+ 		break;
+ 	case DRM_FORMAT_XBGR2101010:
+ 	case DRM_FORMAT_ABGR2101010:
+-		dspcntr |= DISPPLANE_RGBX101010;
++		if (intel_crtc->primary_alpha)
++			dspcntr |= DISPPLANE_RGBA101010;
++		else
++			dspcntr |= DISPPLANE_RGBX101010;
+ 		break;
+ 	default:
+ 		DRM_ERROR("Unsupported pixel format 0x%08x\n", pixel_format);
+@@ -11833,6 +11845,10 @@ static void intel_crtc_init(struct drm_device *dev, int pipe)
+ 
+ 	drm_crtc_helper_add(&intel_crtc->base, &intel_helper_funcs);
+ 
++	intel_crtc->primary_alpha = false;
++	intel_crtc->sprite0_alpha = true;
++	intel_crtc->sprite1_alpha = true;
++
+ 	WARN_ON(drm_crtc_index(&intel_crtc->base) != intel_crtc->pipe);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index b72d2db..41e64c9 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -401,6 +401,9 @@ struct intel_crtc {
+ 	bool new_enabled;
+ 
+ 	uint32_t ddi_pll_sel;
++	bool primary_alpha;
++	bool sprite0_alpha;
++	bool sprite1_alpha;
+ 
+ 	/* reset counter value when the last flip was submitted */
+ 	unsigned int reset_counter;
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 54657aa..dd42e92 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -298,142 +298,6 @@ i915_set_plane_alpha(struct drm_device *dev, void *data, struct drm_file *file)
+ 	return 0;
+ }
+ 
+-/*
+- * enable/disable primary plane alpha channel based on the z-order
+- */
+-void
+-i915_set_primary_alpha(struct drm_i915_private *dev_priv, int zorder, int plane)
+-{
+-	u32 dspcntr;
+-	u32 reg;
+-	u32 pixformat;
+-	bool alpha = false;
+-
+-	if (zorder != P1S1S2C1 && zorder != P1S2S1C1)
+-		alpha = true;
+-	else
+-		alpha = false;
+-
+-	reg = DSPCNTR(plane);
+-	dspcntr = I915_READ(reg);
+-
+-	if (!(dspcntr & DISPLAY_PLANE_ENABLE))
+-		return;
+-
+-	pixformat = dspcntr & DISPPLANE_PIXFORMAT_MASK;
+-	dspcntr &= ~DISPPLANE_PIXFORMAT_MASK;
+-
+-	DRM_DEBUG_DRIVER("pixformat = %x, alpha = %d", pixformat, alpha);
+-
+-	switch (pixformat) {
+-	case DISPPLANE_BGRX888:
+-	case DISPPLANE_BGRA888:
+-		if (alpha)
+-			dspcntr |= DISPPLANE_BGRA888;
+-		else
+-			dspcntr |= DISPPLANE_BGRX888;
+-		break;
+-	case DISPPLANE_RGBX888:
+-	case DISPPLANE_RGBA888:
+-		if (alpha)
+-			dspcntr |= DISPPLANE_RGBA888;
+-		else
+-			dspcntr |= DISPPLANE_RGBX888;
+-		break;
+-	case DISPPLANE_BGRX101010:
+-	case DISPPLANE_BGRA101010:
+-		if (alpha)
+-			dspcntr |= DISPPLANE_BGRA101010;
+-		else
+-			dspcntr |= DISPPLANE_BGRX101010;
+-		break;
+-	case DISPPLANE_RGBX101010:
+-	case DISPPLANE_RGBA101010:
+-		if (alpha)
+-			dspcntr |= DISPPLANE_RGBA101010;
+-		else
+-			dspcntr |= DISPPLANE_RGBX101010;
+-	case DISPPLANE_BGRX565:
+-		dspcntr |= DISPPLANE_BGRX565;
+-		break;
+-	case DISPPLANE_8BPP:
+-		dspcntr |= DISPPLANE_8BPP;
+-		break;
+-	default:
+-		DRM_ERROR("Unknown pixel format 0x%08x\n", pixformat);
+-		break;
+-	}
+-
+-	if (pixformat != (dspcntr & DISPPLANE_PIXFORMAT_MASK)) {
+-		I915_WRITE(reg, dspcntr);
+-		DRM_DEBUG_DRIVER("dspcntr = %x", dspcntr);
+-	}
+-}
+-
+-/*
+- * enable/disable sprite alpha channel based on the z-order
+- */
+-void i915_set_sprite_alpha(struct drm_i915_private *dev_priv, int zorder,
+-				int pipe, int plane)
+-{
+-	u32 spcntr;
+-	u32 pixformat;
+-	bool alpha = false;
+-
+-	if (zorder != S1P1S2C1 && zorder != S1S2P1C1 && plane == 0)
+-		alpha = true;
+-	else if (zorder != S2P1S1C1 && zorder != S2S1P1C1 && plane == 1)
+-		alpha = true;
+-	else
+-		alpha = false;
+-
+-	spcntr = I915_READ(SPCNTR(pipe, plane));
+-	if (!(spcntr & DISPLAY_PLANE_ENABLE))
+-		return;
+-	pixformat = spcntr & SP_PIXFORMAT_MASK;
+-	spcntr &= ~SP_PIXFORMAT_MASK;
+-
+-	DRM_DEBUG_DRIVER("sprite pixformat = %x plane = %d", pixformat, plane);
+-
+-	switch (pixformat) {
+-	case SP_FORMAT_BGRA8888:
+-	case SP_FORMAT_BGRX8888:
+-		if (alpha)
+-			spcntr |= SP_FORMAT_BGRA8888;
+-		else
+-			spcntr |= SP_FORMAT_BGRX8888;
+-		break;
+-	case SP_FORMAT_RGBA8888:
+-	case SP_FORMAT_RGBX8888:
+-		if (alpha)
+-			spcntr |= SP_FORMAT_RGBA8888;
+-		else
+-			spcntr |= SP_FORMAT_RGBX8888;
+-		break;
+-	case SP_FORMAT_RGBA1010102:
+-	case SP_FORMAT_RGBX1010102:
+-		if (alpha)
+-			spcntr |= SP_FORMAT_RGBA1010102;
+-		else
+-			spcntr |= SP_FORMAT_RGBX1010102;
+-		break;
+-	case SP_FORMAT_YUV422:
+-		spcntr |= SP_FORMAT_YUV422;
+-		break;
+-	case SP_FORMAT_BGR565:
+-		spcntr |= SP_FORMAT_BGR565;
+-		break;
+-	default:
+-		DRM_ERROR("Unknown pixel format 0x%08x\n", pixformat);
+-		break;
+-	}
+-
+-	if (pixformat != (spcntr & SP_PIXFORMAT_MASK)) {
+-		I915_WRITE(SPCNTR(pipe, plane), spcntr);
+-		DRM_DEBUG_DRIVER("spcntr = %x ", spcntr);
+-	}
+-}
+-
+ int i915_set_plane_zorder(struct drm_device *dev, void *data,
+ 			  struct drm_file *file)
+ {
+@@ -445,6 +309,9 @@ int i915_set_plane_zorder(struct drm_device *dev, void *data,
+ 	int pipe = (order >> 31) & 0x1;
+ 	int z_order = order & 0x000F;
+ 
++	struct intel_crtc *intel_crtc =
++			to_intel_crtc(dev_priv->plane_to_crtc_mapping[pipe]);
++
+ 	s1_zorder = (order >> 3) & 0x1;
+ 	s1_bottom = (order >> 2) & 0x1;
+ 	s2_zorder = (order >> 1) & 0x1;
+@@ -474,11 +341,20 @@ int i915_set_plane_zorder(struct drm_device *dev, void *data,
+ 		val |= SPRITE_FORCE_BOTTOM;
+ 	I915_WRITE(SPCNTR(pipe, 1), val);
+ 
+-	i915_set_primary_alpha(dev_priv, z_order, pipe);
++	if (z_order != P1S1S2C1 && z_order != P1S2S1C1)
++		intel_crtc->primary_alpha = true;
++	else
++		intel_crtc->primary_alpha = false;
+ 
+-	i915_set_sprite_alpha(dev_priv, z_order, pipe, 0);
+-	i915_set_sprite_alpha(dev_priv, z_order, pipe, 1);
++	if (z_order != S1P1S2C1 && z_order != S1S2P1C1)
++		intel_crtc->sprite0_alpha = true;
++	else
++		intel_crtc->sprite0_alpha = false;
+ 
++	if (z_order != S2P1S1C1 && z_order != S2S1P1C1)
++		intel_crtc->sprite1_alpha = true;
++	else
++		intel_crtc->sprite1_alpha = false;
+ 	return 0;
+ }
+ 
+@@ -498,11 +374,18 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 	int plane = intel_plane->plane;
+ 	u32 sprctl;
+ 	bool rotate = false;
++	bool alpha = true;
+ 	unsigned long sprsurf_offset, linear_offset;
+ 	int pixel_size = drm_format_plane_cpp(fb->pixel_format, 0);
+ 	u32 start_vbl_count;
+ 	bool atomic_update;
+ 
++	if (plane && intel_crtc->sprite1_alpha)
++		alpha = true;
++	else if (!plane && intel_crtc->sprite0_alpha)
++		alpha = true;
++	else
++		alpha = false;
+ 	sprctl = I915_READ(SPCNTR(pipe, plane));
+ 	/* Mask out pixel format bits in case we change it */
+ 	sprctl &= ~SP_PIXFORMAT_MASK;
+@@ -529,19 +412,28 @@ vlv_update_plane(struct drm_plane *dplane, struct drm_crtc *crtc,
+ 		sprctl |= SP_FORMAT_BGRX8888;
+ 		break;
+ 	case DRM_FORMAT_ARGB8888:
+-		sprctl |= SP_FORMAT_BGRA8888;
++		if (alpha)
++			sprctl |= SP_FORMAT_BGRA8888;
++		else
++			sprctl |= SP_FORMAT_BGRX8888;
+ 		break;
+ 	case DRM_FORMAT_XBGR2101010:
+ 		sprctl |= SP_FORMAT_RGBX1010102;
+ 		break;
+ 	case DRM_FORMAT_ABGR2101010:
+-		sprctl |= SP_FORMAT_RGBA1010102;
++		if (alpha)
++			sprctl |= SP_FORMAT_RGBA1010102;
++		else
++			sprctl |= SP_FORMAT_RGBX1010102;
+ 		break;
+ 	case DRM_FORMAT_XBGR8888:
+ 		sprctl |= SP_FORMAT_RGBX8888;
+ 		break;
+ 	case DRM_FORMAT_ABGR8888:
+-		sprctl |= SP_FORMAT_RGBA8888;
++		if (alpha)
++			sprctl |= SP_FORMAT_RGBA8888;
++		else
++			sprctl |= SP_FORMAT_RGBX8888;
+ 		break;
+ 	default:
+ 		/*
+-- 
+1.7.9.5
+

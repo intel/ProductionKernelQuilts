@@ -1,0 +1,209 @@
+From c0daa6baf0ba477d0bba12556958aa5b34fc2ed4 Mon Sep 17 00:00:00 2001
+Message-Id: <c0daa6baf0ba477d0bba12556958aa5b34fc2ed4.1413837856.git.chang-joon.lee@intel.com>
+In-Reply-To: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+References: <006497b7323eca32c2f489a1a9f662743c0d16d2.1413837855.git.chang-joon.lee@intel.com>
+From: Pallavi <pallavi.g@intel.com>
+Date: Tue, 23 Apr 2013 19:08:30 +0530
+Subject: [PATCH 032/312] FOR_UPSTREAM [VPG]: drm/i915: Added panel fitter
+ HDMI property
+
+Added the panel fitter enable/disable property support for the HDMI
+connector to enable/disable the panel fitter from the Userspace for the
+external HDMI display clone scenarios.
+
+V2 - Migration to Kernel 3.10
+As part of migration this patch has been modified
+- intel_hdmi_dpms has been removed and instead enable/disable funcs are
+	added, hence the changes in intel_hdmi_dpms is added in enable
+	function.
+- drm_object_attach_property has replaced drm_connector_attach_property
+
+(cherry picked from commit f3b638f8443a9e934ebfaf70a7b05fd2b2d7d16d)
+
+Issue: APDEV-1163
+Change-Id: I73a1990ca19c695dc1e44211508edd760596d949
+Signed-off-by: Pallavi <pallavi.g@intel.com>
+Reviewed-on: http://android.intel.com:8080/106485
+Reviewed-by: cactus <cactus@intel.com>
+Reviewed-by: Stimson, Dale B <dale.b.stimson@intel.com>
+Tested-by: Stimson, Dale B <dale.b.stimson@intel.com>
+Reviewed-by: buildbot <buildbot@intel.com>
+Tested-by: buildbot <buildbot@intel.com>
+Signed-off-by: A.Sunil Kamath <sunil.kamath@intel.com>
+Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h    |    7 +++++++
+ drivers/gpu/drm/i915/intel_drv.h   |    2 ++
+ drivers/gpu/drm/i915/intel_hdmi.c  |   37 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_modes.c |   30 +++++++++++++++++++++++++++++
+ 4 files changed, 76 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9a66d5b..3f878f7 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -561,6 +561,12 @@ struct intel_device_info {
+ #undef DEFINE_FLAG
+ #undef SEP_SEMICOLON
+ 
++enum hdmi_panel_fitter {
++	AUTO_SCALE,
++	PILLAR_BOX,
++	LETTER_BOX,
++};
++
+ enum i915_cache_level {
+ 	I915_CACHE_NONE = 0,
+ 	I915_CACHE_LLC, /* also used for snoopable memory on non-LLC */
+@@ -1510,6 +1516,7 @@ struct drm_i915_private {
+ 
+ 	struct drm_property *broadcast_rgb_property;
+ 	struct drm_property *force_audio_property;
++	struct drm_property *force_pfit_property;
+ 
+ 	uint32_t hw_context_size;
+ 	struct list_head context_list;
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 8ed1eeb..f2d1b8d 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -500,6 +500,7 @@ struct intel_hdmi {
+ 	bool has_hdmi_sink;
+ 	bool has_audio;
+ 	enum hdmi_force_audio force_audio;
++	enum hdmi_panel_fitter pfit;
+ 	bool rgb_quant_range_selectable;
+ 	void (*write_infoframe)(struct drm_encoder *encoder,
+ 				enum hdmi_infoframe_type type,
+@@ -923,6 +924,7 @@ int intel_connector_update_modes(struct drm_connector *connector,
+ int intel_ddc_get_modes(struct drm_connector *c, struct i2c_adapter *adapter);
+ void intel_attach_force_audio_property(struct drm_connector *connector);
+ void intel_attach_broadcast_rgb_property(struct drm_connector *connector);
++void intel_attach_force_pfit_property(struct drm_connector *connector);
+ 
+ 
+ /* intel_overlay.c */
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index 8b69042..cea534a 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -691,6 +691,19 @@ static void intel_hdmi_prepare(struct intel_encoder *encoder)
+ 	else
+ 		hdmi_val |= SDVO_PIPE_SEL(crtc->pipe);
+ 
++	if (intel_hdmi->pfit) {
++		u32 val = 0;
++		if (intel_hdmi->pfit == PILLAR_BOX)
++			val =  PFIT_ENABLE | (1 << PFIT_PIPE_SHIFT) |
++				PFIT_SCALING_PILLAR;
++		else if (intel_hdmi->pfit == LETTER_BOX)
++			val =  PFIT_ENABLE | (1 << PFIT_PIPE_SHIFT) |
++				PFIT_SCALING_LETTER;
++		DRM_DEBUG_DRIVER("pfit val = %x", val);
++
++		I915_WRITE(PFIT_CONTROL, val);
++	}
++
+ 	I915_WRITE(intel_hdmi->hdmi_reg, hdmi_val);
+ 	POSTING_READ(intel_hdmi->hdmi_reg);
+ }
+@@ -794,6 +807,19 @@ static void intel_enable_hdmi(struct intel_encoder *encoder)
+ 	I915_WRITE(intel_hdmi->hdmi_reg, temp);
+ 	POSTING_READ(intel_hdmi->hdmi_reg);
+ 
++	if (intel_hdmi->pfit) {
++		u32 val = 0;
++		if (intel_hdmi->pfit == PILLAR_BOX)
++			val =  PFIT_ENABLE | (1 << PFIT_PIPE_SHIFT) |
++				PFIT_SCALING_PILLAR;
++		else if (intel_hdmi->pfit == LETTER_BOX)
++			val =  PFIT_ENABLE | (1 << PFIT_PIPE_SHIFT) |
++				PFIT_SCALING_LETTER;
++		DRM_DEBUG_DRIVER("pfit val = %x", val);
++
++		I915_WRITE(PFIT_CONTROL, val);
++	}
++
+ 	/* HW workaround, need to write this twice for issue that may result
+ 	 * in first write getting masked.
+ 	 */
+@@ -1135,6 +1161,15 @@ intel_hdmi_set_property(struct drm_connector *connector,
+ 		goto done;
+ 	}
+ 
++	if (property == dev_priv->force_pfit_property) {
++		if (val == intel_hdmi->pfit)
++			return 0;
++
++		DRM_DEBUG_DRIVER("val = %lld", val);
++		intel_hdmi->pfit = val;
++		goto done;
++	}
++
+ 	return -EINVAL;
+ 
+ done:
+@@ -1431,6 +1466,7 @@ intel_hdmi_add_properties(struct intel_hdmi *intel_hdmi, struct drm_connector *c
+ {
+ 	intel_attach_force_audio_property(connector);
+ 	intel_attach_broadcast_rgb_property(connector);
++	intel_attach_force_pfit_property(connector);
+ 	intel_hdmi->color_range_auto = true;
+ }
+ 
+@@ -1451,6 +1487,7 @@ void intel_hdmi_init_connector(struct intel_digital_port *intel_dig_port,
+ 	connector->interlace_allowed = 0;
+ 	connector->doublescan_allowed = 0;
+ 	connector->stereo_allowed = 1;
++	intel_hdmi->pfit = 0;
+ 
+ 	switch (port) {
+ 	case PORT_B:
+diff --git a/drivers/gpu/drm/i915/intel_modes.c b/drivers/gpu/drm/i915/intel_modes.c
+index 0e860f3..ce1bf22 100644
+--- a/drivers/gpu/drm/i915/intel_modes.c
++++ b/drivers/gpu/drm/i915/intel_modes.c
+@@ -27,6 +27,7 @@
+ #include <linux/i2c.h>
+ #include <linux/fb.h>
+ #include <drm/drm_edid.h>
++#include <drm/drm_crtc.h>
+ #include <drm/drmP.h>
+ #include "intel_drv.h"
+ #include "i915_drv.h"
+@@ -126,3 +127,32 @@ intel_attach_broadcast_rgb_property(struct drm_connector *connector)
+ 
+ 	drm_object_attach_property(&connector->base, prop, 0);
+ }
++
++static const struct drm_prop_enum_list pfit_names[] = {
++	{ 0, "Auto scale" },
++	{ 1, "PillarBox" },
++	{ 2, "LetterBox" },
++};
++
++void
++intel_attach_force_pfit_property(struct drm_connector *connector)
++{
++	struct drm_device *dev = connector->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_property *prop;
++	struct drm_mode_object *obj = &connector->base;
++
++	prop = dev_priv->force_pfit_property;
++	if (prop == NULL) {
++		prop = drm_property_create_enum(dev, 0,
++						"pfit",
++						pfit_names,
++						ARRAY_SIZE(pfit_names));
++		if (prop == NULL)
++			return;
++
++		dev_priv->force_pfit_property = prop;
++	}
++
++	drm_object_attach_property(obj, prop, 0);
++}
+-- 
+1.7.9.5
+

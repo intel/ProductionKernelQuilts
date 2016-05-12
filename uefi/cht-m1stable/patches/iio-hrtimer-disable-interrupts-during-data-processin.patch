@@ -1,0 +1,73 @@
+From 5f2a26859720e3f4703370e5fda8f402699cb286 Mon Sep 17 00:00:00 2001
+From: Mihai Serban <mihai.serban@intel.com>
+Date: Mon, 10 Aug 2015 18:29:51 +0300
+Subject: [PATCH 06/11] iio: hrtimer: disable interrupts during data processing
+
+Current hrtimer trigger implementation generates interrupts continuously at
+a configured rate. Interrupts are not disabled during data processing so
+there are cases when an interrupt is raised in the middle of data processing.
+Such interrupts were just ignored making the trigger's consumer skip some events.
+This patch applies the principle used by triggers based on hardware IRQs:
+interrupts are disabled during data processing and they are re-enabled once
+data processing is done.
+
+Change-Id: I3ba58bae8c3caafd8dd0ef66b0afd8841bf8c125
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-26476
+Signed-off-by: Mihai Serban <mihai.serban@intel.com>
+Reviewed-on: https://android.intel.com:443/486299
+---
+ drivers/iio/trigger/iio-trig-hrtimer.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/iio/trigger/iio-trig-hrtimer.c b/drivers/iio/trigger/iio-trig-hrtimer.c
+index 840b2d6..bc75656 100644
+--- a/drivers/iio/trigger/iio-trig-hrtimer.c
++++ b/drivers/iio/trigger/iio-trig-hrtimer.c
+@@ -28,6 +28,7 @@ struct iio_hrtimer_info {
+ 	struct hrtimer timer;
+ 	unsigned long sampling_frequency;
+ 	ktime_t period;
++	ktime_t last_event;
+ };
+ 
+ static struct config_item_type iio_hrtimer_type = {
+@@ -92,10 +93,10 @@ static enum hrtimer_restart iio_hrtimer_trig_handler(struct hrtimer *timer)
+ 
+ 	info = container_of(timer, struct iio_hrtimer_info, timer);
+ 
+-	hrtimer_forward_now(timer, info->period);
++	info->last_event = hrtimer_cb_get_time(timer);
+ 	iio_trigger_poll(info->swt.trigger, 0);
+ 
+-	return HRTIMER_RESTART;
++	return HRTIMER_NORESTART;
+ }
+ 
+ static int iio_trig_hrtimer_set_state(struct iio_trigger *trig, bool state)
+@@ -113,9 +114,23 @@ static int iio_trig_hrtimer_set_state(struct iio_trigger *trig, bool state)
+ 	return 0;
+ }
+ 
++static int iio_trig_hrtimer_try_reenable(struct iio_trigger *trig)
++{
++
++	struct iio_hrtimer_info *trig_info;
++
++	trig_info = iio_trigger_get_drvdata(trig);
++	hrtimer_start(&trig_info->timer,
++			ktime_add(trig_info->last_event, trig_info->period),
++			HRTIMER_MODE_ABS);
++
++	return 0;
++}
++
+ static const struct iio_trigger_ops iio_hrtimer_trigger_ops = {
+ 	.owner = THIS_MODULE,
+ 	.set_trigger_state = iio_trig_hrtimer_set_state,
++	.try_reenable = iio_trig_hrtimer_try_reenable,
+ };
+ 
+ static struct iio_sw_trigger *iio_trig_hrtimer_probe(const char *name)
+-- 
+1.9.1
+

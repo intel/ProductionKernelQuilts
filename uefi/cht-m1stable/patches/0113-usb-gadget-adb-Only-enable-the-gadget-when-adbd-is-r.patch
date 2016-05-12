@@ -1,0 +1,262 @@
+From 59da77c0153c660e9977cf0f380eb6a78fa3a777 Mon Sep 17 00:00:00 2001
+From: Benoit Goby <benoit@android.com>
+Date: Mon, 19 Mar 2012 18:56:52 -0700
+Subject: [PATCH 113/634] usb: gadget: adb: Only enable the gadget when adbd is
+ ready
+
+When adb is enabled, only connect the gadget when adbd is ready. If adbd
+dies or is restarted (e.g. "adb root"), the gadget is disconnected when
+the adb device is close, and it is re-connected once adb re-open the
+device.
+
+- Add callbacks to adb, similar to FunctionFs callbacks, to notify the
+  gadget when the daemon is ready or closed.
+- Refcount calls to android_enable/android_disable to enable the gadget
+  only once all the function daemons are ready.
+- Add enable/disble to android_usb_function to notify the function when
+  it is added/removed from the list of enabled functions.
+
+Change-Id: Id54ff85aec9cf8715c94b4f9bd6137a79ad58bfc
+Signed-off-by: Benoit Goby <benoit@android.com>
+---
+ drivers/usb/gadget/android.c | 117 ++++++++++++++++++++++++++++++++++++++++---
+ drivers/usb/gadget/f_adb.c   |  11 +++-
+ 2 files changed, 118 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/usb/gadget/android.c b/drivers/usb/gadget/android.c
+index b39ae67..d2c3393 100644
+--- a/drivers/usb/gadget/android.c
++++ b/drivers/usb/gadget/android.c
+@@ -79,6 +79,11 @@ struct android_usb_function {
+ 	int (*init)(struct android_usb_function *, struct usb_composite_dev *);
+ 	/* Optional: cleanup during gadget unbind */
+ 	void (*cleanup)(struct android_usb_function *);
++	/* Optional: called when the function is added the list of
++	 *		enabled functions */
++	void (*enable)(struct android_usb_function *);
++	/* Optional: called when it is removed */
++	void (*disable)(struct android_usb_function *);
+ 
+ 	int (*bind_config)(struct android_usb_function *,
+ 			   struct usb_configuration *);
+@@ -99,6 +104,7 @@ struct android_dev {
+ 	struct device *dev;
+ 
+ 	bool enabled;
++	int disable_depth;
+ 	struct mutex mutex;
+ 	bool connected;
+ 	bool sw_connected;
+@@ -183,20 +189,55 @@ static void android_work(struct work_struct *data)
+ 	}
+ }
+ 
++static void android_enable(struct android_dev *dev)
++{
++	struct usb_composite_dev *cdev = dev->cdev;
++
++	if (WARN_ON(!dev->disable_depth))
++		return;
++
++	if (--dev->disable_depth == 0) {
++		usb_add_config(cdev, &android_config_driver,
++					android_bind_config);
++		usb_gadget_connect(cdev->gadget);
++	}
++}
++
++static void android_disable(struct android_dev *dev)
++{
++	struct usb_composite_dev *cdev = dev->cdev;
++
++	if (dev->disable_depth++ == 0) {
++		usb_gadget_disconnect(cdev->gadget);
++		/* Cancel pending control requests */
++		usb_ep_dequeue(cdev->gadget->ep0, cdev->req);
++		usb_remove_config(cdev, &android_config_driver);
++	}
++}
+ 
+ /*-------------------------------------------------------------------------*/
+ /* Supported functions initialization */
+ 
++struct adb_data {
++	bool opened;
++	bool enabled;
++};
++
+ static int
+ adb_function_init(struct android_usb_function *f,
+ 		struct usb_composite_dev *cdev)
+ {
++	f->config = kzalloc(sizeof(struct adb_data), GFP_KERNEL);
++	if (!f->config)
++		return -ENOMEM;
++
+ 	return adb_setup();
+ }
+ 
+ static void adb_function_cleanup(struct android_usb_function *f)
+ {
+ 	adb_cleanup();
++	kfree(f->config);
+ }
+ 
+ static int
+@@ -206,13 +247,69 @@ adb_function_bind_config(struct android_usb_function *f,
+ 	return adb_bind_config(c);
+ }
+ 
++static void adb_android_function_enable(struct android_usb_function *f)
++{
++	struct android_dev *dev = _android_dev;
++	struct adb_data *data = f->config;
++
++	data->enabled = true;
++
++	/* Disable the gadget until adbd is ready */
++	if (!data->opened)
++		android_disable(dev);
++}
++
++static void adb_android_function_disable(struct android_usb_function *f)
++{
++	struct android_dev *dev = _android_dev;
++	struct adb_data *data = f->config;
++
++	data->enabled = false;
++
++	/* Balance the disable that was called in closed_callback */
++	if (!data->opened)
++		android_enable(dev);
++}
++
+ static struct android_usb_function adb_function = {
+ 	.name		= "adb",
++	.enable		= adb_android_function_enable,
++	.disable	= adb_android_function_disable,
+ 	.init		= adb_function_init,
+ 	.cleanup	= adb_function_cleanup,
+ 	.bind_config	= adb_function_bind_config,
+ };
+ 
++static void adb_ready_callback(void)
++{
++	struct android_dev *dev = _android_dev;
++	struct adb_data *data = adb_function.config;
++
++	mutex_lock(&dev->mutex);
++
++	data->opened = true;
++
++	if (data->enabled)
++		android_enable(dev);
++
++	mutex_unlock(&dev->mutex);
++}
++
++static void adb_closed_callback(void)
++{
++	struct android_dev *dev = _android_dev;
++	struct adb_data *data = adb_function.config;
++
++	mutex_lock(&dev->mutex);
++
++	data->opened = false;
++
++	if (data->enabled)
++		android_disable(dev);
++
++	mutex_unlock(&dev->mutex);
++}
++
+ 
+ #define MAX_ACM_INSTANCES 4
+ struct acm_function_config {
+@@ -858,6 +955,7 @@ static ssize_t enable_store(struct device *pdev, struct device_attribute *attr,
+ {
+ 	struct android_dev *dev = dev_get_drvdata(pdev);
+ 	struct usb_composite_dev *cdev = dev->cdev;
++	struct android_usb_function *f;
+ 	int enabled = 0;
+ 
+ 
+@@ -879,16 +977,18 @@ static ssize_t enable_store(struct device *pdev, struct device_attribute *attr,
+ 		cdev->desc.bDeviceClass = device_desc.bDeviceClass;
+ 		cdev->desc.bDeviceSubClass = device_desc.bDeviceSubClass;
+ 		cdev->desc.bDeviceProtocol = device_desc.bDeviceProtocol;
+-
+-		usb_add_config(cdev, &android_config_driver,
+-					android_bind_config);
+-		usb_gadget_connect(cdev->gadget);
++		list_for_each_entry(f, &dev->enabled_functions, enabled_list) {
++			if (f->enable)
++				f->enable(f);
++		}
++		android_enable(dev);
+ 		dev->enabled = true;
+ 	} else if (!enabled && dev->enabled) {
+-		usb_gadget_disconnect(cdev->gadget);
+-		/* Cancel pending control requests */
+-		usb_ep_dequeue(cdev->gadget->ep0, cdev->req);
+-		usb_remove_config(cdev, &android_config_driver);
++		android_disable(dev);
++		list_for_each_entry(f, &dev->enabled_functions, enabled_list) {
++			if (f->disable)
++				f->disable(f);
++		}
+ 		dev->enabled = false;
+ 	} else {
+ 		pr_err("android_usb: already %s\n",
+@@ -1184,6 +1284,7 @@ static int __init init(void)
+ 	if (!dev)
+ 		return -ENOMEM;
+ 
++	dev->disable_depth = 1;
+ 	dev->functions = supported_functions;
+ 	INIT_LIST_HEAD(&dev->enabled_functions);
+ 	INIT_WORK(&dev->work, android_work);
+diff --git a/drivers/usb/gadget/f_adb.c b/drivers/usb/gadget/f_adb.c
+index 3827715..1629ffb 100644
+--- a/drivers/usb/gadget/f_adb.c
++++ b/drivers/usb/gadget/f_adb.c
+@@ -111,6 +111,8 @@ static struct usb_descriptor_header *hs_adb_descs[] = {
+ 	NULL,
+ };
+ 
++static void adb_ready_callback(void);
++static void adb_closed_callback(void);
+ 
+ /* temporary variable used between adb_open() and adb_gadget_bind() */
+ static struct adb_dev *_adb_dev;
+@@ -407,7 +409,7 @@ static ssize_t adb_write(struct file *fp, const char __user *buf,
+ 
+ static int adb_open(struct inode *ip, struct file *fp)
+ {
+-	printk(KERN_INFO "adb_open\n");
++	pr_info("adb_open\n");
+ 	if (!_adb_dev)
+ 		return -ENODEV;
+ 
+@@ -419,12 +421,17 @@ static int adb_open(struct inode *ip, struct file *fp)
+ 	/* clear the error latch */
+ 	_adb_dev->error = 0;
+ 
++	adb_ready_callback();
++
+ 	return 0;
+ }
+ 
+ static int adb_release(struct inode *ip, struct file *fp)
+ {
+-	printk(KERN_INFO "adb_release\n");
++	pr_info("adb_release\n");
++
++	adb_closed_callback();
++
+ 	adb_unlock(&_adb_dev->open_excl);
+ 	return 0;
+ }
+-- 
+1.9.1
+

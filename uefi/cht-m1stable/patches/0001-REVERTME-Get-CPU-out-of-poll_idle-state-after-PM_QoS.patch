@@ -1,0 +1,65 @@
+From 204b37ad56f9f20a0d89a5ebc47aa1faec9a4f84 Mon Sep 17 00:00:00 2001
+From: huchen2 <hu1.chen@intel.com>
+Date: Fri, 28 Nov 2014 19:04:29 +0800
+Subject: [PATCH] REVERTME: Get CPU out of poll_idle state after PM_QoS change
+
+BZ: GMINL-3608
+
+The author of this patch is <chuansheng.liu@intel.com>
+We got this patch from https://lkml.org/lkml/2014/8/13/831
+
+this patch was rejected by upstream.
+but Upstream patch (K3.18) doesn't work under K3.14.
+
+when resolve upstream patches issue under K3.14,
+or kernel rebase to K3.18. this patch can be reverted.
+
+Detail of this issue:
+During mp3 power KPI tuning, we found that sometimes after
+"pmic_fg_status_monitor" get called, the CPU stays at high power
+consumption. The duration ranges from 2s to 50s.
+
+This is because "pmic_fg_status_monitor" handle PM_QoS and cause some
+cores stuck in C0/poll_idle state.
+"pmic_fg_status_monitor" related work is like below:
+{
+        pm_qos_update_request(&pm_qos, C1 - 1);
+                < == Here keep all cores at C0
+        ...;
+        pm_qos_update_request(&pm_qos, PM_QOS_DEFAULT_VALUE);
+                < == Here some cores still stuck at C0 for 2-50s
+}
+When someone require new PM_QoS, kernel will send IPI to all processors,
+get them out of C state and recalculate a new suitable C state.
+However, IPI can't get CPU out of poll_idle/C0 state because it's a
+polling loop, while other C state adopts mwait.
+This patch set reschedule bit in IPI callback to fix this.
+
+Change-Id: Ifb057072b9ad0ca59bb7703ebfddb68ebc5c7f59
+Signed-off-by: huchen2 <hu1.chen@intel.com>
+Signed-off-by: Zhang Ning <ning.a.zhang@intel.com>
+---
+ drivers/cpuidle/cpuidle.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/cpuidle/cpuidle.c b/drivers/cpuidle/cpuidle.c
+index a55e68f..5a325f0 100644
+--- a/drivers/cpuidle/cpuidle.c
++++ b/drivers/cpuidle/cpuidle.c
+@@ -494,6 +494,13 @@ EXPORT_SYMBOL_GPL(cpuidle_register);
+ static void smp_callback(void *v)
+ {
+ 	/* we already woke the CPU up, nothing more to do */
++#ifdef CONFIG_ARCH_HAS_CPU_RELAX
++	/* if the cpu is in lightest sleep, i.e, poll_idle(), we need set the
++	 * reschedule flag to get it out
++	 */
++	if (is_idle_task(current))
++		set_tsk_need_resched(current);
++#endif
+ }
+ 
+ /*
+-- 
+1.9.1
+

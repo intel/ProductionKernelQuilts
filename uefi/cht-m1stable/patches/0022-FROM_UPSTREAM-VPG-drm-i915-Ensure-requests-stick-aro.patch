@@ -1,0 +1,107 @@
+From 07fe8336dff47c4c5df37c89d66a9ea5de347f44 Mon Sep 17 00:00:00 2001
+Message-Id: <07fe8336dff47c4c5df37c89d66a9ea5de347f44.1421835210.git.chang-joon.lee@intel.com>
+In-Reply-To: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+References: <aa9849875fd9575e7de3d51e779ec326100b81c0.1421835210.git.chang-joon.lee@intel.com>
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Mon, 24 Nov 2014 18:49:28 +0000
+Subject: [PATCH 22/63] FROM_UPSTREAM [VPG]: drm/i915: Ensure requests stick
+ around during waits
+
+Added reference counting of the request structure around __wait_seqno() calls.
+This is a precursor to updating the wait code itself to take the request rather
+than a seqno. At that point, it would be a Bad Idea for a request object to be
+retired and freed while the wait code is still using it.
+
+v3:
+
+Note that even though the mutex lock is held during a call to i915_wait_seqno(),
+it is still necessary to explicitly bump the reference count. It appears that
+the shrinker can asynchronously retire items even though the mutex is locked.
+
+Change-Id: Ib4e2536981bbb07e4e79445839f5a7dd73cee484
+For: VIZ-4377
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Thomas Daniel <Thomas.Daniel@intel.com>
+[danvet: Remove wrongly squashed hunk which breaks the build.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Upstream-repo: git://anongit.freedesktop.org/drm-intel
+Upstream-commit: ff8658850aa9bdb5bc308ff8cce60c2558c58566
+Upstream-as-of-tag: n/a
+---
+ drivers/gpu/drm/i915/i915_gem.c |   17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index a62e2e5..792326a 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1432,9 +1432,11 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
+ 		return ret;
+ 
+ 	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
++	i915_gem_request_reference(req);
+ 	mutex_unlock(&dev->struct_mutex);
+ 	ret = __wait_seqno(ring, seqno, reset_counter, true, NULL, file_priv);
+ 	mutex_lock(&dev->struct_mutex);
++	i915_gem_request_unreference(req);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2975,6 +2977,7 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_gem_wait *args = data;
+ 	struct drm_i915_gem_object *obj;
++	struct drm_i915_gem_request *req;
+ 	struct intel_engine_cs *ring = NULL;
+ 	struct timespec timeout_stack, *timeout = NULL;
+ 	unsigned reset_counter;
+@@ -3004,7 +3007,8 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ 	if (!obj->active || !obj->last_read_req)
+ 		goto out;
+ 
+-	seqno = i915_gem_request_get_seqno(obj->last_read_req);
++	req = obj->last_read_req;
++	seqno = i915_gem_request_get_seqno(req);
+ 	WARN_ON(seqno == 0);
+ 	ring = obj->ring;
+ 
+@@ -3018,11 +3022,16 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ 
+ 	drm_gem_object_unreference(&obj->base);
+ 	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
++	i915_gem_request_reference(req);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	ret = __wait_seqno(ring, seqno, reset_counter, true, timeout, file->driver_priv);
+ 	if (timeout)
+ 		args->timeout_ns = timespec_to_ns(timeout);
++
++	mutex_lock(&dev->struct_mutex);
++	i915_gem_request_unreference(req);
++	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+ 
+ out:
+@@ -4211,6 +4220,8 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 		target = request;
+ 	}
+ 	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
++	if (target)
++		i915_gem_request_reference(target);
+ 	spin_unlock(&file_priv->mm.lock);
+ 
+ 	if (target == NULL)
+@@ -4226,6 +4237,10 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 		queue_delayed_work(dev_priv->wq,
+ 			&dev_priv->mm.retire_work, 0);
+ 
++	mutex_lock(&dev->struct_mutex);
++	i915_gem_request_unreference(target);
++	mutex_unlock(&dev->struct_mutex);
++
+ 	return ret;
+ }
+ 
+-- 
+1.7.9.5
+

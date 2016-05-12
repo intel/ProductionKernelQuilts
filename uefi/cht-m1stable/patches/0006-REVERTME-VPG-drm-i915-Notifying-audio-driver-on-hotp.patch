@@ -1,0 +1,340 @@
+From 12a2082e7f6fd55973b6a5485438bb3bd605e523 Mon Sep 17 00:00:00 2001
+Message-Id: <12a2082e7f6fd55973b6a5485438bb3bd605e523.1441918786.git.yunwei.zhang@intel.com>
+In-Reply-To: <8631704be06e00cb7a7a415f13811ca4ece99e8b.1441918786.git.yunwei.zhang@intel.com>
+References: <8631704be06e00cb7a7a415f13811ca4ece99e8b.1441918786.git.yunwei.zhang@intel.com>
+From: Shubhangi Shrivastava <shubhangi.shrivastava@intel.com>
+Date: Thu, 10 Sep 2015 12:41:11 +0530
+Subject: [PATCH 06/10] REVERTME: [VPG]: drm/i915: Notifying audio driver on
+ hotplug/unplug
+
+This patch updates the register values and encoder specific information
+at the time of hotplug and unplug which is required by audio driver for
+registering audio. This information is then notified to the audio driver
+on hotplug/unplug of the external device.
+
+REVERTME: LP audio is not available upstream and may not be for
+some more time which is required for this.
+
+Change-Id: I325848feb7bba25bb5dc64cea7db1dbe56c711cc
+Tracked-On: https://jira01.devtools.intel.com/browse/GMINL-10172
+Signed-off-by: Sivakumar Thulasimani <sivakumar.thulasimani@intel.com>
+Signed-off-by: Shubhangi Shrivastava <shubhangi.shrivastava@intel.com>
+---
+ drivers/gpu/drm/i915/hdmi_audio_if.c |  5 ++++
+ drivers/gpu/drm/i915/hdmi_audio_if.h |  1 +
+ drivers/gpu/drm/i915/i915_drv.h      |  1 +
+ drivers/gpu/drm/i915/intel_display.c | 44 +++++++++++++++++-------------------
+ drivers/gpu/drm/i915/intel_dp.c      | 33 +++++++++++++++++----------
+ drivers/gpu/drm/i915/intel_drv.h     |  4 +---
+ drivers/gpu/drm/i915/intel_hdmi.c    | 33 +++++++++++++++++++--------
+ 7 files changed, 73 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/hdmi_audio_if.c b/drivers/gpu/drm/i915/hdmi_audio_if.c
+index 3f279b4..d054951 100644
+--- a/drivers/gpu/drm/i915/hdmi_audio_if.c
++++ b/drivers/gpu/drm/i915/hdmi_audio_if.c
+@@ -76,6 +76,11 @@ static inline int android_hdmi_get_eld(struct drm_device *dev, void *eld)
+ 	return 0;
+ }
+ 
++struct hdmi_audio_priv *get_hdmi_priv()
++{
++	return hdmi_priv;
++}
++
+ /*
+  * return whether HDMI audio device is busy.
+  */
+diff --git a/drivers/gpu/drm/i915/hdmi_audio_if.h b/drivers/gpu/drm/i915/hdmi_audio_if.h
+index 34b97d3..82e44548 100644
+--- a/drivers/gpu/drm/i915/hdmi_audio_if.h
++++ b/drivers/gpu/drm/i915/hdmi_audio_if.h
+@@ -120,6 +120,7 @@ extern void mid_hdmi_audio_signal_event(struct drm_device *dev,
+ 		enum had_event_type event);
+ 
+ extern void hdmi_get_eld(uint8_t *eld);
++extern struct hdmi_audio_priv *get_hdmi_priv(void);
+ extern int i915_enable_hdmi_audio_int(struct drm_device *dev, int pipe);
+ extern int i915_disable_hdmi_audio_int(struct drm_device *dev, int pipe);
+ extern uint32_t set_dp_mode(uint32_t reg, uint32_t val);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 1c99cfc..02e5a44 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1793,6 +1793,7 @@ struct drm_i915_private {
+ #ifdef CONFIG_EXTCON
+ 	/* Android uses switch to inform userspace about hotplug events. */
+ 	struct extcon_dev hotplug_switch;
++	int audio_port;
+ #endif
+ 
+ 	/* Atomicity fixes */
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 5d0b597..da96388 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -13356,6 +13356,7 @@ void set_hdmi_priv(struct drm_device *dev)
+ 	}
+ 
+ 	extcon_dev_register(&dev_priv->hotplug_switch);
++	dev_priv->audio_port = 0;
+ #endif
+ }
+ 
+@@ -13543,11 +13544,16 @@ static void intel_setup_outputs(struct drm_device *dev)
+ }
+ 
+ void chv_set_lpe_audio_reg_pipe(struct drm_device *dev,
+-				   struct intel_encoder *intel_encoder,
+-				   struct hdmi_audio_priv *hdmi_priv,
+-				   enum port port)
++				int encoder_type, enum port port)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_encoder *intel_encoder;
++	struct hdmi_audio_priv *hdmi_priv = get_hdmi_priv();
++
++	if(!hdmi_priv) {
++		DRM_DEBUG_KMS("hdmi_priv was never allocated\n");
++		return;
++	}
+ 
+ 	/*
+ 	 * Due to hardware limitaion, Port D will always
+@@ -13560,12 +13566,10 @@ void chv_set_lpe_audio_reg_pipe(struct drm_device *dev,
+ 		hdmi_priv->hdmi_lpe_audio_reg =
+ 			I915_HDMI_AUDIO_LPE_C_CONFIG;
+ 		hdmi_priv->pipe = PIPE_C;
+-		if (intel_encoder->type == INTEL_OUTPUT_HDMI)
+-			hdmi_priv->hdmi_reg =
+-				VLV_CHV_HDMID;
+-		else if (intel_encoder->type == INTEL_OUTPUT_DISPLAYPORT)
+-			hdmi_priv->hdmi_reg =
+-				CHV_DP_D;
++		if (encoder_type == INTEL_OUTPUT_HDMI)
++			hdmi_priv->hdmi_reg = VLV_CHV_HDMID;
++		else
++			hdmi_priv->hdmi_reg = CHV_DP_D;
+ 	} else {
+ 		list_for_each_entry(intel_encoder, &dev->
+ 			mode_config.encoder_list, base.head) {
+@@ -13602,21 +13606,15 @@ void chv_set_lpe_audio_reg_pipe(struct drm_device *dev,
+ 		}
+ 
+ 		if (port == PORT_B) {
+-			if (intel_encoder->type == INTEL_OUTPUT_HDMI)
+-				hdmi_priv->hdmi_reg =
+-					VLV_CHV_HDMIB;
+-			else if (intel_encoder->type ==
+-					INTEL_OUTPUT_DISPLAYPORT)
+-				hdmi_priv->hdmi_reg =
+-					VLV_DP_B;
++			if (encoder_type == INTEL_OUTPUT_HDMI)
++				hdmi_priv->hdmi_reg = VLV_CHV_HDMIB;
++			else
++				hdmi_priv->hdmi_reg = VLV_DP_B;
+ 		} else {
+-			if (intel_encoder->type == INTEL_OUTPUT_HDMI)
+-				hdmi_priv->hdmi_reg =
+-					VLV_CHV_HDMIC;
+-			else if (intel_encoder->type ==
+-					INTEL_OUTPUT_DISPLAYPORT)
+-				hdmi_priv->hdmi_reg =
+-					VLV_DP_C;
++			if (encoder_type == INTEL_OUTPUT_HDMI)
++				hdmi_priv->hdmi_reg = VLV_CHV_HDMIC;
++			else
++				hdmi_priv->hdmi_reg = VLV_DP_C;
+ 		}
+ 	}
+ }
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 3d7ed02..fea7ae5 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -4546,6 +4546,7 @@ intel_dp_get_edid_modes(struct drm_connector *connector, struct i2c_adapter *ada
+ {
+ 	struct intel_connector *intel_connector = to_intel_connector(connector);
+ 	struct intel_dp *intel_dp = intel_attached_dp(connector);
++	struct intel_digital_port *intel_dig_port = dp_to_dig_port(intel_dp);
+ 	struct drm_device *dev = connector->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+@@ -4555,18 +4556,23 @@ intel_dp_get_edid_modes(struct drm_connector *connector, struct i2c_adapter *ada
+ 		if (IS_ERR(intel_connector->edid))
+ 			return 0;
+ 
++		if (dev_priv->audio_port == 0) {
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+-		drm_edid_to_eld(connector, intel_connector->edid);
+-		if (intel_dp->notify_had) {
+-			hdmi_get_eld(connector->eld);
++			drm_edid_to_eld(connector, intel_connector->edid);
++			if (intel_dp->notify_had) {
++				dev_priv->audio_port = intel_dig_port->port;
++				chv_set_lpe_audio_reg_pipe(dev, INTEL_OUTPUT_DISPLAYPORT,
++						intel_dig_port->port);
++				hdmi_get_eld(connector->eld);
+ #ifdef CONFIG_EXTCON
+-			if (strlen(dev_priv->hotplug_switch.name) != 0)
+-				extcon_set_state(&dev_priv->
+-					hotplug_switch, true);
++				if (strlen(dev_priv->hotplug_switch.name) != 0)
++					extcon_set_state(&dev_priv->
++						hotplug_switch, true);
+ #endif
+-			intel_dp->notify_had = false;
+-		}
++			}
+ #endif
++		}
++		intel_dp->notify_had = false;
+ 
+ 		return intel_connector_update_modes(connector,
+ 						    intel_connector->edid);
+@@ -4600,15 +4606,15 @@ intel_dp_detect(struct drm_connector *connector, bool force)
+ 	DRM_DEBUG_KMS("[CONNECTOR:%d:%s]\n",
+ 		      connector->base.id, connector->name);
+ 
+-	intel_dp->has_audio = false;
+-
+ 	if (HAS_PCH_SPLIT(dev))
+ 		status = ironlake_dp_detect(intel_dp);
+ 	else
+ 		status = g4x_dp_detect(intel_dp);
+ 
+-	if (status != connector_status_connected)
++	if (status != connector_status_connected) {
++		intel_dp->has_audio =  false;
+ 		goto out;
++	}
+ 
+ 	if (connector->status == connector_status_connected) {
+ 		DRM_DEBUG_KMS("Connector status is already connected\n");
+@@ -4661,16 +4667,19 @@ out:
+ 		if (status == connector_status_connected) {
+ 			if (intel_dp->has_audio)
+ 				intel_dp->notify_had = true;
+-		} else {
++		} else if (intel_dig_port->port == dev_priv->audio_port) {
+ #ifdef CONFIG_EXTCON
+ 			if (strlen(dev_priv->hotplug_switch.name) != 0)
+ 				extcon_set_state(
+ 				&dev_priv->hotplug_switch, false);
+ #endif
++			chv_set_lpe_audio_reg_pipe(dev, INTEL_OUTPUT_DISPLAYPORT,
++					intel_dig_port->port);
+ 			/* Send a disconnect event to audio */
+ 			DRM_DEBUG_DRIVER("Sending event to audio");
+ 			mid_hdmi_audio_signal_event(dev_priv->dev,
+ 						HAD_EVENT_HOT_UNPLUG);
++			dev_priv->audio_port = 0;
+ 		}
+ 		i915_hdmi_state = status;
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 0167cbd..e301b00 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -980,9 +980,7 @@ void intel_mode_from_pipe_config(struct drm_display_mode *mode,
+ int intel_format_to_fourcc(int format);
+ void intel_crtc_wait_for_pending_flips(struct drm_crtc *crtc);
+ void chv_set_lpe_audio_reg_pipe(struct drm_device *dev,
+-			    struct intel_encoder *intel_encoder,
+-			    struct hdmi_audio_priv *hdmi_priv,
+-			    enum port port);
++				int encoder_type, enum port port);
+ 
+ /* intel_dp.c */
+ void intel_dp_init(struct drm_device *dev, int output_reg, enum port port);
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index 5e3d9d3..d4338d5 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1276,7 +1276,7 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 			intel_hdmi->has_audio =
+ 				(intel_hdmi->force_audio == HDMI_AUDIO_ON);
+ 		intel_encoder->type = INTEL_OUTPUT_HDMI;
+-	} else {
++	} else if (dev_priv->audio_port == intel_dig_port->port) {
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+ 		if ((status != i915_hdmi_state) && (IS_VALLEYVIEW(dev))) {
+ #ifdef CONFIG_EXTCON
+@@ -1284,12 +1284,15 @@ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ 				extcon_set_state(
+ 				&dev_priv->hotplug_switch, 0);
+ #endif
++			chv_set_lpe_audio_reg_pipe(dev, INTEL_OUTPUT_HDMI,
++					intel_dig_port->port);
+ 			/* Send a disconnect event to audio */
+ 			DRM_DEBUG_DRIVER("Sending event to audio");
+ 			mid_hdmi_audio_signal_event(dev_priv->dev,
+ 				HAD_EVENT_HOT_UNPLUG);
+ 		}
+ #endif
++		dev_priv->audio_port = 0;
+ 	}
+ 
+ det_out:
+@@ -1307,6 +1310,9 @@ static int intel_hdmi_get_modes(struct drm_connector *connector)
+ {
+ 	struct intel_encoder *intel_encoder = intel_attached_encoder(connector);
+ 	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(&intel_encoder->base);
++	struct intel_digital_port *intel_dig_port =
++				hdmi_to_dig_port(intel_hdmi);
++	struct drm_device *dev = connector->dev;
+ 	struct drm_i915_private *dev_priv = connector->dev->dev_private;
+ 	enum intel_display_power_domain power_domain;
+ 	struct edid *edid = NULL;
+@@ -1320,11 +1326,13 @@ static int intel_hdmi_get_modes(struct drm_connector *connector)
+ 	intel_display_power_get(dev_priv, power_domain);
+ 
+ 	/* No need to read modes if no connection */
+-	if (connector->status != connector_status_connected) {
++	if ((connector->status != connector_status_connected) &&
++		(dev_priv->audio_port == intel_dig_port->port)) {
+ #ifdef CONFIG_EXTCON
+ 		if (strlen(dev_priv->hotplug_switch.name) != 0)
+ 			extcon_set_state(&dev_priv->hotplug_switch, 0);
+ #endif
++		dev_priv->audio_port = 0;
+ 		goto e_out;
+ 	}
+ 
+@@ -1339,20 +1347,25 @@ static int intel_hdmi_get_modes(struct drm_connector *connector)
+ 	if (edid) {
+ 		drm_mode_connector_update_edid_property(connector, edid);
+ 		ret = drm_add_edid_modes(connector, edid);
++		if (dev_priv->audio_port == 0) {
++			dev_priv->audio_port = intel_dig_port->port;
+ #ifdef CONFIG_SUPPORT_LPDMA_HDMI_AUDIO
+-		drm_edid_to_eld(connector, edid);
+-		if (intel_hdmi->notify_had) {
+-			hdmi_get_eld(connector->eld);
++			drm_edid_to_eld(connector, edid);
++			if (intel_hdmi->notify_had) {
++				chv_set_lpe_audio_reg_pipe(dev, INTEL_OUTPUT_HDMI,
++						intel_dig_port->port);
++				hdmi_get_eld(connector->eld);
+ #ifdef CONFIG_EXTCON
+-			if (strlen(dev_priv->hotplug_switch.name) != 0) {
+-				extcon_set_state(
+-				&dev_priv->hotplug_switch, 1);
+-			}
++				if (strlen(dev_priv->hotplug_switch.name) != 0) {
++					extcon_set_state(
++					&dev_priv->hotplug_switch, 1);
++				}
+ #endif
+-			intel_hdmi->notify_had = 0;
++			}
+ 		}
+ #endif
+ 	}
++	intel_hdmi->notify_had = 0;
+ 
+ 	/* Update the mode status */
+ 	intel_hdmi->edid_mode_count = ret;
+-- 
+1.9.1
+

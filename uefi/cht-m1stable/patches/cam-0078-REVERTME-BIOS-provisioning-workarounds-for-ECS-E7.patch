@@ -1,0 +1,112 @@
+From e7f1868c8ce3889a7431e8f0b51c1621468b5706 Mon Sep 17 00:00:00 2001
+From: Andy Ross <andrew.j.ross@intel.com>
+Date: Mon, 14 Jul 2014 12:56:08 -0700
+Subject: [PATCH 078/117] REVERTME: BIOS & provisioning workarounds for ECS E7
+
+* Add DMI-based temporary variables pending provisioning integration
+
+* mt9m114 got reset wrong, drive both GPIOs
+
+* ov5963 can have a different I2C address, allow config to specify
+
+Signed-off-by: Andy Ross <andrew.j.ross@intel.com>
+---
+ arch/x86/platform/intel-mid/atomisp_gmin_platform.c | 21 +++++++++++++++++++++
+ .../camera/drivers/media/i2c/mt9m114.c              | 10 +++++++++-
+ .../camera/drivers/media/i2c/ov5693.c               | 12 ++++++++++++
+ 3 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+index f20224d..842ec85 100644
+--- a/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
++++ b/arch/x86/platform/intel-mid/atomisp_gmin_platform.c
+@@ -221,6 +221,27 @@ static const struct gmin_cfg_var mrd7_vars[] = {
+ 	{ "INT33F9:00_CsiFmt",   "13" },
+ 	{ "INT33F9:00_CsiBayer", "0" },
+ 	{ "INT33F9:00_CamClk", "1" },
++
++	/* These values are actually for the ecs_e7 board, which sadly
++	 * identifies itself with identical DMI data to the MRD7.  But
++	 * we can get away with it because the ACPI IDs are
++	 * different. */
++	{ "gmin_V2P8GPIO", "402" },
++	/* OV5693 world-facing camera: */
++	{ "INT33BE:00_CamType",  "1" },
++	{ "INT33BE:00_CsiPort",  "1" },
++	{ "INT33BE:00_CsiLanes", "2" },
++	{ "INT33BE:00_CsiFmt",   "13" }, /* FIXME: correct? */
++	{ "INT33BE:00_CsiBayer", "0" }, /* FIXME: correct? */
++	{ "INT33BE:00_CamClk", "0" },
++	{ "INT33BE:00_I2CAddr", "16" }, /* BIOS ACPI bug workaround */
++	/* MT9M114 user-facing camera: */
++	{ "CRMT1040:00_CamType",  "1" },
++	{ "CRMT1040:00_CsiPort",  "0" },
++	{ "CRMT1040:00_CsiLanes", "1" },
++	{ "CRMT1040:00_CsiFmt",   "13" }, /* FIXME: correct? */
++	{ "CRMT1040:00_CsiBayer", "0" }, /* FIXME: correct? */
++	{ "CRMT1040:00_CamClk", "1" },
+ 	{},
+ };
+ 
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+index 6e441a3..811bd02 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/mt9m114.c
+@@ -501,12 +501,20 @@ static int gpio_ctrl(struct v4l2_subdev *sd, bool flag)
+ 	if (dev->platform_data->gpio_ctrl)
+ 		return dev->platform_data->gpio_ctrl(sd, flag);
+ 
++	/* Note: current modules wire only one GPIO signal (RESET#),
++	 * but the schematic wires up two to the connector.  BIOS
++	 * versions have been unfortunately inconsistent with which
++	 * ACPI index RESET# is on, so hit both */
++
+ 	if (flag) {
+ 		ret = dev->platform_data->gpio0_ctrl(sd, 0);
++		ret = dev->platform_data->gpio1_ctrl(sd, 0);
+ 		msleep(60);
+ 		ret |= dev->platform_data->gpio0_ctrl(sd, 1);
++		ret |= dev->platform_data->gpio1_ctrl(sd, 1);
+ 	} else {
+ 		ret = dev->platform_data->gpio0_ctrl(sd, 0);
++		ret = dev->platform_data->gpio1_ctrl(sd, 0);
+ 	}
+ 
+ 	return ret;
+@@ -1874,7 +1882,7 @@ MODULE_DEVICE_TABLE(i2c, mt9m114_id);
+ 
+ static struct acpi_device_id mt9m114_acpi_match[] = {
+ 	{ "INT33F0" },
+-	{ "APTN1040" },
++	{ "CRMT1040" },
+         {},
+ };
+ MODULE_DEVICE_TABLE(acpi, mt9m114_acpi_match);
+diff --git a/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c b/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c
+index 8166b40..8082da4 100644
+--- a/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c
++++ b/drivers/external_drivers/camera/drivers/media/i2c/ov5693.c
+@@ -1621,8 +1621,20 @@ static int ov5693_probe(struct i2c_client *client,
+ 			const struct i2c_device_id *id)
+ {
+ 	struct ov5693_device *dev;
++	int i2c;
+ 	int ret = 0;
+ 
++	/* Firmware workaround: Some modules use a "secondary default"
++	 * address of 0x10 which doesn't appear on schematics, and
++	 * some BIOS versions haven't gotten the memo.  Work around
++	 * via config. */
++	i2c = gmin_get_var_int(&client->dev, "I2CAddr", -1);
++	if (i2c != -1) {
++		dev_info(&client->dev, "Overriding firmware-provided I2C address (0x%x) with 0x%x\n",
++			 client->addr, i2c);
++		client->addr = i2c;
++	}
++
+ 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+ 	if (!dev) {
+ 		dev_err(&client->dev, "out of memory\n");
+-- 
+1.9.3
+
