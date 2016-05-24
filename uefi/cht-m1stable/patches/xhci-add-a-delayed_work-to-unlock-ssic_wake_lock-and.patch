@@ -1,0 +1,162 @@
+From bf332067a513113d5470a15d53c95e571ec82a34 Mon Sep 17 00:00:00 2001
+From: LongX Zhang <longx.zhang@intel.com>
+Date: Fri, 6 May 2016 16:11:09 +0800
+Subject: [PATCH] xhci: add a delayed_work to unlock ssic_wake_lock and _put
+ xhci runtime
+
+When users set up plane mode, modem is turned off. Only when
+users disable plane mode, xhci starts to enumerate again. During
+the plane mode time, system can't enter s0ix and s3 as ssic_wake_lock
+is ative and xhci device runtime pm is disabled.
+
+The patch fixes it by adding ssic_delayed_work. AFter disconnection,
+the work would unlock ssic_wake_lock and _put xhci runtime in 10 seconds.
+So system can enter s0ix and s3.
+
+Change-Id: I0bddde191d2d49be9918754efc3ebdfc05278c8c
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-31168
+Signed-off-by: Zhang Yanmin <yanmin.zhang@intel.com>
+Reviewed-on: https://android.intel.com:443/503906
+---
+ drivers/usb/host/xhci-intel-cap.c | 33 +++++++++++++++++++++++++--------
+ drivers/usb/host/xhci-intel-cap.h |  1 +
+ drivers/usb/host/xhci-pci.c       |  6 ++++++
+ drivers/usb/host/xhci-plat.c      |  5 +++++
+ drivers/usb/host/xhci.c           |  2 ++
+ drivers/usb/host/xhci.h           |  1 +
+ 6 files changed, 40 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-intel-cap.c b/drivers/usb/host/xhci-intel-cap.c
+index e7eb5b6..f640a61 100644
+--- a/drivers/usb/host/xhci-intel-cap.c
++++ b/drivers/usb/host/xhci-intel-cap.c
+@@ -297,6 +297,7 @@ void xhci_intel_ssic_port_unused(struct xhci_hcd *xhci, bool unused)
+ }
+ EXPORT_SYMBOL_GPL(xhci_intel_ssic_port_unused);
+ 
++#define SSIC_ENUMERATION_TIMEOUT	(10)
+ void hub_intel_ssic_check_block_runtime(struct usb_device *udev)
+ {
+ 	struct usb_hcd *hcd = bus_to_hcd(udev->bus);
+@@ -314,10 +315,25 @@ void hub_intel_ssic_check_block_runtime(struct usb_device *udev)
+ 			wake_lock(&xhci->ssic_wake_lock);
+ 			xhci->ssic_runtime_blocked = 1;
+ 			pm_runtime_get(hcd->self.controller);
++			schedule_delayed_work(&xhci->ssic_delayed_work,
++				HZ * SSIC_ENUMERATION_TIMEOUT);
+ 		}
+ 	}
+ }
+ 
++static void hub_intel_ssic_check_unblock_runtime_work(struct xhci_hcd *xhci,
++		int worker)
++{
++	if (xhci->ssic_runtime_blocked) {
++		if (!worker)
++			cancel_delayed_work(&xhci->ssic_delayed_work);
++		xhci_warn(xhci, "unblock runtime\n");
++		xhci->ssic_runtime_blocked = 0;
++		pm_runtime_put(xhci_to_hcd(xhci)->self.controller);
++		wake_unlock(&xhci->ssic_wake_lock);
++	}
++}
++
+ void hub_intel_ssic_check_unblock_runtime(struct usb_device *udev)
+ {
+ 	struct usb_hcd *hcd = bus_to_hcd(udev->bus);
+@@ -329,14 +345,15 @@ void hub_intel_ssic_check_unblock_runtime(struct usb_device *udev)
+ 			udev->portnum,
+ 			xhci->ssic_runtime_blocked);
+ 
+-	if (xhci_intel_ssic_port_check(xhci, udev->portnum)) {
+-		if (xhci->ssic_runtime_blocked) {
+-			xhci_warn(xhci, "unblock runtime\n");
+-			xhci->ssic_runtime_blocked = 0;
+-			pm_runtime_put(hcd->self.controller);
+-			wake_unlock(&xhci->ssic_wake_lock);
+-		}
+-	}
++	if (xhci_intel_ssic_port_check(xhci, udev->portnum))
++		hub_intel_ssic_check_unblock_runtime_work(xhci, 0);
++}
++
++void hub_intel_ssic_check_unblock_work(struct work_struct *work)
++{
++	struct xhci_hcd *xhci = container_of(work,
++			struct xhci_hcd, ssic_delayed_work.work);
++	hub_intel_ssic_check_unblock_runtime_work(xhci, 1);
+ }
+ 
+ /*
+diff --git a/drivers/usb/host/xhci-intel-cap.h b/drivers/usb/host/xhci-intel-cap.h
+index 2cc5a2c..70bea07 100644
+--- a/drivers/usb/host/xhci-intel-cap.h
++++ b/drivers/usb/host/xhci-intel-cap.h
+@@ -79,5 +79,6 @@ extern bool xhci_intel_ssic_port_check(struct xhci_hcd *xhci, int port);
+ extern int xhci_intel_need_disable_stall(struct xhci_hcd *xhci);
+ extern void hub_intel_ssic_check_block_runtime(struct usb_device *udev);
+ extern void hub_intel_ssic_check_unblock_runtime(struct usb_device *udev);
++extern void hub_intel_ssic_check_unblock_work(struct work_struct *work);
+ extern void xhci_intel_pipe_sync_phystatus_quirk(struct xhci_hcd *xhci,
+ 						 bool enable);
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index 7d1190f..74d6061 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -453,6 +453,12 @@ static void xhci_pci_remove(struct pci_dev *dev)
+ 		usb_remove_hcd(xhci->shared_hcd);
+ 		usb_put_hcd(xhci->shared_hcd);
+ 	}
++
++	if (xhci->ssic_runtime_blocked) {
++		wake_unlock(&xhci->ssic_wake_lock);
++		cancel_delayed_work(&xhci->ssic_delayed_work);
++	}
++
+ 	usb_hcd_pci_remove(dev);
+ 
+ 	/* Workaround for spurious wakeups at shutdown with HSW */
+diff --git a/drivers/usb/host/xhci-plat.c b/drivers/usb/host/xhci-plat.c
+index 1d5ba3c..32d5610 100644
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -190,6 +190,11 @@ static int xhci_plat_remove(struct platform_device *dev)
+ 	usb_remove_hcd(xhci->shared_hcd);
+ 	usb_put_hcd(xhci->shared_hcd);
+ 
++	if (xhci->ssic_runtime_blocked) {
++		wake_unlock(&xhci->ssic_wake_lock);
++		cancel_delayed_work(&xhci->ssic_delayed_work);
++	}
++
+ 	usb_remove_hcd(hcd);
+ 	iounmap(hcd->regs);
+ 	release_mem_region(hcd->rsrc_start, hcd->rsrc_len);
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index a7db1e3..0317388 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -4863,6 +4863,8 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
+ 			"xhci_enumeration");
+ 	/* In case ACPI doesn't provide info */
+ 	xhci->ssic_device_present = -1;
++	INIT_DELAYED_WORK(&xhci->ssic_delayed_work,
++		hub_intel_ssic_check_unblock_work);
+ 
+ 	get_quirks(dev, xhci);
+ 
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 4868a35..cbd1667 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1598,6 +1598,7 @@ struct xhci_hcd {
+ 	/* SSIC runtime is blocked */
+ 	bool ssic_runtime_blocked;
+ 	struct wake_lock ssic_wake_lock;
++	struct delayed_work ssic_delayed_work;
+ 
+ 	/* SSIC port number */
+ 	int ssic_port_number;
+-- 
+1.9.1
+

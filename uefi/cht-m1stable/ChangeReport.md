@@ -1,3 +1,26 @@
+## cht-m1stable: Weekly release 2016_WW21
+
+### New patches
+
+Please see the individual patch files for commit text.  
+
+Power:  
+[EM-dc_xpwr_charger-Setting-charging-enabled-upon-ena.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww21/uefi/cht-m1stable/patches/EM-dc_xpwr_charger-Setting-charging-enabled-upon-ena.patch)  
+
+X86/TSC:  
+[x86-tsc-Add-missing-Cherrytrail-frequency-to-the-tab.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww21/uefi/cht-m1stable/patches/x86-tsc-Add-missing-Cherrytrail-frequency-to-the-tab.patch)  
+
+MFD:  
+[EM-mfd_pmic_core-Removing-device-name-from-the-print.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww21/uefi/cht-m1stable/patches/EM-mfd_pmic_core-Removing-device-name-from-the-print.patch)  
+
+USB:  
+[xhci-add-a-delayed_work-to-unlock-ssic_wake_lock-and.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww21/uefi/cht-m1stable/patches/xhci-add-a-delayed_work-to-unlock-ssic_wake_lock-and.patch)  
+
+### Obsoleted patch
+
+[0001-Revert-SSIC-Disable-D3-entry-on-every-SSIC-disconnec.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww20/uefi/cht-m1stable/patches/0001-Revert-SSIC-Disable-D3-entry-on-every-SSIC-disconnec.patch)  
+
+
 ## cht-m1stable: Weekly release 2016_WW20
 
 ### New patches
