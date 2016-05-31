@@ -1,0 +1,214 @@
+From d723672301600ccff283ae0406bb7f21365c30ab Mon Sep 17 00:00:00 2001
+From: Sourab Gupta <sourab.gupta@intel.com>
+Date: Mon, 4 Jan 2016 13:40:21 +0530
+Subject: [PATCH 2/2] SQUASHME! [VPG]: drm/i915: Update process mm stats for
+ Gen GFX memory
+
+The GFX memory consumed by a process is not accounted by kernel. This
+leads to a scenario wherein the low memory killer is not able to
+correctly identify the best process to be killed during OOM scenarios.
+This case particularly manifests when an application has a large GFX
+memory footprint but has a significantly smaller system mem consumption.
+Low mem killer in such a case will not be able to identify this culprit
+process, and lot of innocent process will be killed without freeing much
+memory.
+
+This patch utilizes the memtracker functions to add the accounting for
+the processes' GFX memory consumption.
+The internal kernel counters updated thus don't affect the output of
+procrank, meminfo or smaps. So, it won't affect the behavior of
+memtracker HAL layer or meminfo service.
+The kernel counters updated though would lead to better approximation
+of process' memory consumption, leading to better low mem killer behavior.
+
+The memtracker functions are called at asynchronous points during
+shrinker invocation.
+Thus, in times of memory stress, we ensure to update the processes' GFX
+mem statistics, therefore leading to better low mem killer behavior
+
+    SQUASHME! - This patch should be squashed into the following patch:
+	Author: Sourab Gupta <sourab.gupta@intel.com>
+	Date:   Mon Aug 11 13:12:04 2014 +0530
+	Change-Id: I02552d54a753fcfb94b5bdd9bc9c82702bbf514d
+	MUST_REBASE [VPG]: drm/i915: Sysfs interface to get GFX shmem usage
+		stats per process
+
+Change-Id: Ic00e8c8d6b31e0009eeccdf0d609090880e06597
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-29134
+Signed-off-by: Shi Yang <yang.a.shi@intel.com>
+Signed-off-by: Sourab Gupta <sourab.gupta@intel.com>
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Reviewed-on: https://android.intel.com:443/484426
+Reviewed-on: https://android.intel.com:443/507609
+---
+ drivers/gpu/drm/i915/i915_drv.h       |  8 ++++++++
+ drivers/gpu/drm/i915/i915_gem.c       | 15 +++++++++++++++
+ drivers/gpu/drm/i915/i915_gem_debug.c | 24 ++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_sysfs.c     | 15 +++++++++------
+ 4 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 0a27a85..baae323 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2355,6 +2355,14 @@ struct drm_i915_gem_request *i915_gem_request_find_by_seqno(struct intel_engine_
+ struct drm_i915_gem_request *i915_gem_request_find_by_sync_value(struct intel_engine_cs *ring,
+ 								 uint32_t sync_value);
+ 
++struct i915_gem_file_attr_priv {
++	char tgid_str[16];
++	struct pid *tgid;
++	size_t rss_size;
++	struct mm_struct *mm;
++	struct drm_i915_error_state_buf buf;
++};
++
+ struct drm_i915_file_private {
+ 	struct drm_i915_private *dev_priv;
+ 	struct drm_file *file;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index cf785cf..9fba1ab 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -6365,6 +6365,19 @@ static int num_vma_bound(struct drm_i915_gem_object *obj)
+ }
+ #endif
+ 
++static void i915_gem_update_gfx_stats(struct drm_device *dev)
++{
++	if (!mutex_is_locked_by(&dev->struct_mutex, current) &&
++		!mutex_is_locked_by(&drm_global_mutex, current)) {
++		struct drm_i915_error_state_buf error_str;
++
++		error_str.bytes = 0;
++		error_str.size = 0;
++		error_str.err = -ENOSPC;
++		i915_get_drm_clients_info(&error_str, dev);
++	}
++}
++
+ static unsigned long
+ i915_gem_shrinker_count(struct shrinker *shrinker, struct shrink_control *sc)
+ {
+@@ -6392,6 +6405,8 @@ i915_gem_shrinker_count(struct shrinker *shrinker, struct shrink_control *sc)
+ 	if (unlock)
+ 		mutex_unlock(&dev->struct_mutex);
+ 
++	i915_gem_update_gfx_stats(dev);
++
+ 	return count;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_debug.c b/drivers/gpu/drm/i915/i915_gem_debug.c
+index 43a3764..bf7b9cf 100644
+--- a/drivers/gpu/drm/i915/i915_gem_debug.c
++++ b/drivers/gpu/drm/i915/i915_gem_debug.c
+@@ -153,6 +153,7 @@ struct pid_stat_entry {
+ 	struct drm_open_hash namelist;
+ 	struct per_file_obj_mem_info stats;
+ 	struct pid *tgid;
++	struct i915_gem_file_attr_priv *attr_priv;
+ 	int pid_num;
+ };
+ 
+@@ -261,6 +262,23 @@ static unsigned long i915_obj_get_shmem_pages_alloced(struct drm_i915_gem_object
+ 	return 0;
+ }
+ 
++static void i915_update_task_mm_stats(struct pid_stat_entry *pid_entry)
++{
++	long new_size, old_size;
++
++	new_size =
++		(pid_entry->stats.phys_space_shared_proportion +
++		 pid_entry->stats.phys_space_allocated_priv) / PAGE_SIZE;
++
++	old_size = pid_entry->attr_priv->rss_size;
++
++	/* Update task mm stats */
++	if(pid_entry->attr_priv->mm)
++		add_mm_counter(pid_entry->attr_priv->mm, MM_FILEPAGES, new_size - old_size);
++
++	pid_entry->attr_priv->rss_size = new_size;
++}
++
+ int i915_gem_obj_insert_pid(struct drm_i915_gem_object *obj)
+ {
+ 	int found = 0;
+@@ -835,6 +853,7 @@ __i915_get_drm_clients_info(struct drm_i915_error_state_buf *m,
+ 			list_add_tail(&new_entry->head, &per_pid_stats);
+ 			INIT_LIST_HEAD(&new_entry->namefree);
+ 			new_entry->stats.process_name = file_priv->process_name;
++			new_entry->attr_priv = file_priv->obj_attr->private;
+ 			pid_entry = new_entry;
+ 		}
+ 
+@@ -900,6 +919,8 @@ __i915_get_drm_clients_info(struct drm_i915_error_state_buf *m,
+ 		else
+ 			err_puts(m, "\n");
+ 
++		i915_update_task_mm_stats(pid_entry);
++
+ 		total_shared_prop_space +=
+ 			pid_entry->stats.phys_space_shared_proportion/1024;
+ 		total_priv_space +=
+@@ -976,6 +997,7 @@ __i915_gem_get_obj_info(struct drm_i915_error_state_buf *m,
+ 		if (file_priv->tgid != tgid)
+ 			continue;
+ 
++		pid_entry.attr_priv = file_priv->obj_attr->private;
+ 		file_priv_reqd = file_priv;
+ 		err_puts(m,
+ 			"\n Obj Identifier   Obj-Size Resident-Size Pin Tiling Dirty Shared Vmap Stolen Mappable  AllocState Global/PP  GttOffset (PID: handle count: user virt addrs)\n");
+@@ -990,6 +1012,8 @@ __i915_gem_get_obj_info(struct drm_i915_error_state_buf *m,
+ 	if (file_priv_reqd) {
+ 		int space_remaining;
+ 
++		i915_update_task_mm_stats(&pid_entry);
++
+ 		/* Reset the bytes counter to buffer beginning */
+ 		bytes_copy = m->bytes;
+ 		m->bytes = 0;
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.c b/drivers/gpu/drm/i915/i915_sysfs.c
+index ff691e6..129f5b9 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -1553,12 +1553,6 @@ out:
+ #define GEM_OBJ_STAT_BUF_SIZE (4*1024) /* 4KB */
+ #define GEM_OBJ_STAT_BUF_SIZE_MAX (1024*1024) /* 1MB */
+ 
+-struct i915_gem_file_attr_priv {
+-	char tgid_str[16];
+-	struct pid *tgid;
+-	struct drm_i915_error_state_buf buf;
+-};
+-
+ static ssize_t i915_gem_read_objects(struct file *filp,
+ 				struct kobject *memtrack_kobj,
+ 				struct bin_attribute *attr,
+@@ -1721,6 +1715,9 @@ int i915_gem_create_sysfs_file_entry(struct drm_device *dev,
+ 	obj_attr->read = i915_gem_read_objects;
+ 
+ 	attr_priv->tgid = file_priv->tgid;
++	attr_priv->rss_size = 0;
++	attr_priv->mm = current->mm;
++	atomic_inc(&current->mm->mm_count);
+ 	obj_attr->private = attr_priv;
+ 
+ 	ret = sysfs_create_bin_file(&dev_priv->memtrack_kobj,
+@@ -1777,6 +1774,12 @@ void i915_gem_remove_sysfs_file_entry(struct drm_device *dev,
+ 			return;
+ 		attr_priv = file_priv->obj_attr->private;
+ 
++		if(attr_priv->mm) {
++			add_mm_counter(attr_priv->mm, MM_FILEPAGES,
++						-attr_priv->rss_size);
++			mmdrop(attr_priv->mm);
++		}
++
+ 		sysfs_remove_bin_file(&dev_priv->memtrack_kobj,
+ 				file_priv->obj_attr);
+ 
+-- 
+1.9.1
+

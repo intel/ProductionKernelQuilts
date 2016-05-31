@@ -1,3 +1,55 @@
+## cht-m1stable: Weekly release 2016_WW22
+
+### Baseline update  
+
+3.14.55 -> 3.14.64  
+
+### New patches
+
+Please see the individual patch files for commit text.  
+
+Extcon:  
+[EM-dc_ti_pwrsrc-WA-fix-to-enable-the-VBUS-upon-wakeu.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/EM-dc_ti_pwrsrc-WA-fix-to-enable-the-VBUS-upon-wakeu.patch)  
+
+Graphics:  
+[FROM_UPSTREAM-VPG-drm-i915-Do-not-leak-objects-after.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/FROM_UPSTREAM-VPG-drm-i915-Do-not-leak-objects-after.patch)  
+[FROM_UPSTREAM-VPG-drm-i915-Free-wa_batchbuffer-when-.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/FROM_UPSTREAM-VPG-drm-i915-Free-wa_batchbuffer-when-.patch)  
+[SQUASHME-VPG-drm-i915-Handle-the-fallocate-swap-cond.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/SQUASHME-VPG-drm-i915-Handle-the-fallocate-swap-cond.patch)  
+[SQUASHME-VPG-drm-i915-Update-process-mm-stats-for-Ge.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/SQUASHME-VPG-drm-i915-Update-process-mm-stats-for-Ge.patch)  
+
+USB:  
+[usb-ssic-port-id-correction-in-disable-stall-workaro.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/usb-ssic-port-id-correction-in-disable-stall-workaro.patch)  
+
+Mfd:  
+[Dollar-Cove-TI-handle-IRQ-as-triggered-on-high-level.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/Dollar-Cove-TI-handle-IRQ-as-triggered-on-high-level.patch)  
+
+Audio:  
+[Audio-Allocate-compress-offload-ddr-ring-buffer-in-D.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/Audio-Allocate-compress-offload-ddr-ring-buffer-in-D.patch)  
+
+Touch:  
+[Touch-silead-Make-the-pressure-and-size-value-range-.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/Touch-silead-Make-the-pressure-and-size-value-range-.patch)  
+
+BT:  
+[BT-Remove-the-check-on-CHT-MRD-for-bt_lpm.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/BT-Remove-the-check-on-CHT-MRD-for-bt_lpm.patch)  
+
+### Renamed patch
+
+This patch has been updated and renamed along with the baseline update.  
+
+FROM:  
+[0001-VPG-roll-back-VPG-patches-from-3.14.55-to-3.14.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww21/uefi/cht-m1stable/patches/0001-VPG-roll-back-VPG-patches-from-3.14.55-to-3.14.patch)  
+
+TO:  
+[0001-VPG-roll-back-VPG-patches-from-3.14.64-to-3.14.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww22/uefi/cht-m1stable/patches/0001-VPG-roll-back-VPG-patches-from-3.14.64-to-3.14.patch)  
+
+### Obsoleted patches
+
+These patches have been removed as they are already available in 3.14.64.  
+
+[0652-UPSTREAM-proc-actually-make-proc_fd_permission-threa.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww21/uefi/cht-m1stable/patches/0652-UPSTREAM-proc-actually-make-proc_fd_permission-threa.patch)  
+[UPSTREAM-KEYS-Fix-keyring-ref-leak-in-join_session_k.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww21/uefi/cht-m1stable/patches/UPSTREAM-KEYS-Fix-keyring-ref-leak-in-join_session_k.patch)  
+
+
 ## cht-m1stable: Weekly release 2016_WW21
 
 ### New patches
