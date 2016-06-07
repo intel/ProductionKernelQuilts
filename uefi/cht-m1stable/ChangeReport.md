@@ -1,6 +1,17 @@
+## cht-m1stable: Weekly release 2016_WW23
+
+### New patches
+
+Please see the individual patch files for commit text.  
+
+Power:  
+[EM-power_supply_charger-set-MAX_THROTTLE_STATE-for-m.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww23/uefi/cht-m1stable/patches/EM-power_supply_charger-set-MAX_THROTTLE_STATE-for-m.patch)  
+[EM-power_supply_charger-Fixing-the-KW-issue.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww23/uefi/cht-m1stable/patches/EM-power_supply_charger-Fixing-the-KW-issue.patch)  
+
+
 ## cht-m1stable: Weekly release 2016_WW22
 
-### Baseline update  
+### Baseline update
 
 3.14.55 -> 3.14.64  
 
