@@ -1,0 +1,58 @@
+From 4200ebb7bb687dbfa1391ae6d615542fa8c741db Mon Sep 17 00:00:00 2001
+From: xiao jin <jin.xiao@intel.com>
+Date: Mon, 9 May 2016 14:46:46 +0800
+Subject: [PATCH] sdhci.c: uses TSC instead of jiffies in atomic context.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We hit watchdog panic when sdhci_execute_tuning.
+
+Due to some hardware issue, sdhci int status might not
+be available for a long time. The driver used jiffies
+to wait for 150 ms while local irq disabled. If the thread
+is running on a cpu who is the owner to update jiffies,
+the timer irq can’t be processed because the cpu disable
+irq. That made the driver wait for more time than needed
+and trigger watchdog.
+
+The patch uses TSC instead of jiffies in atomic context.
+
+Change-Id: I90f0fac987d6b4754a0ea7097ac1cf48ad0e9732
+Signed-off-by: xiao jin <jin.xiao@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/OAM-33510
+Reviewed-on: https://android.intel.com:443/503999
+(cherry picked from commit 6ba7d84cdeb97a2b18ee82baa34cb78b11128c02)
+Reviewed-on: https://android.intel.com:443/513202
+---
+ drivers/mmc/host/sdhci.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index af7e557..4d3a97a 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -2102,8 +2102,10 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 		host->mrq = NULL;
+ 
+ 		if (unlikely(host->quirks2 & SDHCI_QUIRK2_TUNING_POLL)) {
+-			unsigned long timeout = jiffies + msecs_to_jiffies(150);
++			u64 timeout = sched_clock() + 150 * ((u64) NSEC_PER_MSEC);
++			u64 clock;
+ 			do {
++				clock = sched_clock();
+ 				unsigned int intmask =
+ 					sdhci_readl(host, SDHCI_INT_STATUS);
+ 				if (!(intmask & SDHCI_INT_DATA_AVAIL))
+@@ -2113,7 +2115,7 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 						intmask & SDHCI_INT_DATA_AVAIL,
+ 						SDHCI_INT_STATUS);
+ 				break;
+-			} while (!time_after(jiffies, timeout));
++			} while (!time_after64(clock, timeout));
+ 		} else {
+ 			spin_unlock_irqrestore(&host->lock, flags);
+ 			/* Wait for Buffer Read Ready interrupt */
+-- 
+1.9.1
+

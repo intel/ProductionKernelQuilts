@@ -1,3 +1,13 @@
+## cht-m1stable: Weekly release 2016_WW24
+
+### New patches
+
+Please see the individual patch files for commit text.  
+
+MMC:  
+[0001-sdhci.c-uses-TSC-instead-of-jiffies-in-atomic-contex.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww24/uefi/cht-m1stable/patches/0001-sdhci.c-uses-TSC-instead-of-jiffies-in-atomic-contex.patch)  
+
+
 ## cht-m1stable: Weekly release 2016_WW23
 
 ### New patches
