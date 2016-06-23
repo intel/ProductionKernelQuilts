@@ -1,3 +1,25 @@
+## cht-m1stable: Weekly release 2016_WW25
+
+### New patches
+
+Please see the individual patch files for commit text.  
+
+Graphics:  
+[Revert-FOR_UPSTREAM-VPG-drm-i915-Fix-audio-checks-du.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww25/uefi/cht-m1stable/patches/Revert-FOR_UPSTREAM-VPG-drm-i915-Fix-audio-checks-du.patch)  
+[0001-Revert-SQUASHME-VPG-drm-i915-Update-process-mm-stats.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww25/uefi/cht-m1stable/patches/0001-Revert-SQUASHME-VPG-drm-i915-Update-process-mm-stats.patch)  
+[0002-Revert-SQUASHME-VPG-drm-i915-Handle-the-fallocate-sw.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww25/uefi/cht-m1stable/patches/0002-Revert-SQUASHME-VPG-drm-i915-Handle-the-fallocate-sw.patch)  
+
+### Renamed patch
+
+This patch has been updated and renamed along with the baseline update.  
+
+FROM:  
+[0001-sdhci.c-uses-TSC-instead-of-jiffies-in-atomic-contex.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww24/uefi/cht-m1stable/patches/0001-sdhci.c-uses-TSC-instead-of-jiffies-in-atomic-contex.patch)  
+
+TO:  
+[sdhci.c-uses-TSC-instead-of-jiffies-in-atomic-contex.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww25/uefi/cht-m1stable/patches/sdhci.c-uses-TSC-instead-of-jiffies-in-atomic-contex.patch)  
+
+
 ## cht-m1stable: Weekly release 2016_WW24
 
 ### New patches
