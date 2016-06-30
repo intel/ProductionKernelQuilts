@@ -1,3 +1,25 @@
+## cht-m1stable: Weekly release 2016_WW26
+
+### New patches
+
+Please see the individual patch files for commit text.  
+
+BT:  
+[Revert-BT-To-pre-MRD-LPM.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww26/uefi/cht-m1stable/patches/Revert-BT-To-pre-MRD-LPM.patch)  
+
+### Renamed patch
+
+This patch has been updated and renamed along with the baseline update.  
+
+FROM:  
+[0001-Revert-SQUASHME-VPG-drm-i915-Update-process-mm-stats.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww25/uefi/cht-m1stable/patches/0001-Revert-SQUASHME-VPG-drm-i915-Update-process-mm-stats.patch)  
+[0002-Revert-SQUASHME-VPG-drm-i915-Handle-the-fallocate-sw.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww25/uefi/cht-m1stable/patches/0002-Revert-SQUASHME-VPG-drm-i915-Handle-the-fallocate-sw.patch)  
+
+TO:  
+[Revert-SQUASHME-VPG-drm-i915-Update-process-mm-stats.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww26/uefi/cht-m1stable/patches/Revert-SQUASHME-VPG-drm-i915-Update-process-mm-stats.patch)  
+[Revert-SQUASHME-VPG-drm-i915-Handle-the-fallocate-sw.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww26/uefi/cht-m1stable/patches/Revert-SQUASHME-VPG-drm-i915-Handle-the-fallocate-sw.patch)  
+
+
 ## cht-m1stable: Weekly release 2016_WW25
 
 ### New patches
