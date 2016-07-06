@@ -1,3 +1,13 @@
+## cht-m1stable: Weekly release 2016_WW27
+
+### New patches
+
+Please see the individual patch files for commit text.  
+
+MM:  
+[VMSCAN-Correct-a-missing-initialization-in-debug_shr.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww27/uefi/cht-m1stable/patches/VMSCAN-Correct-a-missing-initialization-in-debug_shr.patch)  
+
+
 ## cht-m1stable: Weekly release 2016_WW26
 
 ### New patches
