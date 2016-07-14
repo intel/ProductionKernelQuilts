@@ -1,3 +1,13 @@
+## cht-m1stable: Weekly release 2016_WW28
+
+### New patches
+
+Please see the individual patch files for commit text.  
+
+Graphics:  
+[SQUASHME-VPG-drm-i915-Correct-copy_to_user-issue.patch](https://github.com/01org/ProductionKernelQuilts/blob/cht-m1stable-2016_ww28/uefi/cht-m1stable/patches/SQUASHME-VPG-drm-i915-Correct-copy_to_user-issue.patch)  
+
+
 ## cht-m1stable: Weekly release 2016_WW27
 
 ### New patches
